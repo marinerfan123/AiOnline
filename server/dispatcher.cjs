@@ -1347,12 +1347,42 @@ async function finalizeResumedTask(pgPool, ctx, result) {
           });
         }
       } catch (e) { console.warn('[accounting resume]', e.message); }
+      // ── 服务端最终化（视频）：fetch → OSS → media，与 generateAsync / runWaitingPump 完全一致 ──
+      // 注意：result.images 在本路径是 [videoUrl]（视频 URL 字符串），不能当图片最终化；
+      // 因此图片传 []，仅把 result.videoUrl 作为视频最终化（避免「图片」行里塞视频字节）。
+      let finalized;
+      try {
+        finalized = await assetFinalize.finalizeTask(pgPool, {
+          userId: user_id, taskId, prompt: '', model: model || '',
+          ratio: '1:1', contentType: contentType || 'video', pendingIds: [],
+        }, [], result.videoUrl || null);
+      } catch (e) {
+        console.warn('[dispatcher] 视频资产最终化异常（不影响 done 标记）:', e.message);
+        logError('dispatcher.finalizeVideo', `视频最终化失败 taskId=${taskId}: ${e && e.message}`, { taskId, userId: user_id || '' });
+        finalized = { images: [], video: null, errors: [(e && e.message) || String(e)] };
+      }
+      const finalImages = (finalized.images || []).map((it) => ({
+        mediaId: it.mediaId, ossUrl: it.ossUrl, ossObjectKey: it.ossObjectKey || '',
+        ossUploaded: !!it.ossUploaded, status: it.status,
+        contentType: it.contentType || 'image/jpeg', fileSize: it.fileSize || 0,
+      }));
+      const finalVideo = finalized.video ? {
+        mediaId: finalized.video.mediaId, ossUrl: finalized.video.ossUrl, ossObjectKey: finalized.video.ossObjectKey || '',
+        ossUploaded: !!finalized.video.ossUploaded, status: finalized.video.status,
+        contentType: finalized.video.contentType || 'video/mp4', fileSize: finalized.video.fileSize || 0,
+      } : null;
+      const finalResult = Object.assign({}, result, {
+        images: finalImages,
+        videoUrl: finalVideo ? finalVideo.ossUrl : (result.videoUrl || ''),
+        videoMedia: finalVideo,
+        finalizeErrors: finalized.errors || [],
+      });
       await pgPool.query(
         `UPDATE generation_tasks SET status=$2, result=$3, error=$4, completed_at=NOW(), user_id=$5
          WHERE task_id=$1`,
-        [taskId, 'done', JSON.stringify(result || {}), (result && result.error) || '', user_id],
+        [taskId, 'done', JSON.stringify(finalResult), (result && result.error) || '', user_id],
       );
-      realtime.emitTaskUpdate(user_id, { taskId, status: 'done', result: result || null, error: (result && result.error) || '' });
+      realtime.emitTaskUpdate(user_id, { taskId, status: 'done', result: finalResult, error: (result && result.error) || '' });
     } else if (result && result.status === 'timeout') {
       // 防僵尸安全线触发：仍然绝不判失败、绝不释放积分，保留任务待复核（成败只听生成端回复）。
       await updateTaskStatus(pgPool, taskId, 'waiting', null, '等待生成端回复超过安全线，任务保留待复核', user_id);
@@ -1726,7 +1756,39 @@ async function runWaitingPump(pgPool) {
         const ok = result && result.status === 'success' && Array.isArray(result.images) && result.images.length;
         if (ok) {
           await billing.commitCredits(pgPool, opts.user_id, opts.cost, opts.idempotencyKey, opts.costPool).catch(() => {});
-          await updateTaskStatus(pgPool, taskId, 'done', result, null, opts.user_id);
+          // 等待区重试成功：必须与 generateAsync 走一致的服务端最终化（fetch → OSS → media），
+          // 否则 result.images 只存 provider 临时链接，过期后前端显示「图片链接已失效 / 生成失败」。
+          let finalized;
+          try {
+            finalized = await assetFinalize.finalizeTask(pgPool, {
+              userId: opts.user_id,
+              taskId,
+              prompt: opts.prompt,
+              model: opts.canonicalModelId || opts.model,
+              ratio: (opts && opts.ratio) || (opts.clientMeta && opts.clientMeta.ratio) || '1:1',
+              contentType: opts.contentType || 'image',
+              pendingIds: (opts && Array.isArray(opts.pendingIds)) ? opts.pendingIds : [],
+            }, result.images || [], result.videoUrl || null);
+          } catch (e) {
+            console.warn('[waiting] 资产最终化异常（不影响 done 标记）:', e.message);
+            finalized = { images: [], video: null, errors: [(e && e.message) || String(e)] };
+          }
+          const finalImages = (finalized.images || []).map((it) => ({
+            mediaId: it.mediaId, ossUrl: it.ossUrl, ossObjectKey: it.ossObjectKey || '',
+            ossUploaded: !!it.ossUploaded, status: it.status,
+            contentType: it.contentType || 'image/jpeg', fileSize: it.fileSize || 0,
+          }));
+          const finalVideo = finalized.video ? {
+            mediaId: finalized.video.mediaId, ossUrl: finalized.video.ossUrl, ossObjectKey: finalized.video.ossObjectKey || '',
+            ossUploaded: !!finalized.video.ossUploaded, status: finalized.video.status,
+            contentType: finalized.video.contentType || 'video/mp4', fileSize: finalized.video.fileSize || 0,
+          } : null;
+          const finalResult = Object.assign({}, result, {
+            images: finalImages, videoUrl: finalVideo ? finalVideo.ossUrl : (result.videoUrl || ''),
+            videoMedia: finalVideo, finalizeErrors: finalized.errors || [],
+          });
+          await updateTaskStatus(pgPool, taskId, 'done', finalResult, null, opts.user_id);
+          realtime.emitTaskUpdate(opts.user_id, { taskId, status: 'done', result: finalResult, error: '' });
           WAITING_AREA.delete(taskId);
         } else if (result && result.status === 'throttled') {
           // 仍不可用：继续留在等待区，下一轮再试（任务保持 running，前台仍显示"生成中"）

@@ -183,3 +183,6 @@ scripts/prod-keys.json
 # 备份副本（*.bak.* 不被 *.bak 覆盖）
 *.bak.*
 *.bak
+
+# 调试备份副本（bak 后无点）
+*.bak-*
