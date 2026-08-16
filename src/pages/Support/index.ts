@@ -1,0 +1,9 @@
+export { default as HelpCenterPage } from './HelpCenterPage';
+export { default as DocsPage } from './DocsPage';
+export { default as ChangelogPage } from './ChangelogPage';
+export { default as TutorialsPage } from './TutorialsPage';
+export { default as AboutPage } from './AboutPage';
+export { default as GuidePage } from './GuidePage';
+export { default as FeedbackPage } from './FeedbackPage';
+export { default as ReportPage } from './ReportPage';
+export { default as PrivacyPage } from './PrivacyPage';

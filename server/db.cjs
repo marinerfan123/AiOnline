@@ -1,0 +1,196 @@
+// server/db.js — PostgreSQL + Redis 连接层
+const { Pool } = require('pg');
+const Redis = require('ioredis');
+const path = require('path');
+require('dotenv').config({ path: path.resolve(__dirname, '..', '.env') });
+
+// ── PostgreSQL Pool ──
+const pool = new Pool({
+  host: process.env.PG_HOST || 'localhost',
+  port: parseInt(process.env.PG_PORT || '5432', 10),
+  database: process.env.PG_DATABASE || 'huabu',
+  user: process.env.PG_USER || 'postgres',
+  password: process.env.PG_PASSWORD || 'postgres',
+  max: 10,
+  idleTimeoutMillis: 30000,
+});
+
+pool.on('error', (err) => {
+  console.error('[PG] pool error:', err.message);
+});
+
+// ── Redis ──
+const redis = new Redis({
+  host: process.env.REDIS_HOST || 'localhost',
+  port: parseInt(process.env.REDIS_PORT || '6379', 10),
+  password: process.env.REDIS_PASSWORD || undefined,
+  maxRetriesPerRequest: 3,
+  lazyConnect: true,
+});
+
+redis.on('error', (err) => {
+  console.warn('[Redis] connection error (non-fatal):', err.message);
+});
+
+// ── 初始化：建表 ──
+async function initDB() {
+  const client = await pool.connect();
+  try {
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS providers (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        type TEXT NOT NULL DEFAULT 'official',
+        base_url TEXT NOT NULL DEFAULT '',
+        api_key TEXT DEFAULT '',
+        supported_types TEXT[] DEFAULT '{}',
+        enabled BOOLEAN DEFAULT TRUE,
+        protocol TEXT DEFAULT 'openai-compatible',
+        remark TEXT DEFAULT '',
+        default_endpoint JSONB DEFAULT '{}',
+        rate_limits JSONB DEFAULT '{"1k":20,"2k":10,"4k":1}',
+        capacity_model TEXT DEFAULT 'limited',
+        bucket_max INT,
+        cooldown_ms INT DEFAULT 60000,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS models (
+        id TEXT PRIMARY KEY,
+        model_id TEXT NOT NULL,
+        display_name TEXT NOT NULL,
+        type TEXT NOT NULL DEFAULT 'image',
+        provider_id TEXT REFERENCES providers(id) ON DELETE CASCADE,
+        enabled BOOLEAN DEFAULT TRUE,
+        supported_resolutions TEXT[] DEFAULT '{}',
+        capabilities JSONB DEFAULT '{}',
+        endpoint JSONB DEFAULT '{}',
+        param_template JSONB DEFAULT '{}'::jsonb,
+        max_concurrent INT,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS media (
+        id TEXT PRIMARY KEY,
+        title TEXT DEFAULT '',
+        type TEXT DEFAULT 'image',
+        thumbnail TEXT DEFAULT '',
+        full_url TEXT DEFAULT '',
+        prompt TEXT DEFAULT '',
+        model TEXT DEFAULT '',
+        ratio TEXT DEFAULT '1:1',
+        source TEXT DEFAULT 'user',
+        is_favorite BOOLEAN DEFAULT FALSE,
+        is_deleted BOOLEAN DEFAULT FALSE,
+        oss_url TEXT DEFAULT '',
+        oss_object_key TEXT DEFAULT '',
+        oss_uploaded BOOLEAN DEFAULT FALSE,
+        category TEXT DEFAULT 'generated',
+        file_size BIGINT,
+        tags JSONB DEFAULT '[]',
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS oss_config (
+        id INTEGER PRIMARY KEY DEFAULT 1,
+        provider TEXT DEFAULT 'aliyun-oss',
+        access_point_name TEXT DEFAULT '',
+        endpoint_external TEXT DEFAULT '',
+        endpoint_internal TEXT DEFAULT '',
+        bucket TEXT DEFAULT '',
+        region TEXT DEFAULT '',
+        region_label TEXT DEFAULT '',
+        access_key_id TEXT DEFAULT '',
+        access_key_secret TEXT DEFAULT '',
+        path_prefix TEXT DEFAULT 'images/',
+        custom_domain TEXT DEFAULT '',
+        enabled BOOLEAN DEFAULT TRUE
+      );
+
+      CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value JSONB NOT NULL DEFAULT '{}',
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS characters (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        avatar_url TEXT DEFAULT '',
+        gender TEXT DEFAULT '',
+        age INTEGER DEFAULT 0,
+        tags TEXT[] DEFAULT '{}',
+        style JSONB DEFAULT '{}',
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+
+    // 确保 oss_config 有默认行
+    await client.query(`
+      INSERT INTO oss_config (id, enabled) VALUES (1, TRUE)
+      ON CONFLICT (id) DO NOTHING;
+    `);
+
+    // 兼容已部署库：补 rate_limits 列（RPM 感知调度用）
+    await client.query(`
+      ALTER TABLE providers ADD COLUMN IF NOT EXISTS rate_limits JSONB DEFAULT '{"1k":20,"2k":10,"4k":1}';
+    `);
+    // 兼容已部署库：补容量模型相关列（统一共享 B 桶 / unlimited / 冷却时长）
+    await client.query(`
+      ALTER TABLE providers ADD COLUMN IF NOT EXISTS capacity_model TEXT DEFAULT 'limited';
+    `);
+    await client.query(`
+      ALTER TABLE providers ADD COLUMN IF NOT EXISTS bucket_max INT;
+    `);
+    await client.query(`
+      ALTER TABLE providers ADD COLUMN IF NOT EXISTS cooldown_ms INT DEFAULT 60000;
+    `);
+    // 兼容已部署库：补 models 的 per-model 并发/耗时/分类/商用/创作者列
+    await client.query(`
+      ALTER TABLE models ADD COLUMN IF NOT EXISTS max_concurrent INT;
+    `);
+    // 兼容已部署库：补 characters 的扩展字段（参考图 / 描述 / 基础模型 / 来源），
+    // 使 /api/characters 前后端 ICharacter 形状一致，避免前端 referenceImages 为 undefined 崩溃
+    await client.query(`ALTER TABLE characters ADD COLUMN IF NOT EXISTS description TEXT DEFAULT '';`);
+    await client.query(`ALTER TABLE characters ADD COLUMN IF NOT EXISTS reference_images TEXT[] DEFAULT '{}';`);
+    await client.query(`ALTER TABLE characters ADD COLUMN IF NOT EXISTS base_model TEXT DEFAULT '';`);
+    await client.query(`ALTER TABLE characters ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'user';`);
+
+    console.log('[PG] 数据库表初始化完成');
+  } finally {
+    client.release();
+  }
+}
+
+// ── 查询辅助 ──
+async function query(text, params) {
+  return pool.query(text, params);
+}
+
+async function queryOne(text, params) {
+  const res = await pool.query(text, params);
+  return res.rows[0] || null;
+}
+
+async function queryAll(text, params) {
+  const res = await pool.query(text, params);
+  return res.rows;
+}
+
+// 事务
+async function transaction(fn) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await fn(client);
+    await client.query('COMMIT');
+    return result;
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+module.exports = { pool, redis, initDB, query, queryOne, queryAll, transaction };

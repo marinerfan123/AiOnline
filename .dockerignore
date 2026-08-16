@@ -1,0 +1,12 @@
+node_modules
+dist
+.git
+.env
+.env.*
+logs
+server/data
+.workbuddy
+coverage
+*.md
+deploy
+docs

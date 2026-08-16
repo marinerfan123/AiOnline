@@ -1,0 +1,78 @@
+# Phase 0 一键编排：PostgreSQL 17 + Redis 7.2 + 应用（可选 nginx）
+# 用法：
+#   docker compose up -d --build        # 构建并启动
+#   docker compose ps                    # 查看状态
+#   docker compose logs -f app           # 看应用日志
+# 生产前务必覆盖：JWT_SECRET / PG_PASSWORD（通过 shell 环境变量或 .env）
+
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: ${PG_USER:-postgres}
+      POSTGRES_PASSWORD: ${PG_PASSWORD:-0.0.1abcd}
+      POSTGRES_DB: ${PG_DATABASE:-huabu}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PG_USER:-postgres}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    ports:
+      - "5432:5432"
+
+  redis:
+    image: redis:7.2
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    ports:
+      - "6379:6379"
+
+  app:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: 3001
+      PG_HOST: postgres
+      PG_PORT: 5432
+      PG_DATABASE: ${PG_DATABASE:-huabu}
+      PG_USER: ${PG_USER:-postgres}
+      PG_PASSWORD: ${PG_PASSWORD:-0.0.1abcd}
+      PG_POOL_MAX: ${PG_POOL_MAX:-20}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      JWT_SECRET: ${JWT_SECRET:-change-me-to-a-long-random-string}
+    ports:
+      - "3001:3001"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3001/api/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # 可选 nginx 反代（取消注释启用；启用后建议把 app 的 3001 端口改为不对外暴露）
+  # nginx:
+  #   image: nginx:alpine
+  #   depends_on: [app]
+  #   ports: ["80:80"]
+  #   volumes:
+  #     - ./deploy/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+  #   restart: unless-stopped
+
+volumes:
+  pgdata:
+  redisdata:

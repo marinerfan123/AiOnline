@@ -1,0 +1,36 @@
+{
+  "id": "workbench_text_to_image_1",
+  "pluginKey": "@official-plugins/ai-text-to-image",
+  "pluginVersion": "1.0.19",
+  "name": "创作工作台文生图插件",
+  "description": "为创作工作台提供基于文本描述生成高质量图片的能力，支持多种图片比例配置",
+  "icon": "",
+  "paramsSchema": {
+    "type": "object",
+    "properties": {
+      "subject": {
+        "type": "string",
+        "description": "图片生成的核心主题内容描述"
+      },
+      "image_ratio": {
+        "type": "string",
+        "description": "图片比例，可选值：1:1、4:3、3:4、16:9、9:16、3:2、2:3，默认1:1"
+      },
+      "style_requirements": {
+        "type": "string",
+        "description": "图片风格、构图、光影等附加生成要求（可选）"
+      }
+    },
+    "required": [
+      "subject"
+    ]
+  },
+  "formValue": {
+    "prompt": "请生成一张高质量图片，具体要求如下：\n\n主题内容：{{input.subject}}\n\n画面要求：\n1. 风格：根据主题内容自动匹配合适的风格\n2. 构图：根据主题内容选择最佳构图方式\n3. 光线：自然真实，符合场景氛围\n4. 色调：和谐统一，突出主体\n5. 视角：根据主题内容选择最合适的视角\n\n质量要求：\n- 画面清晰，细节丰富\n- 主体突出，背景协调\n- 色彩和谐，视觉舒适\n- 无明显变形或失真\n\n附加要求：{{input.style_requirements}}",
+    "ratio": "{{input.image_ratio}}",
+    "watermark": false
+  },
+  "createdAt": 1785497602797,
+  "updatedAt": 1785497602797,
+  "createdBy": 7576396974828555229
+}

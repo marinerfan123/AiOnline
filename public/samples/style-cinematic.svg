@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 1000" width="800" height="1000">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0c0a09"/>
+      <stop offset="0.5" stop-color="#7c2d12"/>
+      <stop offset="1" stop-color="#134e4a"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.36" r="0.6">
+      <stop offset="0" stop-color="#fb923c" stop-opacity="0.40"/>
+      <stop offset="1" stop-color="#fb923c" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="800" height="1000" fill="url(#bg)"/>
+  <rect width="800" height="1000" fill="url(#glow)"/>
+  <g opacity="0.14" stroke="#fed7aa" stroke-width="1.5" fill="none">
+    <path d="M120 500 L680 500"/>
+    <path d="M400 200 L400 800"/>
+    <circle cx="400" cy="500" r="160"/>
+  </g>
+  <text x="400" y="660" text-anchor="middle" font-family="system-ui, -apple-system, 'PingFang SC', sans-serif" font-size="58" font-weight="800" fill="#fff7ed" letter-spacing="2">示例素材</text>
+  <text x="400" y="712" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="22" font-weight="600" fill="#fdba74" letter-spacing="2">CINEMATIC STYLE</text>
+  <text x="400" y="930" text-anchor="middle" font-family="system-ui, -apple-system, 'PingFang SC', sans-serif" font-size="18" fill="#94a3b8">公共资产 · 可删除，新用户仍默认获得</text>
+</svg>

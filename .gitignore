@@ -1,0 +1,185 @@
+# Dependencies
+node_modules/
+*/node_modules/
+
+# Production builds
+dist/
+*/dist/
+build/
+*/build/
+
+# Environment files
+.env.local
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+/logs/
+
+# Runtime data
+pids
+*.pid
+*.seed
+*.pid.lock
+
+# Coverage directory used by tools like istanbul
+coverage/
+*.lcov
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+
+# === Secrets / runtime credentials (P0: repo is PUBLIC, never leak these) ===
+.env
+.env.*
+!.env.example
+server/data/oss.json
+server/data/.api_token
+server/data/media.json
+server/data/media-uploads/
+server/data/*.json
+!server/data/oss.json.example
+
+# === Agent memory (contains conversation history, must not be public) ===
+.workbuddy/
+
+# === Build output (covers dist/build2 used by this app) ===
+dist/
+build/
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Temporary folders
+tmp/
+temp/
+.playwright-cli/
+
+# Lock files (keep package-lock.json for consistent installs)
+yarn.lock
+pnpm-lock.yaml
+
+# Cache files
+.eslintcache
+*.tsbuildinfo
+
+# swc wasm
+.swc
+
+# Agent files
+.agent/
+
+# ===== 运行时机密（绝不入库） =====
+.env
+.env.*
+!.env.example
+server/data/*.json
+server/data/.api_token
+server/data/media-uploads/
+logs/
+*.log
+
+# ===== 上下文/对话记忆（含历史） =====
+.workbuddy/
+
+# ===== 凭据脚本（含真实 API Key，绝不入库） =====
+scripts/keys/
+scripts/*.keys.json
+scripts/insert-keys*
+*batch-insert-providers.cjs
+*batch-insert-models.cjs
+api-token.tmp
+
+# ===== 临时测试文件（API 冒烟、生成测试、备份） =====
+# 以 _ 开头的根目录文件通常是测试残留，不入库
+/_*.json
+/_*.txt
+/_*.md
+*_backup_*.json
+*_result.json
+*_smoke_*.json
+
+# ===== 本地终端输出捕获（IDE/PowerShell 跑服务时的 stderr 重定向） =====
+backend3001.err
+vite3099.err
+tmp_clean.txt
+
+# ===== 数据库备份（含用户数据，绝不入库） =====
+backups/
+
+# ===== 本地参考/实验目录（不入主仓库） =====
+refs/
+space-landing/
+check_cols.cjs
+
+# ===== safe-git 脚手架 / 临时索引（绝不入库） =====
+_mk/
+_mt/
+_mw/
+_plumbing_tmp/
+git_index_*
+tmp_index*
+plumb_*
+git_plumb_*
+_mk_*.cjs
+server/_tmp_*.cjs
+
+# ===== 凭据 / 会话（绝不入库） =====
+cookies.txt
+
+# ===== 备份与临时产物 =====
+*.bak
+
+# ===== AI 工具目录（按需；如有意入库请移除此条） =====
+.agents/
+.codex/
+
+# ===== 重构基线排除（2026-08-11）=====
+Toonflow-app/
+output/
+
+# 真实 provider 密钥（本地注入用，绝不入库）
+scripts/prod-keys.json
+
+# ===== 2026-08-16: 排除根目录调试/分析残留（非线上部署代码） =====
+/bundle_check.js
+/check_api_models.js
+/check_models_auth.js
+/check_models.js
+/fix_cols.js
+/_inspect_tmp.js
+/list_models.js
+/repair_pending_upload.js
+/repair_pending_upload.cjs
+/set_default_model.js
+/enable_image_models.cjs
+/query_all_tasks_window.cjs
+/query_failed_tasks.cjs
+/query_media_status.cjs
+/query_oss.cjs
+/query_precise_failed.cjs
+/query_rate_window.cjs
+/query_recent_media.cjs
+/query_recent_tasks.cjs
+/_tmp_fix.py
+/项目重构分析资料库/
+
+# ===== 2026-08-16: 真实密钥/生产配置（绝不入库） =====
+/batch_import/keys.json
+/batch_import/prod.env
+/deploy/userlist.txt
+# 备份副本（*.bak.* 不被 *.bak 覆盖）
+*.bak.*
+*.bak

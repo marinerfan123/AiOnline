@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 1000" width="800" height="1000">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1c1407"/>
+      <stop offset="0.55" stop-color="#451a03"/>
+      <stop offset="1" stop-color="#3a2705"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.38" r="0.62">
+      <stop offset="0" stop-color="#fbbf24" stop-opacity="0.40"/>
+      <stop offset="1" stop-color="#fbbf24" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="800" height="1000" fill="url(#bg)"/>
+  <rect width="800" height="1000" fill="url(#glow)"/>
+  <g opacity="0.16" stroke="#fde68a" stroke-width="6" fill="none" stroke-linecap="round">
+    <path d="M300 460 q100 -120 200 0"/>
+    <path d="M320 460 l160 0 l-20 90 l-120 0 z"/>
+  </g>
+  <text x="400" y="660" text-anchor="middle" font-family="system-ui, -apple-system, 'PingFang SC', sans-serif" font-size="58" font-weight="800" fill="#fffbeb" letter-spacing="2">示例素材</text>
+  <text x="400" y="712" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="22" font-weight="600" fill="#fcd34d" letter-spacing="4">PROP</text>
+  <text x="400" y="930" text-anchor="middle" font-family="system-ui, -apple-system, 'PingFang SC', sans-serif" font-size="18" fill="#94a3b8">公共资产 · 可删除，新用户仍默认获得</text>
+</svg>

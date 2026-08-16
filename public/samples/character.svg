@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 1000" width="800" height="1000">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0f172a"/>
+      <stop offset="0.55" stop-color="#0d3b3a"/>
+      <stop offset="1" stop-color="#0b2e2c"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.34" r="0.62">
+      <stop offset="0" stop-color="#5eead4" stop-opacity="0.40"/>
+      <stop offset="1" stop-color="#5eead4" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="800" height="1000" fill="url(#bg)"/>
+  <rect width="800" height="1000" fill="url(#glow)"/>
+  <g opacity="0.10" stroke="#ccfbf1" stroke-width="1.5" fill="none">
+    <circle cx="400" cy="340" r="120"/>
+    <circle cx="400" cy="340" r="200"/>
+    <circle cx="400" cy="340" r="280"/>
+  </g>
+  <circle cx="400" cy="340" r="92" fill="#134e4a" opacity="0.85"/>
+  <circle cx="400" cy="340" r="92" fill="none" stroke="#5eead4" stroke-width="2" opacity="0.6"/>
+  <text x="400" y="352" text-anchor="middle" font-family="system-ui, -apple-system, 'PingFang SC', sans-serif" font-size="34" font-weight="700" fill="#ccfbf1">角色</text>
+  <text x="400" y="660" text-anchor="middle" font-family="system-ui, -apple-system, 'PingFang SC', sans-serif" font-size="58" font-weight="800" fill="#f0fdfa" letter-spacing="2">示例素材</text>
+  <text x="400" y="712" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="22" font-weight="600" fill="#5eead4" letter-spacing="4">CHARACTER</text>
+  <text x="400" y="930" text-anchor="middle" font-family="system-ui, -apple-system, 'PingFang SC', sans-serif" font-size="18" fill="#94a3b8">公共资产 · 可删除，新用户仍默认获得</text>
+</svg>

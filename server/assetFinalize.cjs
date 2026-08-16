@@ -1,0 +1,357 @@
+// server/assetFinalize.cjs — 服务端资产最终化（主流异步生成范式）
+//
+// 设计要点（与主流方案对齐）：
+//   - 由 dispatcher 任务 done 回调调用，负责把 provider 临时 URL 的字节拉回 → 直传 OSS → 写 media 表
+//   - 前端不再负责 OSS 上传、不再负责 provider→OSS 转换；waitForTask 拿到 result.images[i].ossUrl 即最终 URL
+//   - 失败兜底：写一条 status='pending_upload' 的占位行（保留 provider_url 供后台 reaper 续传），
+//     UI 暂用 provider_url 展示，保证积分已扣必有产物
+//   - 视频、图像统一走同一个 finalizeUrl()：把"流式大文件上传"做成主流 PUT 即可（不引入 SDK）
+//
+// 边界条件：
+//   - 50 MB 上限（与 /api/oss/ingest 一致）
+//   - 30s 拉取超时（AbortController）
+//   - SSRF：内网/环路地址直接拒绝（与 ingest 一致）
+//   - OSS PUT 自签 headers（调用方 oss.cjs 已外露 aliyunPutHeaders/tencentCosPutHeaders）
+//
+// 写入字段：
+//   media(id, task_id, provider_url, full_url, thumbnail, oss_url, oss_object_key, oss_uploaded, status, file_size, type, ...)
+
+const ossMod = require('./oss.cjs');
+
+const MAX_BYTES = 50 * 1024 * 1024; // 50 MB
+const FETCH_TIMEOUT_MS = 30000;
+
+function genMediaId(prefix = 'mf') {
+  // 主流生成算法：prefix + 时间戳 + 16 hex 随机；保证 PG id 唯一且时间序
+  const rnd = require('crypto').randomBytes(8).toString('hex');
+  return `${prefix}-${Date.now().toString(36)}-${rnd}`;
+}
+
+function isBlockedHost(host) {
+  if (!host) return true;
+  const h = String(host).toLowerCase();
+  if (h === 'localhost' || h === '127.0.0.1' || h === '0.0.0.0' || h === '[::1]') return true;
+  if (h.startsWith('10.') || h.startsWith('192.168.')) return true;
+  if (h.endsWith('.internal')) return true;
+  if (/^172\.(1[6-9]|2\d|3[01])\./.test(h)) return true;
+  return false;
+}
+
+// 从 URL/Content-Type/响应头推 MIME；落统一表（image/jpeg、video/mp4 …）
+function normalizeContentType(url, responseContentType, fallback = 'image/jpeg') {
+  if (responseContentType) {
+    const ct = String(responseContentType).split(';')[0].trim();
+    if (ct) return ct;
+  }
+  const u = String(url || '').toLowerCase().split('?')[0];
+  const ext = u.match(/\.([a-z0-9]{2,5})$/);
+  if (ext) {
+    const e = ext[1];
+    if (['jpg', 'jpeg'].includes(e)) return 'image/jpeg';
+    if (e === 'png') return 'image/png';
+    if (e === 'webp') return 'image/webp';
+    if (e === 'gif') return 'image/gif';
+    if (e === 'mp4') return 'video/mp4';
+    if (e === 'webm') return 'video/webm';
+    if (e === 'mov') return 'video/quicktime';
+    if (e === 'json') return 'application/json';
+  }
+  return fallback;
+}
+
+async function fetchBytes(url) {
+  let parsed;
+  try { parsed = new URL(String(url)); } catch { throw new Error('非法 URL'); }
+
+  // 支持 data: URI（dispatcher 把 provider 返回的 b64_json 包装成 data:image/...;base64,...）
+  // 不经过 HTTP fetch，直接解码 base64 为 Buffer，供后续 OSS PUT 使用。
+  if (parsed.protocol === 'data:') {
+    const raw = String(url);
+    const comma = raw.indexOf(',');
+    if (comma === -1) throw new Error('data URI 格式错误');
+    const meta = raw.slice(5, comma);
+    const payload = raw.slice(comma + 1);
+    const isBase64 = meta.includes(';base64');
+    if (!isBase64) throw new Error('data URI 仅支持 base64 编码');
+    const ct = meta.split(';')[0] || 'image/png';
+    const buffer = Buffer.from(payload, 'base64');
+    if (buffer.length === 0) throw new Error('空文件');
+    if (buffer.length > MAX_BYTES) throw new Error('超过 50MB 上限');
+    return { buffer, contentType: normalizeContentType(url, ct), byteLength: buffer.length };
+  }
+
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') throw new Error('URL 协议不支持');
+  if (isBlockedHost(parsed.hostname)) throw new Error('URL 指向内网，已拒绝（SSRF 防护）');
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  let r;
+  try {
+    r = await fetch(String(url), { signal: controller.signal, redirect: 'follow' });
+  } finally {
+    clearTimeout(timer);
+  }
+  if (!r.ok) throw new Error(`拉取失败 HTTP ${r.status}`);
+  const cl = r.headers.get('content-length');
+  if (cl && parseInt(cl, 10) > MAX_BYTES) throw new Error('超过 50MB 上限');
+  const buf = Buffer.from(await r.arrayBuffer());
+  if (buf.length === 0) throw new Error('空文件');
+  if (buf.length > MAX_BYTES) throw new Error('超过 50MB 上限');
+  const ct = normalizeContentType(url, r.headers.get('content-type'));
+  return { buffer: buf, contentType: ct, byteLength: buf.length };
+}
+
+// 探测当前 activeCfg 是否可用（Provider 鉴权/桶存在），失败则跳过 OSS 仅写占位
+async function pickActiveCfg(pgPool, ossLog) {
+  const { enabled, activeId, list } = await ossMod.loadOssConfigs(pgPool);
+  if (!enabled) return null;
+  const active = list.find((c) => c.id === activeId);
+  if (!active || !active.enabled) return null;
+  if (!active.accessKeyId || !active.accessKeySecret || !active.bucket) return null;
+  return active;
+}
+
+// 把 objectKey 在用户命名空间下拼接（与 /api/oss/sign-upload 命名规则一致）
+function buildObjectKey(cfg, userId, fileName) {
+  const prefix = (cfg.pathPrefix || 'images/').replace(/^\/+|\/+$/g, '');
+  const safe = String(fileName || 'file').replace(/[^A-Za-z0-9._-]/g, '_');
+  return `${prefix}/${userId}/${Date.now()}_${safe}`;
+}
+
+// 单张资源 OSS PUT（用 aliyunPutHeaders / tencentCosPutHeaders 直传，浏览器等价的 PUT body 直传，
+// 唯一区别是：这里 header 让服务端代发，免去 CORS 烦恼）
+async function putObject(cfg, objectKey, buffer, contentType) {
+  let putUrl, headers;
+  if (cfg.providerType === 'tencent-cos') {
+    cfg._hostName = `${cfg.bucket}${cfg.appId ? '-' + cfg.appId : ''}.cos.${cfg.region || 'ap-shanghai'}.myqcloud.com`;
+    putUrl = `https://${cfg._hostName}/${objectKey}`;
+    const h = ossMod.tencentCosPutHeaders(cfg, objectKey, buffer, contentType);
+    headers = h.headers;
+  } else {
+    const host = ossMod.aliyunHost(cfg);
+    putUrl = `https://${host}/${objectKey}`;
+    const h = ossMod.aliyunPutHeaders(cfg, objectKey, buffer, contentType);
+    headers = h.headers;
+  }
+  const r = await fetch(putUrl, { method: 'PUT', body: buffer, headers });
+  if (!r.ok) {
+    const msg = ossMod.diagnoseOssError(cfg.providerType, r.status, await r.text().catch(() => ''));
+    throw new Error(msg);
+  }
+  return putUrl;
+}
+
+// 重签 GET 7d URL（不直接信任 provider 临时链接）
+function buildGetUrl(cfg, objectKey) {
+  return ossMod.buildOssGetUrl(cfg, objectKey).getUrl;
+}
+
+/**
+ * 终结化 provider 的单个资源 URL。
+ *
+ * @param pgPool
+ * @param {{
+ *   userId: string,
+ *   taskId: string,
+ *   idx: number,                       // 在 result.images 数组中的下标，用于对象命名稳定
+ *   providerUrl: string,               // provider 临时 URL；可能是图片 data: URL（前端 processResultImages 已在前端做了 data:→blob 的情况，后端这里要 fallback 走 fetch）
+ *   type?: 'image' | 'video',
+ *   prompt?: string,
+ *   model?: string,
+ *   ratio?: string,
+ *   creditCost?: number,
+ *   pendingId?: string,                // 生成任务创建时给的 placeholder id；若前端有传就保留一致，避免占位/最终 asset id 不一致
+ * }} opts
+ * @returns {Promise<{
+ *   mediaId: string,
+ *   pendingId: string,
+ *   ossUrl: string,                    // 服务端重签的 7d GET 预签名 URL（OSS 已落）或 provider URL（OSS 失败兜底）
+ *   ossObjectKey: string,
+ *   ossUploaded: boolean,
+ *   status: 'success' | 'pending_upload',
+ *   providerUrl: string,
+ *   contentType: string,
+ *   fileSize: number,
+ *   type: 'image' | 'video',
+ * }>}
+ */
+async function finalizeUrl(pgPool, opts) {
+  if (!pgPool) throw new Error('数据库不可用，无法最终化资源');
+  const { userId, taskId, idx, providerUrl, type = 'image', prompt = '', model = '', ratio = '1:1', creditCost, pendingId } = opts;
+  if (!userId) throw new Error('userId 缺失');
+  if (!providerUrl) throw new Error('providerUrl 缺失');
+
+  const ossLog = ossMod.log;
+  const tag = `task=${taskId} idx=${idx}`;
+  const mediaId = pendingId || genMediaId(type === 'video' ? 'v' : 'm');
+
+  let ossUrl = '';
+  let ossObjectKey = '';
+  let ossUploaded = false;
+  let thumbUrl = '';
+  let contentType = normalizeContentType(providerUrl, null, type === 'video' ? 'video/mp4' : 'image/jpeg');
+  let fileSize = 0;
+  let status = 'pending_upload';
+
+  // ── 1. 拉字节 ──
+  let buffer;
+  try {
+    const fetched = await fetchBytes(providerUrl);
+    buffer = fetched.buffer;
+    contentType = fetched.contentType;
+    fileSize = fetched.byteLength;
+  } catch (e) {
+    // 拉取即失败：写 status=pending_upload（OSS 也跳过）→ 让 reaper 后续重试
+    ossLog('warn', 'finalize', `[assetFinalize] ⚠️ 拉取失败 ${tag} → ${e.message}（占位先入库，reaper 后重试）`, { taskId, userId, providerUrl: String(providerUrl).slice(0, 80), error: e.message, durationMs: 0 });
+    await insertMedia(pgPool, { mediaId, userId, taskId, type, prompt, model, ratio, providerUrl, ossUrl, ossObjectKey, ossUploaded, contentType, fileSize: 0, status: 'pending_upload', errorMessage: e.message });
+    return { mediaId, pendingId: mediaId, ossUrl: providerUrl, ossObjectKey: '', ossUploaded: false, status: 'pending_upload', providerUrl, contentType, fileSize: 0, type };
+  }
+
+  // ── 2. OSS 直传 ──
+  const cfg = await pickActiveCfg(pgPool, ossLog);
+  const t0 = Date.now();
+  if (cfg) {
+    try {
+      const safeName = `${type === 'video' ? 'video' : 'img'}-${taskId}-${idx}.${contentType.split('/')[1] || (type === 'video' ? 'mp4' : 'jpg')}`;
+      ossObjectKey = buildObjectKey(cfg, userId, safeName);
+      await putObject(cfg, ossObjectKey, buffer, contentType);
+      ossUrl = buildGetUrl(cfg, ossObjectKey);
+      thumbUrl = '';
+      if (type === 'image') {
+        try { thumbUrl = ossMod.buildOssThumbUrl(cfg, ossObjectKey) || ''; } catch (_) { thumbUrl = ''; }
+      } else if (type === 'video') {
+        // 视频即时封面帧：OSS 边缘抽帧，无需 ffmpeg
+        // [FIX 2026-08-15] Request 5：与图片 buildOssThumbUrl 同一模式
+        try {
+          const snap = ossMod.buildOssVideoSnapshotUrl(cfg, ossObjectKey);
+          if (snap && snap.signedUrl) thumbUrl = snap.signedUrl;
+        } catch (_) { thumbUrl = ''; }
+      }
+      ossUploaded = true;
+      status = 'success';
+      const providerTag = cfg.providerType === 'tencent-cos' ? 'COS' : 'OSS';
+      ossLog('success', 'finalize', `[assetFinalize] [${providerTag}] ✅ 直传 ${ossObjectKey} → GET 7d（${Date.now() - t0}ms）`, { taskId, userId, providerType: cfg.providerType, bucket: cfg.bucket, objectKey: ossObjectKey, byteLength: fileSize, contentType, durationMs: Date.now() - t0 });
+    } catch (e) {
+      ossLog('warn', 'finalize', `[assetFinalize] ⚠️ OSS PUT 失败 ${tag} → ${e.message}（仍写占位，reaper 重试）`, { taskId, userId, objectKey: ossObjectKey, providerType: cfg && cfg.providerType, error: e.message });
+      // OSS 失败：仍写占位（status=pending_upload），保留 providerUrl 供展示/重试
+      await insertMedia(pgPool, { mediaId, userId, taskId, type, prompt, model, ratio, providerUrl, ossUrl, ossObjectKey, ossUploaded: false, contentType, fileSize, status: 'pending_upload', errorMessage: e.message });
+      return { mediaId, pendingId: mediaId, ossUrl: providerUrl, ossObjectKey: '', ossUploaded: false, status: 'pending_upload', providerUrl, contentType, fileSize, type };
+    }
+  } else {
+    ossLog('warn', 'finalize', `[assetFinalize] ⚠️ OSS 未启用或无活跃配置 ${tag}（按主流：仍写 success=provider_url 兜底展示，并打 reaper 占位）`, { taskId, userId, providerUrl: String(providerUrl).slice(0, 80), byteLength: fileSize });
+    // OSS 未开：占位行 status='pending_upload' + providerUrl；reaper 后台继续重试到 OSS 成功
+    await insertMedia(pgPool, { mediaId, userId, taskId, type, prompt, model, ratio, providerUrl, ossUrl: '', ossObjectKey: '', ossUploaded: false, contentType, fileSize, status: 'pending_upload', errorMessage: 'OSS 未启用或无活跃配置' });
+    return { mediaId, pendingId: mediaId, ossUrl: providerUrl, ossObjectKey: '', ossUploaded: false, status: 'pending_upload', providerUrl, contentType, fileSize, type };
+  }
+
+  // ── 3. 写 media 表（成功/已有 OSS URL）──
+  await insertMedia(pgPool, { mediaId, userId, taskId, type, prompt, model, ratio, providerUrl, thumbnail: thumbUrl, ossUrl, ossObjectKey, ossUploaded: true, contentType, fileSize, status: 'success', errorMessage: '' });
+
+  return { mediaId, pendingId: mediaId, ossUrl, ossObjectKey, ossUploaded: true, status: 'success', providerUrl, contentType, fileSize, type };
+}
+
+// media 表 INSERT（或幂等 UPSERT）
+async function insertMedia(pgPool, row) {
+  const id = row.mediaId;
+  const fields = `(id, task_id, type, thumbnail, full_url, prompt, model, ratio, source, is_favorite, is_deleted, oss_url, oss_object_key, oss_uploaded, status, error_message, file_size, user_id, category)`;
+  const values = `($1,$2,$3,$4,$5,$6,$7,$8,'user',FALSE,FALSE,$9,$10,$11,$12,$13,$14,$15,'generated')`;
+  // 用 ON CONFLICT (id) DO UPDATE 保证幂等（重入不重复插入）
+  const params = [
+    id, row.taskId, row.type,
+    row.thumbnail || row.ossUrl || row.providerUrl,
+    row.ossUrl || row.providerUrl,
+    row.prompt, row.model, row.ratio,
+    row.ossUrl || '', row.ossObjectKey || '', row.ossUploaded || false,
+    row.status, row.errorMessage || '', row.fileSize || 0,
+    row.userId,
+  ];
+  await pgPool.query(
+    `INSERT INTO media ${fields} VALUES ${values}
+     ON CONFLICT (id) DO UPDATE SET
+       task_id = EXCLUDED.task_id,
+       type = EXCLUDED.type,
+       full_url = EXCLUDED.full_url,
+       thumbnail = EXCLUDED.thumbnail,
+       prompt = EXCLUDED.prompt,
+       model = EXCLUDED.model,
+       ratio = EXCLUDED.ratio,
+       oss_url = EXCLUDED.oss_url,
+       oss_object_key = EXCLUDED.oss_object_key,
+       oss_uploaded = EXCLUDED.oss_uploaded,
+       status = EXCLUDED.status,
+       error_message = EXCLUDED.error_message,
+       file_size = EXCLUDED.file_size,
+       user_id = EXCLUDED.user_id,
+       category = EXCLUDED.category`,
+    params,
+  );
+}
+
+// 入口：批量终结化（dispatcher 任务 done 回调里调用）
+// ctx: { userId, taskId, prompt, model, ratio, contentType, count, pendingIds }
+// pendingIds 与前端 /api/generate 提交时的 placeholder id 一一对应：
+//   服务端用 pendingId 作 media.id，让最终资产行与前端占位「id 锁定」——
+//   onGenerate 在前端按 id 找占位并替换，绝不丢图。
+async function finalizeTask(pgPool, ctx, providerImages, providerVideoUrl) {
+  const out = { images: [], video: null, errors: [] };
+  const userId = ctx.userId;
+  const taskId = ctx.taskId;
+  const prompt = ctx.prompt || '';
+  const model = ctx.model || '';
+  const ratio = ctx.ratio || '1:1';
+  const pendingIds = Array.isArray(ctx.pendingIds) ? ctx.pendingIds : [];
+
+  // 图片：并行终结化（注意：OSS PUT 是写同一 namespace 不同 objectKey，互不阻塞）
+  const imgTasks = (providerImages || []).filter(Boolean);
+  if (imgTasks.length) {
+    const settled = await Promise.allSettled(imgTasks.map((u, i) => finalizeUrl(pgPool, {
+      userId, taskId, idx: i, providerUrl: u, type: 'image', prompt, model, ratio,
+      pendingId: pendingIds[i] || undefined,
+    })));
+    settled.forEach((r, i) => {
+      if (r.status === 'fulfilled') out.images.push(r.value);
+      else {
+        const e = r.reason;
+        out.errors.push(`image[${i}]: ${e && e.message ? e.message : String(e)}`);
+        // 失败兜底：构造一个 failed 占位项（不在 DB 写，由前端展示失败卡）
+        out.images.push({
+          mediaId: pendingIds[i] || `mf-fail-${taskId}-${i}`,
+          pendingId: pendingIds[i] || `mf-fail-${taskId}-${i}`,
+          ossUrl: imgTasks[i], ossObjectKey: '', ossUploaded: false, status: 'failed',
+          providerUrl: imgTasks[i], contentType: 'image/jpeg', fileSize: 0, type: 'image',
+        });
+      }
+    });
+  }
+
+  // 视频：单条
+  if (providerVideoUrl) {
+    try {
+      out.video = await finalizeUrl(pgPool, {
+        userId, taskId, idx: 0, providerUrl: providerVideoUrl, type: 'video', prompt, model, ratio,
+        pendingId: pendingIds[0] || undefined,
+      });
+    } catch (e) {
+      out.errors.push(`video: ${e && e.message ? e.message : String(e)}`);
+      out.video = {
+        mediaId: pendingIds[0] || `vf-fail-${taskId}-0`,
+        pendingId: pendingIds[0] || `vf-fail-${taskId}-0`,
+        ossUrl: providerVideoUrl, ossObjectKey: '', ossUploaded: false, status: 'failed',
+        providerUrl: providerVideoUrl, contentType: 'video/mp4', fileSize: 0, type: 'video',
+      };
+    }
+  }
+  return out;
+}
+
+module.exports = {
+  finalizeUrl,
+  finalizeTask,
+  genMediaId,
+  normalizeContentType,
+  fetchBytes,
+  putObject,
+  buildObjectKey,
+  buildGetUrl,
+  pickActiveCfg,
+  insertMedia,
+};

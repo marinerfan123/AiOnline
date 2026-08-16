@@ -1,0 +1,124 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "./tailwind-theme.css";
+@import "./typography.css";
+@import "./styles/premium.css";
+@import "./styles/fonts.css";
+
+/* ════════════════════════════════════════════════════════════════
+   设计刻度约定（统一锚点 · 新增样式前先对照此处，避免"有大有小"）
+   原则：间距只走 4pt 节奏；字号/图标靠层级而非随手数值；颜色用 token
+   ── 字号层级（size + weight + color + space 四维叠加建立层级）──
+     页面标题  text-lg  font-bold
+     区块标题  text-base font-semibold
+     正文/卡片标题 text-sm font-medium
+     辅助文字  text-xs
+     角标徽章  text-[10px] font-semibold（统一，禁止 9px/11px 混用）
+   ── 图标尺寸（按功能映射，不允许随机跨档）──
+     操作/状态图标 size-4 （按钮内、卡片角标操作）
+     次级状态点   size-3.5（卡片悬浮小图标、徽章内图标）
+     装饰性大图标 size-10（空状态、首屏）
+   ── 间距（4pt 基底：1=4px 2=8px 3=12px 4=16px 5=20px 6=24px）──
+   ════════════════════════════════════════════════════════════════ */
+
+/* Shimmer 流光动画：用于"检测链接中..."等临时加载状态 */
+@keyframes shimmer {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(100%); }
+}
+.shimmer {
+  animation: shimmer 1.6s linear infinite;
+}
+
+/* ── Landing 承接页专用动画 ── */
+@keyframes fade-up {
+  from { opacity: 0; transform: translateY(18px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.fade-up {
+  animation: fade-up 0.7s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+@keyframes float-glow {
+  0%, 100% { transform: translate3d(0, 0, 0) scale(1); opacity: 0.55; }
+  50%      { transform: translate3d(0, -24px, 0) scale(1.08); opacity: 0.8; }
+}
+.float-glow { animation: float-glow 9s ease-in-out infinite; }
+
+/* ─────────────────────────────────────────────────────────────
+ * 全局光标规整：避免 button 内文字节点被 Chrome 解析为 I-beam "可插入"
+ * Tailwind v4 preflight 不再默认给 <button> 加 cursor: pointer，
+ * 导致 button 上的文字节点被按 text 渲染，给用户"能插入"错觉。
+ * 这里显式给所有交互元素 + 容器显式 cursor，并把 cursor 透传到子节点。
+ * ───────────────────────────────────────────────────────────── */
+button,
+[role="button"],
+a {
+  cursor: pointer;
+}
+/* 强制 button 内的文字节点继承父级 pointer，覆盖 Chrome 的 text-node auto 行为 */
+button *,
+[role="button"] * {
+  cursor: pointer;
+}
+/* 非交互容器显式 default，避免 div 间距区域被误判为 text */
+div,
+span:not([role]):empty {
+  cursor: default;
+}
+/* 输入控件保留各自的语义光标 */
+input,
+textarea,
+select,
+[contenteditable="true"] {
+  cursor: text;
+}
+input[type="button"],
+input[type="submit"],
+input[type="reset"] {
+  cursor: pointer;
+}
+/* 关闭误选：button 文字不要被双击选中（强化"这不是文本"） */
+button,
+[role="button"] {
+  -webkit-user-select: none;
+  user-select: none;
+}
+/* 待生成/loading 状态显示进度光标 */
+button[disabled],
+[data-loading="true"] {
+  cursor: wait;
+}
+
+/* 导航台/抽屉等滚动区域隐藏滚动条，保持精致 */
+.scrollbar-hidden {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+.scrollbar-hidden::-webkit-scrollbar {
+  display: none;
+}
+
+/* 主内容区精致滚动条：细圆角、半透明、hover 高亮，无布局跳动 */
+.lux-scrollbar {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.16) transparent;
+}
+.lux-scrollbar::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+.lux-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+  border-radius: 9999px;
+}
+.lux-scrollbar::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.16);
+  border-radius: 9999px;
+  transition: background 0.2s ease;
+}
+.lux-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.35);
+}
+.lux-scrollbar:hover {
+  scrollbar-color: rgba(255, 255, 255, 0.35) transparent;
+}
