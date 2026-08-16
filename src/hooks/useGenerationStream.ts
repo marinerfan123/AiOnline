@@ -2,7 +2,7 @@
 //
 // 关键设计：内置轮询兜底。
 //   生成「完成判定」是核心关键路径，绝不可因 SSE 异常（浏览器不支持 / 代理掐断 / 事件丢失）而丢失。
-//   因此 waitForTask 在监听 SSE 事件的同时，每 3s 主动 query 一次状态接口；二者任一命中终态即 resolve。
+//   因此 waitForTask 在监听 SSE 事件的同时，每 10s 主动 query 一次状态接口；二者任一命中终态即 resolve。
 //   这既拿到「SSE 近实时完成通知」的主流体验，又对 SSE 故障零信任依赖。
 import { apiGetGenerationStatus } from '../services/api';
 
@@ -81,13 +81,13 @@ function ensureConnection(): void {
 
 // 等待指定 taskId 到达终态（done / failed / cancelled / not_found）。
 // - SSE 事件命中即立即 resolve（近实时）。
-// - 内置 3s 轮询兜底：SSE 未连 / 丢事件也能拿到结果。
-// - 超过 timeoutMs（对齐原 MAX_POLLS 上限：视频 ~95min、图片 ~3.5min）仍非终态 → resolve 当前状态，
-//   由调用方保留 pending 显示（成败只听生成端回复，绝不误判失败）。
+// - 内置 10s 轮询兜底：SSE 未连 / 丢事件也能拿到结果。
+// - 轮询持续到后端返回终态（done/failed/cancelled/not_found）；一旦命中即 resolve。
+//   timeoutMs 仍接受但已不再用作硬截止（避免「后端已 done 但轮询超时先返回 running」导致 UI 卡生成中）。
+//   由调用方在 fallback 分支自行保留 pending 显示，绝不误判失败。
 export function waitForTask(taskId: string, opts?: { timeoutMs?: number }): Promise<TaskUpdate> {
   const timeoutMs = opts?.timeoutMs ?? 95 * 60 * 1000;
   ensureConnection();
-  const deadline = Date.now() + timeoutMs;
   return new Promise<TaskUpdate>((resolve) => {
     let settled = false;
     let last: TaskUpdate = { taskId, status: 'running' };
@@ -117,11 +117,10 @@ export function waitForTask(taskId: string, opts?: { timeoutMs?: number }): Prom
         const st = await apiGetGenerationStatus(taskId);
         last = st as TaskUpdate;
         if (st.status === 'done' || st.status === 'failed' || st.status === 'cancelled' || st.status === 'not_found') settle(st as TaskUpdate);
-        else if (Date.now() > deadline) settle(last);
       } catch {
         /* 忽略单次查询异常，下一轮再试 */
       }
-    }, 3000);
+    }, 10000);
     fallbacks.set(taskId, fb);
   });
 }
