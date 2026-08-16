@@ -93,17 +93,33 @@ async function loadDispatchPairs(pgPool, modelIds, contentType) {
     `SELECT * FROM providers WHERE id = ANY($1)`,
     [neededProviderIds],
   );
+  const kRes = await pgPool.query(
+    `SELECT * FROM api_keys WHERE provider_id = ANY($1)`,
+    [neededProviderIds],
+  );
+  const keysByProvider = new Map();
+  for (const r of kRes.rows || []) {
+    if (!keysByProvider.has(r.provider_id)) keysByProvider.set(r.provider_id, []);
+    keysByProvider.get(r.provider_id).push(r);
+  }
   const providerById = new Map();
-  for (const pr of pRes.rows || []) providerById.set(pr.id, pr);
+  for (const pr of pRes.rows || []) {
+    pr.__apiKeys = keysByProvider.get(pr.id) || []; // 附带 key 池原始行，供 dispatcher 对账运行时态
+    providerById.set(pr.id, pr);
+  }
 
-  // 5) 组装 pairs（过滤：服务商启用 + 有 api_key）
+  // 5) 组装 pairs（过滤：服务商启用 + 有可用 key）
+  //    可用 key = 老列 providers.api_key（legacy fallback） OR 池中至少一把 active 且长度≥6 的 key
   const pairs = [];
   for (const t of targets) {
     const mr = modelRowByCombo.get(`${t.model_id}|${t.provider_id}`);
     const pr = providerById.get(t.provider_id);
     if (!mr || !pr) continue;                       // 模型行或服务商缺失 → 跳过
     if (!pr.enabled) continue;                      // 服务商未启用
-    if (!pr.api_key || pr.api_key.length < 6) continue; // 无有效密钥
+    const poolKeys = (pr.__apiKeys || []);
+    const activePoolKeys = poolKeys.filter((k) => (k.status || 'active') === 'active' && (k.api_key || '').length >= 6);
+    const hasKey = (pr.api_key && pr.api_key.length >= 6) || activePoolKeys.length > 0;
+    if (!hasKey) continue;                          // 无任何可用密钥
     // 克隆模型行并注入上游 wire name（model_id 原样保留供账务/能力判定）
     const model = {
       ...mr,

@@ -355,6 +355,43 @@ async function initDB() {
       ALTER TABLE generation_tasks ADD COLUMN IF NOT EXISTS cost_pool TEXT DEFAULT 'recharge';
     `);
 
+    // === 多 Key 池（同一供应商多把 API Key，各自独立参与生成分配）===
+    await pgPool.query(`
+      CREATE TABLE IF NOT EXISTS api_keys (
+        id TEXT PRIMARY KEY,
+        provider_id TEXT NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+        api_key TEXT NOT NULL,
+        label TEXT DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'active',   -- active | manual_cold | disabled
+        weight INT NOT NULL DEFAULT 1,
+        consecutive_failures INT NOT NULL DEFAULT 0,
+        last_failure_at TIMESTAMPTZ,
+        last_used_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_by TEXT DEFAULT '',
+        UNIQUE (provider_id, api_key)
+      );
+    `);
+    // 回填：现存 providers.api_key（非空）且 api_keys 尚无记录 → 插入「主 key」（幂等）
+    try {
+      const provs = await pgPool.query("SELECT id, api_key FROM providers WHERE api_key IS NOT NULL AND api_key <> ''");
+      for (const pr of (provs.rows || [])) {
+        const existing = await pgPool.query('SELECT 1 FROM api_keys WHERE provider_id = $1 LIMIT 1', [pr.id]);
+        if (existing.rows.length === 0) {
+          await pgPool.query(
+            `INSERT INTO api_keys (id, provider_id, api_key, label, status, weight)
+             VALUES ($1, $2, $3, '主 key', 'active', 1)
+             ON CONFLICT (provider_id, api_key) DO NOTHING`,
+            [`akey-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`, pr.id, pr.api_key],
+          );
+        }
+      }
+      console.log('[initDB] 多 Key 池表已就绪（api_keys）');
+    } catch (e) {
+      console.warn('[initDB] api_keys 回填跳过（非致命）:', e.message);
+    }
+
     // === 模型级参数模板回填（后台可自定义；空模板按 type 派生默认）===
     await backfillModelParamTemplates();
 
@@ -2652,9 +2689,56 @@ async function handleAPI(req, res) {
     }
   }
 
+  // ── 多 Key 池辅助：loadProviderKeys（遮蔽明文 + 状态/失败计数）；addProviderKeys（追加去重，幂等）──
+  async function loadProviderKeys(pool, providerIds) {
+    if (!pool || !Array.isArray(providerIds) || providerIds.length === 0) return {};
+    const r = await pool.query('SELECT * FROM api_keys WHERE provider_id = ANY($1)', [providerIds]);
+    const map = {};
+    for (const row of (r.rows || [])) {
+      const pid = row.provider_id;
+      if (!map[pid]) map[pid] = [];
+      const raw = row.api_key || '';
+      const masked = raw.length > 8 ? raw.slice(0, 4) + '…' + raw.slice(-4) : (raw ? '****' : '');
+      map[pid].push({
+        id: row.id, label: row.label || '', status: row.status || 'active',
+        failures: row.consecutive_failures || 0, masked, lastUsedAt: row.last_used_at,
+        createdAt: row.created_at,
+      });
+    }
+    return map;
+  }
+  // 追加 key（去重：同 provider 同值不重复）；若 provider 尚无「主 key」标签则首个 key 标「主 key」；若 providers.api_key 为空则补第一把作 fallback。
+  async function addProviderKeys(pool, providerId, apiKeys) {
+    const clean = [...new Set((apiKeys || []).map((x) => String(x).trim()).filter((x) => x && x.length >= 6 && !x.includes('*')))];
+    const hasPrimary = await pool.query("SELECT 1 FROM api_keys WHERE provider_id=$1 AND label='主 key' LIMIT 1", [providerId]);
+    const primaryExists = hasPrimary.rows.length > 0;
+    let added = 0;
+    for (const k of clean) {
+      const ex = await pool.query('SELECT 1 FROM api_keys WHERE provider_id=$1 AND api_key=$2', [providerId, k]);
+      if (ex.rows.length) continue; // 去重
+      const label = (!primaryExists && added === 0) ? '主 key' : '';
+      await pool.query(
+        `INSERT INTO api_keys (id, provider_id, api_key, label, status, weight) VALUES ($1,$2,$3,$4,'active',1)`,
+        [`akey-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`, providerId, k, label],
+      );
+      added++;
+    }
+    // providers.api_key 为空 → 用第一把补齐（legacy 代码 / 恢复链路 fallback）
+    const cur = await pool.query('SELECT api_key FROM providers WHERE id=$1', [providerId]);
+    if (!cur.rows[0] || !cur.rows[0].api_key) {
+      const first = await pool.query('SELECT api_key FROM api_keys WHERE provider_id=$1 ORDER BY created_at LIMIT 1', [providerId]);
+      if (first.rows[0]) await pool.query('UPDATE providers SET api_key=$1, updated_at=NOW() WHERE id=$2', [first.rows[0].api_key, providerId]);
+    }
+    return added;
+  }
+
   if (url === '/api/providers' && method === 'GET') {
     const maskKey = (p) => ({ ...p, apiKey: p.apiKey ? '***' : '' });
-    if (pgPool) { const r = await pgPool.query('SELECT * FROM providers ORDER BY created_at'); return sendJSON(res, 200, r.rows.map(fromSnake).map(maskKey)); }
+    if (pgPool) {
+      const r = await pgPool.query('SELECT * FROM providers ORDER BY created_at');
+      const keyMap = await loadProviderKeys(pgPool, r.rows.map((x) => x.id));
+      return sendJSON(res, 200, r.rows.map(fromSnake).map((p) => ({ ...maskKey(p), apiKeys: keyMap[p.id] || [] })));
+    }
     return sendJSON(res, 200, readJSON('providers').map(maskKey));
   }
   // ── POST /api/providers：单条创建（RESTful，不再是破坏性全量同步）──
@@ -2675,12 +2759,22 @@ async function handleAPI(req, res) {
         // 安全：创建时若 api_key 是占位（含 '*' 或 <6 字符）则落空，不写入伪密钥
         let apiKey = s.api_key || '';
         if (apiKey.includes('*') || apiKey.length < 6) apiKey = '';
+        // 批量 key：POST 体可携带 apiKeys[]（每行一把）；首把作为 providers.api_key fallback
+        const apiKeysIn = Array.isArray(body.apiKeys) ? body.apiKeys : [];
+        if (!apiKey) {
+          const first = (apiKeysIn.map((x) => String(x).trim()).filter((x) => x && x.length >= 6 && !x.includes('*')))[0];
+          if (first) apiKey = first;
+        }
         const exists = await pgPool.query('SELECT id FROM providers WHERE id=$1', [s.id]);
         if (exists.rows[0]) return sendJSON(res, 409, { error: '服务商已存在', id: s.id });
         await pgPool.query(
           `INSERT INTO providers (id,name,type,base_url,api_key,supported_types,enabled,protocol,remark,default_endpoint,max_concurrent,rate_limits,capacity_model,bucket_max,cooldown_ms,revision,updated_at,updated_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,1,NOW(),$16)`,
           [s.id, s.name, s.type, s.base_url, apiKey, s.supported_types || [], s.enabled !== false, s.protocol || 'openai-compatible', s.remark || '', JSON.stringify(s.default_endpoint || {}), Number(s.max_concurrent) || 2, JSON.stringify(s.rate_limits || {}), s.capacity_model || 'limited', s.bucket_max != null ? Number(s.bucket_max) : null, Number(s.cooldown_ms) || 60000, (realUser && realUser.id) || '']
         );
+        // 批量 key 落库（追加去重；首把已是 providers.api_key，这里仅补其余）
+        if (Array.isArray(apiKeysIn) && apiKeysIn.length) {
+          try { await addProviderKeys(pgPool, s.id, apiKeysIn); } catch (e) { console.error('[providers] 批量 key 写入失败', e.message); }
+        }
         return sendJSON(res, 201, { ok: true, id: s.id, revision: 1 });
       } catch (e) {
         console.error('[providers] POST 失败', e.message);
@@ -2694,6 +2788,66 @@ async function handleAPI(req, res) {
     writeJSON('providers', list);
     return sendJSON(res, 201, { ok: true, id: s.id, revision: 1 });
   }
+  // ── 多 Key 池管理路由：同一供应商多把 API Key，各自独立参与生成分配 ──
+  // 必须在通用 PATCH/DELETE /api/providers/ 之前匹配，避免被 startsWith 误捕获。
+  const KEY_ROUTE = /^\/api\/providers\/([^/]+)\/keys(\/([^/]+))?$/;
+  if (KEY_ROUTE.test(url)) {
+    if (!admin.requireAdmin(req)) return sendJSON(res, 403, { error: '需要管理员权限' });
+    const m = url.match(KEY_ROUTE);
+    const pid = decodeURIComponent(m[1]);
+    const keyId = m[3] || null;
+    if (!pgPool) return sendJSON(res, 501, { error: 'JSON 兜底模式不支持 Key 池管理' });
+    if (method === 'GET') {
+      const r = await pgPool.query('SELECT * FROM api_keys WHERE provider_id=$1 ORDER BY created_at', [pid]);
+      const list = (r.rows || []).map((row) => {
+        const raw = row.api_key || '';
+        const masked = raw.length > 8 ? raw.slice(0, 4) + '…' + raw.slice(-4) : (raw ? '****' : '');
+        return { id: row.id, label: row.label || '', status: row.status || 'active', failures: row.consecutive_failures || 0, masked, lastUsedAt: row.last_used_at, createdAt: row.created_at };
+      });
+      return sendJSON(res, 200, { keys: list });
+    }
+    if (method === 'POST') {
+      const body = await parseBody(req); if (!body || typeof body !== 'object') return sendJSON(res, 400, { error: 'Invalid JSON' });
+      const arr = Array.isArray(body.apiKeys) ? body.apiKeys : (body.apiKey ? [body.apiKey] : []);
+      const added = await addProviderKeys(pgPool, pid, arr);
+      if (dispatcher.invalidateProviderKeyCache) dispatcher.invalidateProviderKeyCache(pid);
+      const r = await pgPool.query('SELECT * FROM api_keys WHERE provider_id=$1 ORDER BY created_at', [pid]);
+      const keys = (r.rows || []).map((row) => ({ id: row.id, label: row.label || '', status: row.status || 'active', failures: row.consecutive_failures || 0, createdAt: row.created_at }));
+      return sendJSON(res, 200, { ok: true, added, keys });
+    }
+    if (method === 'PATCH' && keyId) {
+      const body = await parseBody(req); if (!body || typeof body !== 'object') return sendJSON(res, 400, { error: 'Invalid JSON' });
+      let pi = 1;
+      const sets = []; const vals = [];
+      if (body.status) {
+        if (!['active', 'manual_cold', 'disabled'].includes(body.status)) return sendJSON(res, 400, { error: 'status 仅支持 active | manual_cold | disabled' });
+        sets.push(`status=$${pi++}`); vals.push(body.status);
+      }
+      if (typeof body.label === 'string') { sets.push(`label=$${pi++}`); vals.push(body.label); }
+      sets.push('updated_at=NOW()');
+      if (sets.length <= 1) return sendJSON(res, 400, { error: '无可更新字段（status 或 label）' });
+      vals.push(keyId); vals.push(pid);
+      await pgPool.query(`UPDATE api_keys SET ${sets.join(', ')} WHERE id=$${pi++} AND provider_id=$${pi++}`, vals);
+      if (dispatcher.invalidateProviderKeyCache) dispatcher.invalidateProviderKeyCache(pid);
+      return sendJSON(res, 200, { ok: true });
+    }
+    if (method === 'DELETE' && keyId) {
+      await pgPool.query('DELETE FROM api_keys WHERE id=$1 AND provider_id=$2', [keyId, pid]);
+      // 若删掉的是主 key（providers.api_key 指向它），用剩余第一把补齐 fallback
+      const cur = await pgPool.query('SELECT api_key FROM providers WHERE id=$1', [pid]);
+      const curKey = cur.rows[0] && cur.rows[0].api_key;
+      const still = await pgPool.query('SELECT api_key FROM api_keys WHERE provider_id=$1', [pid]);
+      const stillKeys = (still.rows || []).map((x) => x.api_key);
+      if (!curKey || !stillKeys.includes(curKey)) {
+        const fb = stillKeys[0] || '';
+        await pgPool.query('UPDATE providers SET api_key=$1, updated_at=NOW() WHERE id=$2', [fb, pid]);
+      }
+      if (dispatcher.invalidateProviderKeyCache) dispatcher.invalidateProviderKeyCache(pid);
+      return sendJSON(res, 200, { ok: true });
+    }
+    return sendJSON(res, 405, { error: 'Method Not Allowed' });
+  }
+
   // ── PATCH /api/providers/:id：单条局部更新 + 乐观锁（revision 不匹配 → 409）──
   if (url.startsWith('/api/providers/') && method === 'PATCH') {
     if (!admin.requireAdmin(req)) return sendJSON(res, 403, { error: '需要管理员权限' });
@@ -2753,6 +2907,13 @@ async function handleAPI(req, res) {
     if (r.status === 'conflict') return sendJSON(res, 409, { error: '数据已被其他管理员修改（revision 不匹配），请刷新后重试', currentRevision: r.currentRevision });
     const row = await pgPool.query('SELECT * FROM providers WHERE id=$1', [id]);
     if (!row.rows[0]) return sendJSON(res, 404, { error: '服务商不存在' });
+    // 多 Key 池：PATCH 携带 apiKeys → 追加（去重），不删除既有 key；同步刷新运行时态
+    if (Array.isArray(patch.apiKeys) && patch.apiKeys.length) {
+      try {
+        await addProviderKeys(pgPool, id, patch.apiKeys);
+        if (dispatcher.invalidateProviderKeyCache) dispatcher.invalidateProviderKeyCache(id);
+      } catch (e) { console.error('[providers] PATCH apiKeys 写入失败', e.message); }
+    }
     return sendJSON(res, 200, { ok: true, provider: fromSnake(row.rows[0]), revision: r.revision });
   }
   // 账号冷热状态快照（内存态，供管理面板展示 + 手动强切）

@@ -156,6 +156,43 @@ async function initDB() {
     await client.query(`ALTER TABLE characters ADD COLUMN IF NOT EXISTS base_model TEXT DEFAULT '';`);
     await client.query(`ALTER TABLE characters ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'user';`);
 
+    // 兼容已部署库：多 Key 池（同一供应商多把 API Key，各自独立参与生成分配）
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS api_keys (
+        id TEXT PRIMARY KEY,
+        provider_id TEXT NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+        api_key TEXT NOT NULL,
+        label TEXT DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'active',   -- active | manual_cold | disabled
+        weight INT NOT NULL DEFAULT 1,
+        consecutive_failures INT NOT NULL DEFAULT 0,
+        last_failure_at TIMESTAMPTZ,
+        last_used_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_by TEXT DEFAULT '',
+        UNIQUE (provider_id, api_key)
+      );
+    `);
+    // 回填：现存 providers.api_key（非空）且 api_keys 尚无记录 → 插入「主 key」
+    // 幂等：每启动仅对尚无任何 key 的 provider 补一条；老 providers.api_key 列保留作 fallback。
+    try {
+      const provs = await client.query(`SELECT id, api_key FROM providers WHERE api_key IS NOT NULL AND api_key <> ''`);
+      for (const pr of provs.rows || []) {
+        const existing = await client.query(`SELECT 1 FROM api_keys WHERE provider_id = $1 LIMIT 1`, [pr.id]);
+        if (existing.rows.length === 0) {
+          await client.query(
+            `INSERT INTO api_keys (id, provider_id, api_key, label, status, weight)
+             VALUES ($1, $2, $3, '主 key', 'active', 1)
+             ON CONFLICT (provider_id, api_key) DO NOTHING`,
+            [`akey-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`, pr.id, pr.api_key],
+          );
+        }
+      }
+    } catch (e) {
+      console.warn('[PG] api_keys 回填跳过（非致命）:', e.message);
+    }
+
     console.log('[PG] 数据库表初始化完成');
   } finally {
     client.release();

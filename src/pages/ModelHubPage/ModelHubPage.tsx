@@ -28,6 +28,7 @@ import {
   Briefcase,
   Boxes,
   Gift,
+  KeyRound,
 } from 'lucide-react';
 import { toast } from 'sonner';
 import {
@@ -48,7 +49,7 @@ import { useModelHub } from '@/hooks/useModelHub';
 import { groupModelsByModelId } from '@/utils/groupModels';
 import { useOssConfig, dataUrlToFile } from '@/hooks/useOssConfig';
 import { MOCK_MEDIA_LIST } from '@/data/media';
-import { apiGetMedia, apiSaveMedia, apiGetSettings, apiSaveSettings, apiSyncProviderModels, apiPreviewProviderModels, apiDeleteModel, stripBlobItems } from '@/services/api';
+import { apiGetMedia, apiSaveMedia, apiGetSettings, apiSaveSettings, apiSyncProviderModels, apiPreviewProviderModels, apiDeleteModel, stripBlobItems, apiAddProviderKeys, apiPatchProviderKey, apiDeleteProviderKey } from '@/services/api';
 import EndpointsTab from './EndpointsTab';
 import PairingTab from './PairingTab';
 import AsyncAddDialog from './AsyncAddDialog';
@@ -82,7 +83,7 @@ const PROVIDER_TYPE_ICONS: Record<ProviderType, typeof Server> = {
 };
 
 export default function ModelHubPage() {
-  const { providers, models, setProviders, setModels, patchModel, deleteProvider, deleteModel, cleanupOrphanModels, getProviderName } = useModelHub();
+  const { providers, models, setProviders, setModels, patchModel, deleteProvider, deleteModel, cleanupOrphanModels, reloadProviders, getProviderName } = useModelHub();
   const navigate = useNavigate();
   const { enabled: ossEnabled, ingestFromUrl, ingestFile } = useOssConfig();
   const [activeTab, setActiveTab] = useState<'providers' | 'models' | 'endpoints' | 'pairing' | 'storage'>('models');
@@ -120,6 +121,20 @@ export default function ModelHubPage() {
   // 同 vendor/baseUrl 的 provider 密钥池展开态
   const [expandedProviderPools, setExpandedProviderPools] = useState<Set<string>>(new Set());
 
+  // 单 provider 内的「多 Key 池」展开态
+  const [keyPoolExpanded, setKeyPoolExpanded] = useState<Set<string>>(new Set());
+  // 批量加 Key 弹层
+  const [batchAddProvider, setBatchAddProvider] = useState<any | null>(null);
+  const [batchKeysText, setBatchKeysText] = useState('');
+  const [batchKeysBusy, setBatchKeysBusy] = useState(false);
+
+  // 取某 provider 的密钥池（后端返回 apiKeys: [{id,label,status,failures,masked,...}]）
+  const getKeys = (p: any): Array<{ id: string; label: string; status: string; failures: number; masked: string; lastUsedAt: string | null }> =>
+    Array.isArray(p?.apiKeys) ? p.apiKeys.filter((k: any) => k && typeof k === 'object' && k.id) : [];
+  // 从 textarea 解析有效 key 行（去空、去占位 '*'、长度>=6）
+  const parseKeyLines = (txt: string): string[] =>
+    txt.split('\n').map((s) => s.trim()).filter(Boolean).filter((k) => !k.includes('*') && k.length >= 6);
+
   // 已保存模型卡的内联编辑（displayName + mappingName + creditCost）
   const [editingGroupId, setEditingGroupId] = useState<string | null>(null);
   const [editDisplayName, setEditDisplayName] = useState('');
@@ -138,7 +153,6 @@ export default function ModelHubPage() {
   const [formEnabled, setFormEnabled] = useState(true);
   const [formRemark, setFormRemark] = useState('');
   const [formProtocol, setFormProtocol] = useState<'openai-compatible' | 'custom'>('openai-compatible');
-  const [showApiKey, setShowApiKey] = useState(false);
   const [formMaxConcurrent, setFormMaxConcurrent] = useState(2);
   // 容量模型与限速（统一共享 B 桶）
   const [formCapacityModel, setFormCapacityModel] = useState<'limited' | 'unlimited'>('limited');
@@ -215,7 +229,6 @@ export default function ModelHubPage() {
     setFormBucketMax('');
     setFormCooldownSec(60);
     setFormOpCosts({ '1k': 1, '2k': 2, '4k': 20, video: 20 });
-    setShowApiKey(false);
     setProviderDialogOpen(true);
   };
 
@@ -224,7 +237,8 @@ export default function ModelHubPage() {
     setFormName(provider.name);
     setFormType(provider.type);
     setFormBaseUrl(provider.baseUrl);
-    setFormApiKey(provider.apiKey);
+    // 主 key 已被后端遮蔽为 '***'，不能回填到输入框；编辑时输入框仅用于「追加新 key」
+    setFormApiKey('');
     setFormTypes([...provider.supportedTypes]);
     setFormEnabled(provider.enabled);
     setFormRemark(provider.remark || '');
@@ -250,11 +264,10 @@ export default function ModelHubPage() {
     }
     setFormBucketMax(provider.bucketMax != null ? Number(provider.bucketMax) : '');
     setFormCooldownSec(Math.round((provider.cooldownMs || 60000) / 1000));
-    setShowApiKey(false);
     setProviderDialogOpen(true);
   };
 
-  const handleSaveProvider = () => {
+  const handleSaveProvider = async () => {
     if (!formName.trim()) {
       toast.error('请输入服务商名称');
       return;
@@ -283,22 +296,25 @@ export default function ModelHubPage() {
     }
 
     if (editingProvider) {
+      // 编辑：保留主 key（masked）不变，仅更新普通字段；新 key 走专用接口追加
       setProviders((prev) =>
         prev.map((p) =>
           p.id === editingProvider.id
-            ? { ...p, name: formName, type: formType, baseUrl: formBaseUrl, apiKey: formApiKey, supportedTypes: formTypes, enabled: formEnabled, remark: formRemark, protocol: formProtocol, maxConcurrent: formMaxConcurrent, rateLimits, ...capacityMeta }
+            ? { ...p, name: formName, type: formType, baseUrl: formBaseUrl, apiKey: editingProvider.apiKey, supportedTypes: formTypes, enabled: formEnabled, remark: formRemark, protocol: formProtocol, maxConcurrent: formMaxConcurrent, rateLimits, ...capacityMeta }
             : p,
         ),
       );
       toast.success('服务商已更新');
     } else {
+      const keyLines = parseKeyLines(formApiKey);
       const newProvider = {
         // ID 用 Date.now + 随机后缀，避免同毫秒创建时撞 ID
         id: `prov-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
         name: formName,
         type: formType,
         baseUrl: formBaseUrl,
-        apiKey: formApiKey,
+        apiKey: keyLines[0] || '',
+        apiKeys: keyLines, // 多 key：首把作主 key，其余后端追加
         maxConcurrent: formMaxConcurrent,
         rateLimits,
         ...capacityMeta,
@@ -311,6 +327,22 @@ export default function ModelHubPage() {
       setProviders((prev) => [...prev, newProvider]);
       toast.success('服务商已添加');
     }
+
+    // 编辑态：若输入框有新增 key，则追加到密钥池
+    if (editingProvider) {
+      const addLines = parseKeyLines(formApiKey);
+      if (addLines.length) {
+        try {
+          const r = await apiAddProviderKeys(editingProvider.id, addLines);
+          if (!r.ok) toast.warning(`新增密钥部分失败：${r.error || ''}`);
+        } catch (e) {
+          toast.error(`新增密钥失败：${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
+    }
+
+    // 刷新内存态（含最新的 apiKeys 结构）并关闭弹窗
+    await reloadProviders().catch(() => {});
     setProviderDialogOpen(false);
   };
 
@@ -340,6 +372,82 @@ export default function ModelHubPage() {
       toast.success('连接成功，延迟 128ms');
     } else {
       toast.error('连接失败：服务商未启用');
+    }
+  };
+
+  // ── 多 Key 池管理（同 provider 多把 key 各自独立调度）────────────────────────
+  const keyStatusMeta = (status: string) => {
+    switch (status) {
+      case 'active': return { dot: 'bg-emerald-400', text: 'text-emerald-400', label: '启用' };
+      case 'manual_cold': return { dot: 'bg-amber-400', text: 'text-amber-400', label: '已隔离' };
+      case 'disabled': return { dot: 'bg-red-400', text: 'text-red-400', label: '已停用' };
+      default: return { dot: 'bg-zinc-500', text: 'text-zinc-500', label: status };
+    }
+  };
+
+  const toggleKeyPool = (id: string) => {
+    setKeyPoolExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  };
+
+  const openBatchAddKeys = (provider: any) => {
+    setBatchAddProvider(provider);
+    setBatchKeysText('');
+  };
+  const closeBatchAddKeys = () => {
+    setBatchAddProvider(null);
+    setBatchKeysText('');
+    setBatchKeysBusy(false);
+  };
+  const submitBatchAddKeys = async () => {
+    if (!batchAddProvider) return;
+    const lines = parseKeyLines(batchKeysText);
+    if (lines.length === 0) {
+      toast.error('请至少输入一把有效 API Key（每行一把，至少 6 位）');
+      return;
+    }
+    setBatchKeysBusy(true);
+    try {
+      const r = await apiAddProviderKeys(batchAddProvider.id, lines);
+      if (r.ok) {
+        toast.success(`已添加 ${r.added ?? lines.length} 把密钥`);
+        await reloadProviders().catch(() => {});
+        closeBatchAddKeys();
+      } else {
+        toast.error(`添加失败：${r.error || '未知错误'}`);
+      }
+    } catch (e) {
+      toast.error(`添加失败：${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setBatchKeysBusy(false);
+    }
+  };
+
+  const setKeyStatus = async (provider: any, key: any, status: string) => {
+    try {
+      const r = await apiPatchProviderKey(provider.id, key.id, { status });
+      if (r.ok) await reloadProviders().catch(() => {});
+      else toast.error(`操作失败：${r.error || ''}`);
+    } catch (e) {
+      toast.error(`操作失败：${e instanceof Error ? e.message : String(e)}`);
+    }
+  };
+
+  const deleteKey = async (provider: any, key: any) => {
+    if (!confirm(`确定删除密钥 ${key.masked}？此操作不可恢复。`)) return;
+    try {
+      const r = await apiDeleteProviderKey(provider.id, key.id);
+      if (r.ok) {
+        toast.success('密钥已删除');
+        await reloadProviders().catch(() => {});
+      } else {
+        toast.error(`删除失败：${r.error || ''}`);
+      }
+    } catch (e) {
+      toast.error(`删除失败：${e instanceof Error ? e.message : String(e)}`);
     }
   };
 
@@ -1245,6 +1353,58 @@ export default function ModelHubPage() {
                         <p className='truncate text-xs text-zinc-500'>{provider.remark}</p>
                       </div>
                     )}
+
+                    {/* 多 Key 池 */}
+                    <div className='px-5 pb-3'>
+                      <div className='flex items-center justify-between mb-2'>
+                        <button
+                          onClick={() => toggleKeyPool(provider.id)}
+                          className='flex items-center gap-1 text-xs font-medium text-zinc-400 hover:text-white transition-colors'
+                        >
+                          <KeyRound className='size-3.5' />
+                          <span>密钥池（{getKeys(provider).length}）</span>
+                          <ChevronDown className={`size-3.5 transition-transform ${keyPoolExpanded.has(provider.id) ? 'rotate-180' : ''}`} />
+                        </button>
+                        <button
+                          onClick={() => openBatchAddKeys(provider)}
+                          className='flex items-center gap-1 rounded-lg border border-emerald-500/30 bg-emerald-500/5 px-2 py-1 text-[11px] font-semibold text-emerald-400 hover:bg-emerald-500/10 transition-colors'
+                        >
+                          <Plus className='size-3' />
+                          批量加 Key
+                        </button>
+                      </div>
+                      {keyPoolExpanded.has(provider.id) && (
+                        <div className='space-y-1.5'>
+                          {getKeys(provider).length === 0 && (
+                            <p className='text-[11px] text-zinc-600'>该服务商暂无独立密钥（仅有主 Key）。</p>
+                          )}
+                          {getKeys(provider).map((k) => {
+                            const sm = keyStatusMeta(k.status);
+                            return (
+                              <div key={k.id} className='flex items-center gap-2 rounded-lg bg-zinc-950/40 px-2.5 py-1.5'>
+                                <span className={`h-2 w-2 shrink-0 rounded-full ${sm.dot}`} />
+                                <span className='font-mono text-[11px] text-zinc-300'>{k.masked}</span>
+                                {k.label ? <span className='text-[10px] text-zinc-500'>{k.label}</span> : null}
+                                {k.failures > 0 && <span className='text-[10px] text-red-400'>失败 {k.failures}</span>}
+                                <div className='ml-auto flex items-center gap-1'>
+                                  {k.status === 'active' ? (
+                                    <>
+                                      <button onClick={() => setKeyStatus(provider, k, 'manual_cold')} className='rounded-md px-1.5 py-0.5 text-[10px] text-amber-400 hover:bg-amber-500/10 transition-colors' title='隔离该 Key（暂停分配但保留）'>隔离</button>
+                                      <button onClick={() => setKeyStatus(provider, k, 'disabled')} className='rounded-md px-1.5 py-0.5 text-[10px] text-red-400 hover:bg-red-500/10 transition-colors' title='停用该 Key'>停用</button>
+                                    </>
+                                  ) : (
+                                    <button onClick={() => setKeyStatus(provider, k, 'active')} className='rounded-md px-1.5 py-0.5 text-[10px] text-emerald-400 hover:bg-emerald-500/10 transition-colors' title='启用该 Key'>启用</button>
+                                  )}
+                                  <button onClick={() => deleteKey(provider, k)} className='flex h-5 w-5 items-center justify-center rounded-md text-zinc-500 hover:bg-red-500/10 hover:text-red-400 transition-colors' title='删除'>
+                                    <Trash2 className='size-3' />
+                                  </button>
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
 
                     <div className='flex items-center gap-1 border-t border-zinc-800/50 px-3 py-2'>
                       <button
@@ -2321,25 +2481,26 @@ export default function ModelHubPage() {
                   />
                 </div>
 
-                {/* API Key */}
+                {/* API Key（多 key 支持：每行一把） */}
                 <div>
-                  <label className="mb-1 block text-xs font-medium text-zinc-400">API Key</label>
-                  <div className="relative">
-                    <input
-                      type={showApiKey ? 'text' : 'password'}
-                      value={formApiKey}
-                      onChange={(e) => setFormApiKey(e.target.value)}
-                      placeholder="sk-xxxxxxxxxxxxxxxx"
-                      className="w-full rounded-xl bg-zinc-800/50 px-3 py-1.5 pr-16 text-sm text-white placeholder:text-zinc-600 border border-zinc-700 focus:outline-none focus:border-emerald-500/50 transition-colors font-mono"
-                    />
-                    <button
-                      type="button"
-                      onClick={() => setShowApiKey(!showApiKey)}
-                      className="absolute right-1.5 top-1/2 -translate-y-1/2 rounded-lg px-2 py-0.5 text-[11px] text-zinc-500 hover:text-white transition-colors"
-                    >
-                      {showApiKey ? '隐藏' : '显示'}
-                    </button>
-                  </div>
+                  <label className="mb-1 flex items-center justify-between text-xs font-medium text-zinc-400">
+                    <span>API Key（每行一把，多 Key 独立调度）</span>
+                    {parseKeyLines(formApiKey).length > 0 && (
+                      <span className="text-emerald-400">将创建 {parseKeyLines(formApiKey).length} 把</span>
+                    )}
+                  </label>
+                  <textarea
+                    value={formApiKey}
+                    onChange={(e) => setFormApiKey(e.target.value)}
+                    placeholder={'sk-xxxxxxxxxxxxxxxx\nsk-yyyyyyyyyyyyyyyy（可选第二把）'}
+                    rows={editingProvider ? 2 : 3}
+                    className="w-full resize-none rounded-xl bg-zinc-800/50 px-3 py-2 text-sm text-white placeholder:text-zinc-600 border border-zinc-700 focus:outline-none focus:border-emerald-500/50 transition-colors font-mono"
+                  />
+                  <p className="mt-1 text-[10px] text-zinc-500">
+                    {editingProvider
+                      ? '编辑时留空 = 保留现有密钥；输入新 Key 将追加到密钥池。'
+                      : '首行作为主 Key，其余自动加入密钥池（各自独立并发 / 冷却 / 熔断）。'}
+                  </p>
                 </div>
 
                 {/* 接口协议 + 获取模型（同行） */}
@@ -2377,7 +2538,7 @@ export default function ModelHubPage() {
                     <label className="mb-1 block text-xs font-medium text-zinc-400">拉取模型</label>
                     <button
                       type="button"
-                      onClick={() => fetchModels(formBaseUrl, formApiKey, formProtocol)}
+                      onClick={() => fetchModels(formBaseUrl, parseKeyLines(formApiKey)[0] || formApiKey, formProtocol)}
                       disabled={fetchingModels}
                       className="flex w-full items-center justify-center gap-1.5 rounded-xl border border-emerald-500/30 bg-emerald-500/5 py-1.5 text-xs font-semibold text-emerald-400 hover:bg-emerald-500/10 hover:border-emerald-500/50 transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed"
                     >
@@ -2575,6 +2736,49 @@ export default function ModelHubPage() {
               >
                 {editingProvider ? '保存修改' : '添加服务商'}
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 批量加 Key 弹层 */}
+      {batchAddProvider && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" onClick={closeBatchAddKeys}>
+          <div className="w-full max-w-lg rounded-2xl border border-zinc-800 bg-zinc-950 p-5 shadow-2xl" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-sm font-bold text-white">批量加 Key · {batchAddProvider.name}</h3>
+              <button onClick={closeBatchAddKeys} className="flex h-7 w-7 items-center justify-center rounded-lg text-zinc-400 hover:bg-zinc-800 hover:text-white transition-colors" title="关闭">
+                <X className="size-4" />
+              </button>
+            </div>
+            <p className="mb-2 text-[11px] text-zinc-500">
+              每行一把 API Key（至少 6 位），将追加到该服务商的密钥池，与现有 Key 各自独立参与生成分配。
+            </p>
+            <textarea
+              value={batchKeysText}
+              onChange={(e) => setBatchKeysText(e.target.value)}
+              placeholder={'sk-xxxxxxxxxxxxxxxx\nsk-yyyyyyyyyyyyyyyy'}
+              rows={6}
+              autoFocus
+              className="w-full resize-none rounded-xl bg-zinc-800/50 px-3 py-2 text-sm text-white placeholder:text-zinc-600 border border-zinc-700 focus:outline-none focus:border-emerald-500/50 transition-colors font-mono"
+            />
+            <div className="mt-2 flex items-center justify-between">
+              <span className="text-[11px] text-zinc-500">
+                {parseKeyLines(batchKeysText).length > 0
+                  ? `将创建 ${parseKeyLines(batchKeysText).length} 把`
+                  : '请输入至少一把有效 Key'}
+              </span>
+              <div className="flex items-center gap-2">
+                <button onClick={closeBatchAddKeys} className="rounded-full border border-zinc-700 px-4 py-1.5 text-sm text-white hover:bg-zinc-800/50 transition-colors">取消</button>
+                <button
+                  onClick={submitBatchAddKeys}
+                  disabled={batchKeysBusy || parseKeyLines(batchKeysText).length === 0}
+                  className="flex items-center gap-1.5 rounded-full bg-emerald-500 px-4 py-1.5 text-sm font-bold text-black hover:bg-emerald-400 transition-colors disabled:opacity-50"
+                >
+                  {batchKeysBusy ? <Loader2 className="size-3.5 animate-spin" /> : <Plus className="size-3.5" />}
+                  <span>确认添加</span>
+                </button>
+              </div>
             </div>
           </div>
         </div>

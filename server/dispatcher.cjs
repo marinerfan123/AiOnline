@@ -60,6 +60,76 @@ const DEFAULT_COOLDOWN_MS = 60000;                     // 整账号冷却默认 
 const ACCOUNT_CONC_CAP = 4;                            // 单账号并发硬上限（与 provider.max_concurrent 取小）
 const MAX_RETRY = 3;                                   // 单任务「全部账号不可用」时的最多重试（无感切换）
 
+// ─── 多 Key 池（同一供应商多把 API Key，各自独立参与生成分配）───
+// AKEYS[pid] = Map<keyId, keyState>；keyState 持有 per-key 运行时态（并发/失败/CB），持久于内存跨请求。
+// DB 的 api_keys 表是成员与 status 的权威源；syncKeyPool 每次请求从 DB 对账，但保留运行时计数（不重置）。
+const AKEYS = {};
+// 每 key 并发上限 = provider.max_concurrent（默认 2）；总容量随 key 数线性扩展（aggregate cap = perKeyCap × activeKeyCount）
+const KEY_STATUS_ACTIVE = 'active';
+
+// 从 DB 行对账某 provider 的 key 池到内存态：新增 key 初始化运行时态；保留已有 key 的计数（不重置）；
+// DB 中已删除的 key 同步移除（释放运行时态）。
+function syncKeyPool(pid, dbRows) {
+  let m = AKEYS[pid];
+  if (!m) { m = new Map(); AKEYS[pid] = m; }
+  const freshIds = new Set();
+  for (const r of (dbRows || [])) {
+    freshIds.add(r.id);
+    const existing = m.get(r.id);
+    if (existing) {
+      existing.apiKey = r.api_key;
+      existing.status = r.status || KEY_STATUS_ACTIVE;
+      existing.weight = (typeof r.weight === 'number' && r.weight > 0) ? r.weight : 1;
+    } else {
+      m.set(r.id, {
+        id: r.id, apiKey: r.api_key, status: r.status || KEY_STATUS_ACTIVE,
+        weight: (typeof r.weight === 'number' && r.weight > 0) ? r.weight : 1,
+        conc: 0, consecutiveFailures: 0, lastUsedAt: 0, lastFailureAt: 0,
+        cbState: router.cbInitState(),
+      });
+    }
+  }
+  for (const id of [...m.keys()]) if (!freshIds.has(id)) m.delete(id);
+  return m;
+}
+
+// 热刷新：清空某 provider（或全部）的 key 运行时态，下次请求重新从 DB 对账（立即生效新增/隔离/启用）。
+function invalidateProviderKeyCache(pid) {
+  if (pid) { delete AKEYS[pid]; }
+  else { for (const k of Object.keys(AKEYS)) delete AKEYS[k]; }
+}
+
+// 从池中按「最少最近使用（lastUsedAt ASC）」轮转选一把可用 key：
+// active 且 CB 准入 且 并发未达 keyConcCap。无可用 key 返回 null。
+function pickKey(pid, now, keyConcCap) {
+  const m = AKEYS[pid];
+  if (!m || m.size === 0) return null;
+  const cands = [];
+  for (const ks of m.values()) {
+    if (ks.status !== KEY_STATUS_ACTIVE) continue;     // 隔离/禁用跳过
+    let cbAdm;
+    try { cbAdm = router.cbAdmit(ks.cbState, now); } catch (e) { cbAdm = { admit: true, state: ks.cbState }; }
+    ks.cbState = cbAdm.state;
+    if (!cbAdm.admit) continue;                        // 该 key 熔断隔离（CB OPEN/HALF_OPEN 额度耗尽）
+    if (ks.conc >= keyConcCap) continue;               // 单 key 并发满
+    cands.push(ks);
+  }
+  if (cands.length === 0) return null;
+  cands.sort((x, y) => (x.lastUsedAt || 0) - (y.lastUsedAt || 0));
+  return cands[0];
+}
+
+// 暴露每 key 运行时态给监控/管理接口（与 DB 的 label/status 合并展示）。
+function getKeyStates(pid) {
+  const m = AKEYS[pid];
+  if (!m) return [];
+  return [...m.values()].map((ks) => ({
+    id: ks.id, status: ks.status, conc: ks.conc, consecutiveFailures: ks.consecutiveFailures,
+    lastUsedAt: ks.lastUsedAt ? new Date(ks.lastUsedAt).toISOString() : null,
+    cbState: ks.cbState ? ks.cbState.state : null,
+  }));
+}
+
 // ─── 占位符替换 ─────────────────────────────────────
 function fillTemplate(template, vars) {
   return String(template).replace(/\{\{\s*([\w.]+)\s*\}\}/g, (_, key) => {
@@ -153,10 +223,10 @@ function isGptImageModel(model) {
   return /gpt-image/i.test(name);
 }
 
-async function imageGenerate(provider, model, opts) {
+async function imageGenerate(provider, model, opts, apiKeyOverride) {
   const { prompt, ratio, resolution, count, referenceImages, negative } = opts;
   const baseUrl = provider.base_url;
-  const apiKey = provider.api_key;
+  const apiKey = (apiKeyOverride && apiKeyOverride.length >= 6) ? apiKeyOverride : provider.api_key;
   if (!apiKey) return { images: [], status: 'error', error: '服务商未配置 API Key' };
 
   const isAgnes = /agnes-ai\.cn/i.test(baseUrl || '');
@@ -504,10 +574,21 @@ async function attemptOnAccount(p, tier, input, contentType, recorder) {
   if (a.capacityModel !== 'unlimited' && a.bucket.tokens < cost) { markReject(a, now); return null; } // 共享桶空 → 拒单（未请求）
   // per-model 并发覆盖：模型自身设了 max_concurrent（非 null 正数）则优先用，否则回退服务商默认
   const modelConc = (p.model && typeof p.model.max_concurrent === 'number' && p.model.max_concurrent > 0) ? p.model.max_concurrent : null;
-  const concCap = Math.min(modelConc ?? (Number(p.provider.max_concurrent) || 2), ACCOUNT_CONC_CAP);
-  if (a.conc >= concCap) return null;                          // 单账号并发满（非拒单，仅忙，不记 attempt）
+  const keyConcCap = modelConc ?? (Number(p.provider.max_concurrent) || 2);
+  // 多 Key 池：总并发上限随可用 key 数扩展（aggregate cap = perKeyCap × activeKeyCount）；单 key 行为与旧版一致
+  const pool = AKEYS[p.provider.id];
+  const poolExists = !!(pool && pool.size > 0);
+  const activeKeyCount = poolExists ? pool.size : 1;
+  const aggCap = Math.max(keyConcCap, keyConcCap * activeKeyCount); // 多 key → 容量线性扩展
+  if (a.conc >= aggCap) return null;                          // 整池并发满（非拒单，仅忙，不记 attempt）
+  // ── 选 key：优先池内轮转；池为空（legacy）回退 providers.api_key；池存在但全不可用 → 本账号不可用 ──
+  const selKey = poolExists ? pickKey(p.provider.id, now, keyConcCap) : null;
+  const multiKey = poolExists && pool.size > 1;
+  const effectiveApiKey = selKey ? selKey.apiKey : (poolExists ? '' : (p.provider.api_key || ''));
+  if (!effectiveApiKey) return null;                          // 无任何可用 key
   if (a.capacityModel !== 'unlimited') a.bucket.tokens -= cost; // 占用单位
   a.conc += 1; GLOBAL_ACTIVE += 1;
+  if (selKey) { selKey.conc += 1; selKey.lastUsedAt = now; }
   const t0 = Date.now();                                       // 真正发起请求的时刻（仅此后记 attempt）
   // 向 recorder 记一次实际尝试（best-effort，绝不影响主链路）；success/timeout/failed/429/error 各分支各自调用
   const mark = async (status, extra) => {
@@ -522,9 +603,10 @@ async function attemptOnAccount(p, tier, input, contentType, recorder) {
     } catch (e) { /* recorder 已内部吞错，双保险 */ }
   };
   try {
+    const providerWithKey = selKey ? { ...p.provider, api_key: effectiveApiKey } : p.provider;
     let res = contentType === 'video'
-      ? await videoGenerate(p.provider, p.model, input)
-      : await imageGenerate(p.provider, p.model, input);
+      ? await videoGenerate(providerWithKey, p.model, input)
+      : await imageGenerate(p.provider, p.model, input, effectiveApiKey);
     // 图片：瞬时网络/限流错误有界重试（吸收供应商偶发抖动，治"时好时坏"）；视频异步长任务不在此重试
     if (contentType !== 'video' && res && res.status === 'error' && isTransient(res.error)) {
       for (let ri = 0; ri < 2; ri++) {
@@ -538,7 +620,8 @@ async function attemptOnAccount(p, tier, input, contentType, recorder) {
     if (res && res.rateLimited) {                              // 真实 429 → 退还、整账号冷却、拒单（不扣费）
       if (a.capacityModel !== 'unlimited') a.bucket.tokens += cost;
       a.conc -= 1; GLOBAL_ACTIVE -= 1;
-      markReject(a, now);
+      if (selKey) { selKey.conc -= 1; selKey.consecutiveFailures += 1; selKey.lastFailureAt = now; try { selKey.cbState = router.cbRecordOutcome(selKey.cbState, 'failure', now); } catch (e) {} }
+      if (!multiKey) markReject(a, now);                       // 单 key 保持原语义；多 key 不冷却整池，仅隔离该 key
       await mark('rate_limited', { httpStatus: 429, providerErrorCode: 'RATE_LIMITED' }); // 429 也是一次真实尝试
       return null;
     }
@@ -547,6 +630,7 @@ async function attemptOnAccount(p, tier, input, contentType, recorder) {
     // 把 timeout 显式透传出去，避免被当成"资源不可用"误入等待区反复重新轮询（浪费 + 语义错）。
     // 上层 dispatchOne → generate → generateAsync 的 timeout 分支会标 'waiting' 保留待复核（积分仍 held，不释放）。
     if (res && res.status === 'timeout') {
+      if (selKey) selKey.conc -= 1;
       a.conc -= 1; GLOBAL_ACTIVE -= 1;
       await mark('timeout', { providerErrorCode: 'TIMEOUT' });
       return {
@@ -561,6 +645,7 @@ async function attemptOnAccount(p, tier, input, contentType, recorder) {
     // 每个 key 会新建真实 provider 任务并轮询到完成，多 key 下逐个尝试会卡 running 数小时、积分永不释放、前台永不更新。
     // 释放本账号限流额度 + 并发槽（任务已死，不占坑）；不 markReject（非整账号冷却，避免无谓降低容量）。
     if (res && res.status === 'failed') {
+      if (selKey) selKey.conc -= 1;
       if (a.capacityModel !== 'unlimited') a.bucket.tokens += cost;
       a.conc -= 1; GLOBAL_ACTIVE -= 1;
       await mark('failed', { providerErrorCode: 'PROVIDER_FAILED' });
@@ -575,13 +660,15 @@ async function attemptOnAccount(p, tier, input, contentType, recorder) {
     if (!res || res.status !== 'success') {                    // 真失败（网络抖动/无图片/配置错）→ 冷却该账号后切下一个
       if (a.capacityModel !== 'unlimited') a.bucket.tokens += cost;
       a.conc -= 1; GLOBAL_ACTIVE -= 1;
-      markReject(a, now);
+      if (selKey) { selKey.conc -= 1; selKey.consecutiveFailures += 1; selKey.lastFailureAt = now; try { selKey.cbState = router.cbRecordOutcome(selKey.cbState, 'failure', now); } catch (e) {} }
+      if (!multiKey) markReject(a, now);                       // 多 key：仅隔离该 key，不冷却整池
       await mark('error', { providerErrorCode: 'PROVIDER_ERROR' });
       return null;
     }
     try { a.cbState = router.cbRecordOutcome(a.cbState, 'success', now); } catch (e) { /* 熔断异常不阻断 */ }
-    a.consecutiveRejects = 0;                                  // 成功 → 重置拒单计数、释放并发槽
+    if (!multiKey) a.consecutiveRejects = 0;                   // 成功 → 单 key 重置拒单计数、释放并发槽
     a.conc -= 1; GLOBAL_ACTIVE -= 1;
+    if (selKey) { selKey.conc -= 1; selKey.consecutiveFailures = 0; try { selKey.cbState = router.cbRecordOutcome(selKey.cbState, 'success', now); } catch (e) {} }
     await mark('success', { httpStatus: 200 });
     // 精确归因：本次成功出自哪个 provider / model / 类型 / 产出资产数（供双边记账）
     const units = res.images ? (res.images.length || 0) : (res.videoUrl ? 1 : 0);
@@ -589,7 +676,8 @@ async function attemptOnAccount(p, tier, input, contentType, recorder) {
   } catch (e) {
     if (a.capacityModel !== 'unlimited') a.bucket.tokens += cost;
     a.conc -= 1; GLOBAL_ACTIVE -= 1;
-    markReject(a, now);
+    if (selKey) { selKey.conc -= 1; selKey.consecutiveFailures += 1; selKey.lastFailureAt = now; try { selKey.cbState = router.cbRecordOutcome(selKey.cbState, 'failure', now); } catch (er) {} }
+    if (!multiKey) markReject(a, now);
     await mark('error', { providerErrorCode: 'EXCEPTION' });
     return null;
   }
@@ -793,6 +881,12 @@ async function generate(pgPool, opts) {
   if (pairs.length === 0) {
     return { status: 'failed', error: '该模型没有可用的已启用服务商（请检查服务商密钥与启用状态，或配置模型线路绑定）', images: [] };
   }
+
+  // 多 Key 池对账：为本批涉及的服务商同步 api_keys 运行时态（保留计数，不重置）；
+  // AKEYS 是 per-key 并发/熔断/失败计数的权威运行时源，DB 仅作成员与 status 的权威源。
+  try {
+    for (const p of pairs) syncKeyPool(p.provider.id, p.provider.__apiKeys || []);
+  } catch (e) { /* 非致命：无 key 池不影响 legacy 单 key 路径 */ }
 
   // 5. 并发分配：单任务内部已做「拒单静默切下一个供应商」+「全部不可用 → throttled」
   // 视频数量固定 1（用户需求：视频不支持批量），图片按设置并行 count 张
@@ -1529,6 +1623,8 @@ module.exports = {
   resumeRunningTasks, resumeWaitingArea, resumeRunningImageTasks, persistProviderTaskId, finalizeResumedTask, genericVideoPoll,
   startStuckTaskWatchdog,
   getAcct, normalizeRateLimits, costFor, getAccountStates, setManualState,
+  // ── 多 Key 池（同一供应商多把 API Key，各自独立参与生成分配）──
+  syncKeyPool, invalidateProviderKeyCache, getKeyStates, pickKey,
   // ── 智能路由（Phase 3.4 / Phase A 切换调用）──
   setRoutingWeights, getRoutingWeights, snapshotAcct, explainRouting,
   buildDispatchSequence, setRoutingV3Enabled, getRoutingV3Enabled, applyRuntimeSettings,

@@ -114,6 +114,26 @@ export async function apiPatchProvider(id: string, patch: Record<string, any>): 
 export async function apiDeleteProvider(id: string): Promise<void> {
   await apiFetch(`/api/providers/${id}`, { method: 'DELETE' });
 }
+// ─── 多 Key 池（同 provider 多把 API Key，各自独立调度）───
+// GET 返回 { keys: [{ id, label, status, failures, masked, lastUsedAt, createdAt }] }
+export async function apiGetProviderKeys(id: string): Promise<{ keys: Array<{ id: string; label: string; status: string; failures: number; masked: string; lastUsedAt: string | null; createdAt: string }> }> {
+  try { return await apiFetch(`/api/providers/${encodeURIComponent(id)}/keys`); } catch { return { keys: [] }; }
+}
+// POST 追加多把 key（去重、首把标主 key）。body: { apiKeys: string[] }。返回 { ok, added, keys }
+export async function apiAddProviderKeys(id: string, apiKeys: string[]): Promise<{ ok?: boolean; added?: number; keys?: any[]; error?: string }> {
+  try { return await apiFetch(`/api/providers/${encodeURIComponent(id)}/keys`, { method: 'POST', body: JSON.stringify({ apiKeys }) }); }
+  catch (e) { return { ok: false, error: (e instanceof Error ? e.message : String(e)).slice(0, 200) }; }
+}
+// PATCH 单把 key 状态/备注：body { status?: 'active'|'manual_cold'|'disabled', label?: string }
+export async function apiPatchProviderKey(id: string, keyId: string, patch: { status?: string; label?: string }): Promise<{ ok?: boolean; error?: string }> {
+  try { return await apiFetch(`/api/providers/${encodeURIComponent(id)}/keys/${encodeURIComponent(keyId)}`, { method: 'PATCH', body: JSON.stringify(patch) }); }
+  catch (e) { return { ok: false, error: (e instanceof Error ? e.message : String(e)).slice(0, 200) }; }
+}
+// DELETE 单把 key（删主 key 后端自动用剩余第一把补齐 fallback）
+export async function apiDeleteProviderKey(id: string, keyId: string): Promise<{ ok?: boolean; error?: string }> {
+  try { return await apiFetch(`/api/providers/${encodeURIComponent(id)}/keys/${encodeURIComponent(keyId)}`, { method: 'DELETE' }); }
+  catch (e) { return { ok: false, error: (e instanceof Error ? e.message : String(e)).slice(0, 200) }; }
+}
 // 账号冷热状态快照（调度器内存态）
 export async function apiGetProviderStates(): Promise<Record<string, any>> {
   try { const r = await apiFetch<{ states: Record<string, any> }>('/api/providers/states'); return r.states || {}; } catch { return {}; }

@@ -105,6 +105,19 @@ async function refreshModels() {
 }
 
 /**
+ * 重新拉取服务商（含密钥池 apiKeys），用于密钥增删/改状态后刷新内存态。
+ * 后端 GET /api/providers 已遮蔽主 api_key 并附 apiKeys，故直接整体替换即可。
+ */
+async function reloadProviders() {
+  try {
+    const apiP = await apiGetProviders();
+    if (apiP.length > 0) { providersState = apiP; notify(); }
+  } catch (e) {
+    console.error('[useModelHub] reloadProviders 失败', e);
+  }
+}
+
+/**
  * 以「旧内存态 → 新内存态」为基准做增量对账：
  *  - 新增的 id → POST 单创建
  *  - 既有且字段变化 → PATCH 变更字段（带 revision 乐观锁）
@@ -308,6 +321,7 @@ export function useModelHub() {
     deleteProvider,
     deleteModel,
     cleanupOrphanModels,
+    reloadProviders,
     getProviderName,
     getModelsByType,
     getDefaultModel,
