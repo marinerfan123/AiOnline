@@ -14,6 +14,9 @@ const { loadDispatchPairs } = require('./modules/modelhub/bindings.cjs');
 const { makeJobRecorder, NULL_RECORDER, recordResumeJob } = require('./modules/modelhub/jobs.cjs');
 const router = require('./modules/modelhub/router.cjs'); // Phase 3.4 确定性智能路由（纯函数，非阻断接入）
 const assetFinalize = require('./assetFinalize.cjs'); // Phase 1 主流化：服务端最终化 provider 资源到 OSS + 写 media（替代前端 processResultImages）
+const uploadQueue = require('./uploadQueue.cjs'); // 搬运与 API 解耦：终态上传移出请求/SSE 关键路径，后台队列异步搬
+const rateLimit = require('./rateLimitRedis.cjs'); // Redis 共享限流（多 worker/多实例安全，#360 解法）
+const cpuMonitor = require('./cpuMonitor.cjs'); // CPU 自适应负载降级（80% 阈值进入 SHED，返 503）
 
 // ─── 日志总线注入（由 server.js 启动时 setLogSink(logbus) 注入）───
 // 生成失败 / 异常必须落到后台「核心错误日志 + 实时监控」(logbus.emit('ERROR') → syslog 持久化 + SSE 广播)，
@@ -59,6 +62,8 @@ const DEFAULT_RPM = { '1k': 20, '2k': 10, '4k': 1, '8k': 1 };        // 仅旧�
 const DEFAULT_COOLDOWN_MS = 60000;                     // 整账号冷却默认 60s（可调）
 const ACCOUNT_CONC_CAP = 4;                            // 单账号并发硬上限（与 provider.max_concurrent 取小）
 const MAX_RETRY = 3;                                   // 单任务「全部账号不可用」时的最多重试（无感切换）
+const KEY_ROTATE_MAX = 4;                              // 多 key 池 429 时池内换 key 重试上限（解锁聚合吞吐，同时防止系统性限流时狂打 N 次计费调用）
+const KEY_429_COOLDOWN_MS = 60000;                     // 单把 key 收到 429 后的冷却（匹配上游 1 请求/分钟，避免立即重选打爆）
 
 // ─── 多 Key 池（同一供应商多把 API Key，各自独立参与生成分配）───
 // AKEYS[pid] = Map<keyId, keyState>；keyState 持有 per-key 运行时态（并发/失败/CB），持久于内存跨请求。
@@ -84,7 +89,7 @@ function syncKeyPool(pid, dbRows) {
       m.set(r.id, {
         id: r.id, apiKey: r.api_key, status: r.status || KEY_STATUS_ACTIVE,
         weight: (typeof r.weight === 'number' && r.weight > 0) ? r.weight : 1,
-        conc: 0, consecutiveFailures: 0, lastUsedAt: 0, lastFailureAt: 0,
+        conc: 0, consecutiveFailures: 0, lastUsedAt: 0, lastFailureAt: 0, cooldownUntil: 0,
         cbState: router.cbInitState(),
       });
     }
@@ -99,14 +104,24 @@ function invalidateProviderKeyCache(pid) {
   else { for (const k of Object.keys(AKEYS)) delete AKEYS[k]; }
 }
 
+// 单把 key 收到 429 后的短期冷却：尊重上游 Retry-After（若有），否则默认 KEY_429_COOLDOWN_MS。
+// 与整账号冷却（markReject / ACCT.cooldownUntil）解耦——多 key 池下只冷却这一把，不波及池内其他 key，
+// 由 pickKey 在选 key 时跳过冷却中的 key，从而「自然轮换」到下一把可用 key（限流感知密钥池的核心）。
+function cooldownKey(ks, now, retryAfterMs) {
+  if (!ks) return;
+  const ms = (typeof retryAfterMs === 'number' && retryAfterMs > 0) ? retryAfterMs : KEY_429_COOLDOWN_MS;
+  ks.cooldownUntil = now + ms;
+}
+
 // 从池中按「最少最近使用（lastUsedAt ASC）」轮转选一把可用 key：
-// active 且 CB 准入 且 并发未达 keyConcCap。无可用 key 返回 null。
+// active 且 未冷却(cooldownUntil) 且 CB 准入 且 并发未达 keyConcCap。无可用 key 返回 null。
 function pickKey(pid, now, keyConcCap) {
   const m = AKEYS[pid];
   if (!m || m.size === 0) return null;
   const cands = [];
   for (const ks of m.values()) {
     if (ks.status !== KEY_STATUS_ACTIVE) continue;     // 隔离/禁用跳过
+    if (ks.cooldownUntil && now < ks.cooldownUntil) continue;  // 该 key 429 冷却中，跳过（不让重选打爆）
     let cbAdm;
     try { cbAdm = router.cbAdmit(ks.cbState, now); } catch (e) { cbAdm = { admit: true, state: ks.cbState }; }
     ks.cbState = cbAdm.state;
@@ -305,7 +320,7 @@ async function imageGenerate(provider, model, opts, apiKeyOverride) {
     }
     const text = await response.text();
     const data = text ? JSON.parse(text) : null;
-    if (!response.ok) return makeError(data, response.status, '图片生成失败');
+    if (!response.ok) return makeError(data, response.status, '图片生成失败', response.headers);
     const imgs = extractImages(data, undefined);
     return imgs.length
       ? { images: imgs, status: 'success' }
@@ -457,13 +472,26 @@ function extractImages(body, endpoint) {
   return [];
 }
 
-function makeError(body, status, fallback) {
+// 解析上游 Retry-After / x-ratelimit-reset 头 → 毫秒；钳制 [1s, 10min]，避免极端值把 key 冷却过久。
+function parseRetryAfterMs(headers) {
+  if (!headers) return undefined;
+  const raw = (headers.get && headers.get('retry-after')) || (headers.get && headers.get('x-ratelimit-reset'));
+  if (!raw) return undefined;
+  const n = Number(raw);
+  if (!isNaN(n)) return Math.min(600000, Math.max(1000, n * 1000));
+  const d = Date.parse(raw);
+  if (!isNaN(d)) return Math.min(600000, Math.max(1000, d - Date.now()));
+  return undefined;
+}
+
+function makeError(body, status, fallback, headers) {
   const errMsg =
     (body && body.error && body.error.message) ||
     (body && body.message) ||
     (typeof body === 'string' ? body.slice(0, 200) : '') ||
     `HTTP ${status}`;
-  return { status: 'error', error: `${fallback}：${errMsg}`, images: [], videoUrl: '', rateLimited: status === 429 };
+  const retryAfterMs = status === 429 ? parseRetryAfterMs(headers) : undefined;
+  return { status: 'error', error: `${fallback}：${errMsg}`, images: [], videoUrl: '', rateLimited: status === 429, retryAfterMs };
 }
 
 // ─── 统一共享 B 桶调度 ─────────────────────────────
@@ -543,7 +571,9 @@ function isCold(a, now) {
 // 确定性错误（响应中无图片字段、鉴权失败、参数错）不重试，避免无谓重试放大故障。
 function isTransient(err) {
   if (!err) return false;
-  return /网络错误|timeout|timed out|ETIMEDOUT|ECONN|socket|hang up|abort|5\d\d|429|too many|rate limit|upstream|bad gateway|gateway timeout|service unavailable/i.test(err);
+  // 注意：429 / 限流 不在此列 —— 429 由 attemptOnAccount 的 rateLimited 分支（外层 while 池内轮换）统一处理；
+  // 若此处也把 429 当瞬时错重试，会与外层轮换「双重计数」→ 单 429 被放大成多次计费调用（10 次扣费事故根因之一）。
+  return /网络错误|timeout|timed out|ETIMEDOUT|ECONN|socket|hang up|abort|5\d\d|upstream|bad gateway|gateway timeout|service unavailable/i.test(err);
 }
 
 // 拒单：切下一个供应商、不扣费、不返错；首次拒单即冷，连续 3 拒也冷（双路径，任一即冷却）
@@ -556,22 +586,52 @@ function markReject(a, now) {
   } catch (e) { /* 熔断逻辑异常不影响生成 */ }
 }
 
+// ── Redis 共享限流接入（#360 解法）──
+// 本地 GLOBAL_ACTIVE / a.conc / a.bucket 仍维护（监控展示 + Redis 降级兜底）；
+// Redis 层为跨进程权威闸：全局并发 + per-provider 并发(ZSET 租约) + per-provider RPM 令牌桶(Lua)。
+// 返回 rl 句柄（含 slot id），任一闸不满足返回 null（上层切下一个账号）。
+async function acquireRateLimitSlots(p, cost, multiKey, a, aggCap, now) {
+  let bucketCharged = false;
+  if (!multiKey && a.capacityModel !== 'unlimited') {
+    const ok = await rateLimit.tryProviderBucket(p.provider.id, cost, a.bucket.cap, now);
+    if (!ok) { markReject(a, now); return null; } // 桶空 → 拒单（与旧语义一致）
+    bucketCharged = true;
+  }
+  const provConcId = await rateLimit.incrProviderConc(p.provider.id, aggCap);
+  if (!provConcId) { if (bucketCharged) rateLimit.refundProviderBucket(p.provider.id, cost, a.bucket.cap); return null; }
+  const globalId = await rateLimit.acquireGlobalSlot(GLOBAL_MAX);
+  if (!globalId) {
+    rateLimit.decProviderConc(p.provider.id, provConcId);
+    if (bucketCharged) rateLimit.refundProviderBucket(p.provider.id, cost, a.bucket.cap);
+    return null;
+  }
+  return { globalId, provConcId, bucketCharged };
+}
+
 // 在单个账号上尝试一次生成；账号不可用（冷却/桶空/并发满）或失败（429/异常）返回 null（上层切下一个）
 async function attemptOnAccount(p, tier, input, contentType, recorder) {
   const now = Date.now();
   const a = getAcct(p.provider.id, p.provider);
-  // 管理员手动隔离（保持原语义：manualState='cold' 硬隔离）
+  // 管理员手动隔离（不论单 key / 多 key 池都生效：硬隔离整个服务商）
   if (a.manualState === 'cold') return null;
-  // Circuit Breaker 权威准入（Phase 3.5，非阻断）：OPEN 冷却中 / HALF_OPEN 探测额度耗尽 → 隔离，绝不发请求
-  let cbAdm;
-  try { cbAdm = router.cbAdmit(a.cbState, now); } catch (e) { cbAdm = { admit: true, state: a.cbState || null }; }
-  a.cbState = cbAdm.state;
-  if (!cbAdm.admit) return null;   // 熔断隔离：不扣令牌、不占并发、不记 attempt（解决「一直打/一直失败/一直扣资源」）
-  // 仅 CLOSED 态套用 legacy 短冷却作为补充背压（防单点抖动放大）；OPEN/HALF_OPEN 由 CB 全权裁决
-  if (a.cbState.state === 'CLOSED' && isCold(a, now)) return null;
-  refillAccount(a, now);
+  // 多 Key 池判定：multi-key 下彻底跳过 legacy 桶/冷却/CB
+  // ——legacy 桶 (bucket_units_per_min=20) 与单 key CB 是「单 key 时代」的限流器，与「475 把 key 各自独立」语义冲突；
+  // per-key CB + 每 key 并发上限 已经接管单个 key 的故障隔离，无需再被单账号共享桶/熔断二次拦截。
+  const _poolEarly = AKEYS[p.provider.id];
+  const _multiKey = !!(_poolEarly && _poolEarly.size > 1);
+  // 始终计算 cost：recorder 记录 attempt 成本始终需要；legacy 令牌桶占用仅在单 key 路径生效（多 key 池彻底跳过）
   const cost = costFor(a, tier);
-  if (a.capacityModel !== 'unlimited' && a.bucket.tokens < cost) { markReject(a, now); return null; } // 共享桶空 → 拒单（未请求）
+  if (!_multiKey) {
+    // Circuit Breaker 权威准入（Phase 3.5，非阻断）：OPEN 冷却中 / HALF_OPEN 探测额度耗尽 → 隔离，绝不发请求
+    let cbAdm;
+    try { cbAdm = router.cbAdmit(a.cbState, now); } catch (e) { cbAdm = { admit: true, state: a.cbState || null }; }
+    a.cbState = cbAdm.state;
+    if (!cbAdm.admit) return null;   // 熔断隔离：不扣令牌、不占并发、不记 attempt（解决「一直打/一直失败/一直扣资源」）
+    // 仅 CLOSED 态套用 legacy 短冷却作为补充背压（防单点抖动放大）；OPEN/HALF_OPEN 由 CB 全权裁决
+    if (a.cbState.state === 'CLOSED' && isCold(a, now)) return null;
+    refillAccount(a, now);
+    if (a.capacityModel !== 'unlimited' && a.bucket.tokens < cost) { markReject(a, now); return null; } // 共享桶空 → 拒单（未请求）
+  }
   // per-model 并发覆盖：模型自身设了 max_concurrent（非 null 正数）则优先用，否则回退服务商默认
   const modelConc = (p.model && typeof p.model.max_concurrent === 'number' && p.model.max_concurrent > 0) ? p.model.max_concurrent : null;
   const keyConcCap = modelConc ?? (Number(p.provider.max_concurrent) || 2);
@@ -580,14 +640,16 @@ async function attemptOnAccount(p, tier, input, contentType, recorder) {
   const poolExists = !!(pool && pool.size > 0);
   const activeKeyCount = poolExists ? pool.size : 1;
   const aggCap = Math.max(keyConcCap, keyConcCap * activeKeyCount); // 多 key → 容量线性扩展
-  if (a.conc >= aggCap) return null;                          // 整池并发满（非拒单，仅忙，不记 attempt）
   // ── 选 key：优先池内轮转；池为空（legacy）回退 providers.api_key；池存在但全不可用 → 本账号不可用 ──
   const selKey = poolExists ? pickKey(p.provider.id, now, keyConcCap) : null;
   const multiKey = poolExists && pool.size > 1;
   const effectiveApiKey = selKey ? selKey.apiKey : (poolExists ? '' : (p.provider.api_key || ''));
   if (!effectiveApiKey) return null;                          // 无任何可用 key
-  if (a.capacityModel !== 'unlimited') a.bucket.tokens -= cost; // 占用单位
-  a.conc += 1; GLOBAL_ACTIVE += 1;
+  // 跨进程权威闸：全局并发 + per-provider 并发 + (单 key 路径)RPM 令牌桶；任一不满足返回 null（上层切下一个）
+  const rl = await acquireRateLimitSlots(p, cost, _multiKey, a, aggCap, now);
+  if (!rl) return null;
+  if (!_multiKey && a.capacityModel !== 'unlimited') a.bucket.tokens -= cost; // 本地展示/降级兜底（权威由 Redis 令牌桶）
+  a.conc += 1; GLOBAL_ACTIVE += 1;                            // 本地展示/降级兜底计数
   if (selKey) { selKey.conc += 1; selKey.lastUsedAt = now; }
   const t0 = Date.now();                                       // 真正发起请求的时刻（仅此后记 attempt）
   // 向 recorder 记一次实际尝试（best-effort，绝不影响主链路）；success/timeout/failed/429/error 各分支各自调用
@@ -603,27 +665,50 @@ async function attemptOnAccount(p, tier, input, contentType, recorder) {
     } catch (e) { /* recorder 已内部吞错，双保险 */ }
   };
   try {
-    const providerWithKey = selKey ? { ...p.provider, api_key: effectiveApiKey } : p.provider;
-    let res = contentType === 'video'
-      ? await videoGenerate(providerWithKey, p.model, input)
-      : await imageGenerate(p.provider, p.model, input, effectiveApiKey);
-    // 图片：瞬时网络/限流错误有界重试（吸收供应商偶发抖动，治"时好时坏"）；视频异步长任务不在此重试
-    if (contentType !== 'video' && res && res.status === 'error' && isTransient(res.error)) {
-      for (let ri = 0; ri < 2; ri++) {
-        await sleep(300 * (ri + 1));
-        const r2 = await imageGenerate(p.provider, p.model, input);
-        if (r2.status === 'success') { res = r2; break; }
-        if (!isTransient(r2.error)) { res = r2; break; }
-        res = r2;
+    let res;
+    let rotateCount = 0;
+    while (true) {
+      const providerWithKey = selKey ? { ...p.provider, api_key: effectiveApiKey } : p.provider;
+      res = contentType === 'video'
+        ? await videoGenerate(providerWithKey, p.model, input)
+        : await imageGenerate(p.provider, p.model, input, effectiveApiKey);
+      // 图片：瞬时网络/限流错误有界重试（吸收供应商偶发抖动，治"时好时坏"）；视频异步长任务不在此重试
+      // 守卫 !res.rateLimited：429 已交外层 while 处理，绝不在此重复重试放大计费
+      if (contentType !== 'video' && res && res.status === 'error' && !res.rateLimited && isTransient(res.error)) {
+        for (let ri = 0; ri < 2; ri++) {
+          await sleep(300 * (ri + 1));
+          const r2 = await imageGenerate(p.provider, p.model, input);
+          if (r2.status === 'success') { res = r2; break; }
+          if (!isTransient(r2.error)) { res = r2; break; }
+          res = r2;
+        }
       }
-    }
-    if (res && res.rateLimited) {                              // 真实 429 → 退还、整账号冷却、拒单（不扣费）
-      if (a.capacityModel !== 'unlimited') a.bucket.tokens += cost;
-      a.conc -= 1; GLOBAL_ACTIVE -= 1;
-      if (selKey) { selKey.conc -= 1; selKey.consecutiveFailures += 1; selKey.lastFailureAt = now; try { selKey.cbState = router.cbRecordOutcome(selKey.cbState, 'failure', now); } catch (e) {} }
-      if (!multiKey) markReject(a, now);                       // 单 key 保持原语义；多 key 不冷却整池，仅隔离该 key
-      await mark('rate_limited', { httpStatus: 429, providerErrorCode: 'RATE_LIMITED' }); // 429 也是一次真实尝试
-      return null;
+      if (res && res.rateLimited) {                            // 真实 429：冷却当前 key + 池内换下一把重试（解锁聚合吞吐）
+        if (!_multiKey && a.capacityModel !== 'unlimited') a.bucket.tokens += cost; if (rl && rl.bucketCharged) rateLimit.refundProviderBucket(p.provider.id, cost, a.bucket.cap); // 单 key 路径退还桶（多 key 未占用）
+        if (selKey) {
+          selKey.conc -= 1;                                     // 释放本 key 并发槽
+          selKey.consecutiveFailures += 1;
+          selKey.lastFailureAt = Date.now();
+          cooldownKey(selKey, Date.now(), res.retryAfterMs);   // 按 Retry-After（默认 60s）冷却该 key，避免立即重选打爆
+          try { selKey.cbState = router.cbRecordOutcome(selKey.cbState, 'failure', Date.now()); } catch (e) {}
+        }
+        await mark('rate_limited', { httpStatus: 429, providerErrorCode: 'RATE_LIMITED' }); // 429 也是一次真实尝试
+        // 多 key 池：在池内轮换下一把未冷却/未熔断/并发未满的 key 重试；单 key 池直接拒单（与原语义一致）
+        if (multiKey && rotateCount < KEY_ROTATE_MAX) {
+          const nextKey = pickKey(p.provider.id, Date.now(), keyConcCap);
+          if (nextKey && nextKey !== selKey) {
+            selKey = nextKey;
+            effectiveApiKey = selKey.apiKey;
+            selKey.conc += 1; selKey.lastUsedAt = Date.now();
+            rotateCount += 1;
+            continue;                                           // 换 key 重试（仍在本账号/本 provider 内）
+          }
+        }
+        if (!multiKey) markReject(a, now);                      // 单 key 保持原语义：整账号冷却；多 key 不冷却整池，仅隔离该 key
+        a.conc -= 1; GLOBAL_ACTIVE -= 1; if (rl) { rateLimit.decProviderConc(p.provider.id, rl.provConcId); rateLimit.releaseGlobalSlot(rl.globalId); }
+        return null;                                            // 池内可换 key 已耗尽（或单 key）→ 上层切下一个账号/等待区
+      }
+      break;                                                    // 非 429：交予下方 timeout/failed/error/success 分支处理
     }
     // 生成端迟迟未给终态（安全线触发：video 适配器 pollLoop 返回 status:'timeout'）——
     // 成败只听生成端回复，时间永远不当判据：绝不在此判失败、绝不释放积分。
@@ -631,7 +716,7 @@ async function attemptOnAccount(p, tier, input, contentType, recorder) {
     // 上层 dispatchOne → generate → generateAsync 的 timeout 分支会标 'waiting' 保留待复核（积分仍 held，不释放）。
     if (res && res.status === 'timeout') {
       if (selKey) selKey.conc -= 1;
-      a.conc -= 1; GLOBAL_ACTIVE -= 1;
+      a.conc -= 1; GLOBAL_ACTIVE -= 1; if (rl) { rateLimit.decProviderConc(p.provider.id, rl.provConcId); rateLimit.releaseGlobalSlot(rl.globalId); }
       await mark('timeout', { providerErrorCode: 'TIMEOUT' });
       return {
         status: 'timeout',
@@ -646,8 +731,8 @@ async function attemptOnAccount(p, tier, input, contentType, recorder) {
     // 释放本账号限流额度 + 并发槽（任务已死，不占坑）；不 markReject（非整账号冷却，避免无谓降低容量）。
     if (res && res.status === 'failed') {
       if (selKey) selKey.conc -= 1;
-      if (a.capacityModel !== 'unlimited') a.bucket.tokens += cost;
-      a.conc -= 1; GLOBAL_ACTIVE -= 1;
+      if (!_multiKey && a.capacityModel !== 'unlimited') a.bucket.tokens += cost; if (rl && rl.bucketCharged) rateLimit.refundProviderBucket(p.provider.id, cost, a.bucket.cap);
+      a.conc -= 1; GLOBAL_ACTIVE -= 1; if (rl) { rateLimit.decProviderConc(p.provider.id, rl.provConcId); rateLimit.releaseGlobalSlot(rl.globalId); }
       await mark('failed', { providerErrorCode: 'PROVIDER_FAILED' });
       return {
         status: 'failed',
@@ -658,8 +743,8 @@ async function attemptOnAccount(p, tier, input, contentType, recorder) {
       };
     }
     if (!res || res.status !== 'success') {                    // 真失败（网络抖动/无图片/配置错）→ 冷却该账号后切下一个
-      if (a.capacityModel !== 'unlimited') a.bucket.tokens += cost;
-      a.conc -= 1; GLOBAL_ACTIVE -= 1;
+      if (!_multiKey && a.capacityModel !== 'unlimited') a.bucket.tokens += cost; if (rl && rl.bucketCharged) rateLimit.refundProviderBucket(p.provider.id, cost, a.bucket.cap);
+      a.conc -= 1; GLOBAL_ACTIVE -= 1; if (rl) { rateLimit.decProviderConc(p.provider.id, rl.provConcId); rateLimit.releaseGlobalSlot(rl.globalId); }
       if (selKey) { selKey.conc -= 1; selKey.consecutiveFailures += 1; selKey.lastFailureAt = now; try { selKey.cbState = router.cbRecordOutcome(selKey.cbState, 'failure', now); } catch (e) {} }
       if (!multiKey) markReject(a, now);                       // 多 key：仅隔离该 key，不冷却整池
       await mark('error', { providerErrorCode: 'PROVIDER_ERROR' });
@@ -667,15 +752,15 @@ async function attemptOnAccount(p, tier, input, contentType, recorder) {
     }
     try { a.cbState = router.cbRecordOutcome(a.cbState, 'success', now); } catch (e) { /* 熔断异常不阻断 */ }
     if (!multiKey) a.consecutiveRejects = 0;                   // 成功 → 单 key 重置拒单计数、释放并发槽
-    a.conc -= 1; GLOBAL_ACTIVE -= 1;
+    a.conc -= 1; GLOBAL_ACTIVE -= 1; if (rl) { rateLimit.decProviderConc(p.provider.id, rl.provConcId); rateLimit.releaseGlobalSlot(rl.globalId); }
     if (selKey) { selKey.conc -= 1; selKey.consecutiveFailures = 0; try { selKey.cbState = router.cbRecordOutcome(selKey.cbState, 'success', now); } catch (e) {} }
     await mark('success', { httpStatus: 200 });
     // 精确归因：本次成功出自哪个 provider / model / 类型 / 产出资产数（供双边记账）
     const units = res.images ? (res.images.length || 0) : (res.videoUrl ? 1 : 0);
     return { ...res, providerId: p.provider.id, modelId: p.model.model_id, modelType: contentType, units, bindingId: p.bindingId || '' };
   } catch (e) {
-    if (a.capacityModel !== 'unlimited') a.bucket.tokens += cost;
-    a.conc -= 1; GLOBAL_ACTIVE -= 1;
+    if (!_multiKey && a.capacityModel !== 'unlimited') a.bucket.tokens += cost; if (rl && rl.bucketCharged) rateLimit.refundProviderBucket(p.provider.id, cost, a.bucket.cap);
+    a.conc -= 1; GLOBAL_ACTIVE -= 1; if (rl) { rateLimit.decProviderConc(p.provider.id, rl.provConcId); rateLimit.releaseGlobalSlot(rl.globalId); }
     if (selKey) { selKey.conc -= 1; selKey.consecutiveFailures += 1; selKey.lastFailureAt = now; try { selKey.cbState = router.cbRecordOutcome(selKey.cbState, 'failure', now); } catch (er) {} }
     if (!multiKey) markReject(a, now);
     await mark('error', { providerErrorCode: 'EXCEPTION' });
@@ -833,7 +918,7 @@ async function dispatchOne(pairs, tier, input, contentType, recorder, pgPool) {
     });
     let brokeForGlobal = false;
     for (const p of seq) {
-      if (GLOBAL_ACTIVE >= GLOBAL_MAX) { await sleep(120); brokeForGlobal = true; break; }
+      if (rateLimit.globalIsFull(GLOBAL_MAX)) { await sleep(120); brokeForGlobal = true; break; }
       if (recorder && recorder.setRetryReason) recorder.setRetryReason(retryReason);
       const r = await attemptOnAccount(p, tier, input, contentType, recorder);
       if (!r) {                                               // 本次未产出结果（限流/冷却/瞬错/忙）→ 记录原因，切下一个账号
@@ -891,17 +976,23 @@ async function generate(pgPool, opts) {
   // 5. 并发分配：单任务内部已做「拒单静默切下一个供应商」+「全部不可用 → throttled」
   // 视频数量固定 1（用户需求：视频不支持批量），图片按设置并行 count 张
   const total = contentType === 'video' ? 1 : Math.max(1, Math.min(4, Number(count) || 1));
+  // 计费安全闸（防「10 次扣费」事故）：原生支持 n 的模型（gpt-image 等 OpenAI 官方端点）
+  // 一次 API 调用即可出 N 张图，绝不能拆成 N 次独立调用 —— 否则中转按 N 次计费，用户被收 N 倍钱。
+  // 判定与 imageGenerate 内 isGptImageModel 保持一致（基于配对模型上游名）。
+  const nCapable = contentType !== 'video' && pairs.some((p) => isGptImageModel(p.model));
+  const effectiveTotal = nCapable ? 1 : total;   // gpt-image：1 个子任务承载 N 张；其余模型维持原拆单
+  const perCallCount = nCapable ? total : 1;      // gpt-image：单次 n=total；其余：每子任务 1 张
   // 智能路由尝试数据双写：仅异步生产路径（有 taskId）激活；sync 测试路径无 taskId → 空操作 recorder。
   // 每个子任务（每张图/每段视频）独立一个 job（job_id = `${task_id}__${i}`），其内各 provider 尝试为 attempt。
   const doRecord = !!(pgPool && opts.taskId);
   const tasks = [];
-  for (let i = 0; i < total; i++) {
+  for (let i = 0; i < effectiveTotal; i++) {
     const jobId = `${opts.taskId}__${i}`;
     const recorder = doRecord
       ? makeJobRecorder(pgPool, { jobId, taskId: opts.taskId, modelId: canonicalModelId, cost: opts.cost || 0 })
       : NULL_RECORDER;
     tasks.push((async () => {
-      const input = { prompt, ratio, resolution, count: 1, referenceImages, negative, durationSec, videoMode, taskId: opts.taskId, onSubmitted: opts.onSubmitted };
+      const input = { prompt, ratio, resolution, count: perCallCount, referenceImages, negative, durationSec, videoMode, taskId: opts.taskId, onSubmitted: opts.onSubmitted };
       if (recorder.begin) await recorder.begin().catch(() => {});
       const r = await dispatchOne(pairs, tier, input, contentType, recorder, pgPool);
       if (recorder.finish) await recorder.finish(r.status, r.providerId).catch(() => {});
@@ -926,7 +1017,7 @@ async function generate(pgPool, opts) {
     if (r.status === 'timeout') { timedOut = true; if (r.error) errors.push(r.error); continue; }
     if (r.status === 'success') {
       if (r.images && r.images.length) {
-        images.push(r.images[0]);
+        for (const url of r.images) images.push(url);   // gpt-image 单次返回 N 张，全部收集（不再只取第一张）
       } else if (r.videoUrl) {
         // 视频：videoUrl 单独通道；同时并入 images 以兼容上层 images.length 成功判定
         videos.push(r.videoUrl);
@@ -955,8 +1046,51 @@ function getArrayByPath(obj, path) {
   return Array.isArray(v) ? v : [];
 }
 
+// ─── 搬运与 API 解耦：完成结算并异步入队（不阻塞请求/SSE，done 由后台 worker 发出）───
+// 入队失败兜底：退回同步 finalize+emit（与旧行为一致），确保 'done' 永不丢失、客户端不卡 running。
+async function completeViaQueue(pgPool, { userId, taskId, cost, costPool, idempotencyKey, ctx, providerImages, providerVideoUrl, originalResult }) {
+  // 结算：成功 commit（与现有语义一致：积分在生成成功即扣，不依赖 finalize 成败）
+  await billing.commitCredits(pgPool, userId, cost, idempotencyKey, costPool);
+  try {
+    const groups = (originalResult && originalResult.consumption) || [];
+    const totalUnits = groups.reduce((s, g) => s + (g.units || 0), 0) || 1;
+    for (const g of groups) {
+      const alloc = Math.round((cost || 0) * (g.units || 0) / totalUnits);
+      await accounting.recordConsumption(pgPool, {
+        scope: 'user', actorId: userId || '', purpose: 'generate',
+        providerId: g.providerId || '', modelId: g.modelId || '', modelType: g.modelType || 'image',
+        outputUnits: g.units || 0, customerChargeCredits: alloc,
+        bindingId: g.bindingId || '',
+        idempotencyKey: `${idempotencyKey}:${g.providerId}:${g.modelId}`, taskRef: taskId,
+      });
+    }
+  } catch (e) { console.warn('[accounting completeViaQueue]', e.message); }
+  // 入队：搬运交给后台上传队列 worker（不阻塞本请求/SSE，done 由 worker 在 finalize 完成后发出）
+  try {
+    await uploadQueue.enqueueFinalize(pgPool, { ctx, providerImages, providerVideoUrl, originalResult });
+  } catch (e) {
+    console.warn('[uploadQueue] 入队失败，退回同步 finalize（兜底不丢 done）:', e.message);
+    await uploadQueue.finalizeAndEmit(pgPool, { userId, taskId, ctx, providerImages, providerVideoUrl, originalResult }).catch((err) => {
+      console.warn('[uploadQueue] 兜底 finalize 也失败:', err.message);
+    });
+  }
+}
+
+// 启动后台上传队列（仅 IS_LEADER 调用）：建表 + 崩溃恢复 + 起 worker
+async function startUploadQueue(pgPool) {
+  await uploadQueue.ensureUploadJobsTable(pgPool);
+  await uploadQueue.recoverUploadJobs(pgPool);
+  uploadQueue.startUploadWorker(pgPool);
+  console.log('[dispatcher] 上传队列 worker 已挂载（搬运已解耦至后台）');
+}
+
 // ─── 异步生成：返回 taskId 立即让前端可轮询，状态写入 PG ───
 async function generateAsync(pgPool, opts) {
+  // CPU 自适应降级：若本 worker CPU 持续 >80%（默认阈值），拒绝新任务（route 层转 503 + Retry-After）
+  // in-flight 任务不受影响，SHED 只拒绝「准备入队的新请求」
+  if (cpuMonitor.isShedding()) {
+    return { taskId: null, error: 'CPU_OVERLOAD: 系统繁忙，请稍后重试' };
+  }
   if (!pgPool) return { taskId: null, error: '数据库不可用' };
   const { model, displayModelName, prompt, count, contentType, referenceImages, pendingIds = [], clientMeta = {}, user_id, idempotencyKey, cost = 0, costPool = 'recharge' } = opts;
   // 生成一个稳定 taskId：便于前端 localStorage 持久化关联
@@ -997,79 +1131,23 @@ async function generateAsync(pgPool, opts) {
       const ok = result && result.status === 'success' && Array.isArray(result.images) && result.images.length;
       try {
         if (ok) {
-          // G3 结算点：成功 commit（reserve 已在 /api/generate handler 扣除）。
-          // Phase 1 主流化：资产最终化下沉到服务端（fetch provider 字节 → OSS PUT → 写 media），
-          // 前端不再负责 OSS 上传、不再负责 provider→OSS 转换、不再负责写 media 表 —— 主流做法
-          // （Replicate/fal.ai/Stability）一致。
-          await billing.commitCredits(pgPool, user_id, cost, idempotencyKey, costPool);
-          // 双边记账：按 (provider, model) 组记录后台量 vs 客户量（图/视频按资产数；客户收费按产出比例分摊，整体 margin 精确）
-          try {
-            const groups = (result && result.consumption) || [];
-            const totalUnits = groups.reduce((s, g) => s + (g.units || 0), 0) || 1;
-            for (const g of groups) {
-              const alloc = Math.round((cost || 0) * (g.units || 0) / totalUnits);
-              await accounting.recordConsumption(pgPool, {
-                scope: 'user', actorId: user_id || '', purpose: 'generate',
-                providerId: g.providerId || '', modelId: g.modelId || '', modelType: g.modelType || 'image',
-                outputUnits: g.units || 0, customerChargeCredits: alloc,
-                bindingId: g.bindingId || '',
-                idempotencyKey: `${idempotencyKey}:${g.providerId}:${g.modelId}`, taskRef: taskId,
-              });
-            }
-          } catch (e) { console.warn('[accounting generate-async]', e.message); }
-
-          // ── 服务端最终化：fetch → OSS → media ──
-          // 失败兜底：写占位行（status=pending_upload），保留 provider_url 供后台 reaper 重试，
-          // 失败绝不能阻断 done（积分已扣，资产必然落处）；仅前端可能要展示「资源暂时走 provider URL」
-          let finalized;
-          try {
-            finalized = await assetFinalize.finalizeTask(pgPool, {
-              userId: user_id,
-              taskId,
+          // 搬运与 API 解耦：结算 + 异步入队（不 await OSS 上传）；
+          // done 事件由后台上传队列 worker 在 finalize 完成后发出（见 uploadQueue.cjs）。
+          await completeViaQueue(pgPool, {
+            userId: user_id, taskId,
+            cost, costPool, idempotencyKey,
+            ctx: {
+              userId: user_id, taskId,
               prompt,
               model: canonicalModelId,
               ratio: (opts && opts.ratio) || (clientMeta && clientMeta.ratio) || '1:1',
               contentType: contentType || 'image',
-              // 与前端占位 id 一一对应，让 onGenerate 在前端按 id 找占位并替换，绝不丢图
               pendingIds: (opts && Array.isArray(opts.pendingIds)) ? opts.pendingIds : [],
-            }, result.images || [], result.videoUrl || null);
-          } catch (e) {
-            console.warn('[dispatcher] 资产最终化异常（不影响 done 标记）:', e.message);
-            logError('dispatcher.finalize', `资产最终化失败 taskId=${taskId}: ${e && e.message}`, { taskId, userId: user_id || '', contentType: contentType || 'image' });
-            finalized = { images: [], video: null, errors: [(e && e.message) || String(e)] };
-          }
-          const finalImages = (finalized.images || []).map((it) => ({
-            mediaId: it.mediaId,
-            ossUrl: it.ossUrl,
-            ossObjectKey: it.ossObjectKey || '',
-            ossUploaded: !!it.ossUploaded,
-            status: it.status,
-            contentType: it.contentType || 'image/jpeg',
-            fileSize: it.fileSize || 0,
-          }));
-          const finalVideo = finalized.video
-            ? {
-                mediaId: finalized.video.mediaId,
-                ossUrl: finalized.video.ossUrl,
-                ossObjectKey: finalized.video.ossObjectKey || '',
-                ossUploaded: !!finalized.video.ossUploaded,
-                status: finalized.video.status,
-                contentType: finalized.video.contentType || 'video/mp4',
-                fileSize: finalized.video.fileSize || 0,
-              }
-            : null;
-          const finalResult = Object.assign({}, result, {
-            images: finalImages,
-            videoUrl: finalVideo ? finalVideo.ossUrl : (result.videoUrl || ''),
-            videoMedia: finalVideo,
-            finalizeErrors: finalized.errors || [],
+            },
+            providerImages: result.images || [],
+            providerVideoUrl: result.videoUrl || null,
+            originalResult: result,
           });
-          await pgPool.query(
-            `UPDATE generation_tasks SET status=$2, result=$3, error=$4, completed_at=NOW(), user_id=$5
-             WHERE task_id=$1`,
-            [taskId, 'done', JSON.stringify(finalResult), (result && result.error) || '', user_id],
-          );
-          realtime.emitTaskUpdate(user_id, { taskId, status: 'done', result: finalResult, error: (result && result.error) || '' });
         } else if (result && result.status === 'throttled') {
           // 资源全不可用（该任务所有可用供应商都冷却/限流）→ 进入等待区后台重试，
           // 不立即判失败、不释放积分（仍持有，等待真正生成或超时再释放）。
@@ -1292,34 +1370,22 @@ async function resumeOneImageTask(pgPool, row, opts) {
   const ok = result && result.status === 'success' && Array.isArray(result.images) && result.images.length;
   try {
     if (ok) {
-      // 成功 commit（reserve 已在原 /api/generate handler 扣除，此处仅结算）
-      await billing.commitCredits(pgPool, row.user_id, row.cost, row.idempotency_key, row.cost_pool);
-      // 资产最终化：fetch provider 字节 → OSS PUT → 写 media（按 pendingIds 替换前端占位）
-      const finalized = await assetFinalize.finalizeTask(pgPool, {
-        userId: row.user_id,
-        taskId: row.task_id,
-        prompt: row.prompt,
-        model: opts.canonicalModelId || row.model,
-        ratio: opts.ratio || '1:1',
-        contentType: 'image',
-        pendingIds: opts.pendingIds || [],
-      }, result.images || [], null);
-      const finalImages = (finalized.images || []).map((it) => ({
-        mediaId: it.mediaId,
-        ossUrl: it.ossUrl,
-        ossObjectKey: it.ossObjectKey || '',
-        ossUploaded: !!it.ossUploaded,
-        status: it.status,
-        contentType: it.contentType || 'image/jpeg',
-        fileSize: it.fileSize || 0,
-      }));
-      const finalResult = Object.assign({}, result, { images: finalImages });
-      await pgPool.query(
-        `UPDATE generation_tasks SET status=$2, result=$3, error=$4, completed_at=NOW(), user_id=$5
-         WHERE task_id=$1`,
-        [row.task_id, 'done', JSON.stringify(finalResult), '', row.user_id],
-      );
-      realtime.emitTaskUpdate(row.user_id, { taskId: row.task_id, status: 'done', result: finalResult, error: '' });
+      // 搬运与 API 解耦：结算 + 异步入队（不 await OSS 上传）；done 由后台上传队列 worker 发出
+      await completeViaQueue(pgPool, {
+        userId: row.user_id, taskId: row.task_id,
+        cost: row.cost, costPool: row.cost_pool, idempotencyKey: row.idempotency_key,
+        ctx: {
+          userId: row.user_id, taskId: row.task_id,
+          prompt: row.prompt,
+          model: opts.canonicalModelId || row.model,
+          ratio: opts.ratio || '1:1',
+          contentType: 'image',
+          pendingIds: opts.pendingIds || [],
+        },
+        providerImages: result.images || [],
+        providerVideoUrl: null,
+        originalResult: result,
+      });
     } else if (result && result.status === 'timeout') {
       // 防僵尸安全线触发：成败只听生成端回复，绝不判失败、绝不释放积分，保留任务待复核
       await updateTaskStatus(pgPool, row.task_id, 'waiting', null, '等待生成端回复超过安全线，任务保留待复核', row.user_id);
@@ -1426,57 +1492,18 @@ async function finalizeResumedTask(pgPool, ctx, result) {
   const ok = result && result.status === 'success' && Array.isArray(result.images) && result.images.length;
   try {
     if (ok) {
-      await billing.commitCredits(pgPool, user_id, cost, idempotencyKey, costPool);
-      try {
-        const groups = (result && result.consumption) || [];
-        const totalUnits = groups.reduce((s, g) => s + (g.units || 0), 0) || 1;
-        for (const g of groups) {
-          const alloc = Math.round((cost || 0) * (g.units || 0) / totalUnits);
-          await accounting.recordConsumption(pgPool, {
-            scope: 'user', actorId: user_id || '', purpose: 'generate',
-            providerId: g.providerId || '', modelId: g.modelId || '', modelType: g.modelType || 'image',
-            outputUnits: g.units || 0, customerChargeCredits: alloc,
-            bindingId: g.bindingId || '',
-            idempotencyKey: `${idempotencyKey}:${g.providerId}:${g.modelId}`, taskRef: taskId,
-          });
-        }
-      } catch (e) { console.warn('[accounting resume]', e.message); }
-      // ── 服务端最终化（视频）：fetch → OSS → media，与 generateAsync / runWaitingPump 完全一致 ──
-      // 注意：result.images 在本路径是 [videoUrl]（视频 URL 字符串），不能当图片最终化；
-      // 因此图片传 []，仅把 result.videoUrl 作为视频最终化（避免「图片」行里塞视频字节）。
-      let finalized;
-      try {
-        finalized = await assetFinalize.finalizeTask(pgPool, {
+      // 搬运与 API 解耦：结算 + 异步入队（不 await OSS 上传）；done 由后台上传队列 worker 发出
+      await completeViaQueue(pgPool, {
+        userId: user_id, taskId,
+        cost, costPool, idempotencyKey,
+        ctx: {
           userId: user_id, taskId, prompt: '', model: model || '',
           ratio: '1:1', contentType: contentType || 'video', pendingIds: [],
-        }, [], result.videoUrl || null);
-      } catch (e) {
-        console.warn('[dispatcher] 视频资产最终化异常（不影响 done 标记）:', e.message);
-        logError('dispatcher.finalizeVideo', `视频最终化失败 taskId=${taskId}: ${e && e.message}`, { taskId, userId: user_id || '' });
-        finalized = { images: [], video: null, errors: [(e && e.message) || String(e)] };
-      }
-      const finalImages = (finalized.images || []).map((it) => ({
-        mediaId: it.mediaId, ossUrl: it.ossUrl, ossObjectKey: it.ossObjectKey || '',
-        ossUploaded: !!it.ossUploaded, status: it.status,
-        contentType: it.contentType || 'image/jpeg', fileSize: it.fileSize || 0,
-      }));
-      const finalVideo = finalized.video ? {
-        mediaId: finalized.video.mediaId, ossUrl: finalized.video.ossUrl, ossObjectKey: finalized.video.ossObjectKey || '',
-        ossUploaded: !!finalized.video.ossUploaded, status: finalized.video.status,
-        contentType: finalized.video.contentType || 'video/mp4', fileSize: finalized.video.fileSize || 0,
-      } : null;
-      const finalResult = Object.assign({}, result, {
-        images: finalImages,
-        videoUrl: finalVideo ? finalVideo.ossUrl : (result.videoUrl || ''),
-        videoMedia: finalVideo,
-        finalizeErrors: finalized.errors || [],
+        },
+        providerImages: [],   // 视频路径：图片传空，仅 videoUrl
+        providerVideoUrl: result.videoUrl || null,
+        originalResult: result,
       });
-      await pgPool.query(
-        `UPDATE generation_tasks SET status=$2, result=$3, error=$4, completed_at=NOW(), user_id=$5
-         WHERE task_id=$1`,
-        [taskId, 'done', JSON.stringify(finalResult), (result && result.error) || '', user_id],
-      );
-      realtime.emitTaskUpdate(user_id, { taskId, status: 'done', result: finalResult, error: (result && result.error) || '' });
     } else if (result && result.status === 'timeout') {
       // 防僵尸安全线触发：仍然绝不判失败、绝不释放积分，保留任务待复核（成败只听生成端回复）。
       await updateTaskStatus(pgPool, taskId, 'waiting', null, '等待生成端回复超过安全线，任务保留待复核', user_id);
@@ -1632,6 +1659,7 @@ module.exports = {
   getWaitingAreaStatus, enqueueWaiting, dequeueWaiting, waitingAreaSize,
   allResourcesDown, waitingAreaTriggered, setWaitingThreshold, getWaitingThreshold,
   refreshWaitingThreshold, runWaitingPump, updateTaskStatus, planPriority, cancelTask,
+  startUploadQueue,
 };
 
 // ─── 等待区（资源全不可用时积压请求；超阈值触发前台"资源不足"）───
@@ -1851,40 +1879,22 @@ async function runWaitingPump(pgPool) {
         const result = await generate(pgPool, opts);
         const ok = result && result.status === 'success' && Array.isArray(result.images) && result.images.length;
         if (ok) {
-          await billing.commitCredits(pgPool, opts.user_id, opts.cost, opts.idempotencyKey, opts.costPool).catch(() => {});
-          // 等待区重试成功：必须与 generateAsync 走一致的服务端最终化（fetch → OSS → media），
-          // 否则 result.images 只存 provider 临时链接，过期后前端显示「图片链接已失效 / 生成失败」。
-          let finalized;
-          try {
-            finalized = await assetFinalize.finalizeTask(pgPool, {
-              userId: opts.user_id,
-              taskId,
+          // 搬运与 API 解耦：结算 + 异步入队（不 await OSS 上传）；done 由后台上传队列 worker 发出
+          await completeViaQueue(pgPool, {
+            userId: opts.user_id, taskId,
+            cost: opts.cost, costPool: opts.costPool, idempotencyKey: opts.idempotencyKey,
+            ctx: {
+              userId: opts.user_id, taskId,
               prompt: opts.prompt,
               model: opts.canonicalModelId || opts.model,
               ratio: (opts && opts.ratio) || (opts.clientMeta && opts.clientMeta.ratio) || '1:1',
               contentType: opts.contentType || 'image',
               pendingIds: (opts && Array.isArray(opts.pendingIds)) ? opts.pendingIds : [],
-            }, result.images || [], result.videoUrl || null);
-          } catch (e) {
-            console.warn('[waiting] 资产最终化异常（不影响 done 标记）:', e.message);
-            finalized = { images: [], video: null, errors: [(e && e.message) || String(e)] };
-          }
-          const finalImages = (finalized.images || []).map((it) => ({
-            mediaId: it.mediaId, ossUrl: it.ossUrl, ossObjectKey: it.ossObjectKey || '',
-            ossUploaded: !!it.ossUploaded, status: it.status,
-            contentType: it.contentType || 'image/jpeg', fileSize: it.fileSize || 0,
-          }));
-          const finalVideo = finalized.video ? {
-            mediaId: finalized.video.mediaId, ossUrl: finalized.video.ossUrl, ossObjectKey: finalized.video.ossObjectKey || '',
-            ossUploaded: !!finalized.video.ossUploaded, status: finalized.video.status,
-            contentType: finalized.video.contentType || 'video/mp4', fileSize: finalized.video.fileSize || 0,
-          } : null;
-          const finalResult = Object.assign({}, result, {
-            images: finalImages, videoUrl: finalVideo ? finalVideo.ossUrl : (result.videoUrl || ''),
-            videoMedia: finalVideo, finalizeErrors: finalized.errors || [],
+            },
+            providerImages: result.images || [],
+            providerVideoUrl: result.videoUrl || null,
+            originalResult: result,
           });
-          await updateTaskStatus(pgPool, taskId, 'done', finalResult, null, opts.user_id);
-          realtime.emitTaskUpdate(opts.user_id, { taskId, status: 'done', result: finalResult, error: '' });
           WAITING_AREA.delete(taskId);
         } else if (result && result.status === 'throttled') {
           // 仍不可用：继续留在等待区，下一轮再试（任务保持 running，前台仍显示"生成中"）
@@ -1907,6 +1917,10 @@ function getAccountStates() {  const out = {};
   const now = Date.now();
   for (const pid of Object.keys(ACCT)) {
     const a = ACCT[pid];
+    // 多 Key 池下 legacy 账号的 cold/cooldownUntil/consecutiveRejects 不再代表「能否调度」——
+    // per-key CB 与并发已接管所有限流；UI 的「cold 计数」不应被这把 legacy 钥匙污染。
+    const pool = AKEYS[pid];
+    const multiKey = !!(pool && pool.size > 1);
     out[pid] = {
       capacityModel: a.capacityModel,
       bucketUnitsPerMin: a.bucketB,
@@ -1915,10 +1929,11 @@ function getAccountStates() {  const out = {};
       conc: a.conc,
       cooldownUntil: a.cooldownUntil,
       cooldownMs: a.cooldownMs,
-      cold: isCold(a, now),
+      cold: multiKey ? false : isCold(a, now),
       manualState: a.manualState,
       consecutiveRejects: a.consecutiveRejects,
       ops: a.ops,
+      poolSize: pool ? pool.size : 0,
     };
   }
   return out;

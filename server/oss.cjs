@@ -18,27 +18,44 @@ function aliyunHost(cfg) {
   const epRaw = String(cfg.endpointExternal || '').replace(/^https?:\/\//, '');
   return epRaw.includes(cfg.bucket) ? epRaw : `${cfg.bucket}.${epRaw}`;
 }
-// 缩略图处理参数：长边缩到 480px，转 WebP（兼容性最优），质量 70。
-// 想要更激进压缩可改 format,avif（所有现代浏览器已支持，但旧客户端会破图）。
-const THUMB_PROCESS = 'image/resize,w_480/format,webp/quality,q_70';
-// 视频封面帧：OSS 服务端在 t=1000ms 抽帧 → jpg，w_480 实测 1280×704 原生视频产出 ~43KB jpg
-// 无需 ffmpeg，复用 aliyunBuildSignedUrls 签名链（V1 签名：原始值进串、编码值进 URL）
-const VIDEO_SNAPSHOT_PROCESS = 'video/snapshot,t_1000,f_jpg,w_480';
-
-function aliyunBuildSignedUrls(cfg, objectKey, process) {
+function aliyunBuildSignedUrls(cfg, objectKey) {
   const host = aliyunHost(cfg);
   const rawUrl = `https://${host}/${objectKey}`;
   const expires = Math.floor(Date.now() / 1000) + 7 * 24 * 3600;
-  let getSignStr = `GET\n\n\n${expires}\n/${cfg.bucket}/${objectKey}`;
-  let signedUrl = `${rawUrl}?Expires=${expires}&OSSAccessKeyId=${encodeURIComponent(cfg.accessKeyId)}`;
-  if (process) {
-    const encP = encodeURIComponent(process);
-    // V1 签名规范：CanonicalizedResource 用「原始值」，URL 用「编码值」
-    getSignStr += `?x-oss-process=${process}`;
-    signedUrl += `&x-oss-process=${encP}`;
-  }
+  const qParams = `Expires=${expires}&OSSAccessKeyId=${cfg.accessKeyId}`;
+  const getSignStr = `GET\n\n\n${expires}\n/${cfg.bucket}/${objectKey}`;
   const getSig = crypto.createHmac('sha1', cfg.accessKeySecret).update(getSignStr).digest('base64');
-  return { rawUrl, signedUrl: `${signedUrl}&Signature=${encodeURIComponent(getSig)}`, expires };
+  return { rawUrl, signedUrl: `${rawUrl}?${qParams}&Signature=${encodeURIComponent(getSig)}`, expires };
+}
+// 生成「图片处理」签名 GET URL（省钱省流量：缩图 + 降质 + webp）。
+// 关键：x-oss-process 必须算进签名串（CanonicalizedResource 带 ?x-oss-process=原始值），
+// 否则阿里云返回 SignatureDoesNotMatch(403)。此格式已在生产实测验证（5.2MB -> 8.8KB webp）。
+function aliyunBuildThumbUrl(cfg, objectKey, processStr) {
+  const host = aliyunHost(cfg);
+  const rawUrl = `https://${host}/${objectKey}`;
+  const expires = Math.floor(Date.now() / 1000) + 7 * 24 * 3600;
+  const signStr = `GET\n\n\n${expires}\n/${cfg.bucket}/${objectKey}?x-oss-process=${processStr}`;
+  const sig = crypto.createHmac('sha1', cfg.accessKeySecret).update(signStr).digest('base64');
+  return {
+    rawUrl,
+    signedUrl: `${rawUrl}?Expires=${expires}&OSSAccessKeyId=${encodeURIComponent(cfg.accessKeyId)}&x-oss-process=${encodeURIComponent(processStr)}&Signature=${encodeURIComponent(sig)}`,
+    expires,
+  };
+}
+// 图片「省钱省流量」缩略图 URL。assetFinalize.cjs 按此名字调用（与 aliyunBuildThumbUrl 区分：
+// 此处固定图片处理串，调用方无需关心 process 细节）。返回字符串或空串。
+function buildOssThumbUrl(cfg, objectKey) {
+  if (!cfg || cfg.providerType !== 'aliyun-oss') return '';
+  const processStr = 'image/resize,w_1024/quality,q_80/format,webp';
+  const r = aliyunBuildThumbUrl(cfg, objectKey, processStr);
+  return r && r.signedUrl ? r.signedUrl : '';
+}
+// 视频首帧快照（边缘抽帧，无需 ffmpeg）。assetFinalize.cjs 期望返回 { signedUrl } 或 null。
+function buildOssVideoSnapshotUrl(cfg, objectKey) {
+  if (!cfg || cfg.providerType !== 'aliyun-oss') return null;
+  const processStr = 'video/snapshot,t_1000,m_fast,format,jpg,w_400';
+  const r = aliyunBuildThumbUrl(cfg, objectKey, processStr);
+  return r && r.signedUrl ? { signedUrl: r.signedUrl } : null;
 }
 function aliyunPutHeaders(cfg, objectKey, buffer, contentType) {
   const md5 = crypto.createHash('md5').update(buffer).digest('base64');
@@ -55,6 +72,27 @@ function aliyunPutHeaders(cfg, objectKey, buffer, contentType) {
     },
   };
 }
+
+// 流式 PUT 签名（不依赖整 buffer）：调用方已算好 md5 或选择不校验。
+// 用于 assetFinalize「边下边传」场景——下载流不能先整图算 MD5。
+// 双兼容：旧 aliyunPutHeaders(buffer) 仍给 probeConnectivity 等服务端自签场景用。
+//   - md5 为空（纯流式无法预知整 body 哈希）：签名串 Content-MD5 行留空，阿里云照样接受
+//   - contentLength 缺失则不写 Content-Length（由 fetch 走 chunked）
+function aliyunPutHeadersStream(cfg, objectKey, { md5, contentType, contentLength }) {
+  const safeMd5 = md5 || '';
+  const date = new Date().toUTCString();
+  const signStr = `PUT\n${safeMd5}\n${contentType}\n${date}\n/${cfg.bucket}/${objectKey}`;
+  const sig = crypto.createHmac('sha1', cfg.accessKeySecret).update(signStr).digest('base64');
+  const headers = {
+    'Authorization': `OSS ${cfg.accessKeyId}:${sig}`,
+    'Content-Type': contentType,
+    'Date': date,
+  };
+  if (safeMd5) headers['Content-MD5'] = safeMd5;
+  if (contentLength != null) headers['Content-Length'] = String(contentLength);
+  return { md5: safeMd5, date, headers };
+}
+
 // 浏览器直传专用：query-string 形式 PUT 预签名（不依赖 forbidden header）
 // 阿里云 OSS 的 header 签名依赖 Date/Content-MD5（浏览器无法手动设置），
 // 故直传必须走 URL 签名。
@@ -96,6 +134,26 @@ function tencentCosPutHeaders(cfg, _objectKey, buffer, contentType) {
     },
   };
 }
+
+// 腾讯云流式 PUT 签名：不依赖 buffer，只需 contentLength（签名基于 host+sign-time，与 body 无关）。
+// 用于 assetFinalize 边下边传——body 直接是下载流，零整图驻留。
+function tencentCosPutHeadersStream(cfg, _objectKey, { contentType, contentLength }) {
+  const secretId = cfg.accessKeyId;
+  const secretKey = cfg.accessKeySecret;
+  const qKeyTime = `${Math.floor(Date.now() / 1000)};${Math.floor(Date.now() / 1000) + 7 * 24 * 3600}`;
+  const signKey = crypto.createHmac('sha1', secretKey).update(qKeyTime).digest();
+  const httpString = `put\n/${_objectKey}\n\nhost=${cfg._hostName || ''}\n`;
+  const stringToSign = `sha1\n${qKeyTime}\n${crypto.createHash('sha1').update(httpString).digest('hex')}\n`;
+  const signature = crypto.createHmac('sha1', signKey).update(stringToSign).digest('hex');
+  const headers = {
+    'Authorization': `q-sign-algorithm=sha1&q-ak=${secretId}&q-sign-time=${qKeyTime}&q-key-time=${qKeyTime}&q-header-list=host&q-url-param-list=&q-signature=${signature}`,
+    'Host': cfg._hostName || '',
+    'Content-Type': contentType || 'application/octet-stream',
+  };
+  if (contentLength != null) headers['Content-Length'] = String(contentLength);
+  return { headers };
+}
+
 function tencentCosSignUrl(cfg, objectKey) {
   const hostName = cfg._hostName || `${cfg.bucket}${cfg.appId ? '-' + cfg.appId : ''}.cos.${cfg.region || 'ap-shanghai'}.myqcloud.com`;
   const secretId = cfg.accessKeyId;
@@ -136,19 +194,6 @@ function buildOssGetUrl(cfg, objectKey) {
   }
   const { signedUrl, expires } = aliyunBuildSignedUrls(cfg, objectKey);
   return { getUrl: signedUrl, expires };
-}
-
-// 缩略图签名链：仅 aliyun 支持 x-oss-process；tencent 返回 null（调用方回退全图）
-function buildOssThumbUrl(cfg, objectKey) {
-  if (cfg.providerType === 'tencent-cos') return null;
-  return aliyunBuildSignedUrls(cfg, objectKey, THUMB_PROCESS).signedUrl;
-}
-
-// 视频封面帧：给视频对象生成「OSS 边缘抽帧」的签名链
-// 返回 { signedUrl, expires }；tencent-cos 暂无视频快照能力 → 返回 null（前端 fallback 用 video 元素自身）
-function buildOssVideoSnapshotUrl(cfg, objectKey) {
-  if (cfg.providerType === 'tencent-cos') return null;
-  return aliyunBuildSignedUrls(cfg, objectKey, VIDEO_SNAPSHOT_PROCESS);
 }
 
 // 用户的 OSS 命名空间前缀，用于隔离校验（与 sign-upload 的 objectKey 构造保持一致）
@@ -252,15 +297,18 @@ module.exports = {
   aliyunHost,
   aliyunBuildSignedUrls,
   aliyunPutHeaders,
+  aliyunPutHeadersStream,
   aliyunPutSignUrl,
+  aliyunBuildThumbUrl,
+  buildOssThumbUrl,
+  buildOssVideoSnapshotUrl,
   tencentCosHost,
   tencentCosPutHeaders,
+  tencentCosPutHeadersStream,
   tencentCosSignUrl,
   tencentCosPutSignUrl,
   // 辅助
   buildOssGetUrl,
-  buildOssThumbUrl,
-  buildOssVideoSnapshotUrl,
   userOssNamespace,
   loadOssConfigs,
   diagnoseOssError,

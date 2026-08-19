@@ -6,6 +6,8 @@ import fs from 'fs';
 import crypto from 'crypto';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import cluster from 'node:cluster';
+import os from 'node:os';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 3001;
@@ -46,6 +48,7 @@ import billing from './billing.cjs'; // Phase A 积分计费
 import accounting from './accounting.cjs'; // Phase M6+ 全局双边账务（后台量 vs 客户量）
 import redisStore from './redis.cjs';       // Phase 0 优雅 Redis 层（自动内存兜底）
 import rateLimitMod from './ratelimit.cjs'; // Phase 0 固定窗口限流
+import cpuMonitor from './cpuMonitor.cjs'; // CPU 自适应负载降级（dispatcher 入口检查 + healthz 暴露）
 const { initRedis, isRedisUp } = redisStore;
 const { clientIp, rateLimit } = rateLimitMod;
 import adminMod from './admin.cjs'; // Phase 2 运营总控台(M3) + 全局智能体层(M4) 后台接口
@@ -354,43 +357,6 @@ async function initDB() {
       -- 计费池标识（reward/recharge），dispatcher.cjs 在途/孤儿/等待区扫描与 finalize 均读取
       ALTER TABLE generation_tasks ADD COLUMN IF NOT EXISTS cost_pool TEXT DEFAULT 'recharge';
     `);
-
-    // === 多 Key 池（同一供应商多把 API Key，各自独立参与生成分配）===
-    await pgPool.query(`
-      CREATE TABLE IF NOT EXISTS api_keys (
-        id TEXT PRIMARY KEY,
-        provider_id TEXT NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
-        api_key TEXT NOT NULL,
-        label TEXT DEFAULT '',
-        status TEXT NOT NULL DEFAULT 'active',   -- active | manual_cold | disabled
-        weight INT NOT NULL DEFAULT 1,
-        consecutive_failures INT NOT NULL DEFAULT 0,
-        last_failure_at TIMESTAMPTZ,
-        last_used_at TIMESTAMPTZ,
-        created_at TIMESTAMPTZ DEFAULT NOW(),
-        updated_at TIMESTAMPTZ DEFAULT NOW(),
-        updated_by TEXT DEFAULT '',
-        UNIQUE (provider_id, api_key)
-      );
-    `);
-    // 回填：现存 providers.api_key（非空）且 api_keys 尚无记录 → 插入「主 key」（幂等）
-    try {
-      const provs = await pgPool.query("SELECT id, api_key FROM providers WHERE api_key IS NOT NULL AND api_key <> ''");
-      for (const pr of (provs.rows || [])) {
-        const existing = await pgPool.query('SELECT 1 FROM api_keys WHERE provider_id = $1 LIMIT 1', [pr.id]);
-        if (existing.rows.length === 0) {
-          await pgPool.query(
-            `INSERT INTO api_keys (id, provider_id, api_key, label, status, weight)
-             VALUES ($1, $2, $3, '主 key', 'active', 1)
-             ON CONFLICT (provider_id, api_key) DO NOTHING`,
-            [`akey-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`, pr.id, pr.api_key],
-          );
-        }
-      }
-      console.log('[initDB] 多 Key 池表已就绪（api_keys）');
-    } catch (e) {
-      console.warn('[initDB] api_keys 回填跳过（非致命）:', e.message);
-    }
 
     // === 模型级参数模板回填（后台可自定义；空模板按 type 派生默认）===
     await backfillModelParamTemplates();
@@ -1801,6 +1767,7 @@ async function handleAPI(req, res) {
 
   // Phase 0 健康检查：公开端点，网关前放行，供 nginx/容器探针与压测使用
   if (url === '/api/healthz' && method === 'GET') {
+    const cpu = cpuMonitor.getStatus();
     return sendJSON(res, 200, {
       status: 'ok',
       pg: !!pgPool,
@@ -1808,6 +1775,16 @@ async function handleAPI(req, res) {
       uptime: Math.floor(process.uptime()),
       version: process.env.npm_package_version || '0.1.0',
       ts: Date.now(),
+      cpu: {
+        percent: Math.round(cpu.cpuPercent * 1000) / 10, // 单核占比（%），保留 1 位小数（仅观测，不再触发 SHED）
+        elP99Ms: Math.round((cpu.elP99Ms || 0) * 10) / 10, // 事件循环 p99 延迟（ms）——实际健康闸门信号
+        shedding: cpu.shedding,
+        primarySignal: cpu.primarySignal, // 'eventloop' 现代 Node | 'cpu' 退化模式
+        elShedding: !!cpu.elShedding,
+        cpuShedding: !!cpu.cpuShedding,
+        shedThreshold: Math.round(cpu.shedThreshold * 100),
+        recoverThreshold: Math.round(cpu.recoverThreshold * 100),
+      },
     });
   }
 
@@ -1870,13 +1847,12 @@ async function handleAPI(req, res) {
             [uid]
           );
           const items = mr.rows.map((x) => {
-            const full = x.oss_url || x.full_url || '';
-            const thumb = (x.thumbnail && /^https?:/i.test(x.thumbnail)) ? x.thumbnail : full;
+            const url = x.oss_url || x.full_url || x.thumbnail || '';
             return {
               id: x.id,
               title: x.title || '',
-              thumbnail: thumb,
-              fullUrl: full,
+              thumbnail: url,
+              fullUrl: url,
               type: x.type || 'image',
               category: x.category || 'generated',
             };
@@ -2038,6 +2014,214 @@ async function handleAPI(req, res) {
       });
     } catch (e) {
       return sendJSON(res, 500, { error: '路由决策失败：' + (e?.message || e) });
+    }
+  }
+  // ── 模型参与度总览（密钥池 / 模型四态：已同步 / 已绑定 / 实际被调用 / 当前冷却熔断）──
+  // 参与口径严格对齐 dispatcher.loadDispatchPairs (server/modules/modelhub/bindings.cjs)：
+  //   参与 = 存在 enabled 绑定（或 legacy models.provider_id 回退）且对应服务商 enabled + api_key 有效（>=6 位）。
+  //   冷却/熔断 = dispatcher.getAccountStates() 内存态（与 generate 同源），cold 或 cbState∈{OPEN,HALF_OPEN}。
+  if (url === '/api/admin/model-participation' && method === 'GET') {
+    if (!admin.requireAdmin(req)) return sendJSON(res, 403, { error: '需要管理员权限' });
+    if (!pgPool) return sendJSON(res, 503, { error: '数据库不可用' });
+    try {
+      const u = new URL(req.url, 'http://localhost');
+      const onlyProblems = u.searchParams.get('onlyProblems') === '1';
+      const providerFilter = (u.searchParams.get('providerId') || '').trim();
+
+      // 1) 实时账号状态（冷却/熔断）来自 dispatcher 内存态（ACCT），与 generate 同源
+      const states = dispatcher.getAccountStates(); // pid -> {cold, manualState, cbState:{state,...}, cooldownUntil, ...}
+
+      // 2) 服务商（密钥）基础信息 + 有效性（enabled && api_key.length>=6，对齐 bindings.cjs:106）
+      const provRows = await pgPool.query('SELECT id, name, base_url, api_key, enabled, max_concurrent FROM providers ORDER BY created_at');
+      const providers = provRows.rows.map((p) => {
+        const st = states[p.id] || null;
+        const cb = st && st.cbState ? st.cbState.state : 'CLOSED';
+        const cooling = !!st && (st.cold || st.manualState === 'cold' || cb === 'OPEN' || cb === 'HALF_OPEN');
+        const valid = p.enabled && p.api_key && p.api_key.length >= 6;
+        return {
+          providerId: p.id,
+          name: p.name || '',
+          baseUrl: p.base_url || '',
+          keyMasked: p.api_key && p.api_key.length > 4 ? '***' + String(p.api_key).slice(-4) : '***',
+          enabled: p.enabled,
+          maxConcurrent: p.max_concurrent,
+          validKey: valid,
+          cold: st ? st.cold : null,
+          manualState: st ? st.manualState : null,
+          cbState: cb,
+          cooldownUntil: st ? st.cooldownUntil : null,
+          cooling,
+        };
+      });
+      // 2.5) 每个服务商配置的 key 池规模（DB api_keys 为权威源；dispatcher.cjs 注释：DB 是成员与 status 的权威源）
+      //      不受重启/内存态影响；AKEYS 运行时态仅作"已加载/熔断"补充。
+      const keyRows = await pgPool.query(
+        `SELECT provider_id,
+                COUNT(*)::int AS n,
+                COUNT(*) FILTER (WHERE status = 'active')::int AS active_n,
+                COUNT(*) FILTER (WHERE status <> 'active')::int AS isolated_n
+           FROM api_keys GROUP BY provider_id`
+      );
+      const keyStatsByProvider = {};
+      for (const r of keyRows.rows) {
+        keyStatsByProvider[r.provider_id] = { total: Number(r.n) || 0, active: Number(r.active_n) || 0, isolated: Number(r.isolated_n) || 0 };
+      }
+      const providerStateMap = {};
+      for (const p of providers) providerStateMap[p.providerId] = p;
+      const validProviderIds = new Set(providers.filter((p) => p.validKey).map((p) => p.providerId));
+
+      // 3) 已同步模型（models 表）——按 model_id 聚合为「逻辑模型」；一行多 provider 属正常设计
+      const modelRows = await pgPool.query('SELECT id, model_id, display_name, mapping_name, type, provider_id, enabled FROM models');
+      // 4) 绑定（provider_model_bindings，仅 enabled）
+      const bindRows = await pgPool.query('SELECT model_id, provider_id, enabled, id FROM provider_model_bindings');
+      const boundByModel = {}; // model_id -> [providerId]
+      for (const b of bindRows.rows) {
+        if (!b.enabled) continue;
+        (boundByModel[b.model_id] = boundByModel[b.model_id] || []).push(b.provider_id);
+      }
+      // 5) 近 24h 实际调用（generation_attempts）
+      const attRows = await pgPool.query(
+        `SELECT model_id, provider_id, COUNT(*)::int AS cnt,
+                SUM(CASE WHEN status='success' THEN 1 ELSE 0 END)::int AS succ
+           FROM generation_attempts
+          WHERE created_at >= NOW() - INTERVAL '24 hours'
+          GROUP BY model_id, provider_id`
+      );
+      const calledByModel = {};         // model_id -> {cnt, succ}
+      const calledByModelProvider = {}; // "model_id|provider_id" -> {cnt, succ}
+      for (const a of attRows.rows) {
+        calledByModel[a.model_id] = calledByModel[a.model_id] || { cnt: 0, succ: 0 };
+        calledByModel[a.model_id].cnt += Number(a.cnt) || 0;
+        calledByModel[a.model_id].succ += Number(a.succ) || 0;
+        calledByModelProvider[a.model_id + '|' + a.provider_id] = { cnt: Number(a.cnt) || 0, succ: Number(a.succ) || 0 };
+      }
+
+      // 6) 组装 per-model 行（按 model_id 聚合；参与口径对齐 loadDispatchPairs）
+      //    models 表一行对应一个「模型×服务商」组合（dispatcher 按 model_id|provider_id 组合键去重），
+      //    此处按 model_id 归并为逻辑模型，避免参与页面把同一模型渲染 100+ 次。
+      const modelAgg = {}; // model_id -> { rows, hasMapping, enabledAny }
+      for (const m of modelRows.rows) {
+        const a = (modelAgg[m.model_id] = modelAgg[m.model_id] || { modelId: m.model_id, rows: [], hasMapping: false, enabledAny: false });
+        a.rows.push(m);
+        if (m.mapping_name) a.hasMapping = true;
+        if (m.enabled) a.enabledAny = true;
+      }
+      const models = Object.values(modelAgg).map((a) => {
+        const first = a.rows[0];
+        const mappingRow = a.rows.find((r) => r.mapping_name) || first;
+        const displayName = mappingRow.display_name || first.model_id;
+        const mappingName = mappingRow.mapping_name || null;
+        // 收集所有有效 legacy provider（enabled 行 + api_key 有效），而非仅取一行
+        const legacyProviders = [];
+        const seenLegacy = new Set();
+        for (const r of a.rows) {
+          if (r.enabled && r.provider_id && validProviderIds.has(r.provider_id) && !seenLegacy.has(r.provider_id)) {
+            legacyProviders.push(r.provider_id); seenLegacy.add(r.provider_id);
+          }
+        }
+        const bps = boundByModel[a.modelId] || [];
+        const candidateProviders = [];
+        const seen = new Set();
+        for (const lp of legacyProviders) { if (!seen.has(lp)) { candidateProviders.push(lp); seen.add(lp); } }
+        for (const bp of bps) { if (validProviderIds.has(bp) && !seen.has(bp)) { candidateProviders.push(bp); seen.add(bp); } }
+        const participates = candidateProviders.length > 0;
+        const called = calledByModel[a.modelId] || { cnt: 0, succ: 0 };
+        // 并发容量维度：单线路 + 低并发 = 批量提交必崩（如 gpt-image-1）
+        let totalConcurrency = 0; let unlimited = false;
+        for (const cp of candidateProviders) {
+          const mc = providerStateMap[cp] ? providerStateMap[cp].maxConcurrent : null;
+          if (mc == null) unlimited = true; else totalConcurrency += Number(mc) || 0;
+        }
+        const poolSize = candidateProviders.length;
+        const effectiveSlots = unlimited ? null : totalConcurrency;
+        const lowCapacity = participates && (poolSize <= 1 && (effectiveSlots == null ? false : effectiveSlots <= 1));
+        let cooling = false; const coolingProviders = [];
+        for (const cp of candidateProviders) {
+          const ps = providerStateMap[cp];
+          if (ps && ps.cooling) { cooling = true; coolingProviders.push(cp); }
+        }
+        return {
+          modelId: a.modelId,
+          displayName,
+          mappingName,
+          type: first.type,
+          enabled: a.enabledAny,
+          synced: a.rows.some((r) => r.provider_id),   // 已同步到上游服务商
+          bound: bps.length > 0,                        // 已绑定（enabled 绑定）
+          boundProviders: bps,
+          legacyProviders,
+          participates,                                  // 实际可参与调度
+          candidateProviders,
+          poolSize,
+          totalConcurrency: effectiveSlots,
+          unlimited,
+          lowCapacity,
+          calledLast24h: called.cnt,
+          successLast24h: called.succ,
+          cooling,
+          coolingProviders,
+        };
+      });
+
+      // 7) 过滤器
+      let filteredModels = models;
+      if (providerFilter) filteredModels = filteredModels.filter((x) => (x.candidateProviders || []).includes(providerFilter));
+      if (onlyProblems) filteredModels = filteredModels.filter((x) => !x.participates || x.cooling || x.lowCapacity);
+
+      // 8) 服务商维度聚合（每个密钥承载的同步/绑定/调用 + 是否冷却）
+      const provAgg = providers.map((p) => {
+        let syncedModels = 0, boundModels = 0, servedModels = 0, called24h = 0;
+        for (const m of models) {
+          const isLegacy = (m.legacyProviders || []).includes(p.providerId);
+          const isBound = (m.boundProviders || []).includes(p.providerId);
+          if (!isLegacy && !isBound) continue;
+          if (m.synced && isLegacy) syncedModels++;
+          if (isBound) boundModels++;
+          if ((m.candidateProviders || []).includes(p.providerId)) servedModels++;
+          const cm = calledByModelProvider[m.model_id + '|' + p.providerId];
+          if (cm) called24h += cm.cnt;
+        }
+        // 密钥池（墨池池）维度：DB api_keys 为权威池规模（配置总数/活跃/隔离，不受重启影响）；
+        // AKEYS 为运行时态（与 generate 同源）：已加载 key 数 + 当前熔断(OPEN/HALF_OPEN) key 数。
+        const dk = keyStatsByProvider[p.providerId] || { total: 0, active: 0, isolated: 0 };
+        const rt = dispatcher.getKeyStates(p.providerId) || [];
+        let rtActive = 0, rtIsolated = 0, rtCooling = 0;
+        for (const ks of rt) {
+          if (ks.status === 'active') rtActive++; else rtIsolated++;
+          const cb = ks.cbState; // getKeyStates 返回字符串 CLOSED/OPEN/HALF_OPEN 或 null
+          if (cb === 'OPEN' || cb === 'HALF_OPEN') rtCooling++;
+        }
+        return Object.assign({}, p, {
+          syncedModels, boundModels, servedModels, called24h,
+          poolSize: dk.total,            // 配置 key 总数（墨池池规模，权威源）
+          activeKeys: dk.active,         // DB 活跃 key 数
+          isolatedKeys: dk.isolated,     // DB 隔离/禁用 key 数
+          runtimeLoaded: rt.length,      // AKEYS 已加载 key 数（重启后首调度前可能为 0）
+          coolingKeys: rtCooling,        // AKEYS 运行时熔断 key 数
+        });
+      });
+
+      // 9) 汇总
+      const summary = {
+        totalModels: models.length,
+        syncedModels: models.filter((m) => m.synced).length,
+        boundModels: models.filter((m) => m.bound).length,
+        participatesModels: models.filter((m) => m.participates).length,
+        calledModels24h: models.filter((m) => m.calledLast24h > 0).length,
+        coolingModels: models.filter((m) => m.cooling).length,
+        lowCapacityModels: models.filter((m) => m.lowCapacity).length,
+        totalProviders: providers.length,
+        validProviders: providers.filter((p) => p.validKey).length,
+        coolingProviders: providers.filter((p) => p.cooling).length,
+      };
+
+      return sendJSON(res, 200, {
+        summary,
+        providers: onlyProblems ? provAgg.filter((p) => p.cooling) : provAgg,
+        models: filteredModels,
+      });
+    } catch (e) {
+      return sendJSON(res, 500, { error: '查询模型参与度失败：' + (e?.message || e) });
     }
   }
   if (url.startsWith('/api/admin/') && method !== 'OPTIONS') return admin.handleAdmin(req, res, url.split('?')[0], method);
@@ -2254,30 +2438,9 @@ async function handleAPI(req, res) {
             try {
               const fresh = ossMod.buildOssGetUrl(ac, m.ossObjectKey).getUrl;
               m.ossUrl = fresh;
-              m.fullUrl = fresh;
-              // 图片：生成「缩略图专用签名链」（OSS 服务端 resize+webp），并持久化，
-              // 使网格走小图、OSS 出流量与存储成本大幅下降（实测 6.5MB→27KB）
-              if (m.type === 'image' && m.ossObjectKey) {
-                try {
-                  const thumb = ossMod.buildOssThumbUrl(ac, m.ossObjectKey);
-                  if (thumb) {
-                    m.thumbnail = thumb;
-                    if (pgPool) await pgPool.query('UPDATE media SET thumbnail=$1 WHERE id=$2', [thumb, m.id]);
-                  }
-                } catch (_) { /* 单张失败不影响其它 */ }
-              } else if (m.type === 'video' && m.ossObjectKey) {
-                // 视频封面帧：OSS 边缘抽帧（video/snapshot,t_1000,f_jpg,w_480），零 ffmpeg 依赖
-                // [FIX 2026-08-15] Request 5：让视频也有轻量封面，网格/<video poster> 优先用此链
-                try {
-                  const snap = ossMod.buildOssVideoSnapshotUrl(ac, m.ossObjectKey);
-                  if (snap && snap.signedUrl) {
-                    m.thumbnail = snap.signedUrl;
-                    if (pgPool) await pgPool.query('UPDATE media SET thumbnail=$1 WHERE id=$2', [snap.signedUrl, m.id]);
-                  }
-                } catch (_) { /* 单张失败不影响其它 */ }
-              } else if (m.thumbnail && OSS_HOST.test(m.thumbnail)) {
-                m.thumbnail = fresh;
-              }
+              // thumbnail/fullUrl 若也是该 OSS 签名链，一并刷新（详情面板/查看器/下载用的是 fullUrl）
+              if (m.thumbnail && OSS_HOST.test(m.thumbnail)) m.thumbnail = fresh;
+              if (m.fullUrl && OSS_HOST.test(m.fullUrl)) m.fullUrl = fresh;
             } catch (_) { /* 单个重签失败保留原值 */ }
           }
         }
@@ -2689,56 +2852,9 @@ async function handleAPI(req, res) {
     }
   }
 
-  // ── 多 Key 池辅助：loadProviderKeys（遮蔽明文 + 状态/失败计数）；addProviderKeys（追加去重，幂等）──
-  async function loadProviderKeys(pool, providerIds) {
-    if (!pool || !Array.isArray(providerIds) || providerIds.length === 0) return {};
-    const r = await pool.query('SELECT * FROM api_keys WHERE provider_id = ANY($1)', [providerIds]);
-    const map = {};
-    for (const row of (r.rows || [])) {
-      const pid = row.provider_id;
-      if (!map[pid]) map[pid] = [];
-      const raw = row.api_key || '';
-      const masked = raw.length > 8 ? raw.slice(0, 4) + '…' + raw.slice(-4) : (raw ? '****' : '');
-      map[pid].push({
-        id: row.id, label: row.label || '', status: row.status || 'active',
-        failures: row.consecutive_failures || 0, masked, lastUsedAt: row.last_used_at,
-        createdAt: row.created_at,
-      });
-    }
-    return map;
-  }
-  // 追加 key（去重：同 provider 同值不重复）；若 provider 尚无「主 key」标签则首个 key 标「主 key」；若 providers.api_key 为空则补第一把作 fallback。
-  async function addProviderKeys(pool, providerId, apiKeys) {
-    const clean = [...new Set((apiKeys || []).map((x) => String(x).trim()).filter((x) => x && x.length >= 6 && !x.includes('*')))];
-    const hasPrimary = await pool.query("SELECT 1 FROM api_keys WHERE provider_id=$1 AND label='主 key' LIMIT 1", [providerId]);
-    const primaryExists = hasPrimary.rows.length > 0;
-    let added = 0;
-    for (const k of clean) {
-      const ex = await pool.query('SELECT 1 FROM api_keys WHERE provider_id=$1 AND api_key=$2', [providerId, k]);
-      if (ex.rows.length) continue; // 去重
-      const label = (!primaryExists && added === 0) ? '主 key' : '';
-      await pool.query(
-        `INSERT INTO api_keys (id, provider_id, api_key, label, status, weight) VALUES ($1,$2,$3,$4,'active',1)`,
-        [`akey-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`, providerId, k, label],
-      );
-      added++;
-    }
-    // providers.api_key 为空 → 用第一把补齐（legacy 代码 / 恢复链路 fallback）
-    const cur = await pool.query('SELECT api_key FROM providers WHERE id=$1', [providerId]);
-    if (!cur.rows[0] || !cur.rows[0].api_key) {
-      const first = await pool.query('SELECT api_key FROM api_keys WHERE provider_id=$1 ORDER BY created_at LIMIT 1', [providerId]);
-      if (first.rows[0]) await pool.query('UPDATE providers SET api_key=$1, updated_at=NOW() WHERE id=$2', [first.rows[0].api_key, providerId]);
-    }
-    return added;
-  }
-
   if (url === '/api/providers' && method === 'GET') {
     const maskKey = (p) => ({ ...p, apiKey: p.apiKey ? '***' : '' });
-    if (pgPool) {
-      const r = await pgPool.query('SELECT * FROM providers ORDER BY created_at');
-      const keyMap = await loadProviderKeys(pgPool, r.rows.map((x) => x.id));
-      return sendJSON(res, 200, r.rows.map(fromSnake).map((p) => ({ ...maskKey(p), apiKeys: keyMap[p.id] || [] })));
-    }
+    if (pgPool) { const r = await pgPool.query('SELECT * FROM providers ORDER BY created_at'); return sendJSON(res, 200, r.rows.map(fromSnake).map(maskKey)); }
     return sendJSON(res, 200, readJSON('providers').map(maskKey));
   }
   // ── POST /api/providers：单条创建（RESTful，不再是破坏性全量同步）──
@@ -2759,22 +2875,12 @@ async function handleAPI(req, res) {
         // 安全：创建时若 api_key 是占位（含 '*' 或 <6 字符）则落空，不写入伪密钥
         let apiKey = s.api_key || '';
         if (apiKey.includes('*') || apiKey.length < 6) apiKey = '';
-        // 批量 key：POST 体可携带 apiKeys[]（每行一把）；首把作为 providers.api_key fallback
-        const apiKeysIn = Array.isArray(body.apiKeys) ? body.apiKeys : [];
-        if (!apiKey) {
-          const first = (apiKeysIn.map((x) => String(x).trim()).filter((x) => x && x.length >= 6 && !x.includes('*')))[0];
-          if (first) apiKey = first;
-        }
         const exists = await pgPool.query('SELECT id FROM providers WHERE id=$1', [s.id]);
         if (exists.rows[0]) return sendJSON(res, 409, { error: '服务商已存在', id: s.id });
         await pgPool.query(
           `INSERT INTO providers (id,name,type,base_url,api_key,supported_types,enabled,protocol,remark,default_endpoint,max_concurrent,rate_limits,capacity_model,bucket_max,cooldown_ms,revision,updated_at,updated_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,1,NOW(),$16)`,
           [s.id, s.name, s.type, s.base_url, apiKey, s.supported_types || [], s.enabled !== false, s.protocol || 'openai-compatible', s.remark || '', JSON.stringify(s.default_endpoint || {}), Number(s.max_concurrent) || 2, JSON.stringify(s.rate_limits || {}), s.capacity_model || 'limited', s.bucket_max != null ? Number(s.bucket_max) : null, Number(s.cooldown_ms) || 60000, (realUser && realUser.id) || '']
         );
-        // 批量 key 落库（追加去重；首把已是 providers.api_key，这里仅补其余）
-        if (Array.isArray(apiKeysIn) && apiKeysIn.length) {
-          try { await addProviderKeys(pgPool, s.id, apiKeysIn); } catch (e) { console.error('[providers] 批量 key 写入失败', e.message); }
-        }
         return sendJSON(res, 201, { ok: true, id: s.id, revision: 1 });
       } catch (e) {
         console.error('[providers] POST 失败', e.message);
@@ -2788,66 +2894,6 @@ async function handleAPI(req, res) {
     writeJSON('providers', list);
     return sendJSON(res, 201, { ok: true, id: s.id, revision: 1 });
   }
-  // ── 多 Key 池管理路由：同一供应商多把 API Key，各自独立参与生成分配 ──
-  // 必须在通用 PATCH/DELETE /api/providers/ 之前匹配，避免被 startsWith 误捕获。
-  const KEY_ROUTE = /^\/api\/providers\/([^/]+)\/keys(\/([^/]+))?$/;
-  if (KEY_ROUTE.test(url)) {
-    if (!admin.requireAdmin(req)) return sendJSON(res, 403, { error: '需要管理员权限' });
-    const m = url.match(KEY_ROUTE);
-    const pid = decodeURIComponent(m[1]);
-    const keyId = m[3] || null;
-    if (!pgPool) return sendJSON(res, 501, { error: 'JSON 兜底模式不支持 Key 池管理' });
-    if (method === 'GET') {
-      const r = await pgPool.query('SELECT * FROM api_keys WHERE provider_id=$1 ORDER BY created_at', [pid]);
-      const list = (r.rows || []).map((row) => {
-        const raw = row.api_key || '';
-        const masked = raw.length > 8 ? raw.slice(0, 4) + '…' + raw.slice(-4) : (raw ? '****' : '');
-        return { id: row.id, label: row.label || '', status: row.status || 'active', failures: row.consecutive_failures || 0, masked, lastUsedAt: row.last_used_at, createdAt: row.created_at };
-      });
-      return sendJSON(res, 200, { keys: list });
-    }
-    if (method === 'POST') {
-      const body = await parseBody(req); if (!body || typeof body !== 'object') return sendJSON(res, 400, { error: 'Invalid JSON' });
-      const arr = Array.isArray(body.apiKeys) ? body.apiKeys : (body.apiKey ? [body.apiKey] : []);
-      const added = await addProviderKeys(pgPool, pid, arr);
-      if (dispatcher.invalidateProviderKeyCache) dispatcher.invalidateProviderKeyCache(pid);
-      const r = await pgPool.query('SELECT * FROM api_keys WHERE provider_id=$1 ORDER BY created_at', [pid]);
-      const keys = (r.rows || []).map((row) => ({ id: row.id, label: row.label || '', status: row.status || 'active', failures: row.consecutive_failures || 0, createdAt: row.created_at }));
-      return sendJSON(res, 200, { ok: true, added, keys });
-    }
-    if (method === 'PATCH' && keyId) {
-      const body = await parseBody(req); if (!body || typeof body !== 'object') return sendJSON(res, 400, { error: 'Invalid JSON' });
-      let pi = 1;
-      const sets = []; const vals = [];
-      if (body.status) {
-        if (!['active', 'manual_cold', 'disabled'].includes(body.status)) return sendJSON(res, 400, { error: 'status 仅支持 active | manual_cold | disabled' });
-        sets.push(`status=$${pi++}`); vals.push(body.status);
-      }
-      if (typeof body.label === 'string') { sets.push(`label=$${pi++}`); vals.push(body.label); }
-      sets.push('updated_at=NOW()');
-      if (sets.length <= 1) return sendJSON(res, 400, { error: '无可更新字段（status 或 label）' });
-      vals.push(keyId); vals.push(pid);
-      await pgPool.query(`UPDATE api_keys SET ${sets.join(', ')} WHERE id=$${pi++} AND provider_id=$${pi++}`, vals);
-      if (dispatcher.invalidateProviderKeyCache) dispatcher.invalidateProviderKeyCache(pid);
-      return sendJSON(res, 200, { ok: true });
-    }
-    if (method === 'DELETE' && keyId) {
-      await pgPool.query('DELETE FROM api_keys WHERE id=$1 AND provider_id=$2', [keyId, pid]);
-      // 若删掉的是主 key（providers.api_key 指向它），用剩余第一把补齐 fallback
-      const cur = await pgPool.query('SELECT api_key FROM providers WHERE id=$1', [pid]);
-      const curKey = cur.rows[0] && cur.rows[0].api_key;
-      const still = await pgPool.query('SELECT api_key FROM api_keys WHERE provider_id=$1', [pid]);
-      const stillKeys = (still.rows || []).map((x) => x.api_key);
-      if (!curKey || !stillKeys.includes(curKey)) {
-        const fb = stillKeys[0] || '';
-        await pgPool.query('UPDATE providers SET api_key=$1, updated_at=NOW() WHERE id=$2', [fb, pid]);
-      }
-      if (dispatcher.invalidateProviderKeyCache) dispatcher.invalidateProviderKeyCache(pid);
-      return sendJSON(res, 200, { ok: true });
-    }
-    return sendJSON(res, 405, { error: 'Method Not Allowed' });
-  }
-
   // ── PATCH /api/providers/:id：单条局部更新 + 乐观锁（revision 不匹配 → 409）──
   if (url.startsWith('/api/providers/') && method === 'PATCH') {
     if (!admin.requireAdmin(req)) return sendJSON(res, 403, { error: '需要管理员权限' });
@@ -2907,13 +2953,6 @@ async function handleAPI(req, res) {
     if (r.status === 'conflict') return sendJSON(res, 409, { error: '数据已被其他管理员修改（revision 不匹配），请刷新后重试', currentRevision: r.currentRevision });
     const row = await pgPool.query('SELECT * FROM providers WHERE id=$1', [id]);
     if (!row.rows[0]) return sendJSON(res, 404, { error: '服务商不存在' });
-    // 多 Key 池：PATCH 携带 apiKeys → 追加（去重），不删除既有 key；同步刷新运行时态
-    if (Array.isArray(patch.apiKeys) && patch.apiKeys.length) {
-      try {
-        await addProviderKeys(pgPool, id, patch.apiKeys);
-        if (dispatcher.invalidateProviderKeyCache) dispatcher.invalidateProviderKeyCache(id);
-      } catch (e) { console.error('[providers] PATCH apiKeys 写入失败', e.message); }
-    }
     return sendJSON(res, 200, { ok: true, provider: fromSnake(row.rows[0]), revision: r.revision });
   }
   // 账号冷热状态快照（内存态，供管理面板展示 + 手动强切）
@@ -3052,6 +3091,11 @@ async function handleAPI(req, res) {
       const { taskId, error } = await dispatcher.generateAsync(pgPool, genOpts);
       if (error) {
         await billing.releaseCredits(pgPool, realUser.id, cost, idemKey, pay.pool).catch(() => {});
+        // CPU 自适应降级：dispatcher 检测到本 worker CPU 超阈值 → 返 503 + Retry-After（前端可重试）
+        if (typeof error === 'string' && error.startsWith('CPU_OVERLOAD')) {
+          res.setHeader('Retry-After', '5');
+          return sendJSON(res, 503, { status: 'overloaded', error, retryAfterSec: 5 });
+        }
         return sendJSON(res, 200, { status: 'failed', error });
       }
       return sendJSON(res, 200, { status: 'pending', taskId });
@@ -3598,7 +3642,6 @@ async function handleAPI(req, res) {
       category: 'category', commercial_use: 'commercialUse', creator: 'creator',
       param_template: 'paramTemplate',
       sort_order: 'sortOrder',
-      supported_resolutions: 'supportedResolutions',  // [FIX 2026-08-15] 允许后台编辑清晰度档位（管理模型抽屉 + 模型 Hub per-row 编辑器）
     };
     if (!pgPool) return sendJSON(res, 501, { error: 'JSON 兜底模式不支持 PATCH' });
     try {
@@ -3624,7 +3667,6 @@ async function handleAPI(req, res) {
         else if (col === 'display_name') v = String(v);
         else if (col === 'param_template') v = JSON.stringify((v && typeof v === 'object') ? v : (v == null ? {} : v));
         else if (col === 'sort_order') v = (v == null || v === '' || Number.isNaN(Number(v))) ? 0 : Math.floor(Number(v));
-        else if (col === 'supported_resolutions') v = Array.isArray(v) ? v.map((x) => String(x)) : (v ? [String(v)] : []);  // [FIX 2026-08-15] TEXT[] 数组转换
         cols.push(col); vals.push(v);
       }
       // 校验：仅当本次 patch 真正改动奖励余额相关字段时，才强制校验「支持奖励余额必须填写奖励积分(>0)」
@@ -4180,14 +4222,44 @@ const server = http.createServer(async (req, res) => {
   sendJSON(res, 404, { error: 'Not Found' });
 });
 
+// ─── Node cluster（多 worker 用满多核；#360 限流已迁 Redis，多实例/多 worker 安全）───
+// 仅当 ENABLE_CLUSTER !== 'false' 且为多核时启用；env WEB_CONCURRENCY 可指定 worker 数，默认 = CPU 核数。
+// 主进程只负责 fork/管理 worker 并转发信号；worker 才运行 app（initDB/listen/SIGTERM）。
+const CLUSTER_ENABLED = process.env.ENABLE_CLUSTER !== 'false';
+const NUM_WORKERS = process.env.WEB_CONCURRENCY
+  ? Math.max(1, parseInt(process.env.WEB_CONCURRENCY, 10) || 1)
+  : Math.max(1, os.cpus().length);
+
+if (CLUSTER_ENABLED && cluster.isPrimary) {
+  console.log(`[cluster] 主进程 pid=${process.pid} 启动 ${NUM_WORKERS} 个 worker（共 ${os.cpus().length} 核）`);
+  for (let i = 0; i < NUM_WORKERS; i++) cluster.fork();
+  cluster.on('exit', (worker, code, signal) => {
+    console.error(`[cluster] worker ${worker.process.pid} 退出(${signal || code})，自动重启`);
+    cluster.fork();
+  });
+  for (const sig of ['SIGTERM', 'SIGINT']) {
+    process.on(sig, () => {
+      console.log(`[cluster] 主进程收到 ${sig}，转发给所有 worker`);
+      for (const id of Object.keys(cluster.workers || {})) cluster.workers[id].kill(sig);
+      setTimeout(() => process.exit(0), 8000).unref(); // 给 worker 优雅退出时间，超时兜底
+    });
+  }
+  // 主进程到此为止，不运行 app（下方 bootstrap 仅在 worker 执行）
+}
+
+// cluster 模式：仅 worker 运行 app；单进程模式(ENABLE_CLUSTER=false)：主进程即运行 app（否则 app 完全不启动）
+if (cluster.isWorker || !CLUSTER_ENABLED) {
+// leader worker（id=1）独跑周期性调度/崩溃恢复；单进程模式下 IS_LEADER 恒 true 亦运行，避免多 worker 重复扫 DB / 重复续轮询
+const IS_LEADER = !CLUSTER_ENABLED || cluster.worker?.id === 1;
 await initDB();
 await initRedis();
+cpuMonitor.start(); // 启动 CPU 自适应负载降级监控（每 worker 独立）
 
 // ─── 崩溃恢复：启动即扫描在途视频任务，续轮询崩溃前已提交但本进程未完成的任务 ───
 // 必须在 PG 就绪后、且 pgPool 全局已赋值后调用（resumeRunningTasks 内部用 pgPool 重新加载 provider/model）。
 // 只恢复已持久化 provider_task_id 的 running 任务；提交前崩溃的任务无 provider task id，
 // 由 billing.cjs 的 running>30min 兜底释放 held 积分，不会泄漏（此处仅负责"拿回那一笔生成结果"）。
-if (pgPool) {
+if (pgPool && IS_LEADER) {
   dispatcher.resumeRunningTasks(pgPool)
     .then((r) => { if (r && r.resumed) console.log(`[startup] 崩溃恢复：续轮询 ${r.resumed} 个在途视频任务`); })
     .catch((e) => console.warn('[startup] 崩溃恢复扫描失败（不影响启动）:', e.message));
@@ -4197,10 +4269,10 @@ if (pgPool) {
   dispatcher.resumeWaitingArea(pgPool)
     .then((r) => { if (r && r.resumed) console.log(`[startup] 等待区恢复：重试 ${r.resumed} 个排队任务`); })
     .catch((e) => console.warn('[startup] 等待区恢复扫描失败（不影响启动）:', e.message));
-  // 图片任务崩溃恢复：重启后重驱在途图片任务（图片同步生成、无 provider_task_id，resumeRunningTasks 不覆盖，见 dispatcher 注释）。
-  dispatcher.resumeRunningImageTasks(pgPool)
-    .then((r) => { if (r && r.resumed) console.log(`[startup] 图片崩溃恢复：重驱 ${r.resumed} 个在途图片任务`); })
-    .catch((e) => console.warn('[startup] 图片崩溃恢复扫描失败（不影响启动）:', e.message));
+  // 搬运与 API 解耦：启动后台上传队列 worker（建表 + 崩溃恢复 + 起 worker），仅 leader worker 跑
+  dispatcher.startUploadQueue(pgPool)
+    .then(() => console.log('[startup] 上传队列 worker 已启动'))
+    .catch((e) => console.warn('[startup] 上传队列启动失败（不影响启动）:', e.message));
 }
 
 // ─── 核心错误持久化 + 进程级异常兜底（#449/#450）───
@@ -4272,9 +4344,20 @@ if (isProduction) {
   }
 }
 
+// ─── HTTP 连接/超时调优（CPU 优化：b 方案，零依赖）───
+// 作用：延长入站 keep-alive + 收紧请求/socket 超时 → 前端复用 TCP 连接、减少握手，
+// 快速回收半开/慢连接，降低 sys CPU。等效覆盖「a：连接复用」的精神（出站 fetch 因
+// Node22 内置 undici 已默认 keepAlive，且容器内缺 undici 包无法改 per-host 上限，故不出包）。
+// 注意：headersTimeout 必须 > keepAliveTimeout（Node 硬性约束），否则启动报错。
+server.keepAliveTimeout = 30000;        // 入站连接 keep-alive 30s（默认 5s），前端/代理复用连接
+server.headersTimeout = 35000;          // 必须 > keepAliveTimeout
+server.requestTimeout = 60000;          // 单个请求处理上限 60s，超时即断，防慢请求占连接
+server.timeout = 65000;                 // socket 空闲超时 65s
+server.maxHeadersCount = 200;           // 放宽头部上限，避免大 headers 请求被拒
+
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 服务: http://localhost:${PORT} | 📁 ${DATA_DIR} | 🐘 PG:connected(强制·唯一数据源) | 🔴 Redis:${isRedisUp() ? 'up' : 'memory-fallback(仅缓存)'}`);
-  orderExpiry.start(); // 启动订单超时调度器（启动即扫一次）
+  if (IS_LEADER) orderExpiry.start(); // 调度器仅 leader worker 跑（避免多实例重复扫 DB）
 });
 
 // ─── 优雅关闭（SIGTERM/SIGINT）──
@@ -4323,3 +4406,4 @@ function gracefulShutdown(sig) {
 }
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+} // end if (cluster.isWorker || !CLUSTER_ENABLED)

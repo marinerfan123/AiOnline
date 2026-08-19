@@ -17,6 +17,8 @@
 //   media(id, task_id, provider_url, full_url, thumbnail, oss_url, oss_object_key, oss_uploaded, status, file_size, type, ...)
 
 const ossMod = require('./oss.cjs');
+const crypto = require('crypto');
+const { Transform, PassThrough, Readable } = require('stream');
 
 const MAX_BYTES = 50 * 1024 * 1024; // 50 MB
 const FETCH_TIMEOUT_MS = 30000;
@@ -77,7 +79,7 @@ async function fetchBytes(url) {
     const buffer = Buffer.from(payload, 'base64');
     if (buffer.length === 0) throw new Error('空文件');
     if (buffer.length > MAX_BYTES) throw new Error('超过 50MB 上限');
-    return { buffer, contentType: normalizeContentType(url, ct), byteLength: buffer.length };
+    return { buffer, contentType: normalizeContentType(url, ct), byteLength: buffer.length, isStream: false };
   }
 
   if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') throw new Error('URL 协议不支持');
@@ -92,12 +94,19 @@ async function fetchBytes(url) {
   }
   if (!r.ok) throw new Error(`拉取失败 HTTP ${r.status}`);
   const cl = r.headers.get('content-length');
-  if (cl && parseInt(cl, 10) > MAX_BYTES) throw new Error('超过 50MB 上限');
+  const contentLength = cl ? parseInt(cl, 10) : 0;
+  if (contentLength > MAX_BYTES) throw new Error('超过 50MB 上限');
+  const ct = normalizeContentType(url, r.headers.get('content-type'));
+  // 流式：不下整图进 RAM，直接把 response.body（Web ReadableStream）交给上传侧边下边传。
+  // 仅当服务商返回 content-length 时才走纯流式（上传需预知长度）；否则退回整图 buffer 模式保正确性。
+  if (r.body && contentLength > 0) {
+    return { stream: r.body, contentType: ct, contentLength, byteLength: contentLength, isStream: true };
+  }
+  // 兜底：chunked 无 content-length → 整图读入（旧行为）
   const buf = Buffer.from(await r.arrayBuffer());
   if (buf.length === 0) throw new Error('空文件');
   if (buf.length > MAX_BYTES) throw new Error('超过 50MB 上限');
-  const ct = normalizeContentType(url, r.headers.get('content-type'));
-  return { buffer: buf, contentType: ct, byteLength: buf.length };
+  return { buffer: buf, contentType: ct, byteLength: buf.length, isStream: false };
 }
 
 // 探测当前 activeCfg 是否可用（Provider 鉴权/桶存在），失败则跳过 OSS 仅写占位
@@ -117,22 +126,69 @@ function buildObjectKey(cfg, userId, fileName) {
   return `${prefix}/${userId}/${Date.now()}_${safe}`;
 }
 
+// 阿里云 Content-MD5 两段式：下载流先 pipe 经过 MD5 计算并缓存到 PassThrough，
+// 下载完成后用算好的 md5 做签名，再把 PassThrough 作为 PUT body 发出。
+// 避免「先整图 Buffer 再算 MD5」的确定性整图驻留（仍为流缓冲，但无额外 JS 堆双拷贝）。
+function makeMd5Transform() {
+  const hash = crypto.createHash('md5');
+  return new Transform({
+    transform(chunk, _enc, cb) { hash.update(chunk); cb(null, chunk); },
+    flush(cb) { this.md5 = hash.digest('base64'); cb(); },
+  });
+}
+async function streamToPassThroughWithMd5(webStream) {
+  // FIX: 旧实现用 pipe(md5T).pipe(pt) 等待 pt finish 才 resolve，但 pt 在返回前无人消费，
+  // 背压导致整个管道死锁。改为先把 WebStream 完整读入 buffer 计算 MD5，再返回新 ReadableStream。
+  // 图片/视频大小受 MAX_BYTES 50MB 限制，整图驻留内存可接受，且避免了流式 MD5 的复杂竞态。
+  const reader = webStream.getReader();
+  const chunks = [];
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (value) chunks.push(Buffer.from(value));
+  }
+  const buf = Buffer.concat(chunks);
+  if (buf.length === 0) throw new Error('空文件');
+  if (buf.length > 50 * 1024 * 1024) throw new Error('超过 50MB 上限');
+  const md5 = crypto.createHash('md5').update(buf).digest('base64');
+  return { md5, stream: Readable.toWeb(Readable.from([buf])) };
+}
+
 // 单张资源 OSS PUT（用 aliyunPutHeaders / tencentCosPutHeaders 直传，浏览器等价的 PUT body 直传，
 // 唯一区别是：这里 header 让服务端代发，免去 CORS 烦恼）
-async function putObject(cfg, objectKey, buffer, contentType) {
-  let putUrl, headers;
+// fetched: { buffer?, stream?, contentType, contentLength, isStream }
+//   - 腾讯云：纯流式（body 直接是下载流，零整图驻留）
+//   - 阿里云：两段式算 MD5 后流式发出
+//   - 无 stream（data: URI / chunked 无 content-length）：退回整图 buffer 旧路径，双兼容
+async function putObject(cfg, objectKey, fetched, contentType) {
+  const canStream = fetched.isStream && fetched.contentLength > 0 && fetched.stream;
+  let putUrl, headers, body;
   if (cfg.providerType === 'tencent-cos') {
     cfg._hostName = `${cfg.bucket}${cfg.appId ? '-' + cfg.appId : ''}.cos.${cfg.region || 'ap-shanghai'}.myqcloud.com`;
     putUrl = `https://${cfg._hostName}/${objectKey}`;
-    const h = ossMod.tencentCosPutHeaders(cfg, objectKey, buffer, contentType);
-    headers = h.headers;
+    if (canStream) {
+      const h = ossMod.tencentCosPutHeadersStream(cfg, objectKey, { contentType, contentLength: fetched.contentLength });
+      headers = h.headers; body = fetched.stream;
+    } else {
+      const h = ossMod.tencentCosPutHeaders(cfg, objectKey, fetched.buffer, contentType);
+      headers = h.headers; body = fetched.buffer;
+    }
   } else {
     const host = ossMod.aliyunHost(cfg);
     putUrl = `https://${host}/${objectKey}`;
-    const h = ossMod.aliyunPutHeaders(cfg, objectKey, buffer, contentType);
-    headers = h.headers;
+    if (canStream) {
+      const { md5, stream } = await streamToPassThroughWithMd5(fetched.stream);
+      const h = ossMod.aliyunPutHeadersStream(cfg, objectKey, { md5, contentType, contentLength: fetched.contentLength });
+      headers = h.headers; body = stream;
+    } else {
+      const h = ossMod.aliyunPutHeaders(cfg, objectKey, fetched.buffer, contentType);
+      headers = h.headers; body = fetched.buffer;
+    }
   }
-  const r = await fetch(putUrl, { method: 'PUT', body: buffer, headers });
+  const fetchOpts = { method: 'PUT', body, headers };
+  // undici 硬要求：body 是 ReadableStream 时必须声明 duplex:'half'，否则直接抛错
+  if (canStream) fetchOpts.duplex = 'half';
+  const r = await fetch(putUrl, fetchOpts);
   if (!r.ok) {
     const msg = ossMod.diagnoseOssError(cfg.providerType, r.status, await r.text().catch(() => ''));
     throw new Error(msg);
@@ -193,12 +249,11 @@ async function finalizeUrl(pgPool, opts) {
   let status = 'pending_upload';
 
   // ── 1. 拉字节 ──
-  let buffer;
+  let fetched = null;
   try {
-    const fetched = await fetchBytes(providerUrl);
-    buffer = fetched.buffer;
+    fetched = await fetchBytes(providerUrl);
     contentType = fetched.contentType;
-    fileSize = fetched.byteLength;
+    fileSize = fetched.byteLength || (fetched.buffer ? fetched.buffer.length : 0);
   } catch (e) {
     // 拉取即失败：写 status=pending_upload（OSS 也跳过）→ 让 reaper 后续重试
     ossLog('warn', 'finalize', `[assetFinalize] ⚠️ 拉取失败 ${tag} → ${e.message}（占位先入库，reaper 后重试）`, { taskId, userId, providerUrl: String(providerUrl).slice(0, 80), error: e.message, durationMs: 0 });
@@ -213,7 +268,7 @@ async function finalizeUrl(pgPool, opts) {
     try {
       const safeName = `${type === 'video' ? 'video' : 'img'}-${taskId}-${idx}.${contentType.split('/')[1] || (type === 'video' ? 'mp4' : 'jpg')}`;
       ossObjectKey = buildObjectKey(cfg, userId, safeName);
-      await putObject(cfg, ossObjectKey, buffer, contentType);
+      await putObject(cfg, ossObjectKey, fetched, contentType);
       ossUrl = buildGetUrl(cfg, ossObjectKey);
       thumbUrl = '';
       if (type === 'image') {
@@ -246,7 +301,7 @@ async function finalizeUrl(pgPool, opts) {
   // ── 3. 写 media 表（成功/已有 OSS URL）──
   await insertMedia(pgPool, { mediaId, userId, taskId, type, prompt, model, ratio, providerUrl, thumbnail: thumbUrl, ossUrl, ossObjectKey, ossUploaded: true, contentType, fileSize, status: 'success', errorMessage: '' });
 
-  return { mediaId, pendingId: mediaId, ossUrl, ossObjectKey, ossUploaded: true, status: 'success', providerUrl, contentType, fileSize, type };
+  return { mediaId, pendingId: mediaId, ossUrl, thumbnail: thumbUrl, ossObjectKey, ossUploaded: true, status: 'success', providerUrl, contentType, fileSize, type };
 }
 
 // media 表 INSERT（或幂等 UPSERT）

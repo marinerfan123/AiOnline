@@ -193,6 +193,16 @@ async function initDB() {
       console.warn('[PG] api_keys 回填跳过（非致命）:', e.message);
     }
 
+    // 兼容已部署库：models 一行对应一个「模型×服务商」组合，加 (model_id, provider_id) 唯一约束防止完全重复行复活。
+    // 包 try/catch：若历史库尚有完全重复行（应先清理），仅告警不阻断启动（PG 铁律：initDB 失败=exit，故此处必须容错）。
+    try {
+      await client.query(
+        `CREATE UNIQUE INDEX IF NOT EXISTS ix_models_model_provider ON models(model_id, provider_id);`
+      );
+    } catch (e) {
+      console.warn('[PG] 建 ix_models_model_provider 跳过（存在完全重复行，请先清理 models 表）：', e.message);
+    }
+
     console.log('[PG] 数据库表初始化完成');
   } finally {
     client.release();
