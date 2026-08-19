@@ -35,6 +35,10 @@ export default function SystemSettingsPage() {
   const [loadedLimit, setLoadedLimit] = useState<number>(30);
   const [loadedWindow, setLoadedWindow] = useState<number>(60);
 
+  // 全局生成并发数（maxThreads）：调度器同时进行的生成任务上限
+  const [maxThreads, setMaxThreads] = useState<number>(10);
+  const [loadedThreads, setLoadedThreads] = useState<number>(10);
+
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -53,6 +57,10 @@ export default function SystemSettingsPage() {
           setGenWindow(safeWindow);
           setLoadedLimit(safeLimit);
           setLoadedWindow(safeWindow);
+          const mt = Number(s.maxThreads);
+          const safeThreads = Number.isInteger(mt) && mt >= 1 && mt <= 1000 ? mt : 10;
+          setMaxThreads(safeThreads);
+          setLoadedThreads(safeThreads);
         }
       } catch {
         // 读不到配置不阻断，回退默认 manual
@@ -65,7 +73,8 @@ export default function SystemSettingsPage() {
 
   const dirty = sortMode !== loaded
     || genLimit !== loadedLimit
-    || genWindow !== loadedWindow;
+    || genWindow !== loadedWindow
+    || maxThreads !== loadedThreads;
 
   const handleSave = useCallback(async () => {
     setSaving(true);
@@ -75,17 +84,19 @@ export default function SystemSettingsPage() {
         ...cur,
         workspaceModelSort: sortMode,
         genRateLimit: { limit: genLimit, windowSec: genWindow },
+        maxThreads,
       });
       setLoaded(sortMode);
       setLoadedLimit(genLimit);
       setLoadedWindow(genWindow);
+      setLoadedThreads(maxThreads);
       toast.success('已保存系统设置');
     } catch (e) {
       toast.error('保存失败：' + (e instanceof Error ? e.message : String(e)));
     } finally {
       setSaving(false);
     }
-  }, [sortMode, genLimit, genWindow]);
+  }, [sortMode, genLimit, genWindow, maxThreads]);
 
   return (
     <div className="mx-auto max-w-3xl px-6 py-8">
@@ -230,6 +241,36 @@ export default function SystemSettingsPage() {
         <div className="mt-3 rounded-lg border border-zinc-800/80 bg-zinc-950/40 px-3 py-2 text-[11px] text-zinc-500">
           等效规则：同一 IP 每 <span className="text-zinc-300">{genWindow}</span> 秒最多提交{' '}
           <span className="text-zinc-300">{genLimit}</span> 次生成。超过后返回「生成请求过于频繁」，需等待窗口重置。
+        </div>
+      </section>
+
+      {/* 全局生成并发数（maxThreads） */}
+      <section className="mt-6 rounded-2xl border border-zinc-800 bg-zinc-900/40 p-5">
+        <div className="mb-1 flex items-center gap-2">
+          <Gauge className="h-4 w-4 text-emerald-400" />
+          <h2 className="text-sm font-medium text-zinc-100">全局生成并发数</h2>
+        </div>
+        <p className="mb-4 text-xs text-zinc-500">
+          控制调度器同时进行的生成任务数量上限。数值越大吞吐越高；供应商侧的每密钥/每账号限流会自动兜底，放宽此处不会被上游冲垮。修改后立即生效，无需重启。
+        </p>
+        <div>
+          <label className="mb-1.5 flex items-center gap-1.5 text-xs font-medium text-zinc-300">
+            <Gauge className="h-3.5 w-3.5 text-zinc-500" />
+            最大并发任务数（maxThreads）
+          </label>
+          <input
+            type="number"
+            min={1}
+            max={1000}
+            value={maxThreads}
+            disabled={loading}
+            onChange={(e) => {
+              const v = Math.max(1, Math.min(1000, Math.floor(Number(e.target.value) || 1)));
+              setMaxThreads(v);
+            }}
+            className="w-full rounded-lg border border-zinc-800 bg-zinc-950/60 px-3 py-2 text-sm text-zinc-100 outline-none focus:border-emerald-500/60"
+          />
+          <p className="mt-1 text-[11px] text-zinc-600">取值范围 1 – 1000，默认 10。当前生效值会预填于此。</p>
         </div>
       </section>
     </div>

@@ -17,6 +17,7 @@ import {
   Grid3X3,
   Download,
   AlertCircle,
+  CheckSquare,
 } from 'lucide-react';
 import { toast } from 'sonner';
 import MediaCard from '@/components/MediaCard';
@@ -194,6 +195,23 @@ export default function LibraryPage() {
       const next = new Set(prev);
       if (next.has(id)) next.delete(id);
       else next.add(id);
+      return next;
+    });
+  };
+
+  // 当前筛选结果是否已被全部选中（用于全选按钮的「全选/取消全选」切换）
+  const allFilteredSelected =
+    filtered.length > 0 && filtered.every((m) => selectedIds.has(m.id));
+
+  // 全选 / 取消全选：仅作用于当前可见的筛选结果
+  const toggleSelectAll = () => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (allFilteredSelected) {
+        filtered.forEach((m) => next.delete(m.id));
+      } else {
+        filtered.forEach((m) => next.add(m.id));
+      }
       return next;
     });
   };
@@ -432,6 +450,19 @@ export default function LibraryPage() {
               <LayoutList className="size-4" />
               <span>{batchMode ? '取消批量' : '批量选择'}</span>
             </button>
+            {batchMode && (
+              <button
+                onClick={toggleSelectAll}
+                className={`flex items-center gap-1.5 rounded-full px-3 py-2 text-sm transition-all duration-300 ${
+                  allFilteredSelected
+                    ? 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/30'
+                    : 'bg-zinc-900 text-white border border-zinc-800 hover:border-zinc-700'
+                }`}
+              >
+                <CheckSquare className="size-4" />
+                <span>{allFilteredSelected ? '取消全选' : '全选'}</span>
+              </button>
+            )}
             {/* 显示生成失败项 */}
             <button
               onClick={() => setShowFailed((v) => !v)}
@@ -648,6 +679,19 @@ export default function LibraryPage() {
             <LayoutList className="size-4" />
             <span>{batchMode ? '取消批量' : '批量选择'}</span>
           </button>
+          {batchMode && (
+            <button
+              onClick={toggleSelectAll}
+              className={`flex items-center gap-1.5 rounded-full px-3 py-2 text-sm transition-all duration-300 ${
+                allFilteredSelected
+                  ? 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/30'
+                  : 'bg-zinc-900 text-white border border-zinc-800 hover:border-zinc-700'
+              }`}
+            >
+              <CheckSquare className="size-4" />
+              <span>{allFilteredSelected ? '取消全选' : '全选'}</span>
+            </button>
+          )}
           {/* 显示生成失败项：默认隐藏避免裂图占位，勾上后可查看 + 重新生成 */}
           <button
             onClick={() => setShowFailed((v) => !v)}
