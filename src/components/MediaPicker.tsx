@@ -132,11 +132,11 @@ export default function MediaPicker({
     try {
       const [media, c] = await Promise.all([apiGetMedia(), apiGetMediaCounts()]);
       const items = Array.isArray(media) ? (media as IMediaItem[]) : [];
-      setList(items.filter((m) => !m.isDeleted && !m.is_deleted));
+      setList(items.filter((m) => !m.isDeleted));
       setCounts(c);
       // 默认选中第一项
       if (items.length > 0 && !selectedId) {
-        const first = items.find((m) => !m.isDeleted && !m.is_deleted);
+        const first = items.find((m) => !m.isDeleted);
         if (first) setSelectedId(first.id);
       }
     } catch (e: any) {
@@ -282,7 +282,7 @@ export default function MediaPicker({
     if (!files || files.length === 0) return;
     setUploading(true);
     try {
-      const newItems: Partial<IMediaItem>[] = [];
+      const newItems: IMediaItem[] = [];
       const ossOk = ossConfig.enabled;
       for (const file of Array.from(files)) {
         // 本地预览（仅当前会话，不落库 base64）

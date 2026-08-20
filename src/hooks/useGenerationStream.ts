@@ -51,7 +51,7 @@ export type TaskUpdate = {
 let es: EventSource | null = null;
 let esDisabled = false; // SSE 彻底不可用（浏览器不支持 / 反复失败）时禁用，避免无谓重试
 const listeners = new Map<string, Set<(u: TaskUpdate) => void>>();
-const fallbacks = new Map<string, ReturnType<typeof setInterval>>();
+const fallbacks = new Map<string, number>();
 
 function ensureConnection(): void {
   if (es || esDisabled || typeof window === 'undefined' || typeof EventSource === 'undefined') return;
@@ -115,8 +115,8 @@ export function waitForTask(taskId: string, opts?: { timeoutMs?: number }): Prom
     const fb = window.setInterval(async () => {
       try {
         const st = await apiGetGenerationStatus(taskId);
-        last = st as TaskUpdate;
-        if (st.status === 'done' || st.status === 'failed' || st.status === 'canceled' || st.status === 'not_found') settle(st as TaskUpdate);
+        last = st as unknown as TaskUpdate;
+        if (st.status === 'done' || st.status === 'failed' || st.status === 'canceled' || st.status === 'not_found') settle(st as unknown as TaskUpdate);
       } catch {
         /* 忽略单次查询异常，下一轮再试 */
       }

@@ -46,8 +46,8 @@ export default function RechargeModal({ open, onClose }: { open: boolean; onClos
 
   // 拉取后台实际启用的支付方式，按配置显隐微信/支付宝
   useEffect(() => {
-    apiGetPaymentMethods().then((items) => {
-      const available = items.length ? items : ['wxpay', 'alipay'];
+    apiGetPaymentMethods().then((res) => {
+      const available = res.items.length ? res.items : ['wxpay', 'alipay'];
       setMethods(available);
       setChannel((prev) => (available.includes(prev) ? prev : available[0] || 'wxpay'));
     }).catch(() => {});

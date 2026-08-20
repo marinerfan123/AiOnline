@@ -48,6 +48,8 @@ describe('data/settings.ts', () => {
         ratio: '1:1',
         model: 'Nano Banana Pro',
         count: 2,
+        resolution: '2k',
+        quality: 'standard',
       };
       assert.strictEqual(settings.contentType, 'image');
       assert.strictEqual(settings.ratio, '1:1');
@@ -62,6 +64,8 @@ describe('data/settings.ts', () => {
         model: 'Sora',
         count: 1,
         duration: 8,
+        resolution: '2k',
+        quality: 'standard',
       };
       assert.strictEqual(settings.duration, 8);
     });
@@ -73,6 +77,8 @@ describe('data/settings.ts', () => {
         model: 'Kling',
         count: 1,
         videoMode: 'i2v_first',
+        resolution: '2k',
+        quality: 'standard',
       };
       assert.strictEqual(settings.videoMode, 'i2v_first');
     });

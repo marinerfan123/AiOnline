@@ -69,7 +69,7 @@ const QUALITY_OPTIONS: { key: Quality; label: string }[] = [
 
 // 视频分辨率档位（后台开关开启才显示）
 const VIDEO_RESOLUTIONS: ('1k' | '2k' | '3k' | '4k')[] = ['1k', '2k', '3k', '4k'];
-const DEFAULT_DURATIONS: number[] = [4, 6, 8, 10];
+const DEFAULT_DURATIONS: (4 | 6 | 8 | 10)[] = [4, 6, 8, 10];
 
 /**
  * 解析「有效参数模板」：优先用模型后台配置 paramTemplate，缺失时按 type 派生兜底，
@@ -370,7 +370,7 @@ function GenerationBar({
 
   // ── 重试 / 配方 / 变体 imperative handle ──
   // 全部走 ref（而非 useEffect 依赖 state），避免父级回调身份变化导致 effect 重跑取消定时器。
-  const handleGenerateRef = useRef<(overrides?: { referenceImages?: string[] }) => Promise<void>>(async () => {});
+  const handleGenerateRef = useRef<(overrides?: { referenceImages?: string[]; attributedStyle?: ReferenceStyle | null }) => Promise<void>>(async () => {});
   // 把会被 imperative 方法用到的「最新值 / 回调」放进 ref，确保调用时拿到当前渲染的最新版本
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
@@ -628,7 +628,7 @@ function GenerationBar({
       // 直接编排：预填 prompt + model + ratio，延时后触发生成。
       // 不依赖 useEffect，避免父级回调身份变化导致定时器被取消。
       onPromptChangeRef.current(payload.prompt);
-      onSettingsChangeRef.current({ ...settingsRef.current, model: payload.model, ratio: payload.ratio });
+      onSettingsChangeRef.current({ ...settingsRef.current, model: payload.model, ratio: payload.ratio as Ratio });
       setTimeout(() => {
         handleGenerateRef.current();
       }, 120);
@@ -707,7 +707,7 @@ function GenerationBar({
     // 分辨率
     if (settings.contentType === 'image') {
       const imgRes = tpl.resolutions || [];
-      if (imgRes.length && !imgRes.includes(settings.resolution)) {
+      if (imgRes.length && !imgRes.includes(settings.resolution as Resolution)) {
         patch.resolution = (tpl.defaults?.resolution || imgRes[0] || '1k') as Resolution;
       }
     } else {
@@ -773,9 +773,11 @@ function GenerationBar({
   const modelsLoaded = models.length > 0;
   const currentModelLabel = getEffectiveModelName(currentModel) || (modelsLoaded ? settings.model : '加载中...') || '无';
   // 模型是否支持赠送余额（缺省视为支持）
-  const modelSupportsReward = (m?: IAiModel | null) => (m ? m.supportsRewardBalance !== false : false);
+  // 双池价格：参数用 Pick 型（IAiModel 与聚合后的 GroupedModel 都满足）
+  type RewardModel = Pick<IAiModel, 'supportsRewardBalance' | 'rewardCreditsRequired' | 'creditCost'>;
+  const modelSupportsReward = (m?: RewardModel | null) => (m ? m.supportsRewardBalance !== false : false);
   // 模型赠送价（支持赠送时所需赠送积分；缺省回退充值价）
-  const modelRewardPrice = (m?: IAiModel | null) =>
+  const modelRewardPrice = (m?: RewardModel | null) =>
     m && typeof m.rewardCreditsRequired === 'number' && m.rewardCreditsRequired > 0
       ? m.rewardCreditsRequired
       : (typeof m?.creditCost === 'number' ? m.creditCost : 0);
@@ -835,7 +837,7 @@ function GenerationBar({
     if (trimmed.length !== referenceImages.length) onSetReferenceImages?.(trimmed);
     let nextRatio: Ratio;
     if (mode === 't2v') {
-      nextRatio = (template.ratios && template.ratios.includes(settings.ratio) ? settings.ratio : (template.ratios?.[0] || '16:9'));
+      nextRatio = (template.ratios && template.ratios.includes(settings.ratio) ? settings.ratio : (template.ratios?.[0] || '16:9') as Ratio);
     } else if (mode === 'i2v_first' || mode === 'i2v_first_last') {
       nextRatio = 'adaptive'; // 图生视频：输出保持首帧宽高比，仅支持 adaptive
     } else {
@@ -914,7 +916,7 @@ function GenerationBar({
     const load = async () => {
       try {
         const s = await apiGetQueueStatus();
-        if (alive) setQueueStatus(s || { waitingAreaSize: 0, allResourcesDown: false, threshold: 10, triggered: false });
+        if (alive) setQueueStatus(s || { waitingAreaSize: 0, memberWaiting: 0, allResourcesDown: false, threshold: 10, triggered: false });
       } catch { /* 静默：队列状态拉取失败不打扰用户 */ }
     };
     load();
@@ -1730,7 +1732,7 @@ function GenerationBar({
                                     : 'text-zinc-400 hover:bg-zinc-800/50 hover:text-white'
                                 }`}
                               >
-                                {d === -1 ? '智能' : `${d}s`}
+                                {(d as number) === -1 ? '智能' : `${d}s`}
                               </button>
                             ))}
                           </div>
@@ -2190,7 +2192,7 @@ function GenerationBar({
             </button>
             <button
               type="button"
-              onClick={handleGenerate}
+              onClick={() => handleGenerate()}
               disabled={!promptText.trim()}
               className="relative z-10 flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-emerald-500 text-black shadow-lg shadow-emerald-500/20 hover:bg-emerald-400 active:scale-95 disabled:cursor-not-allowed disabled:opacity-40 pointer-events-auto transition-all duration-200"
               title="生成（提交后立即释放，可连续提交）"

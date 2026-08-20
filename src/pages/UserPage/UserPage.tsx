@@ -4,6 +4,7 @@ import { ImageOff, ArrowLeft, Loader2 } from 'lucide-react';
 import { apiGetUser, apiGetUserMedia } from '@/services/api';
 import { useAuth } from '@/services/authStore';
 import ImageViewer from '@/components/ImageViewer';
+import type { IMediaItem } from '@/data/media';
 
 interface PubUser { id: string; displayName: string; createdAt: string; }
 interface PubMedia { id: string; title: string; thumbnail: string; fullUrl: string; type: string; category: string; }
@@ -17,6 +18,25 @@ export default function UserPage() {
   const [notFound, setNotFound] = useState(false);
   const [viewerOpen, setViewerOpen] = useState(false);
   const [viewerIndex, setViewerIndex] = useState(0);
+
+  const viewerItems = useMemo<IMediaItem[]>(
+    () =>
+      media.map((m) => ({
+        id: m.id,
+        title: m.title,
+        fullUrl: m.fullUrl,
+        thumbnail: m.thumbnail,
+        type: (m.type === 'video' ? 'video' : 'image') as 'image' | 'video',
+        model: '',
+        ratio: '',
+        createdAt: '',
+        prompt: '',
+        isFavorite: false,
+        isDeleted: false,
+        source: 'user' as const,
+      })),
+    [media],
+  );
 
   useEffect(() => {
     if (!id) return;
@@ -58,21 +78,6 @@ export default function UserPage() {
   }
 
   const isSelf = user?.id === profile.id;
-
-  const viewerItems = useMemo(
-    () =>
-      media.map((m) => ({
-        id: m.id,
-        title: m.title,
-        fullUrl: m.fullUrl,
-        thumbnail: m.thumbnail,
-        type: (m.type === 'video' ? 'video' : 'image') as 'image' | 'video',
-        model: '',
-        ratio: '',
-        createdAt: '',
-      })),
-    [media],
-  );
 
   return (
     <div className="h-full overflow-y-auto">

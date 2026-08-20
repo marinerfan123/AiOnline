@@ -210,6 +210,7 @@ export default function WorkspacePage() {
         generationBarRef.current?.generate({
           prompt: character.description,
           model: character.baseModel || settings.model,
+          ratio: settings.ratio,
           referenceImages: character.referenceImages || [],
           auto: true,
         });

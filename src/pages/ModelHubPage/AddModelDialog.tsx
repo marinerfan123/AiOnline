@@ -19,6 +19,7 @@ interface FetchedItem {
   id: string;
   modelId: string;
   displayName: string;
+  mappingName?: string;
   type: ModelType;
   selected: boolean;
   supportedResolutions: Resolution[];

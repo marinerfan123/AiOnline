@@ -50,6 +50,8 @@ export interface IModelParamTemplate {
   supportsNegative?: boolean;
   /** 是否支持参考图（图生图 / 视频首帧） */
   supportsReference?: boolean;
+  /** 参考图最大张数（图生图 / 视频首帧；缺省按 type 派生） */
+  maxReferenceImages?: number;
   /** 规则说明（展示给用户的可选规则） */
   rules?: IModelParamRule[];
   /** 默认参数（切换模型时回填，避免无效选择） */
@@ -215,6 +217,8 @@ export interface IAiModel {
   /** 手动排序权重：数值越小越靠前；同级按 createdAt 升序兜底。
    *  后台编辑面板「调度」区可改；前端展示顺序由后端 ORDER BY sort_order, created_at 决定。 */
   sortOrder?: number;
+  /** 单模型最大同时生成数（调度器均衡分配用；缺省继承服务商 maxConcurrent） */
+  maxConcurrent?: number;
 }
 
 /**

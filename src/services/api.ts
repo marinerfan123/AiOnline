@@ -156,7 +156,7 @@ export async function apiDeleteModel(id: string) {
   try { await apiFetch(`/api/models/${id}`, { method: 'DELETE' }); } catch {}
 }
 /** 单模型局部更新（管理员）：传任意可编辑字段子集，后端 PATCH 仅更新传入列 + 乐观锁 */
-export async function apiPatchModel(id: string, patch: Record<string, any>) {
+export async function apiPatchModel(id: string, patch: Record<string, any>): Promise<{ ok: boolean; revision?: number | null; error?: string }> {
   try { return await apiFetch(`/api/models/${id}`, { method: 'PATCH', body: JSON.stringify(patch) }); } catch (e) { return { ok: false, error: (e instanceof Error ? e.message : String(e)).slice(0, 300) }; }
 }
 
@@ -298,7 +298,7 @@ export async function apiActivateOssSlot(id: string): Promise<any> {
  */
 export async function apiTestOssSlot(id: string): Promise<{ success: boolean; message: string; status?: number }> {
   try {
-    const r = await apiFetch(`/api/oss/configs/${encodeURIComponent(id)}/test`, { method: 'POST' });
+    const r = await apiFetch<{ success: boolean; message: string; status?: number }>(`/api/oss/configs/${encodeURIComponent(id)}/test`, { method: 'POST' });
     return r || { success: false, message: '无响应' };
   } catch (e) {
     return { success: false, message: (e instanceof Error ? e.message : String(e)).slice(0, 100) };
@@ -729,7 +729,7 @@ export async function apiTranslatePrompt(
 }
 
 // ─── 同步服务商模型列表（后端代理，避免前端持有真实 Key）───
-export async function apiSyncProviderModels(id: string): Promise<{ success: boolean; models?: Array<{ id: string; name: string }>; message?: string }> {
+export async function apiSyncProviderModels(id: string): Promise<{ success: boolean; models?: Array<{ id?: string; name?: string; model?: string; display_name?: string; displayName?: string; [k: string]: any }>; message?: string }> {
   try {
     return await apiFetch(`/api/providers/${id}/sync`, { method: 'POST' });
   } catch (e) {
@@ -854,6 +854,8 @@ export interface RechargeOrder {
   failReason?: string | null;
   bonus?: number;
   packageId?: string | null;
+  /** 支付跳转链接（下单成功后前端跳转 / 展示二维码用） */
+  payUrl?: string;
 }
 /** 创建充值订单（真实支付通道；无通道由后端返回 503，无模拟回退） */
 export async function apiCreateRechargeOrder(params: { amount: number; channel: string; packageId?: string | null }): Promise<{ ok: boolean; order?: RechargeOrder; error?: string }> {
@@ -1076,7 +1078,7 @@ export interface MeTx {
 }
 export async function apiMeTransactions(params: { limit?: number; offset?: number } = {}): Promise<{ items: MeTx[]; total: number }> {
   const qs = new URLSearchParams();
-  Object.entries(params).forEach(([k, v]) => { if (v !== undefined && v !== null && v !== '') qs.set(k, String(v)); });
+  Object.entries(params).forEach(([k, v]) => { if (v !== undefined && v !== null) qs.set(k, String(v)); });
   try { return await apiFetch(`/api/me/transactions?${qs.toString()}`); } catch { return { items: [], total: 0 }; }
 }
 export interface MeRecharge {
@@ -1088,7 +1090,7 @@ export async function apiMeRecharges(): Promise<{ items: MeRecharge[] }> {
 
 // ─── 公开充值套餐（充值弹窗预览，无需登录）───
 export interface TopupPackage {
-  id: string; name: string; credits: number; price: number; bonus: number; sortOrder: number; remark: string;
+  id: string; name: string; credits: number; price: number; bonus: number; sortOrder: number; remark: string; enabled?: boolean;
 }
 export async function apiPublicTopupPackages(): Promise<{ items: TopupPackage[] }> {
   try { return await apiFetch('/api/finance/topup-packages'); } catch { return { items: [] }; }

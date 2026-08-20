@@ -138,7 +138,7 @@ export default function ModelProtocolDrawer({
         toast.success(`测试完成：HTTP ${r.status}`);
         return;
       }
-      const r = await apiTestProviderEndpoint(selectedProvider.id, ep as Record<string, unknown>, {
+      const r = await apiTestProviderEndpoint(selectedProvider.id, ep as unknown as Record<string, unknown>, {
         prompt: testInput,
         model: 'test',
         size: '1024x1024',

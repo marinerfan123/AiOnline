@@ -17,7 +17,7 @@ export interface IMediaItem {
   ossUrl?: string; // OSS 访问链接
   ossObjectKey?: string; // OSS 对象路径
   ossUploaded?: boolean; // 是否已上传到 OSS
-  status?: 'success' | 'failed' | 'pending' | 'canceled'; // 媒体状态：成功 / 失败 / 生成中 / 已取消（默认 success 兼容历史数据；取消卡片即时移除，cancelled 仅作类型完备）
+  status?: 'success' | 'failed' | 'pending' | 'pending_upload' | 'canceled'; // 媒体状态：成功 / 失败 / 生成中 / 已取消（默认 success 兼容历史数据；取消卡片即时移除，cancelled 仅作类型完备）
   errorMessage?: string; // 失败原因（仅 failed 时有值）
   failedAt?: string; // 失败时间（ISO）
   progress?: number; // 生成中进度 0-100（保留字段；当前 UI 不再显示虚假百分比，改为不确定扫光 + 真实已等待时间）

@@ -24,7 +24,7 @@ export default function EcommerceAdminPage() {
           { key: 'coupons', label: '优惠券' },
         ]}
         active={tab}
-        onChange={setTab}
+        onChange={(key) => setTab(key as 'shops' | 'products' | 'orders' | 'coupons')}
       />
 
       {tab === 'shops' && (

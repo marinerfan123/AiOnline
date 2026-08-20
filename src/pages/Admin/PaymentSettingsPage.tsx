@@ -130,17 +130,18 @@ function GlobalSettings({ settings, onSaved }: { settings: PaymentSettings | nul
 }
 
 // ───────────────── 服务商管理 ─────────────────
+function defaultMethods(type: string) {
+  if (type === 'alipay') return ['alipay'];
+  if (type === 'wxpay') return ['wxpay'];
+  if (type === 'stripe') return ['card'];
+  return ['alipay', 'wxpay'];
+}
+
 function ProvidersPanel({ providers, onChanged }: { providers: PaymentProvider[]; onChanged: () => void }) {
   const [showForm, setShowForm] = useState(false);
   const [editing, setEditing] = useState<PaymentProvider | null>(null);
   const [form, setForm] = useState<Partial<PaymentProvider> & { pid?: string; pkey?: string; webhookSecret?: string }>({});
 
-  function defaultMethods(type: string) {
-    if (type === 'alipay') return ['alipay'];
-    if (type === 'wxpay') return ['wxpay'];
-    if (type === 'stripe') return ['card'];
-    return ['alipay', 'wxpay'];
-  }
   function openNew() {
     setEditing(null);
     setForm({ name: '', type: 'easypay', enabled: true, weight: 1, sortOrder: providers.length, apiBase: '', productNamePrefix: '充值', allowRefund: false, supportedMethods: ['alipay', 'wxpay'], remark: '', pid: '', pkey: '', webhookSecret: '' });

@@ -41,7 +41,7 @@ const STATUS_STYLE = (s: number) => {
   return 'text-zinc-400 bg-zinc-500/15 ring-zinc-500/30';
 };
 
-const METHOD_STYLE: Record<string, string> = {
+const METHOD_STYLE: { [k: string]: string } = {
   GET: 'text-sky-300 bg-sky-500/10',
   POST: 'text-emerald-300 bg-emerald-500/10',
   PUT: 'text-amber-300 bg-amber-500/10',

@@ -101,6 +101,7 @@ export function PageHeader({
 export function SectionCard({
   title,
   hint,
+  subtitle,
   icon,
   actions,
   children,
@@ -109,6 +110,7 @@ export function SectionCard({
 }: {
   title?: string;
   hint?: string;
+  subtitle?: ReactNode;
   icon?: ReactNode;
   actions?: ReactNode;
   children?: ReactNode;
@@ -128,6 +130,7 @@ export function SectionCard({
             {icon && <span className="text-emerald-400">{icon}</span>}
             {title && <h2 className="text-sm font-semibold text-white">{title}</h2>}
             {hint && <span className="text-xs text-zinc-500">{hint}</span>}
+            {subtitle && <span className="text-xs text-zinc-400">{subtitle}</span>}
           </div>
           {actions}
         </div>
@@ -176,12 +179,14 @@ export function StatCard({
   unit,
   delta,
   icon,
+  subtitle,
 }: {
   label: string;
   value: string | number;
   unit?: string;
   delta?: { text: string; up?: boolean };
   icon?: ReactNode;
+  subtitle?: ReactNode;
 }) {
   return (
     <div className="rounded-2xl border border-zinc-800 bg-zinc-900/60 p-4">
@@ -193,6 +198,7 @@ export function StatCard({
         <span className="text-2xl font-semibold tabular-nums text-white">{value}</span>
         {unit && <span className="text-xs text-zinc-500">{unit}</span>}
       </div>
+      {subtitle && <div className="mt-1 text-xs text-zinc-400">{subtitle}</div>}
       {delta && (
         <div
           className={cn(

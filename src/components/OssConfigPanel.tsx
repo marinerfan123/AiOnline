@@ -364,6 +364,7 @@ function OssLogPanel() {
     setAutoStick(stick);
   }
 
+  type OssLogFilter = 'success' | 'info' | 'warn' | 'error';
   const FILTERS: { v: OssLogFilter | 'all'; label: string; dot: string }[] = [
     { v: 'all',     label: '全部', dot: 'bg-zinc-400' },
     { v: 'success', label: '成功', dot: 'bg-emerald-400' },

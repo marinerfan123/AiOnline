@@ -166,7 +166,7 @@ export default function EndpointsTab({ providers, setProviders, setModels, model
         toast.success(`测试完成：HTTP ${r.status}`);
         return;
       }
-      const r = await apiTestProviderEndpoint(selectedProvider.id, ep as Record<string, unknown>, { prompt: testInput, model: 'test', size: '1024x1024', n: 1, ratio: '1:1', resolution: '1k', task_id: '' });
+      const r = await apiTestProviderEndpoint(selectedProvider.id, ep as unknown as Record<string, unknown>, { prompt: testInput, model: 'test', size: '1024x1024', n: 1, ratio: '1:1', resolution: '1k', task_id: '' });
       if (!r.success) { setTestOutput(`[错误]\n${r.message}`); toast.error(`测试失败：${(r.message || '').slice(0, 100)}`); return; }
       const out = typeof r.body === 'string' ? r.body : JSON.stringify(r.body, null, 2);
       setTestOutput(`[${proto}]\nHTTP ${r.status}\n${out.slice(0, 2000)}`);

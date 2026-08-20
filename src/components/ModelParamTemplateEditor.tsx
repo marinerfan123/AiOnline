@@ -65,7 +65,7 @@ export function ModelParamTemplateEditor({ modelType, value, onChange }: ModelPa
 
   const set = (patch: Partial<IModelParamTemplate>) => onChange({ ...value, ...patch });
 
-  const parseRules = (text: string): IModelParamTemplate['rules'] => {
+  const parseRules = (text: string): void => {
     setRulesText(text);
     const rules = text
       .split('\n')

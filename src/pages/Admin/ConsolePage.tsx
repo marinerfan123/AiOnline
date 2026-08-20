@@ -109,7 +109,7 @@ export default function ConsolePage() {
           { key: 'alerts', label: '告警中心' },
         ]}
         active={tab}
-        onChange={setTab}
+        onChange={(key) => setTab(key as 'overview' | 'logs' | 'alerts')}
       />
 
       {tab === 'overview' && (

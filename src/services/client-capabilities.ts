@@ -11,4 +11,12 @@ export const capabilityClient = {
     console.log('[capability] check', capability, '→ true');
     return true;
   },
+  /** 旧飞书能力已下线：统一抛错走前端 catch 的「能力暂不可用」兜底 */
+  load(capability: string) {
+    return {
+      async call(_action: string, _payload?: unknown): Promise<never> {
+        throw new Error(`能力未接入：${capability}（飞书 SDK 已下线，走服务端 /api/agent/optimize-prompt）`);
+      },
+    };
+  },
 };

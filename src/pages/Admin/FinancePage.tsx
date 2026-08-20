@@ -15,7 +15,7 @@ import { formatCredits } from '@/utils/format';
 
 type Pkg = {
   id: string; name: string; credits: number; price: number; bonus: number;
-  sortOrder: number; enabled: boolean; remark: string;
+  sortOrder: number; enabled?: boolean; remark: string;
 };
 
 export default function FinancePage() {

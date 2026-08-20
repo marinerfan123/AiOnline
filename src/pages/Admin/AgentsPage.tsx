@@ -113,7 +113,7 @@ export default function AgentsPage() {
           { key: 'rules', label: '自动化规则', icon: <GitBranch className="size-4" /> },
         ]}
         active={tab}
-        onChange={setTab}
+        onChange={(key) => setTab(key as 'rules' | 'providers' | 'agents' | 'dashboard')}
       />
 
       {tab === 'dashboard' && (
