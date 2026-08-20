@@ -18,7 +18,7 @@ test('关闭时不写数据库', async () => {
 
 test('开启时映射旧任务为V2影子批次且不影响旧taskId', async () => {
   const calls = [];
-  const pg = { async query(sql, params = []) { calls.push({ sql, params }); if (/SELECT batch_id/.test(sql)) return { rows: [] }; return { rows: [] }; } };
+  const pg = { async query(sql, params = []) { calls.push({ sql, params }); if (/SELECT batch_id/.test(sql)) return { rows: [] }; if (/INSERT INTO generation_batches_v2/.test(sql)) return { rows:[{batch_id:'shadow-gt-1'}], rowCount:1 }; return { rows: [], rowCount:1 }; } };
   const result = await writeShadowBatch(pg, {
     taskId: 'gt-1', userId: 'u1', idempotencyKey: 'idem-1', modelId: 'm1',
     contentType: 'image', count: 2, unitPrice: 50, pool: 'reward', requestPayload: { prompt: 'x' },

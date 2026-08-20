@@ -73,6 +73,26 @@ test('createBatchWithItems 对Pool使用同一client完成事务并release', asy
   assert.match(client.calls.at(-1).sql, /COMMIT/);
 });
 
+test('normalizeMoney严格拒绝非法金额并转换为万分之一整数', () => {
+  const { normalizeMoney } = require('./intake.cjs');
+  assert.equal(normalizeMoney('50'), 500000);
+  assert.equal(normalizeMoney('0.1234'), 1234);
+  assert.throws(() => normalizeMoney('bad'), /unitPrice/);
+  assert.throws(() => normalizeMoney(Infinity), /unitPrice/);
+  assert.throws(() => normalizeMoney(-1), /unitPrice/);
+  assert.throws(() => normalizeMoney('0.00001'), /4 decimal/);
+});
+
+test('createBatchWithItems 使用ON CONFLICT处理并发首次幂等', async () => {
+  const pg = makeFakePg();
+  await createBatchWithItems(pg, {
+    batchId:'gb-race',userId:'u1',idempotencyKey:'idem-race',modelId:'m1',contentType:'image',count:2,unitPrice:'50.0000',pool:'reward',
+  });
+  const insert = pg.calls.find(c => /INSERT INTO generation_batches_v2/.test(c.sql));
+  assert.match(insert.sql, /ON CONFLICT \(user_id,idempotency_key\) DO NOTHING/i);
+  assert.match(insert.sql, /RETURNING batch_id/i);
+});
+
 test('createBatchWithItems 中途失败会ROLLBACK', async () => {
   const pg = makeFakePg();
   const original = pg.query.bind(pg);
