@@ -163,6 +163,8 @@ export interface IModelProvider {
   bucketMax?: number | null;
   /** 整账号冷却时长（毫秒）；默认 60000 */
   cooldownMs?: number;
+  /** 后端附带的多密钥池摘要（真实 key 已遮蔽）；存在多把 active key 时限额按池聚合 */
+  apiKeys?: Array<string | { id: string; status?: string; label?: string; masked?: string; failures?: number; lastUsedAt?: string | null }>;
   /** 乐观锁版本号（后端维护，PATCH 时必须回传当前值） */
   revision?: number;
   /** 最后更新时间（后端维护） */

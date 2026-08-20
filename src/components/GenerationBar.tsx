@@ -851,7 +851,10 @@ function GenerationBar({
 
   // 当前模型所属服务商对「当前分辨率档」配置的每分钟上限（用于 UI 提示 + 错误兜底）
   const currentProvider = currentModel ? providers.find((p) => p.id === currentModel.providerId) : undefined;
-  const currentRateLimit = currentProvider ? (() => {
+  // 多 key 服务商的 rateLimits 是 legacy 单-key/共享桶配置，执行层已按 key 池聚合并跳过该旧桶；
+  // 不能拿它兜底成“整个模型 X 张/分钟”，否则 Agnes 返回未声明额度的 429 时会误报 4 张/分钟。
+  const providerKeyCount = currentProvider?.apiKeys?.filter((k) => typeof k === 'string' || (k.status || 'active') === 'active').length || 0;
+  const currentRateLimit = currentProvider && providerKeyCount <= 1 ? (() => {
     const rl = (currentProvider.rateLimits || {}) as any;
     const res = settings.contentType === 'video' ? 'video' : (settings.resolution || '1k');
     if (rl && typeof rl === 'object' && rl.bucket_units_per_min != null && rl.ops) {
