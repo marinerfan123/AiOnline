@@ -54,6 +54,8 @@ services:
       REDIS_HOST: redis
       REDIS_PORT: 6379
       REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      # Generation V2 影子双写：仅镜像任务结构，不执行V2 worker；按taskId稳定采样。
+      GENERATION_V2_SHADOW_PERCENT: ${GENERATION_V2_SHADOW_PERCENT:-0}
       JWT_SECRET: ${JWT_SECRET:-change-me-to-a-long-random-string}
     ports:
       - "3001:3001"
