@@ -62,7 +62,7 @@ const DEFAULT_RPM = { '1k': 20, '2k': 10, '4k': 1, '8k': 1 };        // 仅旧�
 const DEFAULT_COOLDOWN_MS = 60000;                     // 整账号冷却默认 60s（可调）
 const ACCOUNT_CONC_CAP = 4;                            // 单账号并发硬上限（与 provider.max_concurrent 取小）
 const MAX_RETRY = 3;                                   // 单任务「全部账号不可用」时的最多重试（无感切换）
-const KEY_ROTATE_MAX = 4;                              // 多 key 池 429 时池内换 key 重试上限（解锁聚合吞吐，同时防止系统性限流时狂打 N 次计费调用）
+const KEY_ROTATE_MAX = 1;                              // 429 后最多换 1 把 key；避免突发流量下 3轮×5key 的重试风暴放大上游压力
 const KEY_429_COOLDOWN_MS = 60000;                     // 单把 key 收到 429 后的冷却（匹配上游 1 请求/分钟，避免立即重选打爆）
 
 // ─── 多 Key 池（同一供应商多把 API Key，各自独立参与生成分配）───
@@ -1870,16 +1870,21 @@ async function runWaitingPump(pgPool) {
       }
       // 会员优先出队：priority 降序（会员先抢恢复的资源），同优先级按入队时间升序（FIFO）。
       due.sort((a, b) => (b.item.priority - a.item.priority) || (a.item.enqueueAt - b.item.enqueueAt));
-      for (const { taskId, item, reason } of due) {
-        if (WAITING_AREA.get(taskId) !== item) continue; // 已被其它分支移除
-        // 已取消任务：跳过重试并立即出队（cancelTask 已释放积分，此处不再触碰计费）
-        if (cancelledTasks.has(taskId)) { cancelledTasks.delete(taskId); WAITING_AREA.delete(taskId); continue; }
+      // 受控并发补位：每个等待任务最多 count=4 张；按 GLOBAL_MAX/4 计算并发任务数，最多12任务≈48张在途。
+      // 旧版逐个 await generate() 导致首波后退化为“一批4张慢慢出”，且全局50槽长期空闲。
+      const pumpConcurrency = Math.max(1, Math.min(12, Math.floor(GLOBAL_MAX / 4)));
+      for (let offset = 0; offset < due.length; offset += pumpConcurrency) {
+        const batch = due.slice(offset, offset + pumpConcurrency);
+        await Promise.all(batch.map(async ({ taskId, item, reason }) => {
+          if (WAITING_AREA.get(taskId) !== item) return; // 已被其它分支移除
+          // 已取消任务：跳过重试并立即出队（cancelTask 已释放积分，此处不再触碰计费）
+        if (cancelledTasks.has(taskId)) { cancelledTasks.delete(taskId); WAITING_AREA.delete(taskId); return; }
         const opts = item.opts;
         if (reason === 'timeout') {
           // 超时只标 waiting 保留待复核：绝不判失败、绝不释放积分（成败只能听生成端回复）。
           await updateTaskStatus(pgPool, taskId, 'waiting', null, '等待区超过安全线仍无可用资源，任务保留待复核（资源恢复后可重试）', opts.user_id);
           WAITING_AREA.delete(taskId);
-          continue;
+          return;
         }
         if (reason === 'maxretry') {
           // 已经成功结算或进入上传队列的任务，绝不能被滞后的等待区副本反向判 failed/release。
@@ -1908,7 +1913,7 @@ async function runWaitingPump(pgPool) {
           if (completionInFlight) {
             console.log(`[waiting] 任务 ${taskId} 已结算或已入上传队列，忽略滞后 maxretry`);
             WAITING_AREA.delete(taskId);
-            continue;
+            return;
           }
           // 全局重试上限：确实没有成功/上传证据时才关闭并释放积分。
           await billing.releaseCredits(pgPool, opts.user_id, opts.cost, opts.idempotencyKey, opts.costPool).catch(() => {});
@@ -1917,10 +1922,28 @@ async function runWaitingPump(pgPool) {
           realtime.emitTaskUpdate(opts.user_id, { taskId, status: 'failed', error: msg });
           console.log(`[waiting] 任务 ${taskId} 重试超 ${WAITING_MAX_RETRY} 次无果，已自动关闭并释放积分 userId=${opts.user_id || ''}`);
           WAITING_AREA.delete(taskId);
-          continue;
+          return;
         }
         item.lastAttempt = now;
         item.attempts += 1;
+        // 重试前终态保护：已有 commit / upload job / done 说明另一条并发路径已经成功，
+        // 当前 WAITING_AREA 项是滞后副本，必须出队，绝不能再次 generate 造成重复上游任务和重复上传。
+        try {
+          const settled = await pgPool.query(
+            `SELECT EXISTS(SELECT 1 FROM generation_tasks t WHERE t.task_id=$1 AND t.status='done')
+                 OR EXISTS(SELECT 1 FROM generation_tasks t JOIN credit_transactions c ON c.ref=t.idempotency_key AND c.kind='commit' WHERE t.task_id=$1)
+                 OR EXISTS(SELECT 1 FROM asset_upload_jobs u WHERE u.task_id=$1) AS protected`,
+            [taskId],
+          );
+          if (settled.rows[0] && settled.rows[0].protected) {
+            WAITING_AREA.delete(taskId);
+            return;
+          }
+        } catch (e) {
+          // 无法核实终态时安全优先：本轮不发新的上游请求，保留到下轮再核实。
+          console.warn('[waiting] retry 终态保护查询失败，跳过本轮:', taskId, e.message);
+          return;
+        }
         // 重试次数/入队时间必须持久化；否则服务重启后 attempts 重置为 0，旧任务会反复获得 10 次额度而长期 running。
         await persistWaitingOpts(pgPool, taskId, opts, item);
         const result = await generate(pgPool, opts);
@@ -1950,6 +1973,7 @@ async function runWaitingPump(pgPool) {
           await updateTaskStatus(pgPool, taskId, 'failed', result, (result && result.error) || '生成失败', opts.user_id);
           WAITING_AREA.delete(taskId);
         }
+        }));
       }
       if (WAITING_AREA.size === 0) break;
       await sleep(1500);

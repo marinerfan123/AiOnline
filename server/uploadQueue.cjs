@@ -68,7 +68,11 @@ async function enqueueFinalize(pgPool, job) {
   };
   await pgPool.query(
     `INSERT INTO asset_upload_jobs (task_id, user_id, state, payload)
-     VALUES ($1, $2, 'queued', $3)`,
+     SELECT $1, $2, 'queued', $3
+      WHERE NOT EXISTS (
+        SELECT 1 FROM asset_upload_jobs
+         WHERE task_id=$1 AND state IN ('queued','processing','done')
+      )`,
     [job.ctx.taskId, job.ctx.userId || null, JSON.stringify(payload)],
   );
 }
