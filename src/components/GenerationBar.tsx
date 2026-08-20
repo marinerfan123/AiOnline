@@ -943,9 +943,9 @@ function GenerationBar({
     message?: string;
   } => {
     if (!user) return { ok: false, reason: 'NO_LOGIN', title: '请先登录', message: '登录后即可使用赠送/充值积分生成作品。' };
-    const cost = typeof currentModel?.creditCost === 'number' ? currentModel.creditCost : 0;
+    const cost = (typeof currentModel?.creditCost === 'number' ? currentModel.creditCost : 0) * batchCount;
     const supportsReward = modelSupportsReward(currentModel);
-    const rewardRequired = modelRewardPrice(currentModel);
+    const rewardRequired = modelRewardPrice(currentModel) * batchCount;
     const reward = user.rewardCredits || 0;
     const recharge = user.rechargeCredits || 0;
     // 价格为 0 的模型直接放行（免费/未定价模型），避免弹窗出现"需 0"的荒谬文案

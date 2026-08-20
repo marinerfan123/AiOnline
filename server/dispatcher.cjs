@@ -1882,7 +1882,35 @@ async function runWaitingPump(pgPool) {
           continue;
         }
         if (reason === 'maxretry') {
-          // 全局重试上限：重试达到上限仍无可用资源 → 直接关闭（判失败 + 释放积分），避免无限保活。
+          // 已经成功结算或进入上传队列的任务，绝不能被滞后的等待区副本反向判 failed/release。
+          // 这会发生在恢复/重复入队竞态：生成成功已 commit+enqueue，旧 WAITING_AREA 项稍后又达到重试上限。
+          let completionInFlight = false;
+          try {
+            const settled = await pgPool.query(
+              `SELECT EXISTS(
+                 SELECT 1 FROM generation_tasks t
+                  WHERE t.task_id=$1 AND t.status='done'
+               ) OR EXISTS(
+                 SELECT 1 FROM generation_tasks t
+                 JOIN credit_transactions c ON c.ref=t.idempotency_key AND c.kind='commit'
+                  WHERE t.task_id=$1
+               ) OR EXISTS(
+                 SELECT 1 FROM asset_upload_jobs u WHERE u.task_id=$1
+               ) AS protected`,
+              [taskId],
+            );
+            completionInFlight = !!(settled.rows[0] && settled.rows[0].protected);
+          } catch (e) {
+            // 状态无法核实时安全优先：保留任务，不能误退款/误判失败。
+            console.warn('[waiting] maxretry 终态保护查询失败，保留任务:', taskId, e.message);
+            completionInFlight = true;
+          }
+          if (completionInFlight) {
+            console.log(`[waiting] 任务 ${taskId} 已结算或已入上传队列，忽略滞后 maxretry`);
+            WAITING_AREA.delete(taskId);
+            continue;
+          }
+          // 全局重试上限：确实没有成功/上传证据时才关闭并释放积分。
           await billing.releaseCredits(pgPool, opts.user_id, opts.cost, opts.idempotencyKey, opts.costPool).catch(() => {});
           const msg = `等待区重试 ${WAITING_MAX_RETRY} 次仍无可用资源，任务已自动关闭`;
           await updateTaskStatus(pgPool, taskId, 'failed', null, msg, opts.user_id);

@@ -3025,8 +3025,14 @@ async function handleAPI(req, res) {
     // 成本解析（L5）：按 canonical model_id 查计费维度（充值价 + 是否支持奖励 + 奖励价），再解析实际扣费池
     // 价格走 accounting 双读链（model_pricing → history → models 回退），保证与价格页统一；奖励价也优先读 model_pricing。
     const priceInfo = await accounting.getModelPrice(pgPool, canonicalModel);
-    const creditCost = priceInfo.creditPrice;
-    const rewardRequired = priceInfo.rewardPrice;
+    const unitCreditCost = priceInfo.creditPrice;
+    const unitRewardRequired = priceInfo.rewardPrice;
+    // 图片按实际张数计费；视频固定 1。与 dispatcher 的 count 归一规则保持一致，防止 count=4 仍只扣单张价。
+    const billingCount = (body.contentType || 'image') === 'video'
+      ? 1
+      : Math.max(1, Math.min(4, Number(body.count) || 1));
+    const creditCost = unitCreditCost * billingCount;
+    const rewardRequired = unitRewardRequired * billingCount;
     const costRes = await pgPool.query(
       'SELECT supports_reward_balance FROM models WHERE model_id=$1 LIMIT 1', [canonicalModel]);
     const mrow = costRes.rows[0];
