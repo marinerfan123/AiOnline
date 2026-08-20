@@ -1,5 +1,5 @@
 'use strict';
-const lease=require('./lease.cjs');const ledger=require('./ledger.cjs');
+const lease=require('./lease.cjs');const ledger=require('./ledger.cjs');const uploadFinalize=require('./upload-finalize.cjs');
 
 async function claimGeneratedItems(pg,{workerId,limit=10,leaseSeconds=120}={}){
  if(!workerId)throw new TypeError('workerId is required');const l=Math.max(1,Math.min(100,Number(limit)||10)),s=Math.max(10,Math.min(900,Number(leaseSeconds)||120));
@@ -7,12 +7,12 @@ async function claimGeneratedItems(pg,{workerId,limit=10,leaseSeconds=120}={}){
 }
 function objectKeyFor(item){return `generation-v2/${item.batch_id}/${item.item_index}.png`}
 async function processUploadItem(pg,item,injected={}){
- const d={transitionItem:lease.transitionItem,settleHold:ledger.settleHold,reconcileBatch:ledger.reconcileBatch,uploadToOss:null,...injected};
+ const d={transitionItem:lease.transitionItem,settleHold:ledger.settleHold,reconcileBatch:ledger.reconcileBatch,finalizeUploadedItem:uploadFinalize.finalizeUploadedItem,uploadToOss:null,...injected};
  const base={itemId:item.item_id,leaseVersion:Number(item.lease_version)};
  if(!item.provider_url){const row=await d.transitionItem(pg,{...base,from:'uploading',to:'review_required',patch:{last_error_code:'PROVIDER_URL_MISSING',last_error:'providerUrl missing before upload',lease_expires_at:null}});return{status:row?'review_required':'stale_lease'}}
  const gate=await d.transitionItem(pg,{...base,from:'uploading',to:'uploading',patch:{lease_expires_at:new Date(Date.now()+120000)}});if(!gate)return{status:'stale_lease'};
  if(typeof d.uploadToOss!=='function')throw new TypeError('uploadToOss is required');
- try{const up=await d.uploadToOss({providerUrl:item.provider_url,objectKey:objectKeyFor(item),item});const row=await d.transitionItem(pg,{...base,from:'uploading',to:'done',patch:{oss_url:up.ossUrl,uploaded_at:new Date(),completed_at:new Date(),lease_expires_at:null}});if(!row)return{status:'stale_lease'};await d.settleHold(pg,{itemId:item.item_id,action:'commit'});if(item.batch_id)await d.reconcileBatch(pg,item.batch_id);return{status:'done',ossUrl:up.ossUrl};}
+ try{const up=await d.uploadToOss({providerUrl:item.provider_url,objectKey:objectKeyFor(item),item});let finalized;if(injected.finalizeUploadedItem){finalized=await d.finalizeUploadedItem(pg,{itemId:item.item_id,leaseVersion:Number(item.lease_version),ossUrl:up.ossUrl});}else if(typeof pg.connect==='function'){finalized=await d.finalizeUploadedItem(pg,{itemId:item.item_id,leaseVersion:Number(item.lease_version),ossUrl:up.ossUrl});}else{const row=await d.transitionItem(pg,{...base,from:'uploading',to:'done',patch:{oss_url:up.ossUrl,uploaded_at:new Date(),completed_at:new Date(),lease_expires_at:null}});if(!row)return{status:'stale_lease'};await d.settleHold(pg,{itemId:item.item_id,action:'commit'});finalized={changed:true};}if(!finalized.changed)return{status:'stale_lease'};if(item.batch_id)await d.reconcileBatch(pg,item.batch_id);return{status:'done',ossUrl:up.ossUrl};}
  catch(e){const row=await d.transitionItem(pg,{...base,from:'uploading',to:'generated',patch:{last_error_code:'UPLOAD_FAILED',last_error:e.message,lease_expires_at:null}});return{status:row?'generated':'stale_lease',error:e.message}}
 }
 async function runUploadTick(pg,opt={},injected={}){const d={claimGeneratedItems,...injected},workerId=opt.workerId;if(!workerId)throw new TypeError('workerId is required');const concurrency=Math.max(1,Math.min(20,Number(opt.concurrency)||4));const items=await d.claimGeneratedItems(pg,{workerId,limit:opt.limit||concurrency*2,leaseSeconds:opt.leaseSeconds||120});for(let x=0;x<items.length;x+=concurrency)await Promise.all(items.slice(x,x+concurrency).map(i=>processUploadItem(pg,i,d)));return{claimed:items.length}}
