@@ -56,6 +56,14 @@ test('transitionItem CAS未命中返回null', async () => {
   }), null);
 });
 
+test('transitionItem 拒绝非法状态边，包括终态回退', async () => {
+  const pg = fakePg();
+  await assert.rejects(() => transitionItem(pg, {
+    itemId: 'gi-1', leaseVersion: 1, from: 'done', to: 'queued', patch: {},
+  }), /illegal state transition/);
+  assert.equal(pg.calls.length, 0);
+});
+
 test('transitionItem 拒绝非法字段，防SQL列注入', async () => {
   const pg = fakePg();
   await assert.rejects(() => transitionItem(pg, {

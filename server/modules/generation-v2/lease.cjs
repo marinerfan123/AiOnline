@@ -1,4 +1,5 @@
 'use strict';
+const { isAllowedTransition } = require('./lease-guard.cjs');
 
 const PATCH_FIELDS = new Set([
   'provider_id', 'key_id', 'provider_request_id', 'provider_url', 'oss_url',
@@ -41,6 +42,7 @@ async function claimItems(pg, { workerId, limit = 10, leaseSeconds = 120 } = {})
 async function transitionItem(pg, { itemId, leaseVersion, from, to, patch = {} } = {}) {
   if (!itemId || !Number.isInteger(Number(leaseVersion))) throw new TypeError('itemId and leaseVersion are required');
   if (!STATES.has(from) || !STATES.has(to)) throw new TypeError('invalid state');
+  if (!isAllowedTransition(from, to)) throw new TypeError(`illegal state transition: ${from}->${to}`);
   const entries = Object.entries(patch || {});
   for (const [field] of entries) {
     if (!PATCH_FIELDS.has(field)) throw new TypeError(`invalid patch field: ${field}`);
