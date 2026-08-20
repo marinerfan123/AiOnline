@@ -14,6 +14,9 @@ let providersState: IModelProvider[] = [];
 let modelsState: IAiModel[] = [];
 const listeners = new Set<() => void>();
 let initialized = false;
+// 每次加载递增版本号：注册/登录后的强制刷新必须压过更早启动的匿名初始化，
+// 防止匿名请求较晚返回后把已登录用户的真实模型列表覆盖掉。
+let loadGeneration = 0;
 
 function notify() {
   listeners.forEach((l) => l());
@@ -22,11 +25,13 @@ function notify() {
 async function initData() {
   if (initialized) return;
   initialized = true;
+  const generation = ++loadGeneration;
 
   const ok = await ensureApi();
   if (ok) {
     try {
       const [apiP, apiM] = await Promise.all([apiGetProviders(), apiGetModels()]);
+      if (generation !== loadGeneration) return;
       // 后端为空时用 MOCK 初始化并写回后端，保证所有设备看到同一份数据
       providersState = apiP.length > 0 ? apiP : [...MOCK_PROVIDERS];
       modelsState = apiM.length > 0 ? apiM : [...MOCK_MODELS];
@@ -34,10 +39,12 @@ async function initData() {
       if (apiP.length === 0) { try { await reconcileProviders([], providersState); } catch {} }
       if (apiM.length === 0) { try { await reconcileModels([], modelsState); } catch {} }
     } catch {
+      if (generation !== loadGeneration) return;
       providersState = [...MOCK_PROVIDERS];
       modelsState = [...MOCK_MODELS];
     }
   } else {
+    if (generation !== loadGeneration) return;
     // 后端不可用：仅内存 MOCK，不落盘
     providersState = [...MOCK_PROVIDERS];
     modelsState = [...MOCK_MODELS];
@@ -47,6 +54,20 @@ async function initData() {
 
 // 模块加载时启动异步初始化
 initData();
+
+/**
+ * 登录/注册成功后强制重载真实模型数据。
+ * 匿名首屏的 /api/providers、/api/models 会因 401 得到空数组；不能让那次一次性初始化永久缓存空状态。
+ */
+export async function reloadModelHubAfterAuth(): Promise<void> {
+  const generation = ++loadGeneration;
+  const [apiP, apiM] = await Promise.all([apiGetProviders(), apiGetModels()]);
+  if (generation !== loadGeneration) return;
+  providersState = apiP;
+  modelsState = apiM;
+  initialized = true;
+  notify();
+}
 
 function subscribe(listener: () => void) {
   listeners.add(listener);

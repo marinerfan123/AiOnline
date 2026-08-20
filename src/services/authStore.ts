@@ -2,6 +2,7 @@
 // 会话为 httpOnly cookie（后端 set-cookie），fetch 已带 credentials:'include' 自动携带。
 import { useSyncExternalStore } from 'react';
 import { apiMe, apiLogin, apiRegister, apiLogout, type AuthUser } from './api';
+import { reloadModelHubAfterAuth } from '@/hooks/useModelHub';
 
 interface AuthState {
   user: AuthUser | null;
@@ -47,6 +48,7 @@ export async function login(email: string, password: string) {
   const r = await apiLogin(email, password);
   state = { ...state, user: r.user };
   emit();
+  await reloadModelHubAfterAuth();
   return r;
 }
 
@@ -54,6 +56,7 @@ export async function register(email: string, password: string, displayName?: st
   const r = await apiRegister(email, password, displayName);
   state = { ...state, user: r.user };
   emit();
+  await reloadModelHubAfterAuth();
   return r;
 }
 
