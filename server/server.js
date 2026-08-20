@@ -38,6 +38,7 @@ import pgLib from 'pg';
 const { Pool } = pgLib;
 let pgPool = null;
 import dispatcher from './dispatcher.cjs';
+import generationV2Shadow from './modules/generation-v2/shadow.cjs';
 // ModelHub V3 Phase 1 — 唯一模型身份 resolver（server.js 仅在此一处调用，不再散落处理 display_name）
 import modelHubResolver from './modules/modelhub/resolver.cjs';
 import modelHubBindings from './modules/modelhub/bindings.cjs';
@@ -3105,6 +3106,21 @@ async function handleAPI(req, res) {
         }
         return sendJSON(res, 200, { status: 'failed', error });
       }
+      // V2影子双写：默认关闭；开启后仅镜像任务结构，不执行V2 worker、不影响旧链路。
+      // 失败必须隔离，旧任务已经接单成功，不能因影子链路回滚或向用户报错。
+      await generationV2Shadow.writeShadowBatch(pgPool, {
+        taskId,
+        userId: realUser.id,
+        idempotencyKey: idemKey,
+        modelId: canonicalModel,
+        contentType: body.contentType || 'image',
+        count: billingCount,
+        unitPrice: pay.pool === 'reward' ? unitRewardRequired : unitCreditCost,
+        pool: pay.pool,
+        requestPayload: genOpts,
+      }).then((shadow) => {
+        if (shadow.enabled && !shadow.written) console.warn('[generation-v2] shadow write failed:', shadow.error);
+      }).catch((e) => console.warn('[generation-v2] shadow write exception:', e.message));
       return sendJSON(res, 200, { status: 'pending', taskId });
     } catch (e) {
       await billing.releaseCredits(pgPool, realUser.id, cost, idemKey, pay.pool).catch(() => {});
