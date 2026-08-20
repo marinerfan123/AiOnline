@@ -1,8 +1,10 @@
 'use strict';
 const { createBatchWithItems } = require('./intake.cjs');
+const { shouldShadowTask } = require('./canary.cjs');
 
-function isShadowEnabled(env = process.env) {
-  return String(env.GENERATION_V2_SHADOW_WRITE || '').toLowerCase() === 'true';
+function isShadowEnabled(env = process.env, taskId = '') {
+  if (String(env.GENERATION_V2_SHADOW_WRITE || '').toLowerCase() === 'true') return true;
+  return shouldShadowTask(taskId, env);
 }
 
 /**
@@ -10,7 +12,7 @@ function isShadowEnabled(env = process.env) {
  * 任何失败均隔离，旧生产链路继续按原行为运行。
  */
 async function writeShadowBatch(pg, input, env = process.env) {
-  if (!isShadowEnabled(env)) return { enabled: false, written: false };
+  if (!isShadowEnabled(env, input && input.taskId)) return { enabled: false, written: false };
   try {
     const batchId = `shadow-${input.taskId}`;
     const result = await createBatchWithItems(pg, {
