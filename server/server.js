@@ -2,6 +2,7 @@
 // 用法: node server.js
 import 'dotenv/config'; // Phase 0: 配置外置化（必须在读取 process.env 前加载）
 import http from 'http';
+import express from 'express'; // 框架化：HTTP 服务 + 中间件 + 路由由 Express 承载
 import fs from 'fs';
 import crypto from 'crypto';
 import path from 'path';
@@ -4196,31 +4197,54 @@ async function handleAPI(req, res) {
 }
 
 // ─── 启动 ────────────────────────────────────────
-const server = http.createServer(async (req, res) => {
-  // 全局请求监控：覆盖 API + 静态资产(/assets/*、/samples/*、SPA 前端路由)，
-  // 驱动后台「实时监控 · API 活动流」大屏。monitor 模块内部已过滤 /api/admin/monitor/* 自身防反馈。
+// ─── Express 应用（框架化：HTTP 服务 + 中间件 + 路由由 Express 承载；/api 分发暂保留 handleAPI，后续逐步迁为 Express 路由）───
+const app = express();
+
+// 全局请求监控：覆盖 API + 静态资产(/assets/*、/samples/*、SPA 前端路由)，
+// 驱动后台「实时监控 · API 活动流」大屏。monitor 模块内部已过滤 /api/admin/monitor/* 自身防反馈。
+app.use((req, res, next) => {
   const monitorT0 = Date.now();
   res.on('finish', () => {
     monitor.record(req.method, (req.url || '').split('?')[0], res.statusCode, Date.now() - monitorT0);
   });
+  next();
+});
 
+// CORS 预检
+app.use((req, res, next) => {
   if (req.method === 'OPTIONS') {
     res.writeHead(204, { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'Content-Type, Authorization', 'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS' });
     return res.end();
   }
-  if (req.url === '/api/token' && req.method === 'GET') return sendJSON(res, 200, { token: API_TOKEN });
-  if (req.url.startsWith('/api/')) {
-    const t0 = Date.now();
-    res.on('finish', () => {
-      traffic.record(req.method, (req.url || '').split('?')[0], res.statusCode, req.user, Date.now() - t0);
-    });
-    return handleAPI(req, res);
-  }
-  // 本地静态文件路由（/media/ 上传 & /samples/ 公共示例）必须早于 SPA fallback，否则会被 index.html 吞掉
+  next();
+});
+
+// API token（网关探针）
+app.get('/api/token', (req, res) => sendJSON(res, 200, { token: API_TOKEN }));
+
+// API 路由 → handleAPI（含流量采样）
+app.use((req, res, next) => {
+  if (!req.url.startsWith('/api/')) return next();
+  const t0 = Date.now();
+  res.on('finish', () => {
+    traffic.record(req.method, (req.url || '').split('?')[0], res.statusCode, req.user, Date.now() - t0);
+  });
+  return handleAPI(req, res);
+});
+
+// 本地静态文件路由（/media/ 上传 & /samples/ 公共示例）必须早于 SPA fallback，否则会被 index.html 吞掉
+app.use((req, res, next) => {
   if (req.url.startsWith('/media/') || req.url.startsWith('/samples/')) return serveLocalFiles(req, res);
+  next();
+});
+
+// SPA 静态回退
+app.use((req, res) => {
   if (fs.existsSync(CLIENT_DIR)) return serveStatic(req, res);
   sendJSON(res, 404, { error: 'Not Found' });
 });
+
+const server = http.createServer(app);
 
 // ─── Node cluster（多 worker 用满多核；#360 限流已迁 Redis，多实例/多 worker 安全）───
 // 仅当 ENABLE_CLUSTER !== 'false' 且为多核时启用；env WEB_CONCURRENCY 可指定 worker 数，默认 = CPU 核数。
