@@ -642,15 +642,17 @@ async function attemptOnAccount(p, tier, input, contentType, recorder) {
   const aggCap = Math.max(keyConcCap, keyConcCap * activeKeyCount); // 多 key → 容量线性扩展
   // ── 选 key：优先池内轮转；池为空（legacy）回退 providers.api_key；池存在但全不可用 → 本账号不可用 ──
   const selKey = poolExists ? pickKey(p.provider.id, now, keyConcCap) : null;
+  // 原子占位：选 key 即同步占用其并发槽（不等下方 await），否则并行子任务会在 await 窗口内选到同一把 key。
+  // agnes 等「1 图/key/5min」限流服务商，同一 key 并发多发只会 429，批量生成退化为串行出图——这是根治点。
+  if (selKey) { selKey.conc += 1; selKey.lastUsedAt = now; }
   const multiKey = poolExists && pool.size > 1;
   const effectiveApiKey = selKey ? selKey.apiKey : (poolExists ? '' : (p.provider.api_key || ''));
-  if (!effectiveApiKey) return null;                          // 无任何可用 key
+  if (!effectiveApiKey) { if (selKey) selKey.conc -= 1; return null; }                          // 无任何可用 key
   // 跨进程权威闸：全局并发 + per-provider 并发 + (单 key 路径)RPM 令牌桶；任一不满足返回 null（上层切下一个）
   const rl = await acquireRateLimitSlots(p, cost, _multiKey, a, aggCap, now);
-  if (!rl) return null;
+  if (!rl) { if (selKey) selKey.conc -= 1; return null; }
   if (!_multiKey && a.capacityModel !== 'unlimited') a.bucket.tokens -= cost; // 本地展示/降级兜底（权威由 Redis 令牌桶）
-  a.conc += 1; GLOBAL_ACTIVE += 1;                            // 本地展示/降级兜底计数
-  if (selKey) { selKey.conc += 1; selKey.lastUsedAt = now; }
+  a.conc += 1; GLOBAL_ACTIVE += 1;                            // 本地展示/降级兜底计数（selKey 并发槽已在上方原子占用）
   const t0 = Date.now();                                       // 真正发起请求的时刻（仅此后记 attempt）
   // 向 recorder 记一次实际尝试（best-effort，绝不影响主链路）；success/timeout/failed/429/error 各分支各自调用
   const mark = async (status, extra) => {
