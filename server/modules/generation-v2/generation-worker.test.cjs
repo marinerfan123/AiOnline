@@ -10,6 +10,7 @@ function makeDeps(overrides = {}) {
     transitions, attempts,
     deps: {
       claimItems: async () => [],
+      withLeaseHeartbeat: async (_pg,_opt,_deps,operation) => operation(new AbortController().signal),
       transitionItem: async (_pg, args) => { transitions.push(args); return { item_id: args.itemId, status: args.to, lease_version: args.leaseVersion }; },
       providerGenerate: async () => ({ status: 'success', providerId: 'p1', keyId: 'k1', providerRequestId: 'up1', providerUrl: 'https://x/a.png' }),
       decideRetry: () => ({ status: 'retry_wait', nextAttemptAt: 1000, allowRelease: false }),

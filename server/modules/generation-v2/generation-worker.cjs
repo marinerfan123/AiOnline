@@ -1,6 +1,7 @@
 'use strict';
 const lease = require('./lease.cjs');
 const retryPolicy = require('./retry-policy.cjs');
+const { withLeaseHeartbeat } = require('./lease-heartbeat.cjs');
 
 async function defaultRecordAttempt(pg, row) {
   await pg.query(
@@ -18,6 +19,9 @@ async function processItem(pg, item, injected = {}) {
     decideRetry: retryPolicy.decideRetry,
     recordAttempt: defaultRecordAttempt,
     providerGenerate: null,
+    withLeaseHeartbeat,
+    workerId: injected.workerId || item.lease_owner,
+    leaseSeconds: injected.leaseSeconds || 120,
     ...injected,
   };
   if (typeof deps.providerGenerate !== 'function') throw new TypeError('providerGenerate is required');
@@ -28,7 +32,15 @@ async function processItem(pg, item, injected = {}) {
   const startedAt = Date.now();
   let result;
   try {
-    result = await deps.providerGenerate(item);
+    if (deps.workerId) {
+      result = await deps.withLeaseHeartbeat(pg, {
+        itemId:item.item_id, leaseVersion:Number(item.lease_version), workerId:deps.workerId,
+        leaseSeconds:deps.leaseSeconds, states:['generating'],
+      }, deps, (signal) => deps.providerGenerate(item, signal));
+    } else {
+      // 单元/纯函数调用兼容；生产 runWorkerTick 必须注入 workerId 并走 heartbeat。
+      result = await deps.providerGenerate(item);
+    }
   } catch (e) {
     result = { status:'error', errorCode:e.code||'EXCEPTION', errorMessage:e.message };
   }
@@ -70,8 +82,9 @@ async function runWorkerTick(pg, options = {}, injected = {}) {
   if (!workerId) throw new TypeError('workerId is required');
   const concurrency = Math.max(1,Math.min(50,Number(options.concurrency)||5));
   const items = await deps.claimItems(pg,{workerId,limit:options.limit||concurrency*2,leaseSeconds:options.leaseSeconds||120});
+  const runtimeDeps = { ...deps, workerId, leaseSeconds:options.leaseSeconds||120 };
   for (let offset=0;offset<items.length;offset+=concurrency) {
-    await Promise.all(items.slice(offset,offset+concurrency).map(item=>processItem(pg,item,deps)));
+    await Promise.all(items.slice(offset,offset+concurrency).map(item=>processItem(pg,item,runtimeDeps)));
   }
   return { claimed:items.length };
 }
