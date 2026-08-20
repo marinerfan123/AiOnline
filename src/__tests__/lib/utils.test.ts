@@ -1,7 +1,7 @@
 /**
  * 测试 lib/utils.ts - cn() 工具函数
  */
-import { describe, it } from 'node:test';
+import { describe, it } from 'vitest';
 import assert from 'node:assert/strict';
 
 // 直接测试 cn() 的基础能力，由于依赖 clsx 和 tailwind-merge，

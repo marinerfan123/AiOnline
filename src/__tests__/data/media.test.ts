@@ -1,7 +1,7 @@
 /**
  * 测试 data/media.ts - IMediaItem 接口和 Mock 数据
  */
-import { describe, it } from 'node:test';
+import { describe, it } from 'vitest';
 import assert from 'node:assert/strict';
 
 // 直接引入数据模块 (HANFU_PROMPT 是私有常量，不可导入)

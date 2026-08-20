@@ -26,4 +26,8 @@ export default defineConfig({
     copyPublicDir: false,
     sourcemap: true,
   },
+  test: {
+    include: ['src/**/*.test.{ts,tsx}'],
+    exclude: ['node_modules/**', 'refs/**', 'dist/**'],
+  },
 })

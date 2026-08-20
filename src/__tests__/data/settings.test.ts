@@ -1,7 +1,7 @@
 /**
  * 测试 data/settings.ts - IGenerationSettings 接口和默认值
  */
-import { describe, it } from 'node:test';
+import { describe, it } from 'vitest';
 import assert from 'node:assert/strict';
 
 import { DEFAULT_SETTINGS } from '../../data/settings.ts';

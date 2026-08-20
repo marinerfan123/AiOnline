@@ -1,7 +1,7 @@
 /**
  * 测试 data/characters.ts - ICharacter 接口和 Mock 数据
  */
-import { describe, it } from 'node:test';
+import { describe, it } from 'vitest';
 import assert from 'node:assert/strict';
 
 import { MOCK_CHARACTERS } from '../../data/characters.ts';

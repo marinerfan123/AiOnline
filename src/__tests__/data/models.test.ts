@@ -1,7 +1,7 @@
 /**
  * 测试 data/models.ts - 模型和服务商类型及工具函数
  */
-import { describe, it } from 'node:test';
+import { describe, it } from 'vitest';
 import assert from 'node:assert/strict';
 
 import {

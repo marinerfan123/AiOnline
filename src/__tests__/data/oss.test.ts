@@ -1,7 +1,7 @@
 /**
  * 测试 data/oss.ts - OSS 配置类型和默认配置
  */
-import { describe, it } from 'node:test';
+import { describe, it } from 'vitest';
 import assert from 'node:assert/strict';
 
 import { DEFAULT_OSS_CONFIG, DEFAULT_OSS_SLOT } from '../../data/oss.ts';
@@ -17,7 +17,6 @@ describe('data/oss.ts', () => {
       const fields = [
         'displayName',
         'endpointExternal',
-        'bucket',
         'region',
         'regionLabel',
       ] as const;
@@ -30,9 +29,10 @@ describe('data/oss.ts', () => {
       }
     });
 
-    it('should have empty access keys by default', () => {
+    it('should have empty access keys and bucket by default', () => {
       assert.strictEqual(DEFAULT_OSS_CONFIG.accessKeyId, '');
       assert.strictEqual(DEFAULT_OSS_CONFIG.accessKeySecret, '');
+      assert.strictEqual(DEFAULT_OSS_CONFIG.bucket, '');
     });
 
     it('should have pathPrefix "images/"', () => {
