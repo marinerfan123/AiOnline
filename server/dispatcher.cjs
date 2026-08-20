@@ -1298,7 +1298,7 @@ async function resumeWaitingArea(pgPool) {
       if (!opts || !opts.model) continue;
       const taskId = row.task_id;
       const runOpts = { ...opts, taskId, onSubmitted: (info) => persistProviderTaskId(pgPool, taskId, info) };
-      enqueueWaiting(taskId, opts);
+      enqueueWaiting(taskId, runOpts);
       resumed++;
     }
     if (resumed) {
@@ -1919,6 +1919,12 @@ async function runWaitingPump(pgPool) {
     }
   } finally {
     waitingPumpRunning = false;
+    // 防丢唤醒：旧泵判断队列为空准备退出的瞬间，可能有新任务 enqueue；
+    // 新任务调用 runWaitingPump 时因 waitingPumpRunning=true 直接返回，随后旧泵退出，任务将永久卡 running。
+    // finally 释放守卫后若队列又非空，必须立即重启泵。
+    if (WAITING_AREA.size > 0) {
+      queueMicrotask(() => runWaitingPump(pgPool).catch((e) => console.warn('[waiting] pump restart error:', e.message)));
+    }
   }
 }
 
