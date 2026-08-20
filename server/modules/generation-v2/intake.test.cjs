@@ -58,6 +58,21 @@ test('createBatchWithItems 命中幂等键时不再创建item或hold', async () 
   assert.match(pg.calls.at(-1).sql, /COMMIT/);
 });
 
+test('createBatchWithItems 对Pool使用同一client完成事务并release', async () => {
+  const client = makeFakePg();
+  let released = false;
+  const pool = {
+    async connect() { return { ...client, release() { released = true; } }; },
+  };
+  await createBatchWithItems(pool, {
+    batchId: 'gb-client', userId: 'u1', idempotencyKey: 'idem-client', modelId: 'm1',
+    contentType: 'image', count: 1, unitPrice: 50, pool: 'reward',
+  });
+  assert.equal(released, true);
+  assert.match(client.calls[0].sql, /BEGIN/);
+  assert.match(client.calls.at(-1).sql, /COMMIT/);
+});
+
 test('createBatchWithItems 中途失败会ROLLBACK', async () => {
   const pg = makeFakePg();
   const original = pg.query.bind(pg);
