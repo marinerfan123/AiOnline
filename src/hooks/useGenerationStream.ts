@@ -35,7 +35,7 @@ export type GenerationResultMeta = {
 };
 export type TaskUpdate = {
   taskId: string;
-  status: 'running' | 'waiting' | 'done' | 'failed' | 'cancelled' | 'not_found' | 'unknown';
+  status: 'running' | 'waiting' | 'done' | 'failed' | 'canceled' | 'not_found' | 'unknown';
   result?: { images?: GenerationResultImage[]; videoUrl?: string; videoMedia?: GenerationResultVideo | null } & GenerationResultMeta | null;
   error?: string;
   pendingIds?: string[];
@@ -108,7 +108,7 @@ export function waitForTask(taskId: string, opts?: { timeoutMs?: number }): Prom
     };
     const onUpdate = (u: TaskUpdate) => {
       last = u;
-      if (u.status === 'done' || u.status === 'failed' || u.status === 'cancelled' || u.status === 'not_found') settle(u);
+      if (u.status === 'done' || u.status === 'failed' || u.status === 'canceled' || u.status === 'not_found') settle(u);
     };
     if (!listeners.has(taskId)) listeners.set(taskId, new Set());
     listeners.get(taskId)!.add(onUpdate);
@@ -116,7 +116,7 @@ export function waitForTask(taskId: string, opts?: { timeoutMs?: number }): Prom
       try {
         const st = await apiGetGenerationStatus(taskId);
         last = st as TaskUpdate;
-        if (st.status === 'done' || st.status === 'failed' || st.status === 'cancelled' || st.status === 'not_found') settle(st as TaskUpdate);
+        if (st.status === 'done' || st.status === 'failed' || st.status === 'canceled' || st.status === 'not_found') settle(st as TaskUpdate);
       } catch {
         /* 忽略单次查询异常，下一轮再试 */
       }

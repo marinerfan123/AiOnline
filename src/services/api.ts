@@ -575,7 +575,7 @@ export async function apiGenerate(payload: {
 // 查询单个生成任务状态（用于前端轮询 / 刷新恢复）
 export async function apiGetGenerationStatus(taskId: string): Promise<{
   taskId: string;
-  status: 'running' | 'done' | 'failed' | 'not_found' | 'unknown';
+  status: 'running' | 'waiting' | 'done' | 'failed' | 'canceled' | 'not_found' | 'unknown';
   result?: { images?: string[]; source?: string; usedProviders?: string[] } | null;
   error?: string;
   pendingIds?: string[];

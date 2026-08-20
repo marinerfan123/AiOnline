@@ -572,7 +572,7 @@ function GenerationBar({
       removePersistedTask(taskId);
       return;
     }
-    if (final.status === 'cancelled') {
+    if (final.status === 'canceled') {
       // 用户主动取消：后端已释放 held 积分并标记 canceled。
       // 本标签页点取消按钮时卡片已被 WorkspacePage.handleCancel 即时移除；
       // 若取消来自其它标签页 / 后端 SSE 远端取消，此处兜底移除仍在的卡片，避免幽灵 pending 残留。
