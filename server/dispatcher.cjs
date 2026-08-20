@@ -779,7 +779,15 @@ function snapshotAcct(pair) {
   const model = (pair && pair.model) || {};
   const pid = provider.id || '';
   const modelConc = (model && typeof model.max_concurrent === 'number' && model.max_concurrent > 0) ? model.max_concurrent : null;
-  const concCap = Math.min(modelConc ?? (Number(provider.max_concurrent) || 2), ACCOUNT_CONC_CAP);
+  const perKeyCap = modelConc ?? (Number(provider.max_concurrent) || 2);
+  // 多 Key 池容量必须与 attemptOnAccount 的执行层一致：perKeyCap × active key 数。
+  // 旧逻辑固定 min(perKeyCap, ACCOUNT_CONC_CAP)，provider.max_concurrent=1 时路由预门控把整个
+  // 475-key 池误判为总并发 1，导致 count=4 的其余 3 张在到达 pickKey 前即被拒入等待区。
+  const pool = AKEYS[pid];
+  const activeKeyCount = pool
+    ? [...pool.values()].filter((ks) => ks.status === KEY_STATUS_ACTIVE).length
+    : 1;
+  const concCap = Math.max(perKeyCap, perKeyCap * Math.max(1, activeKeyCount));
   const a = ACCT[pid];
   if (!a) {
     return {
