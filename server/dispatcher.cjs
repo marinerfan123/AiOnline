@@ -1298,7 +1298,7 @@ async function resumeWaitingArea(pgPool) {
       if (!opts || !opts.model) continue;
       const taskId = row.task_id;
       const runOpts = { ...opts, taskId, onSubmitted: (info) => persistProviderTaskId(pgPool, taskId, info) };
-      enqueueWaiting(taskId, runOpts);
+      enqueueWaiting(taskId, runOpts, row.resume_meta && row.resume_meta.waitingState);
       resumed++;
     }
     if (resumed) {
@@ -1725,12 +1725,12 @@ function allResourcesDown() {
   return entries.every((s) => !!s.cold);
 }
 
-function enqueueWaiting(taskId, opts) {
+function enqueueWaiting(taskId, opts, persisted = null) {
   if (!WAITING_AREA.has(taskId)) {
     WAITING_AREA.set(taskId, {
-      enqueueAt: Date.now(),
-      lastAttempt: 0,
-      attempts: 0,
+      enqueueAt: Number(persisted?.enqueueAt) || Date.now(),
+      lastAttempt: Number(persisted?.lastAttempt) || 0,
+      attempts: Math.max(0, Number(persisted?.attempts) || 0),
       priority: planPriority(opts && opts.userPlan),
       opts,
     });
@@ -1741,7 +1741,7 @@ function waitingAreaSize() { return WAITING_AREA.size; }
 
 // 持久化等待任务的完整 opts 到 resume_meta，供重启/崩溃后 resumeWaitingArea 重建内存队列并续重试。
 // 过滤函数型/Promise 字段（不可序列化），其余原样存 jsonb。
-async function persistWaitingOpts(pgPool, taskId, opts) {
+async function persistWaitingOpts(pgPool, taskId, opts, state = null) {
   if (!pgPool || !taskId || !opts) return;
   try {
     const clean = {};
@@ -1754,7 +1754,14 @@ async function persistWaitingOpts(pgPool, taskId, opts) {
     }
     await pgPool.query(
       `UPDATE generation_tasks SET resume_meta = COALESCE(resume_meta, '{}'::jsonb) || $2::jsonb WHERE task_id=$1`,
-      [taskId, JSON.stringify({ waitingOpts: clean })],
+      [taskId, JSON.stringify({
+        waitingOpts: clean,
+        waitingState: state ? {
+          enqueueAt: Number(state.enqueueAt) || Date.now(),
+          lastAttempt: Number(state.lastAttempt) || 0,
+          attempts: Math.max(0, Number(state.attempts) || 0),
+        } : undefined,
+      })],
     );
   } catch (e) {
     console.warn('[waiting] 持久化 opts 失败:', e.message);
@@ -1886,6 +1893,8 @@ async function runWaitingPump(pgPool) {
         }
         item.lastAttempt = now;
         item.attempts += 1;
+        // 重试次数/入队时间必须持久化；否则服务重启后 attempts 重置为 0，旧任务会反复获得 10 次额度而长期 running。
+        await persistWaitingOpts(pgPool, taskId, opts, item);
         const result = await generate(pgPool, opts);
         const ok = result && result.status === 'success' && Array.isArray(result.images) && result.images.length;
         if (ok) {
