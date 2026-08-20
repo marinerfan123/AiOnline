@@ -22,7 +22,7 @@ import {
 import { toast } from 'sonner';
 import MediaCard from '@/components/MediaCard';
 import ImageViewer from '@/components/ImageViewer';
-import { IMediaItem, MOCK_MEDIA_LIST } from '@/data/media';
+import { IMediaItem } from '@/data/media';
 import { apiGetMedia, apiSaveMedia, apiUpdateMedia, apiDeleteMedia, apiProxyFetch, ensureApi, stripBlobItems } from '@/services/api';
 import { useOssConfig } from '@/hooks/useOssConfig';
 import { useLayoutOutlet } from '@/components/Layout';
@@ -120,24 +120,9 @@ export default function LibraryPage() {
       if (ok) {
         try { list = await apiGetMedia(); } catch { list = []; }
       }
-      const validItems = stripBlobItems(list); // 过滤 blob 临时项
-      // 空数据时把 MOCK 标 failed 后再用（避免本地 dev 显示破图）
-      // MOCK 数据的 thumbnail 是平台专有路径（/spark/app/...），本地永远 404
-      let finalList: IMediaItem[];
-      if (validItems.length > 0) {
-        finalList = validItems;
-      } else {
-        finalList = stripBlobItems(MOCK_MEDIA_LIST).map((m) => ({
-          ...m,
-          status: 'failed' as const,
-          errorMessage: '本地占位示例（首次访问的 mock 数据，链接在本地无效）',
-          failedAt: new Date().toISOString(),
-        }));
-        // 异步写后端，失败也不影响渲染
-        if (ok) {
-          try { apiSaveMedia(finalList); } catch {}
-        }
-      }
+      // 后端素材为空时保持真正的空库；不要重新注入本地 MOCK 占位。
+      // 用户删除全部素材后应看到空状态，而不是过一会儿又出现 6 个“生成失败”。
+      const finalList = stripBlobItems(list);
       if (cancelled) return;
       setMediaList(finalList);
     })();
