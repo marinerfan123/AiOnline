@@ -13,6 +13,7 @@ import {
   ChevronLeft,
 } from 'lucide-react';
 import { PageHeader, SectionCard, Placeholder, TabBar, PhaseBadge } from '@/components/skeleton';
+import InfiniteCanvas from '@/features/canvas/InfiniteCanvas';
 import { apiGetStudioProject, apiUpdateStudioProject } from '@/services/api';
 import { type IStudioProject, STAGE_LABEL, STATUS_LABEL, type StudioProjectStage } from '@/data/studio';
 import { toast } from 'sonner';
@@ -70,6 +71,34 @@ export default function StudioStagePage() {
     );
   }
 
+  if (stage === 'storyboard') {
+    return (
+      <div className="flex h-full flex-col">
+        <div className="flex items-center gap-3 border-b border-zinc-800 px-4 py-2">
+          <button
+            onClick={() => navigate('/studio')}
+            className="flex items-center gap-1.5 rounded-2xl border border-zinc-800 px-3 py-2 text-sm text-zinc-300 hover:bg-zinc-800/50 transition-colors"
+          >
+            <ChevronLeft className="size-4" />
+            项目列表
+          </button>
+          <span className="text-sm font-semibold text-white">
+            {project ? project.title : '未命名项目'}
+          </span>
+          <span className="text-xs text-zinc-500">无限画布分镜</span>
+        </div>
+        <TabBar
+          tabs={STAGES.map((s) => ({ key: s.key, label: s.label, icon: s.icon }))}
+          active={stage}
+          onChange={handleStageChange}
+        />
+        <div className="min-h-0 flex-1">
+          <InfiniteCanvas />
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="mx-auto max-w-6xl space-y-5 p-6">
       {/* 项目头 */}
@@ -115,16 +144,6 @@ export default function StudioStagePage() {
         {stage === 'script' && (
           <SectionCard title="scripts 表" hint="title / body（含场景标记）/ source_idea_id">
             <Placeholder label="AI 编剧：点子扩写成可拍摄剧本" note="POST /api/nodes/script（计费 3）" height="h-56" />
-          </SectionCard>
-        )}
-
-        {stage === 'storyboard' && (
-          <SectionCard title="canvas_nodes + storyboards" hint="node_type / x,y,w,h / data · panels[]" className="ring-1 ring-emerald-500/20">
-            <Placeholder
-              label="无限画布：编排分镜漫画，挂生成能力一键出图（核心引擎，已具备生成能力）"
-              note="POST /api/nodes/storyboard（comic_layout，按张计费 1/张）；Konva/tldraw 预留"
-              height="h-64"
-            />
           </SectionCard>
         )}
 
