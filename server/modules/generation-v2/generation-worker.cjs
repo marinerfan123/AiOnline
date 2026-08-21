@@ -1,4 +1,5 @@
 'use strict';
+const crypto = require('crypto');
 const lease = require('./lease.cjs');
 const retryPolicy = require('./retry-policy.cjs');
 const { withLeaseHeartbeat } = require('./lease-heartbeat.cjs');
@@ -8,7 +9,12 @@ async function defaultRecordAttempt(pg, row) {
     `INSERT INTO generation_item_attempts_v2
       (item_id,attempt_no,lease_version,provider_id,key_id,provider_request_id,status,http_status,error_code,error_message,started_at,finished_at,latency_ms)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
-     ON CONFLICT (item_id,attempt_no) DO NOTHING`,
+     ON CONFLICT (item_id,attempt_no) DO UPDATE SET
+       provider_id=EXCLUDED.provider_id,key_id=EXCLUDED.key_id,
+       provider_request_id=EXCLUDED.provider_request_id,status=EXCLUDED.status,
+       http_status=EXCLUDED.http_status,error_code=EXCLUDED.error_code,
+       error_message=EXCLUDED.error_message,finished_at=EXCLUDED.finished_at,
+       latency_ms=EXCLUDED.latency_ms`,
     [row.itemId,row.attemptNo,row.leaseVersion,row.providerId||null,row.keyId||null,row.providerRequestId||null,row.status,row.httpStatus||null,row.errorCode||null,row.errorMessage||null,new Date(row.startedAt),new Date(row.finishedAt),row.finishedAt-row.startedAt],
   );
 }
@@ -30,6 +36,11 @@ async function processItem(pg, item, injected = {}) {
   if (!started) return { status:'stale_lease' };
 
   const startedAt = Date.now();
+  const clientRequestId = `v2-${item.item_id}-${Number(item.attempt_count)||1}-${crypto.randomUUID()}`;
+  if (typeof pg.query === 'function') {
+    await pg.query(`INSERT INTO generation_item_attempts_v2(item_id,attempt_no,lease_version,client_request_id,status,started_at) VALUES($1,$2,$3,$4,'submitting',NOW()) ON CONFLICT(item_id,attempt_no) DO NOTHING`,[item.item_id,Number(item.attempt_count)||1,Number(item.lease_version),clientRequestId]);
+  }
+  item.client_request_id = clientRequestId;
   let result;
   try {
     if (deps.workerId) {

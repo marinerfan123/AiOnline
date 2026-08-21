@@ -19,6 +19,8 @@ function buildSingleImagePayload(item) {
     modelId: item.model_id,
     contentType: item.content_type || 'image',
     count: 1,
+    idempotencyKey: item.client_request_id || src.idempotencyKey,
+    clientRequestId: item.client_request_id || null,
     pendingIds,
   };
 }

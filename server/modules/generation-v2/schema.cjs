@@ -75,6 +75,7 @@ CREATE TABLE IF NOT EXISTS generation_item_attempts_v2 (
   provider_id TEXT,
   key_id TEXT,
   provider_request_id TEXT,
+  client_request_id TEXT,
   status TEXT NOT NULL,
   http_status INT,
   error_code TEXT,
@@ -84,6 +85,12 @@ CREATE TABLE IF NOT EXISTS generation_item_attempts_v2 (
   latency_ms INT,
   UNIQUE (item_id, attempt_no)
 );
+
+ALTER TABLE generation_item_attempts_v2 ADD COLUMN IF NOT EXISTS client_request_id TEXT;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_generation_attempts_v2_client_request
+  ON generation_item_attempts_v2 (client_request_id)
+  WHERE client_request_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS generation_credit_holds_v2 (
   hold_id BIGSERIAL PRIMARY KEY,
@@ -108,8 +115,12 @@ CREATE TABLE IF NOT EXISTS generation_outbox_v2 (
   payload JSONB NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   published_at TIMESTAMPTZ,
+  lease_owner TEXT,
+  lease_expires_at TIMESTAMPTZ,
   attempts INT NOT NULL DEFAULT 0
 );
+ALTER TABLE generation_outbox_v2 ADD COLUMN IF NOT EXISTS lease_owner TEXT;
+ALTER TABLE generation_outbox_v2 ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ;
 CREATE INDEX IF NOT EXISTS idx_generation_outbox_v2_pending
   ON generation_outbox_v2 (created_at)
   WHERE published_at IS NULL;

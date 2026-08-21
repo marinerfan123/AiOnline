@@ -24,6 +24,7 @@ test('buildSingleImagePayload强制count=1并只保留当前pendingId', () => {
   assert.equal(p.modelId,'m1');
 });
 
+test('buildSingleImagePayload传播预持久化clientRequestId作为上游幂等键',()=>{const p=buildSingleImagePayload({item_id:'i',item_index:0,model_id:'m',content_type:'image',client_request_id:'cr-1',request_payload:{count:4}});assert.equal(p.idempotencyKey,'cr-1');assert.equal(p.clientRequestId,'cr-1')});
 test('normalizeProviderResult抽取单图URL和provider元数据', () => {
   assert.deepEqual(normalizeProviderResult({status:'success',images:['u1','u2'],providerId:'p',keyId:'k',providerTaskId:'t'}), {
     status:'success',providerUrl:'u1',providerId:'p',keyId:'k',providerRequestId:'t',httpStatus:200,

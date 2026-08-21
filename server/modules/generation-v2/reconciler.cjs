@@ -60,16 +60,22 @@ async function resolveReconcilingItem(pg, item, injected = {}) {
   return row ? { status: 'review_required' } : { status: 'stale_lease' };
 }
 
-async function publishOutbox(pg, { limit = 100 } = {}, injected = {}) {
+async function publishOutbox(pg, { limit = 100, workerId = `outbox-${process.pid}`, leaseSeconds = 60 } = {}, injected = {}) {
   const deps = { publish: null, ...injected };
   if (typeof deps.publish !== 'function') throw new TypeError('publish function required');
   const n = Math.max(1, Math.min(500, Number(limit) || 100));
   const r = await pg.query(
-    `SELECT event_id, aggregate_id, aggregate_type, event_type, payload, created_at
-       FROM generation_outbox_v2
-      WHERE published_at IS NULL
-      ORDER BY created_at ASC
-      LIMIT $1 FOR UPDATE SKIP LOCKED`, [n]);
+    `WITH picked AS (
+       SELECT event_id FROM generation_outbox_v2
+        WHERE published_at IS NULL
+          AND (lease_expires_at IS NULL OR lease_expires_at<NOW())
+        ORDER BY created_at ASC FOR UPDATE SKIP LOCKED LIMIT $1
+     )
+     UPDATE generation_outbox_v2 o
+        SET lease_owner=$2,lease_expires_at=NOW()+($3*INTERVAL '1 second')
+       FROM picked WHERE o.event_id=picked.event_id
+     RETURNING o.event_id,o.aggregate_id,o.aggregate_type,o.event_type,o.payload,o.created_at`,
+    [n,workerId,Math.max(10,Math.min(600,Number(leaseSeconds)||60))]);
   const events = r.rows || [];
   if (!events.length) return { published: 0 };
   let published = 0;
@@ -90,7 +96,7 @@ async function publishOutbox(pg, { limit = 100 } = {}, injected = {}) {
 async function markOutboxDelivered(pg, ids) {
   if (!ids || !ids.length) return { count: 0 };
   const r = await pg.query(
-    `UPDATE generation_outbox_v2 SET published_at=NOW(), attempts=attempts+1
+    `UPDATE generation_outbox_v2 SET published_at=NOW(), attempts=attempts+1,lease_owner=NULL,lease_expires_at=NULL
       WHERE event_id=ANY($1::bigint[]) AND published_at IS NULL
       RETURNING event_id`, [ids]);
   return { count: (r.rows || []).length };
