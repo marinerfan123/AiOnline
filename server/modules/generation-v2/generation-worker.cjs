@@ -93,7 +93,13 @@ async function runWorkerTick(pg, options = {}, injected = {}) {
   if (!workerId) throw new TypeError('workerId is required');
   const concurrency = Math.max(1,Math.min(50,Number(options.concurrency)||5));
   const items = await deps.claimItems(pg,{workerId,limit:options.limit||concurrency*2,leaseSeconds:options.leaseSeconds||120});
-  const runtimeDeps = { ...deps, workerId, leaseSeconds:options.leaseSeconds||120 };
+  const runtimeDeps = {
+    ...deps, workerId, leaseSeconds:options.leaseSeconds||120,
+    providerGenerate: async (item, signal) => {
+      const full = deps.loadItemContext ? await deps.loadItemContext(pg, item.item_id) : item;
+      return deps.providerGenerate({ ...full, lease_version:item.lease_version, attempt_count:item.attempt_count, client_request_id:item.client_request_id }, signal);
+    },
+  };
   for (let offset=0;offset<items.length;offset+=concurrency) {
     await Promise.all(items.slice(offset,offset+concurrency).map(item=>processItem(pg,item,runtimeDeps)));
   }

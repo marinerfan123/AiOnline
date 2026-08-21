@@ -65,15 +65,17 @@ test('已取得providerRequestId但响应不明确进入reconciling', async () =
   assert.equal(transitions.at(-1).patch.provider_request_id, 'up-amb');
 });
 
-test('runWorkerTick领取后按concurrency受控并发处理', async () => {
-  let active=0,max=0,done=0;
+test('runWorkerTick领取后加载完整batch上下文并按concurrency受控并发处理', async () => {
+  let active=0,max=0,done=0,loaded=0;
   const { deps } = makeDeps({
     claimItems: async () => Array.from({length:7},(_,i)=>({...ITEM,item_id:`gi-${i}`})),
+    loadItemContext: async (_pg,id)=>{loaded++;return{item_id:id,model_id:'m1',request_payload:{prompt:'x'}}},
     transitionItem: async (_pg,a) => ({item_id:a.itemId,status:a.to}),
     providerGenerate: async () => { active++;max=Math.max(max,active);await new Promise(r=>setTimeout(r,5));active--;done++;return {status:'success',providerUrl:'x'}; },
   });
   const r = await runWorkerTick({}, { workerId:'w1', concurrency:3 }, deps);
   assert.equal(r.claimed,7);
   assert.equal(done,7);
+  assert.equal(loaded,7);
   assert.ok(max<=3, `最大并发${max}`);
 });
