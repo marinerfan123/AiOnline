@@ -72,13 +72,13 @@ test('transitionItem 拒绝非法字段，防SQL列注入', async () => {
   }), /patch field/);
 });
 
-test('reapExpiredLeases 仅回收过期leased/generating并递增fencing token', async () => {
+test('reapExpiredLeases 将leased安全重试、generating转reconciling防重复提交', async () => {
   const pg = fakePg([{ item_id: 'gi-2' }]);
   const rows = await reapExpiredLeases(pg, { limit: 50 });
   assert.equal(rows.length, 1);
   const call = pg.calls[0];
   assert.match(call.sql, /status IN \('leased','generating'\)/i);
   assert.match(call.sql, /lease_expires_at < NOW\(\)/i);
-  assert.match(call.sql, /status='retry_wait'/i);
+  assert.match(call.sql, /CASE WHEN i\.status='generating' THEN 'reconciling' ELSE 'retry_wait'/i);
   assert.match(call.sql, /lease_version=i\.lease_version\+1/i);
 });

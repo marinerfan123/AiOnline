@@ -76,11 +76,14 @@ async function reapExpiredLeases(pg, { limit = 100 } = {}) {
         LIMIT $1
      )
      UPDATE generation_items_v2 i
-        SET status='retry_wait', next_attempt_at=NOW(),
+        SET status=CASE WHEN i.status='generating' THEN 'reconciling' ELSE 'retry_wait' END,
+            next_attempt_at=NOW(),
             lease_owner=NULL, lease_expires_at=NULL,
             lease_version=i.lease_version+1,
             last_error_code='LEASE_EXPIRED',
-            last_error='worker lease expired; reclaimed for retry'
+            last_error=CASE WHEN i.status='generating'
+              THEN 'worker lease expired after provider submission; reconcile before retry'
+              ELSE 'worker lease expired before provider submission; safe to retry' END
        FROM expired
       WHERE i.item_id=expired.item_id
       RETURNING item_id,status,lease_version`,
