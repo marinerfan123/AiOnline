@@ -10,7 +10,7 @@ services:
     image: postgres:17
     environment:
       POSTGRES_USER: ${PG_USER:-postgres}
-      POSTGRES_PASSWORD: ${PG_PASSWORD:-0.0.1abcd}
+      POSTGRES_PASSWORD: ${PG_PASSWORD:?PG_PASSWORD 必须显式设置强密码}
       POSTGRES_DB: ${PG_DATABASE:-huabu}
     volumes:
       - pgdata:/var/lib/postgresql/data
@@ -49,14 +49,14 @@ services:
       PG_PORT: 5432
       PG_DATABASE: ${PG_DATABASE:-huabu}
       PG_USER: ${PG_USER:-postgres}
-      PG_PASSWORD: ${PG_PASSWORD:-0.0.1abcd}
+      PG_PASSWORD: ${PG_PASSWORD:?PG_PASSWORD 必须显式设置强密码}
       PG_POOL_MAX: ${PG_POOL_MAX:-20}
       REDIS_HOST: redis
       REDIS_PORT: 6379
       REDIS_PASSWORD: ${REDIS_PASSWORD:-}
       # Generation V2 影子双写：仅镜像任务结构，不执行V2 worker；按taskId稳定采样。
       GENERATION_V2_SHADOW_PERCENT: ${GENERATION_V2_SHADOW_PERCENT:-0}
-      JWT_SECRET: ${JWT_SECRET:-change-me-to-a-long-random-string}
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET 必须显式设置强随机值}
     ports:
       - "3001:3001"
     healthcheck:
@@ -87,7 +87,7 @@ services:
       PG_PORT: 5432
       PG_DATABASE: ${PG_DATABASE:-huabu}
       PG_USER: ${PG_USER:-postgres}
-      PG_PASSWORD: ${PG_PASSWORD:-0.0.1abcd}
+      PG_PASSWORD: ${PG_PASSWORD:?PG_PASSWORD 必须显式设置强密码}
       REDIS_HOST: redis
       REDIS_PORT: 6379
       REDIS_PASSWORD: ${REDIS_PASSWORD:-}
