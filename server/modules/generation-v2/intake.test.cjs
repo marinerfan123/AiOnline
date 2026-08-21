@@ -38,7 +38,7 @@ test('createBatchWithItems 在单事务创建父批次、N个单图item、每图
   assert.ok(pg.calls.some((c) => /INSERT INTO generation_batches_v2/.test(c.sql)));
   const itemInsert = pg.calls.find((c) => /INSERT INTO generation_items_v2/.test(c.sql));
   assert.ok(itemInsert);
-  assert.equal(itemInsert.params.length, 3 * 3, '每个item应有 itemId/batchId/index');
+  assert.equal(itemInsert.params.length, 3 * 4, '每个item应有 itemId/batchId/index/mode');
   const holdInsert = pg.calls.find((c) => /INSERT INTO generation_credit_holds_v2/.test(c.sql));
   assert.ok(holdInsert);
   assert.equal(holdInsert.params.length, 3 * 4, '每个hold应有 itemId/userId/pool/unitPrice');

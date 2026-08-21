@@ -24,6 +24,7 @@ async function writeShadowBatch(pg, input, env = process.env) {
       count: input.count,
       unitPrice: input.unitPrice,
       pool: input.pool,
+      mode: 'shadow',
       requestPayload: { ...(input.requestPayload || {}), legacyTaskId: input.taskId, shadow: true },
     });
     return { enabled: true, written: true, batchId: result.batchId, count: result.count, idempotent: result.idempotent };

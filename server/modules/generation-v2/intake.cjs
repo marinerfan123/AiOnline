@@ -34,7 +34,7 @@ async function createBatchWithItems(pg, input) {
   const db = ownClient ? await pg.connect() : pg;
   const {
     batchId, userId, idempotencyKey, modelId,
-    contentType = 'image', unitPrice = 0, pool = 'recharge', requestPayload = {},
+    contentType = 'image', unitPrice = 0, pool = 'recharge', requestPayload = {}, mode = 'real',
   } = input || {};
   if (!batchId || !userId || !idempotencyKey || !modelId) throw new TypeError('batchId/userId/idempotencyKey/modelId are required');
   const count = normalizeCount(contentType, input.count);
@@ -86,10 +86,10 @@ async function createBatchWithItems(pg, input) {
     const items = Array.from({ length: count }, (_, i) => ({
       itemId: `gi-${crypto.randomUUID()}`, index: i,
     }));
-    const itemParams = items.flatMap((x) => [x.itemId, batchId, x.index]);
-    const itemRows = items.map((_, i) => `($${i * 3 + 1},$${i * 3 + 2},$${i * 3 + 3})`).join(',');
+    const itemParams = items.flatMap((x) => [x.itemId, batchId, x.index, mode]);
+    const itemRows = items.map((_, i) => `($${i * 4 + 1},$${i * 4 + 2},$${i * 4 + 3},$${i * 4 + 4})`).join(',');
     await db.query(
-      `INSERT INTO generation_items_v2 (item_id,batch_id,item_index) VALUES ${itemRows}`,
+      `INSERT INTO generation_items_v2 (item_id,batch_id,item_index,mode) VALUES ${itemRows}`,
       itemParams,
     );
 

@@ -24,6 +24,7 @@ test('claimItems 使用 SKIP LOCKED、优先级排序并递增 fencing token', a
   const call = pg.calls[0];
   assert.match(call.sql, /FOR UPDATE SKIP LOCKED/i);
   assert.match(call.sql, /ORDER BY priority DESC, created_at ASC/i);
+  assert.match(call.sql, /mode='real'/i);
   assert.match(call.sql, /lease_version=i\.lease_version\+1/i);
   assert.match(call.sql, /status='leased'/i);
   assert.deepEqual(call.params, [8, 'w1', 120]);

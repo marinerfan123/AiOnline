@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS generation_items_v2 (
   item_id TEXT PRIMARY KEY,
   batch_id TEXT NOT NULL REFERENCES generation_batches_v2(batch_id) ON DELETE CASCADE,
   item_index SMALLINT NOT NULL CHECK (item_index >= 0),
+  mode TEXT NOT NULL DEFAULT 'real' CHECK (mode IN ('real','shadow')),
   status TEXT NOT NULL DEFAULT 'queued'
     CHECK (status IN (
       'queued','leased','generating','provider_accepted','reconciling',
@@ -55,9 +56,14 @@ CREATE TABLE IF NOT EXISTS generation_items_v2 (
   UNIQUE (batch_id, item_index)
 );
 
+ALTER TABLE generation_items_v2 ADD COLUMN IF NOT EXISTS mode TEXT NOT NULL DEFAULT 'real';
+UPDATE generation_items_v2 i SET mode='shadow'
+  FROM generation_batches_v2 b
+ WHERE b.batch_id=i.batch_id AND COALESCE((b.request_payload->>'shadow')::boolean,false)=true;
+DROP INDEX IF EXISTS idx_generation_items_v2_claim;
 CREATE INDEX IF NOT EXISTS idx_generation_items_v2_claim
   ON generation_items_v2 (status, next_attempt_at, priority DESC, created_at)
-  WHERE status IN ('queued','retry_wait');
+  WHERE status IN ('queued','retry_wait') AND mode='real';
 CREATE INDEX IF NOT EXISTS idx_generation_items_v2_lease
   ON generation_items_v2 (lease_expires_at)
   WHERE status IN ('leased','generating');

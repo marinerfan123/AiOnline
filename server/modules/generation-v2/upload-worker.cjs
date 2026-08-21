@@ -3,7 +3,7 @@ const lease=require('./lease.cjs');const ledger=require('./ledger.cjs');const up
 
 async function claimGeneratedItems(pg,{workerId,limit=10,leaseSeconds=120}={}){
  if(!workerId)throw new TypeError('workerId is required');const l=Math.max(1,Math.min(100,Number(limit)||10)),s=Math.max(10,Math.min(900,Number(leaseSeconds)||120));
- const r=await pg.query(`WITH picked AS (SELECT item_id FROM generation_items_v2 WHERE status='generated' ORDER BY generated_at ASC FOR UPDATE SKIP LOCKED LIMIT $1) UPDATE generation_items_v2 i SET status='uploading',lease_owner=$2,lease_expires_at=NOW()+($3*INTERVAL '1 second'),lease_version=i.lease_version+1 FROM picked WHERE i.item_id=picked.item_id RETURNING i.*`,[l,workerId,s]);return r.rows||[];
+ const r=await pg.query(`WITH picked AS (SELECT item_id FROM generation_items_v2 WHERE status='generated' AND mode='real' ORDER BY generated_at ASC FOR UPDATE SKIP LOCKED LIMIT $1) UPDATE generation_items_v2 i SET status='uploading',lease_owner=$2,lease_expires_at=NOW()+($3*INTERVAL '1 second'),lease_version=i.lease_version+1 FROM picked WHERE i.item_id=picked.item_id RETURNING i.*`,[l,workerId,s]);return r.rows||[];
 }
 function objectKeyFor(item){return `generation-v2/${item.batch_id}/${item.item_index}.png`}
 async function processUploadItem(pg,item,injected={}){

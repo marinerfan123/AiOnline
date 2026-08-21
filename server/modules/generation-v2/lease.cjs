@@ -21,6 +21,7 @@ async function claimItems(pg, { workerId, limit = 10, leaseSeconds = 120 } = {})
        SELECT item_id
          FROM generation_items_v2
         WHERE status IN ('queued','retry_wait')
+          AND mode='real'
           AND next_attempt_at <= NOW()
         ORDER BY priority DESC, created_at ASC
         FOR UPDATE SKIP LOCKED
@@ -70,6 +71,7 @@ async function reapExpiredLeases(pg, { limit = 100 } = {}) {
        SELECT item_id
          FROM generation_items_v2
         WHERE status IN ('leased','generating')
+          AND mode='real'
           AND lease_expires_at < NOW()
         ORDER BY lease_expires_at ASC
         FOR UPDATE SKIP LOCKED
