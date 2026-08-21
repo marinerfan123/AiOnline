@@ -4379,8 +4379,12 @@ if (redisClient) {
 
 // ─── 生产安全自检（仅 production）───
 if (isProduction) {
-  if (!process.env.JWT_SECRET || process.env.JWT_SECRET === 'dev-only-change-me') {
-    console.warn('[SECURITY] ⚠️ JWT_SECRET 未设置或使用默认值，生产环境会话令牌可被伪造！请通过环境变量设置强随机值。');
+  const unsafeJwt = !process.env.JWT_SECRET
+    || process.env.JWT_SECRET === 'dev-only-change-me'
+    || process.env.JWT_SECRET === 'change-me-to-a-long-random-string';
+  if (unsafeJwt) {
+    console.error('[SECURITY] JWT_SECRET 未设置或使用默认值，生产环境拒绝启动（会话令牌可被伪造）。请设置强随机值后重试。');
+    process.exit(1);
   }
   if (process.env.ADMIN_SEED_PASSWORD && process.env.ADMIN_SEED_PASSWORD === 'Admin@123456') {
     console.warn('[SECURITY] ⚠️ ADMIN_SEED_PASSWORD 仍为默认密码，公开部署前必须覆盖为强密码。');
