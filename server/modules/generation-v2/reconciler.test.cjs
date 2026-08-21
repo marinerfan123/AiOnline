@@ -10,6 +10,6 @@ test('resolveReconcilingItem成功结果转generated，失败转retry_wait',asyn
 
 test('resolveReconcilingItem上游不确定时进入review_required，不释放资金',async()=>{const transitions=[];const pg=fakePg();const d={transitionItem:async(_,a)=>{transitions.push(a);return{status:a.to}},queryProviderStatus:async()=>({status:'unknown'})};const r=await resolveReconcilingItem(pg,{item_id:'i3',lease_version:1,provider_request_id:'r3'},d);assert.equal(r.status,'review_required');assert.equal(transitions.at(-1).to,'review_required')});
 
-test('publishOutbox批量发布generation_outbox_v2未投递事件',async()=>{const pg=fakePg([{outbox_id:1,item_id:'i1',event_type:'item_done',payload:'{}'}]);const published=[];const d={publish:async(e)=>published.push(e)};const r=await publishOutbox(pg,{limit:50},d);assert.equal(r.published,1);assert.equal(published[0].item_id,'i1');assert.match(pg.calls.at(-1).sql,/UPDATE generation_outbox_v2/)});
+test('publishOutbox批量发布generation_outbox_v2未投递事件',async()=>{const pg=fakePg([{event_id:1,aggregate_id:'i1',aggregate_type:'item',event_type:'item_done',payload:'{}'}]);const published=[];const d={publish:async(e)=>published.push(e)};const r=await publishOutbox(pg,{limit:50},d);assert.equal(r.published,1);assert.equal(published[0].aggregate_id,'i1');assert.match(pg.calls.at(-1).sql,/UPDATE generation_outbox_v2/)});
 
-test('markOutboxDelivered按outboxId幂等标记',async()=>{const pg=fakePg([{outbox_id:1}]);const r=await markOutboxDelivered(pg,[1,2,3]);assert.ok(r.count>=0);assert.match(pg.calls[0].sql,/UPDATE generation_outbox_v2.*delivered_at/)});
+test('markOutboxDelivered按eventId幂等标记',async()=>{const pg=fakePg([{event_id:1}]);const r=await markOutboxDelivered(pg,[1,2,3]);assert.ok(r.count>=0);assert.match(pg.calls[0].sql,/UPDATE generation_outbox_v2.*published_at/s)});

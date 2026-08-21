@@ -65,9 +65,9 @@ async function publishOutbox(pg, { limit = 100 } = {}, injected = {}) {
   if (typeof deps.publish !== 'function') throw new TypeError('publish function required');
   const n = Math.max(1, Math.min(500, Number(limit) || 100));
   const r = await pg.query(
-    `SELECT outbox_id, item_id, batch_id, event_type, payload, created_at
+    `SELECT event_id, aggregate_id, aggregate_type, event_type, payload, created_at
        FROM generation_outbox_v2
-      WHERE delivered_at IS NULL
+      WHERE published_at IS NULL
       ORDER BY created_at ASC
       LIMIT $1 FOR UPDATE SKIP LOCKED`, [n]);
   const events = r.rows || [];
@@ -79,7 +79,7 @@ async function publishOutbox(pg, { limit = 100 } = {}, injected = {}) {
       let payload = ev.payload;
       if (typeof payload === 'string') { try { payload = JSON.parse(payload); } catch (_) {} }
       await deps.publish({ ...ev, payload });
-      delivered.push(ev.outbox_id);
+      delivered.push(ev.event_id);
       published++;
     } catch (_) { /* leave undelivered; will retry next tick */ }
   }
@@ -90,9 +90,9 @@ async function publishOutbox(pg, { limit = 100 } = {}, injected = {}) {
 async function markOutboxDelivered(pg, ids) {
   if (!ids || !ids.length) return { count: 0 };
   const r = await pg.query(
-    `UPDATE generation_outbox_v2 SET delivered_at=NOW()
-      WHERE outbox_id=ANY($1::int[]) AND delivered_at IS NULL
-      RETURNING outbox_id`, [ids]);
+    `UPDATE generation_outbox_v2 SET published_at=NOW(), attempts=attempts+1
+      WHERE event_id=ANY($1::bigint[]) AND published_at IS NULL
+      RETURNING event_id`, [ids]);
   return { count: (r.rows || []).length };
 }
 

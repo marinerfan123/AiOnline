@@ -96,6 +96,10 @@ CREATE TABLE IF NOT EXISTS generation_credit_holds_v2 (
   settled_at TIMESTAMPTZ
 );
 
+CREATE UNIQUE INDEX IF NOT EXISTS uq_credit_transactions_v2_ref_kind
+  ON credit_transactions (ref, kind)
+  WHERE ref LIKE 'v2:%';
+
 CREATE TABLE IF NOT EXISTS generation_outbox_v2 (
   event_id BIGSERIAL PRIMARY KEY,
   aggregate_type TEXT NOT NULL,
