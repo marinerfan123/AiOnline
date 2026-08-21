@@ -8,3 +8,7 @@ test('acquireKeyLease调用Redis eval并解析租约',async()=>{const calls=[];c
 test('无可用key返回null',async()=>{const redis={eval:async()=>null};assert.equal(await acquireKeyLease(redis,{providerId:'p',keys:[{id:'k'}]}),null)});
 test('releaseKeyLease带provider/key/token且返回boolean',async()=>{let args;const redis={eval:async(...a)=>{args=a;return 1}};assert.equal(await releaseKeyLease(redis,{providerId:'p',keyId:'k',token:'t'}),true);assert.ok(args.includes('t'))});
 test('参数和key数量受限',async()=>{await assert.rejects(()=>acquireKeyLease({},{}),/redis.eval/);const redis={eval:async(...a)=>{const payload=JSON.parse(a.at(-1));assert.equal(payload.length,500);return null}};await acquireKeyLease(redis,{providerId:'p',keys:Array.from({length:700},(_,i)=>({id:`k${i}`}))})});
+
+test('Redis eval 抛错时 acquire 返回 null 并触发 onError，不向上抛',async()=>{let err=null;const redis={eval:async()=>{throw new Error('ECONNREFUSED')}};const r=await acquireKeyLease(redis,{providerId:'p',keys:[{id:'k'}],onError:e=>{err=e}});assert.equal(r,null);assert.match(err.message,/ECONNREFUSED/)});
+
+test('Redis eval 抛错时 release 返回 false，不抛',async()=>{const redis={eval:async()=>{throw new Error('connection reset')}};assert.equal(await releaseKeyLease(redis,{providerId:'p',keyId:'k',token:'t'}),false)});
