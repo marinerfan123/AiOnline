@@ -1,0 +1,35 @@
+{
+  "unitPass": true,
+  "migration": true,
+  "pgIntegration": true,
+  "shadowAudit": { "sampled": 13, "consistent": 13 },
+  "chaos": {
+    "workerKill": true,
+    "redisRestart": false,
+    "provider429": true
+  },
+  "load": {
+    "p95SubmitMs": 173,
+    "duplicateRate": 0,
+    "ledgerMismatch": 0,
+    "oldestQueueSec": 0
+  },
+  "secrets": false,
+  "dependencies": true,
+  "observability": true,
+  "realAgnesE2E": {
+    "passed": true,
+    "generationMs": 17214,
+    "imageCount": 1,
+    "ossUploaded": true,
+    "finalStatus": "done",
+    "holdStatus": "committed",
+    "commitTransactions": 1,
+    "cleanup": true
+  },
+  "notes": [
+    "Fail-closed evidence snapshot; do not set GENERATION_V2_WORKER_ENABLED=true until all blockers are true.",
+    "Generation worker must remain single-replica until Redis key leasing is wired into dispatcher key selection.",
+    "8-hour soak test is not yet complete."
+  ]
+}

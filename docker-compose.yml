@@ -66,6 +66,39 @@ services:
       retries: 5
     restart: unless-stopped
 
+  generation-v2-worker:
+    profiles: ["generation-v2"]
+    build: .
+    command: ["node", "server/modules/generation-v2/entry.cjs"]
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 768M
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PG_HOST: postgres
+      PG_PORT: 5432
+      PG_DATABASE: ${PG_DATABASE:-huabu}
+      PG_USER: ${PG_USER:-postgres}
+      PG_PASSWORD: ${PG_PASSWORD:-0.0.1abcd}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      GENERATION_V2_WORKER_ENABLED: ${GENERATION_V2_WORKER_ENABLED:-false}
+      GENERATION_V2_EVIDENCE_FILE: /run/generation-v2/evidence.json
+      V2_GENERATION_CONCURRENCY: ${V2_GENERATION_CONCURRENCY:-10}
+      V2_UPLOAD_CONCURRENCY: ${V2_UPLOAD_CONCURRENCY:-4}
+    volumes:
+      - ./deploy/generation-v2:/run/generation-v2:ro
+    restart: unless-stopped
+
   # 可选 nginx 反代（取消注释启用；启用后建议把 app 的 3001 端口改为不对外暴露）
   # nginx:
   #   image: nginx:alpine
