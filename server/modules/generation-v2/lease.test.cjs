@@ -11,7 +11,7 @@ function fakePg(rows = []) {
     async query(sql, params = []) {
       calls.push({ sql, params });
       if (/RETURNING i\.\*/s.test(sql)) return { rows, rowCount: rows.length };
-      if (/RETURNING item_id/s.test(sql)) return { rows, rowCount: rows.length };
+      if (/RETURNING (?:i\.)?item_id/s.test(sql)) return { rows, rowCount: rows.length };
       return { rows: [], rowCount: 0 };
     },
   };

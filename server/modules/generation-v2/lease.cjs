@@ -86,7 +86,7 @@ async function reapExpiredLeases(pg, { limit = 100 } = {}) {
               ELSE 'worker lease expired before provider submission; safe to retry' END
        FROM expired
       WHERE i.item_id=expired.item_id
-      RETURNING item_id,status,lease_version`,
+      RETURNING i.item_id,i.status,i.lease_version`,
     [safeLimit],
   );
   return result.rows || [];
