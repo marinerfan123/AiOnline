@@ -1,0 +1,7 @@
+'use strict';
+const test=require('node:test');const assert=require('node:assert/strict');
+const {createV2Runtime}=require('./runtime.cjs');
+function options(over={}){const calls=[];return{calls,opts:{enabled:false,evidence:{},pg:{},redis:{},generationTick:async()=>calls.push('generation'),uploadTick:async()=>calls.push('upload'),reconcileTick:async()=>calls.push('reconcile'),outboxTick:async()=>calls.push('outbox'),reaperTick:async()=>calls.push('reaper'),...over}}}
+test('默认关闭时不启动任何worker',async()=>{const x=options();const r=createV2Runtime(x.opts);assert.equal(r.enabled,false);await r.start();assert.deepEqual(x.calls,[])});
+test('开关开启但生产门槛不通过时拒绝启动',async()=>{const x=options({enabled:true,evidence:{unitPass:true}});const r=createV2Runtime(x.opts);await assert.rejects(()=>r.start(),/production gate blocked/);assert.deepEqual(x.calls,[])});
+test('门槛通过后组合五类tick且可优雅停止',async()=>{const evidence={unitPass:true,migration:true,pgIntegration:true,shadowAudit:{sampled:12,consistent:12},chaos:{workerKill:true,redisRestart:true,provider429:true},load:{p95SubmitMs:100,duplicateRate:0,ledgerMismatch:0,oldestQueueSec:10},secrets:true,dependencies:true,observability:true};const x=options({enabled:true,evidence,tickIntervalMs:5});const r=createV2Runtime(x.opts);const p=r.start();await new Promise(z=>setTimeout(z,25));await r.stop();await p;for(const n of ['generation','upload','reconcile','outbox','reaper'])assert.ok(x.calls.includes(n),n)});

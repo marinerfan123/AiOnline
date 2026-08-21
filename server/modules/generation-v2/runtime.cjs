@@ -1,0 +1,4 @@
+'use strict';
+const {evaluateProductionGate}=require('./production-gate.cjs');const {createWorkerDaemon}=require('./worker-daemon.cjs');
+function createV2Runtime(o={}){const enabled=o.enabled===true;if(!enabled)return{enabled:false,start:async()=>{},stop:async()=>{}};const gate=evaluateProductionGate(o.evidence||{});let daemon;return{enabled:true,gate,async start(){if(!gate.ready)throw new Error(`production gate blocked: ${gate.blockers.join('; ')}`);const ticks=[o.generationTick,o.uploadTick,o.reconcileTick,o.outboxTick,o.reaperTick].filter(x=>typeof x==='function');daemon=createWorkerDaemon({workerId:o.workerId||`v2-${process.pid}`,pgPool:o.pg,redis:o.redis,tickIntervalMs:o.tickIntervalMs||1000,gracefulShutdownMs:o.gracefulShutdownMs||30000,onError:o.onError,tick:async(pg,redis,ctx)=>{for(const fn of ticks)await fn(pg,redis,ctx)}});return daemon.start()},async stop(){if(daemon)await daemon.stop()}}}
+module.exports={createV2Runtime};

@@ -12,6 +12,7 @@ function createWorkerDaemon(opts = {}) {
   let currentTick = null;
   let stopped = false;
   let resolveStop;
+  let wakeSleep;
   const stopPromise = new Promise(r => { resolveStop = r; });
 
   async function loop() {
@@ -26,7 +27,10 @@ function createWorkerDaemon(opts = {}) {
       if (stopped) break;
       const elapsed = Date.now() - tickStart;
       const delay = Math.max(0, tickIntervalMs - elapsed);
-      if (delay > 0) await new Promise(r => setTimeout(r, delay));
+      if (delay > 0) await new Promise(r => {
+        const timer = setTimeout(() => { wakeSleep = null; r(); }, delay);
+        wakeSleep = () => { clearTimeout(timer); wakeSleep = null; r(); };
+      });
     }
     resolveStop();
   }
@@ -41,8 +45,14 @@ function createWorkerDaemon(opts = {}) {
     },
     async stop() {
       stopped = true;
-      const timeout = new Promise(r => setTimeout(r, gracefulShutdownMs));
+      if (wakeSleep) wakeSleep();
+      let timeoutId;
+      const timeout = new Promise(r => {
+        timeoutId = setTimeout(r, gracefulShutdownMs);
+        timeoutId.unref?.();
+      });
       await Promise.race([stopPromise, timeout]);
+      if (timeoutId) clearTimeout(timeoutId);
     },
   };
 }
