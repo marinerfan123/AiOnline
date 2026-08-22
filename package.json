@@ -11,7 +11,10 @@
     "lint": "concurrently npm:typecheck npm:lint:eslint",
     "lint:eslint": "eslint src",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "test:v2": "node --test server/modules/generation-v2/*.test.cjs",
+    "test:api": "TEST_PG_DATABASE=moling_test NODE_ENV=test node --test server/tests/integration/*.test.cjs",
+    "test:all": "npm run test && npm run test:v2 && npm run test:api"
   },
   "dependencies": {
     "@formkit/auto-animate": "^0.9.0",
@@ -94,5 +97,8 @@
     "typescript": "~5.9",
     "vite": "^8",
     "vitest": "^3.2.0"
+  },
+  "allowScripts": {
+    "esbuild@0.28.2": true
   }
 }

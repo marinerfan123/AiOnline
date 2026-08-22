@@ -13,7 +13,11 @@ function clientIp(req) {
 
 // 固定窗口限流：key 在 windowSec 内最多允许 limit 次
 // 返回 { allowed, remaining, retryAfter(秒) }
+// 测试环境跳过限流
 async function rateLimit({ key, limit, windowSec }) {
+  if (process.env.NODE_ENV === 'test') {
+    return { allowed: true, remaining: limit, retryAfter: 0 };
+  }
   const count = await kvIncr(key, windowSec);
   const allowed = count <= limit;
   return {
