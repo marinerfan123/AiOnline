@@ -215,17 +215,39 @@ test('API Integration Tests', { concurrency: 1 }, async (t) => {
       const raw = JSON.stringify(list.body);
       assert.ok(!raw.includes('FAKE-SECRET-KEY-99999'));
     });
-    t.test('/api/oss leaks no secret', async () => {
-      // SECURITY_FINDING: /api/oss GET returns 200 + accessKeySecret to non-admin.
-      // The route lacks appGateway/requireAdmin guard. Business logic NOT modified per rules.
-      // This test documents the finding; fix requires authorization middleware review.
+    t.test('/api/oss requires admin — anonymous gets 401', async () => {
+      // appGateway blocks unauthenticated at 401 before handleAPI reaches OSS
+      const r = await request(server.baseUrl, { method: 'GET', path: '/api/oss' });
+      assert.equal(r.status, 401, 'anonymous GET /api/oss should be 401');
+      assert.ok(!JSON.stringify(r.body).includes('accessKeySecret'));
+    });
+    t.test('/api/oss requires admin — normal user gets 403', async () => {
       const e = `oss${Date.now()}@t.com`;
       await request(server.baseUrl, { method: 'POST', path: '/api/auth/register', body: { email: e, password: 'TestPass123!' } });
       const lr = await request(server.baseUrl, { method: 'POST', path: '/api/auth/login', body: { email: e, password: 'TestPass123!' } });
       const ck = buildCookieHeader(getCookies(lr.cookies));
       const r = await request(server.baseUrl, { method: 'GET', path: '/api/oss', headers: { Cookie: ck } });
-      // FINDING: returns 200 with accessKeySecret field (currently empty in test DB but route is unguarded)
-      assert.ok(true, 'OSS endpoint reached — see SECURITY_FINDING comment above');
+      assert.equal(r.status, 403, 'normal user GET /api/oss should be 403');
+      const raw = JSON.stringify(r.body);
+      assert.ok(!raw.includes('accessKeySecret'), 'response must not contain accessKeySecret');
+      assert.ok(!raw.includes('accessKeyId'), 'response must not contain accessKeyId');
+    });
+    t.test('/api/oss allows admin', async () => {
+      const adminEmail = `admx${Date.now()}@t.com`;
+      const init = await request(server.baseUrl, { method: 'POST', path: '/api/setup/init', body: { adminEmail, adminPassword: 'InitPass123!' } });
+      // If already initialized (409), create the admin user directly via DB
+      if (init.status === 409) {
+        const { hashPassword } = require('../../auth.cjs');
+        const { createTestPool } = require('../helpers/test-db.cjs');
+        const pg = createTestPool();
+        await pg.query(`INSERT INTO users (id, email, password_hash, role, credits, created_at) VALUES ($1, $2, $3, 'admin', 0, NOW()) ON CONFLICT DO NOTHING`, [`u-oss-admin-${Date.now()}`, adminEmail, hashPassword('InitPass123!')]);
+        await pg.end();
+      }
+      const lr = await request(server.baseUrl, { method: 'POST', path: '/api/auth/login', body: { email: adminEmail, password: 'InitPass123!' } });
+      const ac = buildCookieHeader(getCookies(lr.cookies));
+      const r = await request(server.baseUrl, { method: 'GET', path: '/api/oss', headers: { Cookie: ac } });
+      assert.equal(r.status, 200, 'admin GET /api/oss should be 200');
+      assert.ok(r.body.enabled !== undefined, 'admin should get OSS config');
     });
   });
 });

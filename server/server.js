@@ -3951,8 +3951,9 @@ async function handleAPI(req, res) {
   //   此处仅保留路由分发，签名/上传调用走 ossMod.* ──
   const adminId = (req) => req.user?.id || req.user?.email || 'guest';
 
-  // ── OSS 总览（enabled + active + configs 列表） ──
+  // ── OSS 总览（enabled + active + configs 列表）── 仅限 admin ──
   if (url === '/api/oss' && method === 'GET') {
+    if (!admin.requireAdmin(req)) return sendJSON(res, 403, { error: '需要管理员权限' });
     const t0 = Date.now();
     const { enabled, activeId, list } = await ossMod.loadOssConfigs(pgPool);
     const active = list.find(c => c.id === activeId) || null;
