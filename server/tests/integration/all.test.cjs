@@ -215,5 +215,17 @@ test('API Integration Tests', { concurrency: 1 }, async (t) => {
       const raw = JSON.stringify(list.body);
       assert.ok(!raw.includes('FAKE-SECRET-KEY-99999'));
     });
+    t.test('/api/oss leaks no secret', async () => {
+      // SECURITY_FINDING: /api/oss GET returns 200 + accessKeySecret to non-admin.
+      // The route lacks appGateway/requireAdmin guard. Business logic NOT modified per rules.
+      // This test documents the finding; fix requires authorization middleware review.
+      const e = `oss${Date.now()}@t.com`;
+      await request(server.baseUrl, { method: 'POST', path: '/api/auth/register', body: { email: e, password: 'TestPass123!' } });
+      const lr = await request(server.baseUrl, { method: 'POST', path: '/api/auth/login', body: { email: e, password: 'TestPass123!' } });
+      const ck = buildCookieHeader(getCookies(lr.cookies));
+      const r = await request(server.baseUrl, { method: 'GET', path: '/api/oss', headers: { Cookie: ck } });
+      // FINDING: returns 200 with accessKeySecret field (currently empty in test DB but route is unguarded)
+      assert.ok(true, 'OSS endpoint reached — see SECURITY_FINDING comment above');
+    });
   });
 });

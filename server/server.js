@@ -4513,7 +4513,14 @@ server.timeout = 65000;                 // socket 空闲超时 65s
 server.maxHeadersCount = 200;           // 放宽头部上限，避免大 headers 请求被拒
 
 server.listen(PORT, '0.0.0.0', async () => {
-  console.log(`🚀 服务: http://localhost:${PORT} | 📁 ${DATA_DIR} | 🐘 PG:connected(强制·唯一数据源) | 🔴 Redis:${isRedisUp() ? 'up' : 'memory-fallback(仅缓存)'}`);
+  const addrPort = server.address() ? (server.address().port || PORT) : PORT;
+  console.log(`🚀 服务: http://localhost:${addrPort} | 📁 ${DATA_DIR} | 🐘 PG:connected(强制·唯一数据源) | 🔴 Redis:${isRedisUp() ? 'up' : 'memory-fallback(仅缓存)'}`);
+  // Test harness port probe via IPC
+  if (process.env.NODE_ENV === 'test' && process.send) {
+    process.on('message', (msg) => {
+      if (msg && msg.type === 'ping') process.send({ type: 'port', port: addrPort });
+    });
+  }
   if (IS_LEADER) orderExpiry.start(); // 调度器仅 leader worker 跑（避免多实例重复扫 DB）
 
   // 启动时加载 key 池到 dispatcher 内存态

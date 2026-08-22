@@ -16,7 +16,7 @@ function spawnTestServer() {
       NODE_ENV: 'test',
       TEST_PG_DATABASE: process.env.TEST_PG_DATABASE || 'moling_test',
       PG_DATABASE: process.env.TEST_PG_DATABASE || 'moling_test',
-      PORT: '3999',
+      PORT: '0', // OS-assigned ephemeral port
       ENABLE_CLUSTER: 'false',
     };
 
@@ -31,7 +31,7 @@ function spawnTestServer() {
     });
 
     let resolved = false;
-    const baseUrl = 'http://localhost:3999';
+    let baseUrl = null;
     const timeout = setTimeout(() => {
       child.kill('SIGTERM');
       reject(new Error('Test server did not start within 20s'));
@@ -46,8 +46,33 @@ function spawnTestServer() {
     };
 
     child.stdout?.on('data', (data) => {
-      if (!resolved && data.toString().includes('服务:')) {
+      if (!resolved) {
+        const text = data.toString();
+        // Parse TEST_PORT from test-mode log, then fallback to startup line
+        const tpMatch = text.match(/TEST_PORT=(\d+)/);
+        if (tpMatch && Number(tpMatch[1]) > 0) {
+          resolved = true;
+          baseUrl = `http://localhost:${tpMatch[1]}`;
+          clearTimeout(timeout);
+          resolve({ baseUrl, stop });
+          return;
+        }
+        // Fallback: parse actual bound port from startup log (when PORT != 0)
+        const match = text.match(/localhost:(\d+)/);
+        if (match && Number(match[1]) > 0) {
+          resolved = true;
+          baseUrl = `http://localhost:${match[1]}`;
+          clearTimeout(timeout);
+          resolve({ baseUrl, stop });
+        }
+      }
+    });
+
+    // Ask child to report its actual bound port
+    child.on('message', (msg) => {
+      if (!resolved && msg && msg.type === 'port' && msg.port > 0) {
         resolved = true;
+        baseUrl = `http://localhost:${msg.port}`;
         clearTimeout(timeout);
         resolve({ baseUrl, stop });
       }
