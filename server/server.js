@@ -2195,13 +2195,30 @@ async function handleAPI(req, res) {
         }
         return Object.assign({}, p, {
           syncedModels, boundModels, servedModels, called24h,
-          poolSize: dk.total,            // 配置 key 总数（墨池池规模，权威源）
-          activeKeys: dk.active,         // DB 活跃 key 数
-          isolatedKeys: dk.isolated,     // DB 隔离/禁用 key 数
-          runtimeLoaded: rt.length,      // AKEYS 已加载 key 数（重启后首调度前可能为 0）
-          coolingKeys: rtCooling,        // AKEYS 运行时熔断 key 数
+          poolSize: dk.total,
+          activeKeys: dk.active,
+          isolatedKeys: dk.isolated,
+          runtimeLoaded: rt.length,
+          coolingKeys: rtCooling,
         });
       });
+
+      // 9.5) 为每个provider补充apiKeys详情（单独查询，避免N+1）
+      const allKeyRows = await pgPool.query(
+        `SELECT provider_id, id, api_key, label, status, weight, created_at FROM api_keys ORDER BY provider_id, created_at`
+      );
+      const apiKeysByProvider = {};
+      for (const r of allKeyRows.rows) {
+        if (!apiKeysByProvider[r.provider_id]) apiKeysByProvider[r.provider_id] = [];
+        apiKeysByProvider[r.provider_id].push({
+          id: r.id, label: r.label || 'key', status: r.status, weight: r.weight,
+          masked: r.api_key ? '***' + r.api_key.slice(-4) : '***',
+          createdAt: r.created_at,
+        });
+      }
+      for (const p of providers) {
+        p.apiKeys = apiKeysByProvider[p.providerId] || [];
+      }
 
       // 9) 汇总
       const summary = {
@@ -2855,8 +2872,26 @@ async function handleAPI(req, res) {
   }
 
   if (url === '/api/providers' && method === 'GET') {
-    const maskKey = (p) => ({ ...p, apiKey: p.apiKey ? '***' : '' });
-    if (pgPool) { const r = await pgPool.query('SELECT * FROM providers ORDER BY created_at'); return sendJSON(res, 200, r.rows.map(fromSnake).map(maskKey)); }
+    const maskKey = (p) => ({ ...p, apiKey: p.apiKey ? '***' + p.apiKey.slice(-4) : '' });
+    if (pgPool) {
+      const r = await pgPool.query('SELECT * FROM providers ORDER BY created_at');
+      const list = r.rows.map(fromSnake).map(maskKey);
+      // 附 apiKeys 供前端密钥池展示（与普通 providers 端点一致）
+      try {
+        const kr = await pgPool.query('SELECT provider_id, id, api_key, label, status, weight, created_at FROM api_keys ORDER BY provider_id, created_at');
+        const byProv = {};
+        for (const row of kr.rows) {
+          if (!byProv[row.provider_id]) byProv[row.provider_id] = [];
+          byProv[row.provider_id].push({
+            id: row.id, provider_id: row.provider_id, masked: row.api_key ? '***' + row.api_key.slice(-4) : '***',
+            label: row.label || 'key', status: row.status, weight: row.weight,
+            createdAt: row.created_at,
+          });
+        }
+        for (const p of list) p.apiKeys = byProv[p.id] || [];
+      } catch { for (const p of list) if (!p.apiKeys) p.apiKeys = []; }
+      return sendJSON(res, 200, list);
+    }
     return sendJSON(res, 200, readJSON('providers').map(maskKey));
   }
   // ── POST /api/providers：单条创建（RESTful，不再是破坏性全量同步）──
@@ -2975,6 +3010,78 @@ async function handleAPI(req, res) {
     const id = url.split('/api/providers/')[1];
     if (pgPool) { try { await pgPool.query('DELETE FROM models WHERE provider_id=$1', [id]); await pgPool.query('DELETE FROM providers WHERE id=$1', [id]); return sendJSON(res, 200, { ok: true }); } catch (e) { console.error('[providers] DELETE 失败', e.message); return sendJSON(res, 400, { error: '删除失败：' + e.message }); } }
     writeJSON('providers', readJSON('providers').filter(p => p.id !== id));
+    return sendJSON(res, 200, { ok: true });
+  }
+
+  // ── API Key 池管理 ──
+  // GET /api/providers/:id/keys - 列出key池
+  if (url.startsWith('/api/providers/') && url.endsWith('/keys') && method === 'GET') {
+    if (!admin.requireAdmin(req)) return sendJSON(res, 403, { error: '需要管理员权限' });
+    const id = url.split('/api/providers/')[1].split('/')[0];
+    const rows = await pgPool.query('SELECT id, provider_id, api_key, label, status, weight, created_at FROM api_keys WHERE provider_id = $1 ORDER BY created_at', [id]);
+    return sendJSON(res, 200, { keys: rows.rows.map(r => ({
+      id: r.id, provider_id: r.provider_id, masked: r.api_key.length > 4 ? '***' + r.api_key.slice(-4) : '***',
+      label: r.label, status: r.status, weight: r.weight, createdAt: r.created_at
+    }))});
+  }
+  // POST /api/providers/:id/keys - 批量添加（支持 {apiKeys: string[]} 或 {keys: string}）
+  if (url.startsWith('/api/providers/') && url.endsWith('/keys') && method === 'POST') {
+    if (!admin.requireAdmin(req)) return sendJSON(res, 403, { error: '需要管理员权限' });
+    const id = url.split('/api/providers/')[1].split('/')[0];
+    const body = await parseBody(req);
+    if (!body) return sendJSON(res, 400, { error: 'Invalid JSON' });
+    // 支持两种格式：{apiKeys: [...]} 或 {keys: "line1\nline2"}
+    let lines = [];
+    if (Array.isArray(body.apiKeys)) lines = body.apiKeys.filter(k => k && k.length >= 6);
+    else if (typeof body.keys === 'string') lines = body.keys.trim().split(/\n/).map(s => s.trim()).filter(s => s.length >= 6);
+    if (lines.length === 0) return sendJSON(res, 400, { error: '没有有效的 key（至少6位）' });
+    let added = 0;
+    for (const key of lines) {
+      const keyId = require('crypto').randomUUID();
+      try {
+        await pgPool.query(`INSERT INTO api_keys (id, provider_id, api_key, label, status, weight, created_at) VALUES ($1, $2, $3, $4, 'active', 100, NOW()) ON CONFLICT (provider_id, api_key) DO NOTHING`, [keyId, id, key, 'user-key']);
+        added++;
+      } catch(e) { console.error('[keys] insert failed:', e.message); }
+    }
+    // Sync dispatcher
+    const keys = await pgPool.query('SELECT id, provider_id, api_key, label, status, weight FROM api_keys WHERE provider_id = $1', [id]);
+    dispatcher.syncKeyPool(id, keys.rows);
+    console.log(`[keys] Added ${added} keys for provider ${id}, total: ${keys.rows.length}`);
+    return sendJSON(res, 200, { ok: true, added, total: keys.rows.length });
+  }
+  // PATCH /api/providers/:id/keys/:keyId - 更新key状态/备注
+  if (url.match(/^\/api\/providers\/[^\/]+\/keys\/[^\/]+$/) && method === 'PATCH') {
+    if (!admin.requireAdmin(req)) return sendJSON(res, 403, { error: '需要管理员权限' });
+    const parts = url.split('/');
+    const id = parts[3];
+    const keyId = parts[5];
+    const body = await parseBody(req);
+    if (!body) return sendJSON(res, 400, { error: 'Invalid JSON' });
+    const allowed = { status: 'status', label: 'label' };
+    const cols = [], vals = [];
+    for (const [col, key] of Object.entries(allowed)) {
+      if (!(key in body)) continue;
+      cols.push(col); vals.push(body[key]);
+    }
+    if (cols.length === 0) return sendJSON(res, 400, { error: '无可更新字段' });
+    const setClause = cols.map((c, i) => `${c}=$${i+2}`).join(', ');
+    await pgPool.query(`UPDATE api_keys SET ${setClause} WHERE id=$1 AND provider_id=$2`, [...vals, keyId, id]);
+    // Sync dispatcher
+    const keys = await pgPool.query('SELECT id, provider_id, api_key, label, status, weight FROM api_keys WHERE provider_id = $1', [id]);
+    dispatcher.syncKeyPool(id, keys.rows);
+    return sendJSON(res, 200, { ok: true });
+  }
+  // DELETE /api/providers/:id/keys/:keyId - 删除key
+  if (url.match(/^\/api\/providers\/[^\/]+\/keys\/[^\/]+$/) && method === 'DELETE') {
+    if (!admin.requireAdmin(req)) return sendJSON(res, 403, { error: '需要管理员权限' });
+    const parts = url.split('/');
+    const id = parts[3];
+    const keyId = parts[5];
+    await pgPool.query('DELETE FROM api_keys WHERE id=$1 AND provider_id=$2', [keyId, id]);
+    // Sync dispatcher
+    const keys = await pgPool.query('SELECT id, provider_id, api_key, label, status, weight FROM api_keys WHERE provider_id = $1', [id]);
+    dispatcher.syncKeyPool(id, keys.rows);
+    console.log(`[keys] Deleted key ${keyId} from provider ${id}, remaining: ${keys.rows.length}`);
     return sendJSON(res, 200, { ok: true });
   }
 
@@ -4405,9 +4512,21 @@ server.requestTimeout = 60000;          // 单个请求处理上限 60s，超时
 server.timeout = 65000;                 // socket 空闲超时 65s
 server.maxHeadersCount = 200;           // 放宽头部上限，避免大 headers 请求被拒
 
-server.listen(PORT, '0.0.0.0', () => {
+server.listen(PORT, '0.0.0.0', async () => {
   console.log(`🚀 服务: http://localhost:${PORT} | 📁 ${DATA_DIR} | 🐘 PG:connected(强制·唯一数据源) | 🔴 Redis:${isRedisUp() ? 'up' : 'memory-fallback(仅缓存)'}`);
   if (IS_LEADER) orderExpiry.start(); // 调度器仅 leader worker 跑（避免多实例重复扫 DB）
+
+  // 启动时加载 key 池到 dispatcher 内存态
+  try {
+    const provs = await pgPool.query('SELECT id FROM providers WHERE enabled = true AND api_key IS NOT NULL AND api_key != \'\'');
+    for (const pr of provs.rows) {
+      const keys = await pgPool.query('SELECT id, provider_id, api_key, label, status, weight FROM api_keys WHERE provider_id = $1', [pr.id]);
+      dispatcher.syncKeyPool(pr.id, keys.rows);
+      console.log(`[startup] Loaded ${keys.rows.length} keys for provider ${pr.id}`);
+    }
+  } catch(e) {
+    console.warn('[startup] Key pool init failed:', e.message);
+  }
 });
 
 // ─── 优雅关闭（SIGTERM/SIGINT）──

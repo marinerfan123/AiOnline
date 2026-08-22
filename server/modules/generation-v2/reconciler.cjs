@@ -10,7 +10,7 @@ async function claimReconciling(pg, { workerId, limit = 10, leaseSeconds = 300 }
        SELECT item_id FROM generation_items_v2
         WHERE status='reconciling'
           AND (lease_expires_at IS NULL OR lease_expires_at < NOW())
-        ORDER BY updated_at ASC FOR UPDATE SKIP LOCKED LIMIT $1
+        ORDER BY created_at ASC FOR UPDATE SKIP LOCKED LIMIT $1
      )
      UPDATE generation_items_v2 i
         SET lease_owner=$2, lease_expires_at=NOW()+($3*INTERVAL '1 second'),

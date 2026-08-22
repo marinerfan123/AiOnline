@@ -200,6 +200,7 @@ async function workerTick(pgPool) {
 
 // media.status='pending_upload' reaper：原 finalizeUrl 注释承诺的"reaper 后续重试"，此前未实现。
 // media 行已写好 providerUrl，这里重新拉取+上传，成功则把该行（按 media.id 作 pendingId）幂等更新为 success。
+// 注意：OSS禁用时assetFinalize直接写success，不再产生pending_upload；此reaper仅处理临时故障。
 async function reaperTick(pgPool) {
   try {
     const r = await pgPool.query(
@@ -209,7 +210,18 @@ async function reaperTick(pgPool) {
       [REAPER_LIMIT],
     );
     if (r.rows.length === 0) return;
-    await Promise.allSettled(r.rows.map((m) => retryOneMedia(pgPool, m)));
+    // 过滤掉无provider_url的记录（直接标记失败，避免无限重试）
+    const validRows = r.rows.filter(m => m.provider_url);
+    const nullUrlRows = r.rows.filter(m => !m.provider_url);
+    if (nullUrlRows.length > 0) {
+      await pgPool.query(
+        `UPDATE media SET status='failed', error_message='provider_url missing, cannot upload'
+         WHERE id = ANY($1)`,
+        [nullUrlRows.map(m => m.id)]
+      );
+      console.warn(`[uploadQueue] reaper 跳过 ${nullUrlRows.length} 条无provider_url的记录`);
+    }
+    await Promise.allSettled(validRows.map((m) => retryOneMedia(pgPool, m)));
   } catch (e) {
     console.warn('[uploadQueue] reaper 扫描失败:', e.message);
   }

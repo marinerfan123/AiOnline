@@ -292,10 +292,11 @@ async function finalizeUrl(pgPool, opts) {
       return { mediaId, pendingId: mediaId, ossUrl: providerUrl, ossObjectKey: '', ossUploaded: false, status: 'pending_upload', providerUrl, contentType, fileSize, type };
     }
   } else {
-    ossLog('warn', 'finalize', `[assetFinalize] ⚠️ OSS 未启用或无活跃配置 ${tag}（按主流：仍写 success=provider_url 兜底展示，并打 reaper 占位）`, { taskId, userId, providerUrl: String(providerUrl).slice(0, 80), byteLength: fileSize });
-    // OSS 未开：占位行 status='pending_upload' + providerUrl；reaper 后台继续重试到 OSS 成功
-    await insertMedia(pgPool, { mediaId, userId, taskId, type, prompt, model, ratio, providerUrl, ossUrl: '', ossObjectKey: '', ossUploaded: false, contentType, fileSize, status: 'pending_upload', errorMessage: 'OSS 未启用或无活跃配置' });
-    return { mediaId, pendingId: mediaId, ossUrl: providerUrl, ossObjectKey: '', ossUploaded: false, status: 'pending_upload', providerUrl, contentType, fileSize, type };
+    // OSS 未开：直接用 providerUrl 作为展示 URL，写 success 状态，reaper 不再重试
+    // ossUploaded=false：没有真正上传到OSS，前端不应显示OSS角标
+    ossLog('info', 'finalize', `[assetFinalize] OSS 未启用，使用 providerUrl 直接展示 ${tag}`, { taskId, userId, providerUrl: String(providerUrl).slice(0, 80), byteLength: fileSize });
+    await insertMedia(pgPool, { mediaId, userId, taskId, type, prompt, model, ratio, providerUrl, thumbnail: '', ossUrl: providerUrl, ossObjectKey: '', ossUploaded: false, contentType, fileSize, status: 'success', errorMessage: '' });
+    return { mediaId, pendingId: mediaId, ossUrl: providerUrl, thumbnail: '', ossObjectKey: '', ossUploaded: false, status: 'success', providerUrl, contentType, fileSize, type };
   }
 
   // ── 3. 写 media 表（成功/已有 OSS URL）──
