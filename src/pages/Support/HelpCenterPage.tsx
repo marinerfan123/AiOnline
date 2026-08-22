@@ -1,4 +1,5 @@
 import { HelpCircle, Search, MessageSquare, BookOpen, Video, Shield } from 'lucide-react';
+import { NavLink } from 'react-router-dom';
 import { SupportLayout, SupportCard } from './SupportLayout';
 
 const faqs = [
@@ -68,12 +69,12 @@ export default function HelpCenterPage() {
         <p className="mb-4 text-sm text-zinc-400">
           你可以通过「发送应用反馈」向我们提问，或查看使用文档了解更多细节。
         </p>
-        <a
-          href="/feedback"
+        <NavLink
+          to="/feedback"
           className="inline-flex items-center gap-2 rounded-xl bg-emerald-500 px-4 py-2 text-sm font-medium text-black transition-colors hover:bg-emerald-400"
         >
           <MessageSquare className="size-4" /> 发送反馈
-        </a>
+        </NavLink>
       </SupportCard>
     </SupportLayout>
   );

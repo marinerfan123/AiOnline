@@ -1,4 +1,5 @@
 import { MonitorPlay, Play, Clock, BookOpen } from 'lucide-react';
+import { NavLink } from 'react-router-dom';
 import { SupportLayout, SupportCard } from './SupportLayout';
 
 const tutorials = [
@@ -52,7 +53,7 @@ export default function TutorialsPage() {
           <MonitorPlay className="size-8 text-zinc-600" />
           <p className="text-sm text-zinc-400">
             更多视频教程正在制作中。你也可以查看
-            <a href="/docs" className="mx-1 text-emerald-400 hover:underline">使用文档</a>
+            <NavLink to="/docs" className="mx-1 text-emerald-400 hover:underline">使用文档</NavLink>
             获取图文版说明。
           </p>
         </div>
