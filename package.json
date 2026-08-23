@@ -17,7 +17,10 @@
     "test:all": "npm run test && npm run test:v2 && npm run test:api",
     "test:quality": "node scripts/quality-gate.cjs",
     "check:syntax": "node scripts/check-server-syntax.cjs",
-    "verify": "node scripts/quality-gate.cjs"
+    "verify": "node scripts/quality-gate.cjs",
+    "db:migrate:test": "NODE_ENV=test node server/db/migrate.cjs",
+    "db:migrate:status": "NODE_ENV=test node server/db/migrate.cjs --status",
+    "test:migration": "NODE_ENV=test node --test server/db/migration.test.cjs"
   },
   "dependencies": {
     "@formkit/auto-animate": "^0.9.0",

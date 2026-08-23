@@ -74,19 +74,7 @@ jobs:
           PG_PASSWORD: postgres
           PG_DATABASE: moling_ci_test
         run: |
-          node -e "
-            const { Pool } = require('pg');
-            const { applyGenerationV2Schema } = require('./server/modules/generation-v2/schema.cjs');
-            const p = new Pool({
-              host: 'localhost', port: 5432,
-              database: 'moling_ci_test',
-              user: 'postgres', password: 'postgres',
-            });
-            (async () => {
-              await applyGenerationV2Schema(p);
-              await p.end();
-            })();
-          "
+          node server/db/migrate.cjs
 
       - name: 1. Syntax check
         run: npm run check:syntax
