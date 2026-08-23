@@ -1136,19 +1136,19 @@ function sendJSON(res, code, data) {
   // 防御：避免「headers 已发送」异常导致整个进程崩溃（如某 handler 已响应但未 return 时走到末尾 404）
   if (res.headersSent) return;
   applySecurityHeaders(res);
-  res.writeHead(code, {
+  // SECURITY: CORS origin from config, not wildcard. Allow '*' only without credentials.
+  const corsOrigin = process.env.CORS_ORIGIN;
+  const headers = {
     'Content-Type': 'application/json',
     'Access-Control-Allow-Headers': 'Content-Type, Authorization',
     'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-  });
-  // SECURITY: CORS origin from config, not wildcard. Allow '*' only without credentials.
-  const corsOrigin = process.env.CORS_ORIGIN;
+  };
   if (corsOrigin) {
-    res.setHeader('Access-Control-Allow-Origin', corsOrigin);
+    headers['Access-Control-Allow-Origin'] = corsOrigin;
   } else if (!isProduction) {
-    // dev: permissive; production falls back to no-Allow-Origin (same-origin only)
-    res.setHeader('Access-Control-Allow-Origin', '*');
+    headers['Access-Control-Allow-Origin'] = '*';
   }
+  res.writeHead(code, headers);
   res.end(JSON.stringify(data));
 }
 
@@ -4381,7 +4381,7 @@ app.use((req, res, next) => {
   res.on('finish', () => {
     traffic.record(req.method, (req.url || '').split('?')[0], res.statusCode, req.user, Date.now() - t0);
   });
-  return handleAPI(req, res);
+  return handleAPI(req, res).catch((err) => next(err));
 });
 
 // 本地静态文件路由（/media/ 上传 & /samples/ 公共示例）必须早于 SPA fallback，否则会被 index.html 吞掉
@@ -4394,6 +4394,15 @@ app.use((req, res, next) => {
 app.use((req, res) => {
   if (fs.existsSync(CLIENT_DIR)) return serveStatic(req, res);
   sendJSON(res, 404, { error: 'Not Found' });
+});
+
+// Express error handler (catches unhandled rejections from async middleware)
+app.use((err, req, res, next) => {
+  console.error('[ERROR] Unhandled middleware error:', err && err.message || err);
+  console.error('[ERROR] Stack:', err && err.stack);
+  if (!res.headersSent) {
+    sendJSON(res, 500, { error: 'Internal Server Error' });
+  }
 });
 
 const server = http.createServer(app);
@@ -4515,6 +4524,19 @@ if (isProduction) {
   if (unsafeJwt) {
     console.error('[SECURITY] JWT_SECRET 未设置或使用默认值，生产环境拒绝启动（会话令牌可被伪造）。请设置强随机值后重试。');
     process.exit(1);
+  }
+  // SIGN_SECRET 保护充值订单 HMAC 完整性标记。生产环境若配置了支付通道，缺失该密钥会导致订单签名缺失（本地防篡改失效）。
+  // Webhook 验签由支付平台签名独立保障（fail closed），但 SIGN_SECRET 是本地防篡改的纵深防御层。
+  {
+    const signSecret = process.env.PAYMENT_MASTER_KEY || process.env.PAYMENT_SIGN_SECRET || null;
+    // 仅当 PAYMENT_MASTER_KEY 或 PAYMENT_SIGN_SECRET 任一被显式设置时，才要求 SIGN_SECRET 不为空（避免误报）
+    // 如果两者都未设置，说明支付功能未启用，跳过
+    if (process.env.PAYMENT_MASTER_KEY !== undefined || process.env.PAYMENT_SIGN_SECRET !== undefined) {
+      if (!signSecret) {
+        console.error('[SECURITY] 生产环境检测到支付环境变量已声明但值为空，SIGN_SECRET 缺失将导致订单完整性标记为空。请设置 PAYMENT_MASTER_KEY 或 PAYMENT_SIGN_SECRET 后重试。');
+        process.exit(1);
+      }
+    }
   }
   if (process.env.ADMIN_SEED_PASSWORD && process.env.ADMIN_SEED_PASSWORD === 'Admin@123456') {
     console.warn('[SECURITY] ⚠️ ADMIN_SEED_PASSWORD 仍为默认密码，公开部署前必须覆盖为强密码。');

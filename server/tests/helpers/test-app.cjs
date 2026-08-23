@@ -139,7 +139,8 @@ async function request(baseUrl, options) {
  */
 function getCookies(cookieStrings) {
   const cookies = {};
-  for (const str of (cookieStrings || [])) {
+  if (!Array.isArray(cookieStrings)) return cookies;
+  for (const str of cookieStrings) {
     const eqIdx = str.indexOf('=');
     if (eqIdx < 0) continue;
     const name = str.slice(0, eqIdx).trim();
