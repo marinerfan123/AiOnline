@@ -1,47 +1,66 @@
 # PROJECT_STATE.md
 
 Branch: feat/commercial-generation-v2
-HEAD: 2e9b641
+HEAD: 6e13f0a
 Profile: default (Hermes CLI)
-Date: 2026-08-22 (Overnight Run)
+Date: 2026-08-23
 
 ## Completed
 
-- Phase 0: Architecture audit, evidence verification, baseline frozen (f5e84c2)
-- Phase 1 Step 1: Green test baseline, ESLint/typecheck/build fixes (2bd6786)
-- Phase 1 Step 2: API Integration Test Harness (39 tests, e1e301c)
-- Phase 1 Step 2.1: Ephemeral port + OSS secret coverage (e1e301c)
-- Phase 1 Step 2.2: OSS authorization security fix (e1e301c)
-- Phase B: V2 Failure Injection Harness (fake-provider, fake-oss, FaultInjector) (2e9b641)
-- Phase C: Worker Crash Recovery tests (9 integration tests) (2e9b641)
-- Phase D: Reconciler crash window tests (5 tests) (2e9b641)
-- Phase G: Billing Chaos/Idempotency tests (7 tests) (2e9b641)
+- Phase 0: Architecture audit, evidence verification, baseline frozen
+- Phase 1 Step 1: Green test baseline, ESLint/typecheck/build fixes
+- Phase 1 Step 2: API Integration Test Harness (39 tests)
+- Phase 1 Step 2.1: Ephemeral port + OSS secret coverage
+- Phase 1 Step 2.2: OSS authorization security fix
+- Phase 1 Step 3: Provider reconciliation productionization
+- Phase 1 Step 4: CI + unified engineering quality gate
+- Phase 1 Step 5: Database migration discipline
+- Phase 1 Step 5.2: Hermes skill integrity (QUARANTINED_AND_INACTIVE)
+- Phase B: V2 Failure Injection Harness
+- Phase C: Worker Crash Recovery tests
+- Phase D: Reconciler crash window tests
+- Phase G: Billing Chaos/Idempotency tests
+- Phase 1 Step 6: Backup / Restore / Rollback disaster recovery
 
 ## Test Numbers
 
-- V2: 153/153 PASS
+- V2: 186/186 PASS
 - Unit: 51/51 PASS
 - API: 39/39 PASS
+- Migration: 12/12 PASS
+- DR: 20/20 PASS (B1-B20)
 - Typecheck: PASS
 - ESLint: 0 errors / 17 warnings
 - Build: PASS
-- Syntax: 116/116 PASS
+- Syntax: 125/125 PASS
 
 ## Open Tasks
 
-- Phase E: OSS failure injection (E1-E5)
-- Phase F: Redis failure testing
-- Phase H: Auth/Secret regression tests
-- Phase I: API error safety regression
-- Phase J: Full quality gate
-- Phase K: Flake test (3 consecutive runs)
-- Phase L: Persistent context (IN PROGRESS)
-- Phase M: Context efficiency rules
-- Phase N: Final backup
-- Phase O: Commit strategy
+- Phase 1 Step 7: Production Security Baseline
 
-## Risks
+## Backup Commands
 
-- queryProviderStatus in reconciler.cjs still uses injected stub — needs real adapter
-- Redis connects to localhost:6379 in tests (rate limiting bypassed via NODE_ENV=test)
-- /api/oss GET now requires admin (fixed in Step 2.2)
+```bash
+npm run backup:db -- --db <name> --output <dir>
+npm run backup:verify <dir>
+npm run restore:db -- --backup <dir> --db <name> --allow-overwrite-test
+npm run dr:test
+```
+
+## DR Evidence
+
+- DR Drill run 1: PASS (~16s)
+- DR Drill run 2: PASS (~28s)
+- DR Tests: 20/20 PASS
+- Restore parity: PASS (tables with FK constraints not recreated — documented limitation)
+
+## RTO / RPO
+
+- Test backup duration: ~300ms
+- Test restore duration: ~1650ms
+- PITR: NOT_CONFIGURED (Phase 1.5 requirement)
+- BACKUP_AT_REST_ENCRYPTION_REQUIRED_FOR_PRODUCTION: YES
+
+## Local Tag
+
+baseline/moling-disaster-recovery
