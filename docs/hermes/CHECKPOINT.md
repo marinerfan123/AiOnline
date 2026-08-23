@@ -37,11 +37,11 @@
 - No production secrets | Permissions: contents: read | Concurrency: cancel-in-progress
 
 ## Recent Commits
-1. 6e13f0a - docs(ops): add backup and disaster recovery runbooks + CI DR workflow
-2. 7ed5da8 - feat(ops): add verified database backup and restore tooling
-3. aff578e - docs(hermes): prohibit autonomous self-modification
-4. a5e94e5 - docs: update checkpoint with Step 5 completion
-5. f0f9f39 - feat(db): add versioned PostgreSQL migration framework
+1. 4eb5fde - fix(security): Phase 1 Step 7 — production security baseline
+2. 56f7e71 - docs(hermes): update flake test evidence (3x consecutive PASS)
+3. 6e13f0a - docs(ops): add backup and disaster recovery runbooks + CI DR workflow
+4. 7ed5da8 - feat(ops): add verified database backup and restore tooling
+5. aff578e - docs(hermes): prohibit autonomous self-modification
 
 ## Completed
 - Phase 1 Step 3: Provider reconciliation productionization
@@ -49,9 +49,10 @@
 - Phase 1 Step 5: Database migration discipline
 - Phase 1 Step 5.2: Hermes skill integrity
 - Phase 1 Step 6: Backup / Restore / Rollback disaster recovery
+- Phase 1 Step 7: Production Security Baseline
 
 ## Hermes Policy
 Hermes may not classify a code-changing task COMPLETE unless `npm run verify` passes AFTER the final modification.
 
 ## Next Step
-Phase 1 Step 7: Production Security Baseline
+PHASE 1.5  PRE-PRODUCTION / STAGING

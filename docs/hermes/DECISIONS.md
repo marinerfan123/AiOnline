@@ -30,6 +30,18 @@ Resolution: No revert possible. Documented here as permanent rule.
 - API tests: isolated `moling_test` database, dynamic ports
 - Migration tests: fresh DB per test with `CREATE/DROP DATABASE`
 - DR tests: B1-B20, backup safety + restore parity + fail-closed
+- Security tests: S1-S20, SSRF + auth + CORS + CSRF + secrets + payment
+
+## Security Decisions (Step 7)
+
+- SSRF: `ssrf.cjs` blocks private IPs, DNS rebinding, cloud metadata endpoints
+- CORS: `CORS_ORIGIN` env required for production; same-origin only by default
+- CSRF: `SameSite=Strict` on session cookies
+- Secrets: crypto.cjs fail-closed on non-standard format (no plaintext passthrough)
+- SIGN_SECRET: null instead of empty string (no forged signatures)
+- Webhook errors: generic messages only (no DB internals leaked)
+- Logbus: bounded dedup map (10000 entries, 60s TTL) prevents memory leak
+- Admin SSE: CORS wildcards removed
 
 ## Migration Rollback Philosophy (Step 6)
 

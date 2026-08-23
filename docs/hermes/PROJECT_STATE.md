@@ -21,6 +21,7 @@ Date: 2026-08-23
 - Phase D: Reconciler crash window tests
 - Phase G: Billing Chaos/Idempotency tests
 - Phase 1 Step 6: Backup / Restore / Rollback disaster recovery
+- Phase 1 Step 7: Production Security Baseline
 
 ## Test Numbers
 
@@ -29,6 +30,7 @@ Date: 2026-08-23
 - API: 39/39 PASS
 - Migration: 12/12 PASS
 - DR: 20/20 PASS (B1-B20)
+- Security: 20/20 (S1-S20)
 - Typecheck: PASS
 - ESLint: 0 errors / 17 warnings
 - Build: PASS
@@ -36,7 +38,7 @@ Date: 2026-08-23
 
 ## Open Tasks
 
-- Phase 1 Step 7: Production Security Baseline
+- PHASE 1.5 PRE-PRODUCTION / STAGING
 
 ## Backup Commands
 
@@ -63,4 +65,5 @@ npm run dr:test
 
 ## Local Tag
 
+- baseline/moling-phase1-complete
 baseline/moling-disaster-recovery

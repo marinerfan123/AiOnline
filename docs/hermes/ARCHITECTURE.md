@@ -33,6 +33,12 @@
 
 ## Security
 
+- SSRF: `server/ssrf.cjs` blocks private IPs, DNS rebinding, cloud metadata endpoints
+- Auth: scrypt password hashing, HMAC-SHA256 JWT, `SameSite=Strict` cookies
+- CORS: `CORS_ORIGIN` env for production; same-origin only by default
+- Secrets: crypto.cjs AES-256-GCM, fail-closed on non-standard format
+- Logging: central redaction via `sanitizeErrorMessage()`
+- SSE: user-isolated channels, admin-only monitoring endpoints
 - Redis is cache-only — V2 durable state survives Redis loss
 - OSS is external — provider URLs stored in DB, objects in cloud storage
 - Secrets in .env (not committed), DB tables (backed up but marked sensitive)

@@ -12,6 +12,7 @@
 | API | 39 | 39 | PASS |
 | Migration | 12 | 12 | PASS |
 | DR (B1-B20) | 20 | 20 | PASS |
+| Security (S1-S20) | 20 | 20 | PASS |
 | Build | - | - | PASS |
 
 ## DR Drill Evidence
