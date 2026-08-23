@@ -99,10 +99,12 @@ function isHttps(req) {
 function setCookie(res, name, val, maxAgeSec, req) {
   // 仅当真实传输层为 HTTPS 时才加 Secure；明文 HTTP（裸 IP 直连）省略，否则浏览器拒存导致登录循环（L8）
   const secure = isHttps(req) ? ' Secure;' : '';
-  res.setHeader('Set-Cookie', `${name}=${val}; Path=/; HttpOnly; SameSite=Lax;${secure} Max-Age=${maxAgeSec}`);
+  // SECURITY: SameSite=Strict 防 CSRF 攻击
+  res.setHeader('Set-Cookie', `${name}=${val}; Path=/; HttpOnly; SameSite=Strict;${secure} Max-Age=${maxAgeSec}`);
 }
 function clearCookie(res, name) {
-  res.setHeader('Set-Cookie', `${name}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`);
+  // SECURITY: SameSite=Strict 防 CSRF 攻击
+  res.setHeader('Set-Cookie', `${name}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0`);
 }
 
 // 从请求取当前用户（校验 sid cookie）；无则返回 null（调用方决定 401 或放行）

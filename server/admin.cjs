@@ -367,7 +367,7 @@ function createAdmin(ctx) {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache, no-transform',
       'Connection': 'keep-alive',
-      'Access-Control-Allow-Origin': '*',
+      // SECURITY: removed Access-Control-Allow-Origin: * — admin console SSE must not be cross-origin
     });
     res.write('retry: 3000\n\n');
     let lastFlowId = 0;

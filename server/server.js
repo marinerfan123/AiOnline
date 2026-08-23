@@ -1138,10 +1138,17 @@ function sendJSON(res, code, data) {
   applySecurityHeaders(res);
   res.writeHead(code, {
     'Content-Type': 'application/json',
-    'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Headers': 'Content-Type, Authorization',
     'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
   });
+  // SECURITY: CORS origin from config, not wildcard. Allow '*' only without credentials.
+  const corsOrigin = process.env.CORS_ORIGIN;
+  if (corsOrigin) {
+    res.setHeader('Access-Control-Allow-Origin', corsOrigin);
+  } else if (!isProduction) {
+    // dev: permissive; production falls back to no-Allow-Origin (same-origin only)
+    res.setHeader('Access-Control-Allow-Origin', '*');
+  }
   res.end(JSON.stringify(data));
 }
 
@@ -1292,7 +1299,10 @@ function serveLocalFiles(req, res) {
     if (fs.existsSync(file)) {
       const ext = path.extname(file).toLowerCase();
       const ct = ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg' : ext === '.png' ? 'image/png' : ext === '.webp' ? 'image/webp' : 'application/octet-stream';
-      res.writeHead(200, { 'Content-Type': ct, 'Access-Control-Allow-Origin': '*' });
+      res.writeHead(200, {
+        'Content-Type': ct,
+        ...(process.env.CORS_ORIGIN ? { 'Access-Control-Allow-Origin': process.env.CORS_ORIGIN } : (!isProduction ? { 'Access-Control-Allow-Origin': '*' } : {})),
+      });
       return res.end(fs.readFileSync(file));
     }
     return sendJSON(res, 404, { error: 'Not Found' });
@@ -1305,7 +1315,10 @@ function serveLocalFiles(req, res) {
     if (fs.existsSync(file)) {
       const ext = path.extname(file).toLowerCase();
       const ct = ext === '.svg' ? 'image/svg+xml' : ext === '.png' ? 'image/png' : ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg' : ext === '.webp' ? 'image/webp' : 'application/octet-stream';
-      res.writeHead(200, { 'Content-Type': ct, 'Access-Control-Allow-Origin': '*' });
+      res.writeHead(200, {
+        'Content-Type': ct,
+        ...(process.env.CORS_ORIGIN ? { 'Access-Control-Allow-Origin': process.env.CORS_ORIGIN } : (!isProduction ? { 'Access-Control-Allow-Origin': '*' } : {})),
+      });
       return res.end(fs.readFileSync(file));
     }
     return sendJSON(res, 404, { error: 'Not Found' });
@@ -2849,9 +2862,16 @@ async function handleAPI(req, res) {
 
   // ── Providers ──
   // ── 代理下载图片（绕过浏览器 CORS）──
+  // SECURITY: SSRF protection — require user auth, block private/internal IPs
   if (url === '/api/proxy-fetch' && method === 'POST') {
+    const user = session.getUserFromCookie(req);
+    if (!user) return sendJSON(res, 401, { error: '请先登录' });
     const body = await parseBody(req);
     if (!body?.imageUrl) return sendJSON(res, 400, { success: false, message: '缺少 imageUrl' });
+    // SSRF check
+    const { asyncCheckUrl } = require('./ssrf.cjs');
+    const ssrf = await asyncCheckUrl(body.imageUrl);
+    if (!ssrf.ok) return sendJSON(res, 400, { success: false, message: `URL 不安全：${ssrf.reason}` });
     try {
       const r = await fetch(body.imageUrl, {
         headers: body.headers || {},
@@ -4343,7 +4363,9 @@ app.use((req, res, next) => {
 // CORS 预检
 app.use((req, res, next) => {
   if (req.method === 'OPTIONS') {
-    res.writeHead(204, { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'Content-Type, Authorization', 'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS' });
+    const corsOrigin = process.env.CORS_ORIGIN;
+    const origin = corsOrigin || (!isProduction ? '*' : '');
+    res.writeHead(204, { 'Access-Control-Allow-Origin': origin, 'Access-Control-Allow-Headers': 'Content-Type, Authorization', 'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS' });
     return res.end();
   }
   next();

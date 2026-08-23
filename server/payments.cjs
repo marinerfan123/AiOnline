@@ -8,10 +8,11 @@ const { createLoader } = require('./payments/loader.cjs');
 const { createWebhook } = require('./payments/webhook.cjs');
 
 // 订单签名密钥：仅用于本地订单完整性标记，绝不构成入账凭证（入账必须过 webhook 验签）。
-const SIGN_SECRET = process.env.PAYMENT_MASTER_KEY || process.env.PAYMENT_SIGN_SECRET || '';
+// SECURITY: 空密钥回退已被删除 — 无密钥时订单签名缺失，而非伪造为全零串。
+const SIGN_SECRET = process.env.PAYMENT_MASTER_KEY || process.env.PAYMENT_SIGN_SECRET || null;
 
 function hmac(secret, msg) {
-  if (!secret) return '';
+  if (!secret) return null;
   return crypto.createHmac('sha256', secret).update(msg).digest('hex');
 }
 

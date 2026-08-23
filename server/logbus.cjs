@@ -80,7 +80,7 @@ function createLogBus({ maxBuffer = 1000, skipPath = (u) => u.startsWith('/api/a
       'Cache-Control': 'no-cache, no-transform',
       'Connection': 'keep-alive',
       'X-Accel-Buffering': 'no',
-      'Access-Control-Allow-Origin': '*',
+      // SECURITY: removed Access-Control-Allow-Origin: * — admin SSE must not be cross-origin
     });
     res.write(`retry: 3000\n\n`);
     // 首屏：快照一次性推过去
@@ -126,20 +126,33 @@ function createLogBus({ maxBuffer = 1000, skipPath = (u) => u.startsWith('/api/a
       const msg = args.map(stringify).join(' ');
       // 简单去重：同 source + 同 message 5s 内只记一次
       const now = Date.now();
-      if (!_dedup.has('WARN:console:' + msg) || now - _dedup.get('WARN:console:' + msg) > 5000) {
-        _dedup.set('WARN:console:' + msg, now);
-        emit('WARN', 'console', msg);
+      const key = 'WARN:console:' + msg;
+      const last = _dedup.get(key);
+      if (last && now - last <= 5000) return;
+      _dedup.set(key, now);
+      // SECURITY: 限制 dedup map 大小，防止内存泄漏
+      if (_dedup.size > 10000) {
+        const entries = [..._dedup.entries()].filter(([, ts]) => now - ts < 60000);
+        _dedup.clear();
+        entries.forEach(([k, v]) => _dedup.set(k, v));
       }
+      emit('WARN', 'console', msg);
     };
     console.error = (...args) => {
       try { origError(...args); } catch {}
       const msg = args.map(stringify).join(' ');
       const now = Date.now();
       const key = 'ERROR:console:' + msg;
-      if (!_dedup.has(key) || now - _dedup.get(key) > 5000) {
-        _dedup.set(key, now);
-        emit('ERROR', 'console', msg);
+      const last = _dedup.get(key);
+      if (last && now - last <= 5000) return;
+      _dedup.set(key, now);
+      // SECURITY: 限制 dedup map 大小，防止内存泄漏
+      if (_dedup.size > 10000) {
+        const entries = [..._dedup.entries()].filter(([, ts]) => now - ts < 60000);
+        _dedup.clear();
+        entries.forEach(([k, v]) => _dedup.set(k, v));
       }
+      emit('ERROR', 'console', msg);
     };
   }
   const _dedup = new Map();

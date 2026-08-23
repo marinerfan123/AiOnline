@@ -64,6 +64,10 @@ function normalizeContentType(url, responseContentType, fallback = 'image/jpeg')
 async function fetchBytes(url) {
   let parsed;
   try { parsed = new URL(String(url)); } catch { throw new Error('非法 URL'); }
+  // SSRF protection: only allow http/https to public IPs
+  const { asyncCheckUrl } = require('./ssrf.cjs');
+  const ssrf = await asyncCheckUrl(String(url));
+  if (!ssrf.ok) throw new Error(`SSRF blocked: ${ssrf.reason}`);
 
   // 支持 data: URI（dispatcher 把 provider 返回的 b64_json 包装成 data:image/...;base64,...）
   // 不经过 HTTP fetch，直接解码 base64 为 Buffer，供后续 OSS PUT 使用。

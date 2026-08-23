@@ -99,7 +99,7 @@ function createMonitor({ maxBuffer = 500, snapshotSize = 100, skipPath = (u) => 
       'Cache-Control': 'no-cache, no-transform',
       'Connection': 'keep-alive',
       'X-Accel-Buffering': 'no',        // 关 nginx buffer
-      'Access-Control-Allow-Origin': '*',
+      // SECURITY: removed Access-Control-Allow-Origin: * — admin SSE must not be cross-origin
     });
     res.write(`retry: 3000\n\n`);       // 客户端断线 3s 后重连
     // 首屏：把快照一次性推过去，UI 立刻有内容

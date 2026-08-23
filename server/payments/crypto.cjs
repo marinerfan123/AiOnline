@@ -35,9 +35,9 @@ function encrypt(plain) {
 
 function decrypt(stored) {
   if (!stored) return null;
-  // 兼容极端情况：若不是我们的加密格式（无两个点），原样返回（历史上不应出现）
+  // SECURITY: 拒绝非标准格式 — 不再兼容明文回退，避免意外泄露未加密密钥
   const parts = stored.split('.');
-  if (parts.length !== 3) return stored;
+  if (parts.length !== 3) throw new Error('存储格式无效：拒绝非加密格式密钥（fail closed）');
   const [ivHex, tagHex, encHex] = parts;
   const decipher = crypto.createDecipheriv(ALGO, getKey(), Buffer.from(ivHex, 'hex'));
   decipher.setAuthTag(Buffer.from(tagHex, 'hex'));

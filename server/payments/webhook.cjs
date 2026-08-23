@@ -175,7 +175,7 @@ function createWebhook(ctx) {
          VALUES ('failed',$1,$2,$3)`,
         [entry.id, outTradeNo, { err: String(e.message) }],
       ).catch(() => {});
-      return sendJSON(res, 500, { error: '入账失败：' + e.message });
+      return sendJSON(res, 500, { error: '入账失败' });
     } finally {
       client.release();
     }
