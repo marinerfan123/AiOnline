@@ -20,7 +20,12 @@
     "verify": "node scripts/quality-gate.cjs",
     "db:migrate:test": "NODE_ENV=test node server/db/migrate.cjs",
     "db:migrate:status": "NODE_ENV=test node server/db/migrate.cjs --status",
-    "test:migration": "NODE_ENV=test node --test server/db/migration.test.cjs"
+    "test:migration": "NODE_ENV=test node --test server/db/migration.test.cjs",
+    "backup:db": "node scripts/backup-db.cjs",
+    "restore:db": "node scripts/restore-db.cjs",
+    "backup:verify": "node scripts/verify-backup.cjs",
+    "dr:test": "NODE_ENV=test node scripts/dr-drill.cjs",
+    "test:dr": "NODE_ENV=test node --test --test-concurrency=1 server/tests/backup/disaster-recovery.test.cjs"
   },
   "dependencies": {
     "@formkit/auto-animate": "^0.9.0",
