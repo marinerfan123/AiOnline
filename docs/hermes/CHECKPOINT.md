@@ -26,8 +26,9 @@
 - Migration: 12/12 PASS (M1-M12)
 - DR: 20/20 PASS (B1-B20)
 - Typecheck: PASS | ESLint: 0 err / 17 warn | Build: PASS | Syntax: 125/125 PASS
-- Canonical: `npm run verify` (ALL PASS ~42s)
+- Canonical: `npm run verify` (ALL PASS ~43s)
 - DR Drill: 2 consecutive PASS
+- Flake: 3 consecutive ALL PASS (verify + DR tests)
 - Fail-closed: YES
 
 ## CI
