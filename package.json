@@ -14,7 +14,10 @@
     "test:watch": "vitest",
     "test:v2": "node --test --test-concurrency=1 server/modules/generation-v2/*.test.cjs",
     "test:api": "TEST_PG_DATABASE=moling_test NODE_ENV=test node --test server/tests/integration/*.test.cjs",
-    "test:all": "npm run test && npm run test:v2 && npm run test:api"
+    "test:all": "npm run test && npm run test:v2 && npm run test:api",
+    "test:quality": "node scripts/quality-gate.cjs",
+    "check:syntax": "node scripts/check-server-syntax.cjs",
+    "verify": "node scripts/quality-gate.cjs"
   },
   "dependencies": {
     "@formkit/auto-animate": "^0.9.0",
