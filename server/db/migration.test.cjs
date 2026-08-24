@@ -305,6 +305,120 @@ test('M11: migration history is deterministic across runs', async () => {
   }
 }, { timeout: 120000 });
 
+async function assertGenerationV2RuntimeSchema(pg) {
+  const usersCols = await getTableColumns(pg, 'users');
+  const userColNames = usersCols.map(c => c.column_name);
+  assert.ok(userColNames.includes('email'), 'users should have email');
+  assert.ok(userColNames.includes('password_hash'), 'users should have password_hash');
+  assert.ok(userColNames.includes('reward_credits'), 'users should have reward_credits');
+  assert.ok(userColNames.includes('credits'), 'users should have credits');
+
+  const batchesCols = await getTableColumns(pg, 'generation_batches_v2');
+  const batchColNames = batchesCols.map(c => c.column_name);
+  for (const col of [
+    'batch_id', 'user_id', 'idempotency_key', 'model_id', 'content_type',
+    'requested_count', 'unit_price', 'reserved_total', 'success_count',
+    'failed_count', 'canceled_count', 'status', 'request_payload',
+    'created_at', 'started_at', 'completed_at',
+  ]) {
+    assert.ok(batchColNames.includes(col), `generation_batches_v2 should have ${col}`);
+  }
+
+  const itemsCols = await getTableColumns(pg, 'generation_items_v2');
+  const itemColNames = itemsCols.map(c => c.column_name);
+  for (const col of [
+    'item_id', 'batch_id', 'item_index', 'mode', 'status', 'priority',
+    'attempt_count', 'next_attempt_at', 'lease_owner', 'lease_version',
+    'lease_expires_at', 'provider_id', 'key_id', 'provider_request_id',
+    'provider_url', 'oss_url', 'last_error_code', 'last_error',
+    'created_at', 'started_at', 'generated_at', 'uploaded_at', 'completed_at',
+  ]) {
+    assert.ok(itemColNames.includes(col), `generation_items_v2 should have ${col}`);
+  }
+
+  const attemptsCols = await getTableColumns(pg, 'generation_item_attempts_v2');
+  const attemptColNames = attemptsCols.map(c => c.column_name);
+  for (const col of [
+    'attempt_id', 'item_id', 'attempt_no', 'lease_version', 'provider_id',
+    'key_id', 'provider_request_id', 'client_request_id', 'status',
+    'http_status', 'error_code', 'error_message', 'started_at', 'finished_at', 'latency_ms',
+  ]) {
+    assert.ok(attemptColNames.includes(col), `generation_item_attempts_v2 should have ${col}`);
+  }
+
+  const holdsCols = await getTableColumns(pg, 'generation_credit_holds_v2');
+  const holdColNames = holdsCols.map(c => c.column_name);
+  for (const col of ['hold_id', 'item_id', 'user_id', 'pool', 'amount', 'status', 'created_at', 'settled_at']) {
+    assert.ok(holdColNames.includes(col), `generation_credit_holds_v2 should have ${col}`);
+  }
+
+  const heartbeatCols = await getTableColumns(pg, 'generation_worker_heartbeats_v2');
+  const heartbeatColNames = heartbeatCols.map(c => c.column_name);
+  for (const col of ['worker_id', 'role', 'last_seen_at', 'meta']) {
+    assert.ok(heartbeatColNames.includes(col), `generation_worker_heartbeats_v2 should have ${col}`);
+  }
+
+  const outboxCols = await getTableColumns(pg, 'generation_outbox_v2');
+  const outboxColNames = outboxCols.map(c => c.column_name);
+  for (const col of [
+    'event_id', 'aggregate_type', 'aggregate_id', 'event_type', 'payload',
+    'created_at', 'published_at', 'lease_owner', 'lease_expires_at', 'attempts',
+  ]) {
+    assert.ok(outboxColNames.includes(col), `generation_outbox_v2 should have ${col}`);
+  }
+
+  const itemsIdx = await getTableIndexes(pg, 'generation_items_v2');
+  const idxNames = itemsIdx.map(i => i.indexname);
+  assert.ok(idxNames.includes('idx_generation_items_v2_claim'), 'should have claim index');
+  assert.ok(idxNames.includes('idx_generation_items_v2_lease'), 'should have lease index');
+  assert.ok(idxNames.includes('idx_generation_items_v2_batch'), 'should have batch index');
+  assert.ok(idxNames.includes('uq_generation_items_v2_provider_request'), 'should have unique provider request index');
+  const claimIdx = itemsIdx.find(i => i.indexname === 'idx_generation_items_v2_claim');
+  assert.match(claimIdx.indexdef, /next_attempt_at/i, 'claim index should use runtime retry scheduler');
+  assert.match(claimIdx.indexdef, /priority/i, 'claim index should use priority');
+
+  const outboxIdx = await getTableIndexes(pg, 'generation_outbox_v2');
+  const outboxPending = outboxIdx.find(i => i.indexname === 'idx_generation_outbox_v2_pending');
+  assert.ok(outboxPending, 'should have outbox pending index');
+  assert.match(outboxPending.indexdef, /published_at IS NULL/i, 'outbox pending index should use published_at');
+}
+
+async function assertGenerationV2WorkerStartupPrimitives(pg) {
+  await pg.query(
+    `INSERT INTO generation_worker_heartbeats_v2(worker_id, role, last_seen_at, meta)
+     VALUES('w-migration-test', 'generation', NOW(), '{}'::jsonb)
+     ON CONFLICT (worker_id) DO UPDATE SET last_seen_at=NOW(), meta=EXCLUDED.meta`
+  );
+  await pg.query(
+    `INSERT INTO users (id, email, display_name, password_hash)
+     VALUES ('u-migration-v2', 'migration-v2@test.local', 'Migration V2', '$2b$10$fake')`
+  );
+  await pg.query(
+    `INSERT INTO generation_batches_v2
+       (batch_id, user_id, idempotency_key, model_id, content_type, requested_count, unit_price, reserved_total, request_payload)
+     VALUES ('b-migration-v2', 'u-migration-v2', 'idem-migration-v2', 'model-v2', 'image', 1, 0, 0, '{}'::jsonb)`
+  );
+  await pg.query(
+    `INSERT INTO generation_items_v2 (item_id, batch_id, item_index, status, mode, priority)
+     VALUES ('i-migration-v2', 'b-migration-v2', 0, 'queued', 'real', 10)`
+  );
+  const claimed = await pg.query(
+    `WITH picked AS (
+       SELECT item_id FROM generation_items_v2
+       WHERE status IN ('queued','retry_wait') AND mode='real' AND next_attempt_at <= NOW()
+       ORDER BY priority DESC, created_at ASC
+       FOR UPDATE SKIP LOCKED LIMIT 1
+     )
+     UPDATE generation_items_v2 i
+       SET status='leased', lease_owner='w-migration-test',
+           lease_expires_at=NOW() + INTERVAL '30 seconds',
+           lease_version=i.lease_version+1, attempt_count=i.attempt_count+1
+     FROM picked WHERE i.item_id=picked.item_id
+     RETURNING i.item_id, i.status, i.lease_version`
+  );
+  assert.equal(claimed.rowCount, 1, 'worker should claim a migrated V2 item');
+}
+
 // === M12: Schema parity ===
 test('M12: schema parity between bootstrap and migration-created DB', async () => {
   const suffix = randomSuffix();
@@ -312,26 +426,48 @@ test('M12: schema parity between bootstrap and migration-created DB', async () =
   const pg = createPool(dbName);
   try {
     await migrate(pg);
-    const usersCols = await getTableColumns(pg, 'users');
-    const userColNames = usersCols.map(c => c.column_name);
-    assert.ok(userColNames.includes('email'), 'users should have email');
-    assert.ok(userColNames.includes('password_hash'), 'users should have password_hash');
-    assert.ok(userColNames.includes('reward_credits'), 'users should have reward_credits');
-    assert.ok(userColNames.includes('credits'), 'users should have credits');
+    await assertGenerationV2RuntimeSchema(pg);
+  } finally {
+    await pg.end();
+    await dropTestDb(dbName);
+  }
+}, { timeout: 60000 });
 
-    const itemsCols = await getTableColumns(pg, 'generation_items_v2');
-    const itemColNames = itemsCols.map(c => c.column_name);
-    assert.ok(itemColNames.includes('batch_id'), 'generation_items_v2 should have batch_id');
-    assert.ok(itemColNames.includes('status'), 'generation_items_v2 should have status');
-    assert.ok(itemColNames.includes('lease_version'), 'generation_items_v2 should have lease_version');
-    assert.ok(itemColNames.includes('provider_request_id'), 'generation_items_v2 should have provider_request_id');
-    assert.ok(itemColNames.includes('mode'), 'generation_items_v2 should have mode');
+test('M13: fresh migrations support Generation V2 worker startup primitives', async () => {
+  const suffix = randomSuffix();
+  const dbName = await createTestDb(suffix);
+  const pg = createPool(dbName);
+  try {
+    await migrate(pg);
+    await assertGenerationV2RuntimeSchema(pg);
+    await assertGenerationV2WorkerStartupPrimitives(pg);
+  } finally {
+    await pg.end();
+    await dropTestDb(dbName);
+  }
+}, { timeout: 60000 });
 
-    const itemsIdx = await getTableIndexes(pg, 'generation_items_v2');
-    const idxNames = itemsIdx.map(i => i.indexname);
-    assert.ok(idxNames.includes('idx_generation_items_v2_claim'), 'should have claim index');
-    assert.ok(idxNames.includes('idx_generation_items_v2_lease'), 'should have lease index');
-    assert.ok(idxNames.includes('uq_generation_items_v2_provider_request'), 'should have unique provider request index');
+test('M14: database already at 0002 upgrades to runtime Generation V2 schema', async () => {
+  const suffix = randomSuffix();
+  const dbName = await createTestDb(suffix);
+  const pg = createPool(dbName);
+  try {
+    const all = discoverMigrations();
+    const beforeForward = all.filter(m => m.version <= '0002');
+    assert.equal(beforeForward.length, 2, 'test setup should apply 0001 and 0002 only');
+    await store.ensureMigrationTable(pg);
+    for (const m of beforeForward) {
+      const sql = fs.readFileSync(m.filePath, 'utf8');
+      await pg.query('BEGIN');
+      await pg.query(sql);
+      await store.recordMigration(pg, m.version, m.name, store.computeChecksum(sql));
+      await pg.query('COMMIT');
+    }
+
+    const result = await migrate(pg);
+    assert.ok(result.applied >= 1, 'forward migration should apply to a database already at 0002');
+    await assertGenerationV2RuntimeSchema(pg);
+    await assertGenerationV2WorkerStartupPrimitives(pg);
   } finally {
     await pg.end();
     await dropTestDb(dbName);
