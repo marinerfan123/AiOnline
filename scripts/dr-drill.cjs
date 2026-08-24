@@ -441,11 +441,10 @@ async function requireSeedFixtures(pool) {
       ('dr-item-4', 1, 'dr-provider-1', 'retry', 'rate_limited')
     ON CONFLICT (item_id, attempt_no) DO NOTHING`);
 
-    // Outbox (migration 0002: event_id PK, item_id, batch_id, user_id, event_type, payload, published)
-    await client.query(`INSERT INTO generation_outbox_v2 (event_id, item_id, batch_id, user_id, event_type, payload) VALUES
-      ('dr-evt-1', 'dr-item-1', 'dr-batch-1', 'dr-user-1', 'batch_created', '{"batch_id":"dr-batch-1"}'),
-      ('dr-evt-2', 'dr-item-1', 'dr-batch-1', 'dr-user-1', 'item_done', '{"item_id":"dr-item-1"}')
-    ON CONFLICT (event_id) DO NOTHING`);
+    // Outbox after forward migrations: event_id is BIGINT with sequence default; use runtime aggregate fields.
+    await client.query(`INSERT INTO generation_outbox_v2 (item_id, batch_id, user_id, aggregate_type, aggregate_id, event_type, payload) VALUES
+      ('dr-item-1', 'dr-batch-1', 'dr-user-1', 'generation_batch', 'dr-batch-1', 'batch_created', '{"batch_id":"dr-batch-1"}'),
+      ('dr-item-1', 'dr-batch-1', 'dr-user-1', 'generation_item', 'dr-item-1', 'item_done', '{"item_id":"dr-item-1"}')`);
 
     // Worker heartbeats (migration 0002: worker_id, role, last_heartbeat, created_at)
     await client.query(`INSERT INTO generation_worker_heartbeats_v2 (worker_id, role) VALUES
