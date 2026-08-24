@@ -11,7 +11,14 @@ const crypto = require('crypto');
 let _redis = null;
 let _redisUp = false;
 function redis() {
-  if (_redis && _redisUp) return _redis;
+  // P1-02: re-check Redis connectivity on each call so the application
+  // can recover after a Redis outage without process restart.
+  if (_redis && _redisUp) {
+    if (_redis.status === 'ready' || _redis.status === 'reconnecting') return _redis;
+    // Connection lost — reset and attempt reconnection
+    _redisUp = false;
+    _redis = null;
+  }
   try {
     const mod = require('./redis.cjs');
     const r = mod.getRedis && mod.getRedis();
