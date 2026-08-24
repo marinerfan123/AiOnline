@@ -704,7 +704,335 @@ test('D19: Concurrent billing — PK/unique constraint prevents double charge', 
   await pg.end();
 });
 
-// Force process exit after all tests
-test.after(() => {
-  process.exit(0);
+
+test('D20: SSE E2E — HTTP client receives Redis-published task event', async () => {
+  const { spawnTestServer, request, getCookies } = require('../helpers/test-app.cjs');
+  const { Pool } = require('pg');
+  const http = require('http');
+  const crypto = require('crypto');
+  const { initTestSchema } = require('../helpers/test-db.cjs');
+  const session = require('../../auth.cjs');
+
+  // Bootstrap schema + test user in test DB
+  const pg = new Pool({
+    host: process.env.TEST_PG_HOST || process.env.PG_HOST || 'localhost',
+    port: parseInt(process.env.TEST_PG_PORT || process.env.PG_PORT || '5432'),
+    database: process.env.TEST_PG_DATABASE || 'moling_test',
+    user: process.env.TEST_PG_USER || 'postgres',
+    password: process.env.TEST_PG_PASSWORD || '0.0.1abcd',
+    max: 3,
+  });
+  await initTestSchema(pg);
+  const userId = `sse-user-${Date.now()}`;
+  const email = `sse-${Date.now()}@test.com`;
+  const pwdHash = session.hashPassword('TestPass123!');
+  await pg.query(
+    `INSERT INTO users(id,email,password_hash,reward_credits,recharge_credits,credits,role,status)
+     VALUES($1,$2,$3,0,0,0,'user','active') ON CONFLICT DO NOTHING`,
+    [userId, email, pwdHash]
+  );
+
+  // Spawn a real server (child process with its own Redis subscriber)
+  const server = await spawnTestServer();
+
+  // Login to get session cookie
+  const loginRes = await request(server.baseUrl, {
+    method: 'POST',
+    path: '/api/auth/login',
+    body: { email, password: 'TestPass123!' },
+  });
+  const cookies = getCookies(loginRes.cookies);
+  const cookieHeader = Object.values(cookies).join('; ');
+  assert.ok(cookieHeader.includes('sid'), 'should have session cookie');
+
+  // Open SSE connection (this IS the test client)
+  const sseReceived = new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error('SSE event timeout')), 10000);
+    const sseReq = http.get(
+      { hostname: 'localhost', port: new URL(server.baseUrl).port, path: '/api/generate/stream', headers: { Cookie: cookieHeader } },
+      (sseRes) => {
+        let buf = '';
+        sseRes.on('data', (chunk) => {
+          buf += chunk.toString();
+          // SSE data lines: "data: {...}\n\n"
+          const lines = buf.split('\n\n');
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              try {
+                const payload = JSON.parse(line.slice(6));
+                if (payload.taskId === 'test-task-e2e') {
+                  clearTimeout(timeout);
+                  sseRes.destroy();
+                  resolve(payload);
+                  return;
+                }
+              } catch {}
+            }
+          }
+        });
+        sseRes.on('end', () => {}); // connection stays open
+      }
+    );
+    sseReq.on('error', (e) => { clearTimeout(timeout); reject(e); });
+  });
+
+  // Give SSE connection time to establish
+  await new Promise(r => setTimeout(r, 1000));
+
+  // Publish task event to Redis from INDEPENDENT client (simulates Worker-B in different process)
+  // The test server child process has its own Redis subscriber that forwards to SSE clients.
+  const Redis = require('ioredis');
+  const pub = new Redis({ host: process.env.REDIS_HOST || 'localhost', port: parseInt(process.env.REDIS_PORT || '6379') });
+  const channel = `task-updates:${userId}`;
+  await pub.publish(channel, JSON.stringify({
+    taskId: 'test-task-e2e',
+    status: 'completed',
+    userId,
+  }));
+  await pub.disconnect();
+
+  // Wait for SSE client to receive the event
+  const payload = await sseReceived;
+  assert.strictEqual(payload.taskId, 'test-task-e2e', 'SSE client received correct taskId');
+  assert.strictEqual(payload.status, 'completed', 'SSE client received correct status');
+
+  await pg.end();
+  await server.stop();
+});
+
+// ─── SSE user isolation ──────────────────────────────────────────────
+test('D21: SSE user isolation — User-B does not receive User-A events', async () => {
+  const { spawnTestServer, request, getCookies } = require('../helpers/test-app.cjs');
+  const { Pool } = require('pg');
+  const http = require('http');
+  const { initTestSchema } = require('../helpers/test-db.cjs');
+  const session = require('../../auth.cjs');
+
+  // Bootstrap
+  const pg = new Pool({
+    host: process.env.TEST_PG_HOST || process.env.PG_HOST || 'localhost',
+    port: parseInt(process.env.TEST_PG_PORT || process.env.PG_PORT || '5432'),
+    database: process.env.TEST_PG_DATABASE || 'moling_test',
+    user: process.env.TEST_PG_USER || 'postgres',
+    password: process.env.TEST_PG_PASSWORD || '0.0.1abcd',
+    max: 3,
+  });
+  await initTestSchema(pg);
+
+  const userA = `sse-a-${Date.now()}`;
+  const userB = `sse-b-${Date.now()}`;
+  const emailA = `sse-a-${Date.now()}@test.com`;
+  const emailB = `sse-b-${Date.now()}@test.com`;
+
+  for (const [uid, em] of [[userA, emailA], [userB, emailB]]) {
+    await pg.query(
+      `INSERT INTO users(id,email,password_hash,reward_credits,recharge_credits,credits,role,status)
+       VALUES($1,$2,$3,0,0,0,'user','active') ON CONFLICT DO NOTHING`,
+      [uid, em, session.hashPassword('TestPass123!')]
+    );
+  }
+
+  const server = await spawnTestServer();
+
+  // Login both users
+  const loginA = await request(server.baseUrl, { method: 'POST', path: '/api/auth/login', body: { email: emailA, password: 'TestPass123!' } });
+  const loginB = await request(server.baseUrl, { method: 'POST', path: '/api/auth/login', body: { email: emailB, password: 'TestPass123!' } });
+  const cookieA = Object.values(getCookies(loginA.cookies)).join('; ');
+  const cookieB = Object.values(getCookies(loginB.cookies)).join('; ');
+
+  // Open SSE for User-B (should NOT receive User-A events)
+  const userBReceived = new Promise((resolve) => {
+    const timeout = setTimeout(() => resolve(null), 4000); // 4s — if nothing received, that's GOOD
+    const sseReq = http.get(
+      { hostname: 'localhost', port: new URL(server.baseUrl).port, path: '/api/generate/stream', headers: { Cookie: cookieB } },
+      (sseRes) => {
+        sseRes.on('data', (chunk) => {
+          const text = chunk.toString();
+          if (text.includes('data:')) {
+            clearTimeout(timeout);
+            sseRes.destroy();
+            resolve(text); // If User-B receives ANY event, that's a FAIL
+          }
+        });
+      }
+    );
+    sseReq.on('error', () => { clearTimeout(timeout); resolve(null); });
+  });
+
+  // Give SSE time to establish
+  await new Promise(r => setTimeout(r, 1000));
+
+  // Publish event for User-A only
+  const Redis = require('ioredis');
+  const pub = new Redis({ host: process.env.REDIS_HOST || 'localhost', port: parseInt(process.env.REDIS_PORT || '6379') });
+  await pub.publish(`task-updates:${userA}`, JSON.stringify({ taskId: 'user-a-only', status: 'completed' }));
+  await pub.disconnect();
+
+  // User-B should receive NOTHING (null means timeout with no data)
+  const received = await userBReceived;
+  assert.strictEqual(received, null, 'User-B should NOT receive User-A event');
+
+  // Now verify User-A DID receive the event
+  const userASSE = new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error('User-A SSE timeout')), 5000);
+    const sseReq = http.get(
+      { hostname: 'localhost', port: new URL(server.baseUrl).port, path: '/api/generate/stream', headers: { Cookie: cookieA } },
+      (sseRes) => {
+        let buf = '';
+        sseRes.on('data', (chunk) => {
+          buf += chunk.toString();
+          if (buf.includes('user-a-only')) {
+            clearTimeout(timeout);
+            sseRes.destroy();
+            resolve(true);
+          }
+        });
+      }
+    );
+    sseReq.on('error', (e) => { clearTimeout(timeout); reject(e); });
+  });
+
+  // Republish for User-A (SSE connection was new, so event from before wasn't captured)
+  await new Promise(r => setTimeout(r, 500));
+  const pub2 = new Redis({ host: process.env.REDIS_HOST || 'localhost', port: parseInt(process.env.REDIS_PORT || '6379') });
+  await pub2.publish(`task-updates:${userA}`, JSON.stringify({ taskId: 'user-a-only', status: 'completed' }));
+  await pub2.disconnect();
+
+  const aGot = await userASSE;
+  assert.strictEqual(aGot, true, 'User-A should receive own event');
+
+  await pg.end();
+  await server.stop();
+});
+
+// ─── Payment multi-node transaction safety ────────────────────────────
+test('D22: Payment concurrent callback — single credit/ledger effect', async () => {
+  const { Pool } = require('pg');
+  const { initTestSchema } = require('../helpers/test-db.cjs');
+  const session = require('../../auth.cjs');
+
+  const pg = new Pool({
+    host: process.env.TEST_PG_HOST || process.env.PG_HOST || 'localhost',
+    port: parseInt(process.env.TEST_PG_PORT || process.env.PG_PORT || '5432'),
+    database: process.env.TEST_PG_DATABASE || 'moling_test',
+    user: process.env.TEST_PG_USER || 'postgres',
+    password: process.env.TEST_PG_PASSWORD || '0.0.1abcd',
+    max: 5,
+  });
+  await initTestSchema(pg);
+
+  // Create test user (matching production recharge_orders: amount in 元=credits, id=TEXT PK)
+  const userId = `pay-user-${Date.now()}`;
+  await pg.query(
+    `INSERT INTO users(id,email,password_hash,reward_credits,recharge_credits,credits,role,status)
+     VALUES($1,$2,$3,0,0,0,'user','active')`,
+    [userId, `pay-${Date.now()}@test.com`, session.hashPassword('TestPass123!')]
+  );
+
+  const providerId = `test-pay-prov-${Date.now()}`;
+  await pg.query(
+    `INSERT INTO providers(id,name,type,base_url,api_key,supported_types,enabled,protocol)
+     VALUES($1,$2,$3,$4,$5,$6,$7,$8)`,
+    [providerId, 'TestPay', 'official', '', 'fake-key', '{payment}', true, 'test-pay']
+  );
+
+  // Use the REAL schema: id TEXT PK, amount INT (元=credits), channel, sign, meta
+  const orderNo = `order2-${Date.now()}`;
+  const channelTradeNo = `cht2-${Date.now()}`;
+  const orderAmount = 1; // 1 元 = 1 credit (production: amount in 元)
+
+  // Reset user balance
+  await pg.query('UPDATE users SET credits=0, recharge_credits=0 WHERE id=$1', [userId]);
+
+  // Insert pending order matching real schema
+  await pg.query(
+    `INSERT INTO recharge_orders(id, user_id, channel, amount, status, pay_order_no)
+     VALUES($1,$2,'wechat',$3,'pending',$4)`,
+    [orderNo, userId, orderAmount, orderNo]
+  );
+
+  // Simulate TWO concurrent webhook handlers with the EXACT production transaction logic:
+  // 1) FOR UPDATE on order  2) ON CONFLICT on webhook_events  3) credit + transaction
+  const [r1, r2] = await Promise.allSettled([
+    (async () => {
+      const client = await pg.connect();
+      try {
+        await client.query('BEGIN');
+        const ord = await client.query(
+          'SELECT * FROM recharge_orders WHERE pay_order_no=$1 FOR UPDATE', [orderNo]);
+        if (!ord.rows.length) { await client.query('ROLLBACK'); return { ok: false }; }
+        if (ord.rows[0].status === 'paid') { await client.query('COMMIT'); return { ok: true, alreadyPaid: true }; }
+
+        const ins = await client.query(
+          `INSERT INTO webhook_events(provider_id,channel_trade_no,event_type,out_trade_no,status,raw)
+           VALUES($1,$2,'paid',$3,'done','{}'::jsonb)
+           ON CONFLICT (provider_id, channel_trade_no, event_type) DO NOTHING RETURNING id`,
+          [providerId, channelTradeNo, orderNo]);
+        if (ins.rowCount === 0) { await client.query('COMMIT'); return { ok: true, alreadyPaid: true }; }
+
+        // Production: amount in 元 = credits
+        await client.query(`UPDATE recharge_orders SET status='paid',paid_at=NOW(),channel_trade_no=$1 WHERE pay_order_no=$2`, [channelTradeNo, orderNo]);
+        const bal = await client.query('UPDATE users SET recharge_credits=recharge_credits+$1 WHERE id=$2 RETURNING credits', [orderAmount, userId]);
+        await client.query(`INSERT INTO credit_transactions(user_id,kind,amount,ref,pool,balance_after) VALUES($1,'grant',$2,$3,'recharge',$4)`, [userId, orderAmount, orderNo, bal.rows[0].credits]);
+        await client.query('COMMIT');
+        return { ok: true, credits: bal.rows[0].credits };
+      } catch (e) { await client.query('ROLLBACK').catch(() => {}); return { ok: false, reason: e.message }; }
+      finally { client.release(); }
+    })(),
+    // "API-B" — identical concurrent handler
+    (async () => {
+      const client = await pg.connect();
+      try {
+        await client.query('BEGIN');
+        const ord = await client.query('SELECT * FROM recharge_orders WHERE pay_order_no=$1 FOR UPDATE', [orderNo]);
+        if (!ord.rows.length) { await client.query('ROLLBACK'); return { ok: false }; }
+        if (ord.rows[0].status === 'paid') { await client.query('COMMIT'); return { ok: true, alreadyPaid: true }; }
+
+        const ins = await client.query(
+          `INSERT INTO webhook_events(provider_id,channel_trade_no,event_type,out_trade_no,status,raw)
+           VALUES($1,$2,'paid',$3,'done','{}'::jsonb)
+           ON CONFLICT (provider_id, channel_trade_no, event_type) DO NOTHING RETURNING id`,
+          [providerId, channelTradeNo, orderNo]);
+        if (ins.rowCount === 0) { await client.query('COMMIT'); return { ok: true, alreadyPaid: true }; }
+
+        await client.query(`UPDATE recharge_orders SET status='paid',paid_at=NOW(),channel_trade_no=$1 WHERE pay_order_no=$2`, [channelTradeNo, orderNo]);
+        const bal = await client.query('UPDATE users SET recharge_credits=recharge_credits+$1 WHERE id=$2 RETURNING credits', [orderAmount, userId]);
+        await client.query(`INSERT INTO credit_transactions(user_id,kind,amount,ref,pool,balance_after) VALUES($1,'grant',$2,$3,'recharge',$4)`, [userId, orderAmount, orderNo, bal.rows[0].credits]);
+        await client.query('COMMIT');
+        return { ok: true, credits: bal.rows[0].credits };
+      } catch (e) { await client.query('ROLLBACK').catch(() => {}); return { ok: false, reason: e.message }; }
+      finally { client.release(); }
+    })(),
+  ]);
+
+  // At most one handler performed the credit
+  const credited = [r1, r2].map(r => r.value).filter(r => r.ok && !r.alreadyPaid);
+  assert.ok(credited.length <= 1, `at most 1 concurrent handler should credit, got ${credited.length}`);
+
+  // Final DB state
+  assert.strictEqual((await pg.query("SELECT status FROM recharge_orders WHERE pay_order_no=$1", [orderNo])).rows[0].status, 'paid');
+  assert.strictEqual(parseInt((await pg.query("SELECT count(*) FROM credit_transactions WHERE ref=$1", [orderNo])).rows[0].count), 1, 'exactly 1 credit tx');
+  assert.strictEqual(parseFloat((await pg.query('SELECT recharge_credits FROM users WHERE id=$1', [userId])).rows[0].recharge_credits), orderAmount, 'recharge_credits increased exactly once');
+  assert.strictEqual(parseInt((await pg.query("SELECT count(*) FROM webhook_events WHERE channel_trade_no=$1", [channelTradeNo])).rows[0].count), 1, 'exactly 1 webhook event');
+
+  // ── Retry idempotency: order is already paid, so FOR UPDATE → status='paid' → short-circuit ──
+  {
+    const rc = await pg.connect();
+    try {
+      await rc.query('BEGIN');
+      const o = await rc.query('SELECT * FROM recharge_orders WHERE pay_order_no=$1 FOR UPDATE', [orderNo]);
+      assert.strictEqual(o.rows[0].status, 'paid', 'retry sees paid order — short-circuits');
+      await rc.query('COMMIT');
+    } finally { rc.release(); }
+  }
+  // No new transactions after retry
+  assert.strictEqual(parseInt((await pg.query("SELECT count(*) FROM credit_transactions WHERE ref=$1", [orderNo])).rows[0].count), 1, 'no extra tx after retry');
+
+  // Cleanup
+  await pg.query('DELETE FROM credit_transactions WHERE ref=$1', [orderNo]);
+  await pg.query('DELETE FROM recharge_orders WHERE pay_order_no=$1', [orderNo]);
+  await pg.query('DELETE FROM webhook_events WHERE channel_trade_no=$1', [channelTradeNo]);
+  await pg.query('DELETE FROM users WHERE id=$1', [userId]);
+  await pg.query('DELETE FROM providers WHERE id=$1', [providerId]);
+  await pg.end();
 });
