@@ -24,11 +24,18 @@ const isProduction = process.env.NODE_ENV === 'production';
 const tokenFromEnv = !!process.env.API_TOKEN;
 
 let API_TOKEN = '';
-try { API_TOKEN = fs.readFileSync(TOKEN_FILE, 'utf-8').trim(); } catch {}
-if (!API_TOKEN) {
-  API_TOKEN = crypto.randomBytes(24).toString('hex');
-  fs.writeFileSync(TOKEN_FILE, API_TOKEN);
-  if (!isProduction) console.log(`\n🔑 API Token: ${API_TOKEN}\n`);
+// Multi-node/production: API_TOKEN MUST come from env (shared secret across all nodes).
+// Local file fallback only for single-node dev.
+if (process.env.API_TOKEN) {
+  API_TOKEN = process.env.API_TOKEN;
+} else {
+  // Dev-only: try local file, then auto-generate
+  try { API_TOKEN = fs.readFileSync(TOKEN_FILE, 'utf-8').trim(); } catch {}
+  if (!API_TOKEN) {
+    API_TOKEN = crypto.randomBytes(24).toString('hex');
+    fs.writeFileSync(TOKEN_FILE, API_TOKEN);
+    if (!isProduction) console.log(`\n🔑 API Token: ${API_TOKEN}\n`);
+  }
 }
 // 生产环境若未显式通过环境变量提供 API_TOKEN，则自动生成的 dev 令牌不可作为 system 身份（防后门）
 const devTokenEnabled = !isProduction || tokenFromEnv;
