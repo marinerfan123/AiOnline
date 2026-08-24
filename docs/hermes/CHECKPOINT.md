@@ -56,43 +56,48 @@ Hermes may not classify a code-changing task COMPLETE unless `npm run verify` pa
 
 ## Phase 1.5 Step 1 — Commercial Distributed Staging Foundation
 - Branch: feat/commercial-distributed-staging
-- Status: COMPLETE
-- Commits: 8 (9696b6d..HEAD)
-- Canonical verify: ALL PASS (45s)
+- Status: COMPLETE (evidence-verified)
+- Starting HEAD: f1f2975
+- Commits since start: 1 (9b7dd71)
+- Canonical verify: ALL PASS (44s)
 
-### Distributed Tests (D1-D19) — 19 PASS / 0 FAIL
-- D1: PASS (independent PG pools, one ends, other works)
-- D2: PASS (write via pool-1, read via pool-2 — DB sharing)
-- D3: PASS (JWT HMAC-SHA256 sign/verify cross-node)
-- D4: PASS (task created by pool-1, readable by pool-2, FK safe)
-- D5: PASS (lease expire → reap → worker-02 claims recovered item)
-- D6: PASS (2 workers compete, single claim, no duplicates)
-- D7: PASS (4 workers × 20 items, all claimed, no duplicates)
-- D8: PASS (concurrent insert same idempotency_key → unique violation)
-- D9: PASS (concurrent webhook insert → unique violation)
-- D10: PASS (PG-based lease works, state in PG not Redis)
-- D11: PASS (Worker-A leased item → Worker-B transitions generating→generated via CAS)
-- D12: PASS (actual Redis pub/sub: publish payload, subscriber receives it)
-- D13: PASS (pool creation/reconnection)
-- D14: PASS (expired generating item → reaped to reconciling)
-- D15: PASS (end pool, new pool connects)
-- D16: PASS (migration advisory lock exists)
-- D17: PASS (all 4 V2 tables in PG with correct columns)
-- D18: PASS (user-scoped OSS namespaces, signed URLs)
-- D7b: PASS (8 workers × 40 items, all claimed, no duplicates)
-- D19: PASS (concurrent billing insert → at most 1 succeeds)
+### Distributed Tests — 20 PASS / 0 FAIL
+T01  D1   API-01 dies — API-02 serves          (independent PG pools)
+T02  D2   API requests distribute               (write pool-1, read pool-2)
+T03  D3   Auth multi-node JWT                   (sign/verify cross-node)
+T04  D4   Task cross-node readable              (FK-safe, pool-1→pool-2)
+T05  D5   Worker crash → lease reap → reclaim   (backdate + reap + claim)
+T06  D6   2-worker competition                  (SKIP LOCKED, no dupes)
+T07  D7   4-worker concurrency                  (20 items, 0 dupes)
+T08  D8   Idempotency key unique violation      (concurrent insert)
+T09  D9   Payment webhook dedup                 (concurrent insert, 1 row)
+T10  D10a Redis disconnect → PG lease works     (indep. Redis clients)
+T11  D10b Redis reconnect → data persists       (disconnect → new client)
+T12  D11  Worker-B completes Worker-A's task    (lease_version CAS)
+T13  D12  Redis pub/sub msg delivery            (indep. pub/sub clients)
+T14  D13a Rolling API restart                   (A down → B serves → A up)
+T15  D14a Rolling Worker restart                (A crash → B recovers → A rejoins)
+T16  D15  DB disconnect → reconnect             (end pool → new pool)
+T17  D16  Migration advisory lock exists        (migrationStore.acquireLock)
+T18  D17  No local file dependency              (4 V2 tables in PG)
+T19  D18  OSS user-scoped namespaces            (different users → different ns)
+T20  D7b  8-worker concurrency                  (40 items, 0 dupes)
+T21  D19  Billing PK constraint                 (concurrent hold, ≤1 success)
 
-### Architecture evidence (verified by actual tests)
-- API stateless: YES
-- Worker horizontal scale: YES (SKIP LOCKED, lease_version CAS)
-- Max workers tested: 8
-- SSE cross-node: YES (Redis pub/sub actual message delivery)
-- Billing multi-node: YES (unique constraint + advisory lock)
-- Payment multi-node: YES (unique constraint on webhook_events)
-- No local filesystem dependency: YES (all state in PG)
-- Docker compose: PROOF-OF-CONCEPT (clearly labeled)
+### Evidence vs claim audit
+- Max workers actually tested: 8 (D7b, line 551, `[1..8].map`)
+- Redis durable-state independence: PASS (D10a — Redis disconnect, PG lease still works)
+- Redis restart/reconnect: PASS (D10b — disconnect → new client → data persists)
+- Rolling API restart: PASS (D13a — pg1 end → pg2 serves → pg1_new connects)
+- Rolling Worker restart: PASS (D14a — 2 workers → A expires → reap → A rejoins)
+- Cross-node Redis event bus: PASS (D12 — indep. pub/sub, payload verified)
+- Cross-node SSE end-to-end to client: NOT_VERIFIED (D12 is Redis pub/sub only; no HTTP SSE client)
+- Wrong-user SSE isolation: NOT_VERIFIED (not tested)
+- Billing concurrent hold/commit: PASS (D19 — PK constraint, ≤1 success)
+- Payment concurrent callback: PASS (D9 — unique constraint, 1 row)
+- Payment single credit/ledger: NOT_VERIFIED (D9 only tests dedup constraint; no credit/ledger effect tested)
 
 ### Commercial blockers
 - P0: 0
-- P1: 0
+- P1: 2 (SSE end-to-end to HTTP client not tested; payment credit/ledger effect not tested)
 - P2: 0

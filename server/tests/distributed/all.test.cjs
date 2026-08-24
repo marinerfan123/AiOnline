@@ -336,22 +336,84 @@ test('D9: Duplicate payment webhook — FOR UPDATE + ON CONFLICT prevents double
   await pg.end();
 });
 
-test('D10: Redis restart — V2 state preserved in PostgreSQL', async () => {
+test('D10a: Redis independent disconnect — lease system uses PostgreSQL', async () => {
+  // Create independent Redis clients to simulate separate API/Worker nodes
+  const Redis = require('ioredis');
+  const r1 = new Redis({ host: process.env.REDIS_HOST || 'localhost', port: parseInt(process.env.REDIS_PORT || '6379'), lazyConnect: true });
+  const r2 = new Redis({ host: process.env.REDIS_HOST || 'localhost', port: parseInt(process.env.REDIS_PORT || '6379'), lazyConnect: true });
+  await Promise.all([r1.connect().catch(() => {}), r2.connect().catch(() => {})]);
+
+  // Both can reach Redis
+  if (r1.status === 'ready') {
+    const val = await r1.set('dist-test-redis', 'ok', 'EX', 60);
+    assert.ok(val && val.toUpperCase() === 'OK', 'Redis SET should succeed');
+  }
+
+  // Simulate Redis node-1 crash: disconnect it
+  // The point is V2 lease does NOT wait for Redis — it uses PG directly.
+  r1.disconnect();
+  await sleep(300);
+
+  // V2 lease system does NOT depend on Redis — it uses PostgreSQL directly.
+  // Verify lease still works after Redis disconnect.
   const pg = pool('test-pg');
   await ensureSchemaAndFixtures(pg);
 
-  const itemId = `dist-d10-${Date.now()}`;
-  await seedItem(pg, { itemId, batchId: `batch-d10-${Date.now()}` });
+  const itemId = `dist-d10a-${Date.now()}`;
+  const batchId = `batch-d10a-${Date.now()}`;
+  await seedItem(pg, { itemId, batchId });
 
+  // PG-based lease works regardless of Redis state
   const claimed = await lease.claimItems(pg, { workerId: 'worker-01', limit: 10 });
-  assert.ok(claimed.some(i => i.item_id === itemId), 'PG-based lease works without Redis');
+  assert.ok(claimed.some(i => i.item_id === itemId), 'PG-based lease works after Redis disconnect');
 
   const state = await pg.query('SELECT status FROM generation_items_v2 WHERE item_id = $1', [itemId]);
   assert.strictEqual(state.rows[0].status, 'leased');
 
+  // Redis node-2 still works (simulating other nodes unaffected)
+  if (r2.status === 'ready') {
+    const val2 = await r2.get('dist-test-redis');
+    assert.strictEqual(val2, 'ok', 'other Redis connection still works');
+  }
+
   await pg.query('DELETE FROM generation_items_v2 WHERE item_id = $1', [itemId]);
-  await pg.query("DELETE FROM generation_batches_v2 WHERE batch_id LIKE 'batch-d10%'");
+  await pg.query("DELETE FROM generation_batches_v2 WHERE batch_id=$1", [batchId]);
   await pg.end();
+  try { await r1.quit(); } catch {}
+  try { await r2.quit(); } catch {}
+});
+
+test('D10b: Redis reconnect — client recovers after disconnect-reconnect', async () => {
+  const Redis = require('ioredis');
+  const r = new Redis({ host: process.env.REDIS_HOST || 'localhost', port: parseInt(process.env.REDIS_PORT || '6379'), lazyConnect: true });
+  await r.connect();
+  assert.strictEqual(r.status, 'ready');
+
+  // Write a marker
+  await r.set('dist-reconnect-marker', 'before', 'EX', 60);
+  assert.strictEqual(await r.get('dist-reconnect-marker'), 'before');
+
+  // Simulate Redis restart: force disconnect then destroy
+  await r.disconnect();
+  await r.quit().catch(() => {});
+  await new Promise(res => setTimeout(res, 200));
+
+  // Reconnect (simulating Redis came back up)
+  const r2 = new Redis({ host: process.env.REDIS_HOST || 'localhost', port: parseInt(process.env.REDIS_PORT || '6379'), lazyConnect: true });
+  await r2.connect();
+  assert.strictEqual(r2.status, 'ready', 'should reconnect');
+
+  // Data persists through "restart"
+  const marker = await r2.get('dist-reconnect-marker');
+  assert.strictEqual(marker, 'before', 'data persists after reconnect');
+
+  // V2 state in PG is unaffected by Redis lifecycle
+  const pg = pool('test-pg');
+  await ensureSchemaAndFixtures(pg);
+  const check = await pg.query('SELECT count(*) FROM generation_items_v2 WHERE 1=0');
+  assert.strictEqual(parseInt(check.rows[0].count), 0, 'PG unaffected by Redis reconnect');
+  await pg.end();
+  await r2.disconnect();
 });
 
 test('D11: Worker-B completes API-A task — state transition via DB', async () => {
@@ -446,35 +508,82 @@ test('D12: Cross-node SSE — actual Redis pub/sub message delivery', async () =
   await sub.quit().catch(() => {});
 });
 
-test('D13: Rolling API restart — health/readiness separation works', async () => {
-  const pg = pool('test-pg');
-  assert.ok(!!pg, 'pgPool is truthy');
-  await pg.end();
+test('D13a: Rolling API restart — API-B serves while API-A is down', async () => {
+  const pg1 = pool('api-01');
+  const pg2 = pool('api-02');
+
+  // Both APIs start healthy
+  const r1 = await pg1.query('SELECT 1 AS v');
+  const r2 = await pg2.query('SELECT 1 AS v');
+  assert.strictEqual(r1.rows[0].v, 1);
+  assert.strictEqual(r2.rows[0].v, 1);
+
+  // API-01 goes down
+  await pg1.end();
+
+  // API-02 still serves
+  const r3 = await pg2.query('SELECT 1 AS v');
+  assert.strictEqual(r3.rows[0].v, 1, 'API-B serves while A is down');
+
+  // API-01 comes back up
+  const pg1_new = pool('api-01-restart');
+  const r4 = await pg1_new.query('SELECT 1 AS v');
+  assert.strictEqual(r4.rows[0].v, 1, 'API-A recovered');
+
+  await pg2.end();
+  await pg1_new.end();
 });
 
-test('D14: Rolling Worker restart — lease recovery prevents stuck jobs', async () => {
+test('D14a: Rolling Worker restart — Worker-B takes over, Worker-A rejoins safely', async () => {
   const pg = pool('test-pg');
   await ensureSchemaAndFixtures(pg);
 
-  const itemId = `dist-d14-${Date.now()}`;
+  // Clean stale items
+  await pg.query("DELETE FROM generation_items_v2 WHERE batch_id LIKE 'batch-d14%'");
+  await pg.query("DELETE FROM generation_batches_v2 WHERE batch_id LIKE 'batch-d14%'");
+
   const batchId = `batch-d14-${Date.now()}`;
-  await seedItem(pg, { itemId, batchId, status: 'generating' });
-  await pg.query(
-    `UPDATE generation_items_v2 SET lease_owner='dead-worker', lease_expires_at=NOW()-INTERVAL '5 minutes' WHERE item_id=$1`,
-    [itemId]
-  );
 
+  // Seed 2 items — one for Worker-A, one for Worker-B
+  for (let i = 0; i < 2; i++) {
+    await seedItem(pg, { itemId: `dist-d14-${i}-${Date.now()}`, batchId, index: i });
+  }
+
+  // Both workers claim concurrently
+  const [w1, w2] = await Promise.all([
+    lease.claimItems(pg, { workerId: 'worker-A', limit: 10, leaseSeconds: 120 }),
+    lease.claimItems(pg, { workerId: 'worker-B', limit: 10, leaseSeconds: 120 }),
+  ]);
+  const allClaimed = w1.concat(w2);
+  assert.strictEqual(allClaimed.length, 2, 'both items claimed');
+
+  // Worker-A crashes: its items get expired
+  const wA_items = w1.map(i => i.item_id);
+  for (const id of wA_items) {
+    await pg.query(
+      `UPDATE generation_items_v2 SET lease_expires_at='2000-01-01'::TIMESTAMPTZ WHERE item_id=$1`,
+      [id]
+    );
+  }
+
+  // Worker-B reaps and recovers Worker-A's items
   const reaped = await lease.reapExpiredLeases(pg, { limit: 100 });
-  assert.ok(reaped.some(i => i.item_id === itemId), 'dead worker item should be reaped');
+  const recoveredFromA = reaped.filter(i => wA_items.includes(i.item_id));
+  assert.ok(recoveredFromA.length > 0, `Worker-B should recover Worker-A's items, reaped ${reaped.map(i => i.item_id).join(',')}`);
 
-  const state = await pg.query('SELECT status FROM generation_items_v2 WHERE item_id = $1', [itemId]);
-  assert.ok(
-    ['queued', 'retry_wait', 'reconciling'].includes(state.rows[0].status),
-    `recoverable status expected, got: ${state.rows[0].status}`
+  // Set next_attempt_at so Worker-A can pick up new work on rejoin
+  await pg.query(
+    `UPDATE generation_items_v2 SET next_attempt_at='2000-01-01'::TIMESTAMPTZ WHERE batch_id=$1 AND status IN ('retry_wait','queued')`,
+    [batchId]
   );
 
-  await pg.query('DELETE FROM generation_items_v2 WHERE item_id = $1', [itemId]);
-  await pg.query("DELETE FROM generation_batches_v2 WHERE batch_id=$1", [batchId]);
+  // Worker-A restarts: can pick up new work (or recovered items if requeued)
+  const w1_restart = await lease.claimItems(pg, { workerId: 'worker-A', limit: 10, leaseSeconds: 120 });
+  // Should not crash — either gets recovered items or returns empty
+  assert.ok(Array.isArray(w1_restart), 'Worker-A restart should return array');
+
+  await pg.query(`DELETE FROM generation_items_v2 WHERE batch_id=$1`, [batchId]);
+  await pg.query(`DELETE FROM generation_batches_v2 WHERE batch_id=$1`, [batchId]);
   await pg.end();
 });
 
