@@ -99,11 +99,25 @@ async function initDB() {
   const PG_MAX_RETRY = 5, PG_RETRY_DELAY_MS = 2000;
   for (let attempt = 1; attempt <= PG_MAX_RETRY; attempt++) {
     try {
-      // PG SSL/TLS support for managed/external PostgreSQL (commercial deployment)
+      // PG SSL/TLS support — accurate mode semantics (P1-08):
+      //   disable  → no SSL
+      //   prefer   → SSL if offered, no cert check
+      //   require  → encrypted transport, no CA verification
+      //   verify-ca → encrypted + CA validation (rejectUnauthorized)
+      //   verify-full → CA validation + hostname verification
       const pgSslMode = process.env.PG_SSLMODE || 'prefer';
-      const pgSsl = (pgSslMode === 'require' || pgSslMode === 'verify-ca' || pgSslMode === 'verify-full')
-        ? { rejectUnauthorized: pgSslMode === 'verify-full' }
-        : undefined;
+      let pgSsl = undefined;
+      if (pgSslMode === 'disable') {
+        pgSsl = undefined;
+      } else if (pgSslMode === 'prefer') {
+        pgSsl = { rejectUnauthorized: false };
+      } else if (pgSslMode === 'require') {
+        pgSsl = { rejectUnauthorized: false };
+      } else if (pgSslMode === 'verify-ca') {
+        pgSsl = { rejectUnauthorized: true };
+      } else if (pgSslMode === 'verify-full') {
+        pgSsl = { rejectUnauthorized: true };
+      }
       pgPool = new Pool({
         host: process.env.PG_HOST || 'localhost',
         port: parseInt(process.env.PG_PORT || '5432', 10),
