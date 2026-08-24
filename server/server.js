@@ -4445,16 +4445,23 @@ const NUM_WORKERS = process.env.WEB_CONCURRENCY
 
 if (CLUSTER_ENABLED && cluster.isPrimary) {
   console.log(`[cluster] 主进程 pid=${process.pid} 启动 ${NUM_WORKERS} 个 worker（共 ${os.cpus().length} 核）`);
+  let clusterShuttingDown = false;
   for (let i = 0; i < NUM_WORKERS; i++) cluster.fork();
   cluster.on('exit', (worker, code, signal) => {
+    if (clusterShuttingDown) {
+      console.log(`[cluster] worker ${worker.process.pid} 退出(${signal || code})，关闭中不重启`);
+      return;
+    }
     console.error(`[cluster] worker ${worker.process.pid} 退出(${signal || code})，自动重启`);
     cluster.fork();
   });
   for (const sig of ['SIGTERM', 'SIGINT']) {
     process.on(sig, () => {
+      if (clusterShuttingDown) return;
+      clusterShuttingDown = true;
       console.log(`[cluster] 主进程收到 ${sig}，转发给所有 worker`);
       for (const id of Object.keys(cluster.workers || {})) cluster.workers[id].kill(sig);
-      setTimeout(() => process.exit(0), 8000).unref(); // 给 worker 优雅退出时间，超时兜底
+      setTimeout(() => process.exit(0), 8000).unref();
     });
   }
   // 主进程到此为止，不运行 app（下方 bootstrap 仅在 worker 执行）
