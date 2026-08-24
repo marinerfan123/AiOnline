@@ -46,7 +46,9 @@ services:
 
   # API-01
   api-01:
-    build: .
+    build:
+      context: ..
+      dockerfile: Dockerfile
     container_name: moling-api-01
     depends_on:
       postgres:
@@ -68,7 +70,7 @@ services:
       REDIS_PORT: 6379
       REDIS_PASSWORD: ${REDIS_PASSWORD:-}
       JWT_SECRET: ${JWT_SECRET:-dev-only-change-me}
-      API_TOKEN: ${API_TOKEN:?API_TOKEN must be set for multi-node staging}
+      API_TOKEN: ${API_TOKEN:-distributed-staging-dev-token}
       CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:8080}
     ports:
       - "3001:3001"
@@ -81,7 +83,9 @@ services:
 
   # API-02
   api-02:
-    build: .
+    build:
+      context: ..
+      dockerfile: Dockerfile
     container_name: moling-api-02
     depends_on:
       postgres:
@@ -103,7 +107,7 @@ services:
       REDIS_PORT: 6379
       REDIS_PASSWORD: ${REDIS_PASSWORD:-}
       JWT_SECRET: ${JWT_SECRET:-dev-only-change-me}
-      API_TOKEN: ${API_TOKEN:?API_TOKEN must be set for multi-node staging}
+      API_TOKEN: ${API_TOKEN:-distributed-staging-dev-token}
       CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:8080}
     ports:
       - "3002:3001"
@@ -116,7 +120,9 @@ services:
 
   # Worker-01 (generation only, no HTTP)
   worker-01:
-    build: .
+    build:
+      context: ..
+      dockerfile: Dockerfile
     container_name: moling-worker-01
     depends_on:
       postgres:
@@ -146,7 +152,9 @@ services:
 
   # Worker-02 (generation only, no HTTP)
   worker-02:
-    build: .
+    build:
+      context: ..
+      dockerfile: Dockerfile
     container_name: moling-worker-02
     depends_on:
       postgres:
@@ -184,7 +192,7 @@ services:
     ports:
       - "8080:80"
     volumes:
-      - ./deploy/nginx-distributed.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx-distributed.conf:/etc/nginx/nginx.conf:ro
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost/api/healthz || exit 1"]
       interval: 10s
