@@ -14,7 +14,15 @@ ALTER TABLE generation_batches_v2 ADD COLUMN IF NOT EXISTS success_count SMALLIN
 ALTER TABLE generation_batches_v2 ADD COLUMN IF NOT EXISTS failed_count SMALLINT NOT NULL DEFAULT 0;
 ALTER TABLE generation_batches_v2 ADD COLUMN IF NOT EXISTS canceled_count SMALLINT NOT NULL DEFAULT 0;
 ALTER TABLE generation_batches_v2 ADD COLUMN IF NOT EXISTS request_payload JSONB NOT NULL DEFAULT '{}'::jsonb;
-UPDATE generation_batches_v2 SET request_payload = payload WHERE payload IS NOT NULL AND request_payload = '{}'::jsonb;
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name='generation_batches_v2' AND column_name='payload'
+  ) THEN
+    UPDATE generation_batches_v2 SET request_payload = payload WHERE payload IS NOT NULL AND request_payload = '{}'::jsonb;
+  END IF;
+END $$;
 ALTER TABLE generation_batches_v2 ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ;
 CREATE UNIQUE INDEX IF NOT EXISTS uq_generation_batches_v2_user_idempotency
   ON generation_batches_v2 (user_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
@@ -24,17 +32,57 @@ ALTER TABLE generation_items_v2 ALTER COLUMN item_index TYPE SMALLINT USING item
 ALTER TABLE generation_items_v2 ALTER COLUMN lease_version TYPE BIGINT USING lease_version::bigint;
 ALTER TABLE generation_items_v2 ADD COLUMN IF NOT EXISTS priority INT NOT NULL DEFAULT 0;
 ALTER TABLE generation_items_v2 ADD COLUMN IF NOT EXISTS attempt_count INT NOT NULL DEFAULT 0;
-UPDATE generation_items_v2 SET attempt_count = retry_count WHERE retry_count IS NOT NULL AND attempt_count = 0;
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name='generation_items_v2' AND column_name='retry_count'
+  ) THEN
+    UPDATE generation_items_v2 SET attempt_count = retry_count WHERE retry_count IS NOT NULL AND attempt_count = 0;
+  END IF;
+END $$;
 ALTER TABLE generation_items_v2 ADD COLUMN IF NOT EXISTS next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
-UPDATE generation_items_v2 SET next_attempt_at = next_retry_at WHERE next_retry_at IS NOT NULL;
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name='generation_items_v2' AND column_name='next_retry_at'
+  ) THEN
+    UPDATE generation_items_v2 SET next_attempt_at = next_retry_at WHERE next_retry_at IS NOT NULL;
+  END IF;
+END $$;
 ALTER TABLE generation_items_v2 ALTER COLUMN lease_owner DROP DEFAULT;
 ALTER TABLE generation_items_v2 ADD COLUMN IF NOT EXISTS key_id TEXT;
-UPDATE generation_items_v2 SET key_id = provider_request_key WHERE key_id IS NULL AND provider_request_key IS NOT NULL;
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name='generation_items_v2' AND column_name='provider_request_key'
+  ) THEN
+    UPDATE generation_items_v2 SET key_id = provider_request_key WHERE key_id IS NULL AND provider_request_key IS NOT NULL;
+  END IF;
+END $$;
 ALTER TABLE generation_items_v2 ADD COLUMN IF NOT EXISTS oss_url TEXT;
-UPDATE generation_items_v2 SET oss_url = oss_object_key WHERE oss_url IS NULL AND oss_object_key IS NOT NULL;
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name='generation_items_v2' AND column_name='oss_object_key'
+  ) THEN
+    UPDATE generation_items_v2 SET oss_url = oss_object_key WHERE oss_url IS NULL AND oss_object_key IS NOT NULL;
+  END IF;
+END $$;
 ALTER TABLE generation_items_v2 ADD COLUMN IF NOT EXISTS last_error_code TEXT;
 ALTER TABLE generation_items_v2 ADD COLUMN IF NOT EXISTS last_error TEXT;
-UPDATE generation_items_v2 SET last_error = error_message WHERE last_error IS NULL AND error_message IS NOT NULL;
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name='generation_items_v2' AND column_name='error_message'
+  ) THEN
+    UPDATE generation_items_v2 SET last_error = error_message WHERE last_error IS NULL AND error_message IS NOT NULL;
+  END IF;
+END $$;
 ALTER TABLE generation_items_v2 ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ;
 ALTER TABLE generation_items_v2 ADD COLUMN IF NOT EXISTS generated_at TIMESTAMPTZ;
 ALTER TABLE generation_items_v2 ADD COLUMN IF NOT EXISTS uploaded_at TIMESTAMPTZ;
@@ -77,7 +125,15 @@ BEGIN
 END $$;
 ALTER TABLE generation_item_attempts_v2 ADD COLUMN IF NOT EXISTS lease_version BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE generation_item_attempts_v2 ADD COLUMN IF NOT EXISTS key_id TEXT;
-UPDATE generation_item_attempts_v2 SET key_id = provider_key WHERE key_id IS NULL AND provider_key IS NOT NULL;
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name='generation_item_attempts_v2' AND column_name='provider_key'
+  ) THEN
+    UPDATE generation_item_attempts_v2 SET key_id = provider_key WHERE key_id IS NULL AND provider_key IS NOT NULL;
+  END IF;
+END $$;
 ALTER TABLE generation_item_attempts_v2 ADD COLUMN IF NOT EXISTS provider_request_id TEXT;
 ALTER TABLE generation_item_attempts_v2 ADD COLUMN IF NOT EXISTS http_status INT;
 ALTER TABLE generation_item_attempts_v2 ADD COLUMN IF NOT EXISTS error_code TEXT;
@@ -90,16 +146,34 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_generation_attempts_v2_client_request
 ALTER TABLE generation_credit_holds_v2 ADD COLUMN IF NOT EXISTS hold_id BIGSERIAL;
 ALTER TABLE generation_credit_holds_v2 ALTER COLUMN amount TYPE NUMERIC(14,4) USING amount::numeric;
 ALTER TABLE generation_credit_holds_v2 ADD COLUMN IF NOT EXISTS pool TEXT;
+ALTER TABLE generation_credit_holds_v2 ADD COLUMN IF NOT EXISTS kind TEXT;
+ALTER TABLE generation_credit_holds_v2 ADD COLUMN IF NOT EXISTS ref TEXT;
 UPDATE generation_credit_holds_v2 SET pool = CASE WHEN kind IN ('reward','recharge') THEN kind ELSE 'recharge' END WHERE pool IS NULL;
 ALTER TABLE generation_credit_holds_v2 ALTER COLUMN pool SET NOT NULL;
 ALTER TABLE generation_credit_holds_v2 ADD COLUMN IF NOT EXISTS settled_at TIMESTAMPTZ;
-UPDATE generation_credit_holds_v2 SET settled_at = COALESCE(committed_at, released_at) WHERE settled_at IS NULL;
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='generation_credit_holds_v2' AND column_name='committed_at')
+     AND EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='generation_credit_holds_v2' AND column_name='released_at') THEN
+    UPDATE generation_credit_holds_v2 SET settled_at = COALESCE(committed_at, released_at) WHERE settled_at IS NULL;
+  END IF;
+END $$;
+ALTER TABLE generation_credit_holds_v2 ALTER COLUMN kind DROP NOT NULL;
+ALTER TABLE generation_credit_holds_v2 ALTER COLUMN ref DROP NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS uq_generation_credit_holds_v2_hold_id
   ON generation_credit_holds_v2 (hold_id);
 
 -- Heartbeats: runtime writes last_seen_at/meta.
 ALTER TABLE generation_worker_heartbeats_v2 ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ;
-UPDATE generation_worker_heartbeats_v2 SET last_seen_at = last_heartbeat WHERE last_seen_at IS NULL AND last_heartbeat IS NOT NULL;
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name='generation_worker_heartbeats_v2' AND column_name='last_heartbeat'
+  ) THEN
+    UPDATE generation_worker_heartbeats_v2 SET last_seen_at = last_heartbeat WHERE last_seen_at IS NULL AND last_heartbeat IS NOT NULL;
+  END IF;
+END $$;
 ALTER TABLE generation_worker_heartbeats_v2 ALTER COLUMN last_seen_at SET DEFAULT NOW();
 ALTER TABLE generation_worker_heartbeats_v2 ALTER COLUMN last_seen_at SET NOT NULL;
 ALTER TABLE generation_worker_heartbeats_v2 ADD COLUMN IF NOT EXISTS meta JSONB NOT NULL DEFAULT '{}'::jsonb;
@@ -115,7 +189,15 @@ ALTER TABLE generation_outbox_v2 ADD COLUMN IF NOT EXISTS aggregate_type TEXT;
 UPDATE generation_outbox_v2 SET aggregate_type = 'generation_item' WHERE aggregate_type IS NULL;
 ALTER TABLE generation_outbox_v2 ALTER COLUMN aggregate_type SET NOT NULL;
 ALTER TABLE generation_outbox_v2 ADD COLUMN IF NOT EXISTS aggregate_id TEXT;
-UPDATE generation_outbox_v2 SET aggregate_id = COALESCE(item_id, batch_id, event_id::text) WHERE aggregate_id IS NULL;
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='generation_outbox_v2' AND column_name='item_id')
+     AND EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='generation_outbox_v2' AND column_name='batch_id') THEN
+    UPDATE generation_outbox_v2 SET aggregate_id = COALESCE(item_id, batch_id, event_id::text) WHERE aggregate_id IS NULL;
+  ELSE
+    UPDATE generation_outbox_v2 SET aggregate_id = event_id::text WHERE aggregate_id IS NULL;
+  END IF;
+END $$;
 ALTER TABLE generation_outbox_v2 ALTER COLUMN aggregate_id SET NOT NULL;
 ALTER TABLE generation_outbox_v2 ADD COLUMN IF NOT EXISTS published_at TIMESTAMPTZ;
 ALTER TABLE generation_outbox_v2 ADD COLUMN IF NOT EXISTS attempts INT NOT NULL DEFAULT 0;

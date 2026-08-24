@@ -348,7 +348,7 @@ async function assertGenerationV2RuntimeSchema(pg) {
 
   const holdsCols = await getTableColumns(pg, 'generation_credit_holds_v2');
   const holdColNames = holdsCols.map(c => c.column_name);
-  for (const col of ['hold_id', 'item_id', 'user_id', 'pool', 'amount', 'status', 'created_at', 'settled_at']) {
+  for (const col of ['hold_id', 'item_id', 'user_id', 'pool', 'amount', 'status', 'created_at', 'settled_at', 'kind', 'ref']) {
     assert.ok(holdColNames.includes(col), `generation_credit_holds_v2 should have ${col}`);
   }
 
