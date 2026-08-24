@@ -10,21 +10,21 @@ function createWorkerDaemon(opts = {}) {
 
   let running = false;
   let currentTick = null;
-  let stopped = false;
+  let shuttingDown = false;
   let resolveStop;
   let wakeSleep;
   const stopPromise = new Promise(r => { resolveStop = r; });
 
   async function loop() {
-    while (!stopped) {
+    while (!shuttingDown) {
       const tickStart = Date.now();
       currentTick = (async () => {
-        try { await tick(pgPool, redis, { workerId }); }
+        try { await tick(pgPool, redis, { workerId, shuttingDown }); }
         catch (e) { try { onError(e); } catch (_) {} }
         finally { currentTick = null; }
       })();
       await currentTick;
-      if (stopped) break;
+      if (shuttingDown) break;
       const elapsed = Date.now() - tickStart;
       const delay = Math.max(0, tickIntervalMs - elapsed);
       if (delay > 0) await new Promise(r => {
@@ -44,7 +44,7 @@ function createWorkerDaemon(opts = {}) {
       return loop();
     },
     async stop() {
-      stopped = true;
+      shuttingDown = true;
       if (wakeSleep) wakeSleep();
       let timeoutId;
       const timeout = new Promise(r => {

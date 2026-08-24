@@ -91,6 +91,8 @@ async function runWorkerTick(pg, options = {}, injected = {}) {
   const deps = { claimItems:lease.claimItems, ...injected };
   const workerId = options.workerId;
   if (!workerId) throw new TypeError('workerId is required');
+  // P1-06: stop claiming new work when shutting down; let in-flight complete
+  if (options.shuttingDown) return { claimed: 0, shuttingDown: true };
   const concurrency = Math.max(1,Math.min(50,Number(options.concurrency)||5));
   const items = await deps.claimItems(pg,{workerId,limit:options.limit||concurrency*2,leaseSeconds:options.leaseSeconds||120});
   const runtimeDeps = {
