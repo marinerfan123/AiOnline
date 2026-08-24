@@ -180,7 +180,7 @@ services:
     ports:
       - "8080:80"
     volumes:
-      - ./deploy/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./deploy/nginx-distributed.conf:/etc/nginx/nginx.conf:ro
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost/api/healthz || exit 1"]
       interval: 10s

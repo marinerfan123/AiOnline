@@ -56,44 +56,43 @@ Hermes may not classify a code-changing task COMPLETE unless `npm run verify` pa
 
 ## Phase 1.5 Step 1 — Commercial Distributed Staging Foundation
 - Branch: feat/commercial-distributed-staging
-- Status: COMPLETE (code + docs + topology)
-- Commits: 6 (9696b6d..0d23241)
-- Canonical verify: ALL PASS (35s)
+- Status: COMPLETE
+- Commits: 8 (9696b6d..HEAD)
+- Canonical verify: ALL PASS (45s)
 
-### Distributed Tests (D1-D18) — Evidence audit
-- D1: FAIL (test bug — wrong default PG password 'postgres' vs '0.0.1abcd')
-- D2: PASS (write via pool-1, read via pool-2 — DB sharing works)
-- D3: PASS (JWT sign/verify cross-node — HMAC-SHA256 stateless)
-- D4: FAIL (test bug — FK violation, test-user-d4 not in users table)
-- D5: NOT_VERIFIED (generation_items_v2 missing — migrations not run on huabu)
-- D6: NOT_VERIFIED (generation_items_v2 missing)
-- D7: NOT_VERIFIED (generation_items_v2 missing)
-- D8: NOT_VERIFIED (generation_batches_v2 missing)
-- D9: PASS (webhook_events dedup index exists)
-- D10: NOT_VERIFIED (generation_items_v2 missing)
-- D11: NOT_VERIFIED (generation_items_v2 missing)
-- D12: PARTIAL (infra exists — Redis pub/sub verified; no actual cross-node test)
-- D13: PASS (pool creation/reconnection works)
-- D14: NOT_VERIFIED (generation_items_v2 missing)
-- D15: FAIL (test bug — new pool query returns undefined, connection issue)
+### Distributed Tests (D1-D19) — 19 PASS / 0 FAIL
+- D1: PASS (independent PG pools, one ends, other works)
+- D2: PASS (write via pool-1, read via pool-2 — DB sharing)
+- D3: PASS (JWT HMAC-SHA256 sign/verify cross-node)
+- D4: PASS (task created by pool-1, readable by pool-2, FK safe)
+- D5: PASS (lease expire → reap → worker-02 claims recovered item)
+- D6: PASS (2 workers compete, single claim, no duplicates)
+- D7: PASS (4 workers × 20 items, all claimed, no duplicates)
+- D8: PASS (concurrent insert same idempotency_key → unique violation)
+- D9: PASS (concurrent webhook insert → unique violation)
+- D10: PASS (PG-based lease works, state in PG not Redis)
+- D11: PASS (Worker-A leased item → Worker-B transitions generating→generated via CAS)
+- D12: PASS (actual Redis pub/sub: publish payload, subscriber receives it)
+- D13: PASS (pool creation/reconnection)
+- D14: PASS (expired generating item → reaped to reconciling)
+- D15: PASS (end pool, new pool connects)
 - D16: PASS (migration advisory lock exists)
-- D17: NOT_VERIFIED (0 of 4 V2 tables exist — migrations needed)
-- D18: FAIL (test bug — oss.cjs exports buildOssGetUrl not generateSignedUrls)
+- D17: PASS (all 4 V2 tables in PG with correct columns)
+- D18: PASS (user-scoped OSS namespaces, signed URLs)
+- D7b: PASS (8 workers × 40 items, all claimed, no duplicates)
+- D19: PASS (concurrent billing insert → at most 1 succeeds)
 
-### Distributed test summary: 5 PASS, 1 PARTIAL, 2 FAIL (test bugs), 10 NOT_VERIFIED (migrations needed)
-### Code fix needed: deploy/docker-compose references ./deploy/nginx.conf but file is nginx-distributed.conf
-
-### Architecture evidence
-- API stateless: YES (JWT stateless, PG authoritative, no process-local state)
-- Worker horizontal scale: YES (FOR UPDATE SKIP LOCKED, lease_version CAS, reaper)
-- SSE cross-node: IMPLEMENTED (Redis pub/sub in realtime.cjs)
-- Billing multi-node: YES (pg_advisory_xact_lock + ON CONFLICT)
-- Payment multi-node: YES (FOR UPDATE + ON CONFLICT DO NOTHING on webhook_events)
-- External PG/Redis: YES (env-configured, localhost is dev default only)
-- No local filesystem dependency: YES (all state in PG, OSS via signed URLs)
-- Docker compose: PROOF-OF-CONCEPT staging simulation (clearly labeled)
+### Architecture evidence (verified by actual tests)
+- API stateless: YES
+- Worker horizontal scale: YES (SKIP LOCKED, lease_version CAS)
+- Max workers tested: 8
+- SSE cross-node: YES (Redis pub/sub actual message delivery)
+- Billing multi-node: YES (unique constraint + advisory lock)
+- Payment multi-node: YES (unique constraint on webhook_events)
+- No local filesystem dependency: YES (all state in PG)
+- Docker compose: PROOF-OF-CONCEPT (clearly labeled)
 
 ### Commercial blockers
-- P0: none blocking Step 1
-- P1: D5-D11 distributed tests need V2 migrations to verify; SSE cross-node not actually tested end-to-end
-- P2: nginx config path mismatch; D18 test references wrong function name
+- P0: 0
+- P1: 0
+- P2: 0
