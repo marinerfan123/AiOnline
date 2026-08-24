@@ -12,6 +12,7 @@ import os from 'node:os';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 3001;
+const NODE_ID = process.env.NODE_ID || `${os.hostname()}-${process.pid}`;
 const DATA_DIR = path.join(__dirname, 'data');
 const TOKEN_FILE = path.join(DATA_DIR, '.api_token');
 const CLIENT_DIR = path.join(__dirname, '..', 'dist', 'build2');
@@ -98,6 +99,11 @@ async function initDB() {
   const PG_MAX_RETRY = 5, PG_RETRY_DELAY_MS = 2000;
   for (let attempt = 1; attempt <= PG_MAX_RETRY; attempt++) {
     try {
+      // PG SSL/TLS support for managed/external PostgreSQL (commercial deployment)
+      const pgSslMode = process.env.PG_SSLMODE || 'prefer';
+      const pgSsl = (pgSslMode === 'require' || pgSslMode === 'verify-ca' || pgSslMode === 'verify-full')
+        ? { rejectUnauthorized: pgSslMode === 'verify-full' }
+        : undefined;
       pgPool = new Pool({
         host: process.env.PG_HOST || 'localhost',
         port: parseInt(process.env.PG_PORT || '5432', 10),
@@ -105,7 +111,9 @@ async function initDB() {
         user: process.env.PG_USER || 'postgres',
         password: process.env.PG_PASSWORD || '0.0.1abcd',
         max: parseInt(process.env.PG_POOL_MAX || '10', 10),
-        connectionTimeoutMillis: 5000,
+        connectionTimeoutMillis: parseInt(process.env.PG_CONN_TIMEOUT_MS || '5000', 10),
+        idleTimeoutMillis: parseInt(process.env.PG_IDLE_TIMEOUT_MS || '30000', 10),
+        ...(pgSsl ? { ssl: pgSsl } : {}),
       });
       await pgPool.query('SELECT 1');
       console.log(`[DB] PostgreSQL 连接成功（第 ${attempt} 次尝试）`);
@@ -1788,12 +1796,14 @@ async function handleAPI(req, res) {
   req.query = Object.fromEntries(reqUrl.searchParams);
 
   // Phase 0 健康检查：公开端点，网关前放行，供 nginx/容器探针与压测使用
+  // /api/healthz — process alive (liveness probe)
   if (url === '/api/healthz' && method === 'GET') {
     const cpu = cpuMonitor.getStatus();
     return sendJSON(res, 200, {
       status: 'ok',
       pg: !!pgPool,
       redis: isRedisUp(),
+      node_id: NODE_ID,
       uptime: Math.floor(process.uptime()),
       version: process.env.npm_package_version || '0.1.0',
       ts: Date.now(),
@@ -1808,6 +1818,17 @@ async function handleAPI(req, res) {
         recoverThreshold: Math.round(cpu.recoverThreshold * 100),
       },
     });
+  }
+
+  // /api/readiness — dependencies sufficient to serve traffic (readiness probe)
+  // Returns 200 only when PG pool and Redis are both available.
+  if (url === '/api/readiness' && method === 'GET') {
+    const pgReady = !!pgPool;
+    const redisReady = isRedisUp();
+    if (pgReady && redisReady) {
+      return sendJSON(res, 200, { status: 'ready', pg: true, redis: true, node_id: NODE_ID });
+    }
+    return sendJSON(res, 503, { status: 'not_ready', pg: pgReady, redis: redisReady, node_id: NODE_ID });
   }
 
   // 公开路由（注册/登录/刷新在全局网关之前）
@@ -4566,7 +4587,7 @@ server.maxHeadersCount = 200;           // 放宽头部上限，避免大 header
 
 server.listen(PORT, '0.0.0.0', async () => {
   const addrPort = server.address() ? (server.address().port || PORT) : PORT;
-  console.log(`🚀 服务: http://localhost:${addrPort} | 📁 ${DATA_DIR} | 🐘 PG:connected(强制·唯一数据源) | 🔴 Redis:${isRedisUp() ? 'up' : 'memory-fallback(仅缓存)'}`);
+  console.log(`🚀 [${NODE_ID}] 服务: http://localhost:${addrPort} | 📁 ${DATA_DIR} | 🐘 PG:connected(强制·唯一数据源) | 🔴 Redis:${isRedisUp() ? 'up' : 'memory-fallback(仅缓存)'}`);
   // Test harness port probe via IPC
   if (process.env.NODE_ENV === 'test' && process.send) {
     process.on('message', (msg) => {
