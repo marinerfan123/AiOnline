@@ -62,10 +62,25 @@ async function dropDb(dbName) {
   }
 }
 
+// Source database for backup/restore — respects TEST_PG_DATABASE for portable testing.
+function testDb() {
+  return process.env.TEST_PG_DATABASE || process.env.PG_DATABASE || 'moling_test';
+}
+
+// Child-process env: propagate PG/Redis env vars so backup/restore scripts can override defaults.
+function childEnv() {
+  return Object.assign({}, process.env, {
+    PG_HOST: dbConfig().host,
+    PG_PORT: String(dbConfig().port),
+    PG_USER: dbConfig().user,
+    PG_PASSWORD: dbConfig().password,
+  });
+}
+
 function runBackupScript(opts = {}) {
   const args = [
     path.join(SCRIPTS, 'backup-db.cjs'),
-    '--db', opts.db || 'moling_test',
+    '--db', opts.db || testDb(),
     '--host', dbConfig().host,
     '--port', String(dbConfig().port),
     '--user', dbConfig().user,
@@ -73,7 +88,7 @@ function runBackupScript(opts = {}) {
     '--format', opts.format || 'logical',
   ];
   if (opts.output) args.push('--output', opts.output);
-  return spawnSync('node', args, { cwd: process.cwd(), encoding: 'utf-8' });
+  return spawnSync('node', args, { cwd: process.cwd(), encoding: 'utf-8', env: childEnv() });
 }
 
 function runRestoreScript(opts = {}) {
@@ -87,7 +102,7 @@ function runRestoreScript(opts = {}) {
     '--password', dbConfig().password,
   ];
   if (opts.allowOverwrite) args.push('--allow-overwrite-test');
-  return spawnSync('node', args, { cwd: process.cwd(), encoding: 'utf-8' });
+  return spawnSync('node', args, { cwd: process.cwd(), encoding: 'utf-8', env: childEnv() });
 }
 
 function runVerifyScript(backupDir) {
@@ -156,7 +171,7 @@ describe('Backup/Restore Safety', () => {
 describe('Backup Creation and Verification', () => {
   test('B2: test DB backup succeeds', async () => {
     const outputDir = tmpDir('backup-b2-');
-    const result = runBackupScript({ db: 'moling_test', output: outputDir });
+    const result = runBackupScript({ db: testDb(), output: outputDir });
     assert.equal(result.status, 0, `Backup should succeed: ${result.stdout}\n${result.stderr}`);
     assert.ok(fs.existsSync(path.join(outputDir, 'manifest.json')), 'manifest.json should exist');
     assert.ok(fs.existsSync(path.join(outputDir, 'data.json')), 'data.json should exist');
@@ -164,7 +179,7 @@ describe('Backup Creation and Verification', () => {
 
   test('B3: backup manifest generated with required fields', async () => {
     const outputDir = tmpDir('backup-b3-');
-    runBackupScript({ db: 'moling_test', output: outputDir });
+    runBackupScript({ db: testDb(), output: outputDir });
     const manifest = JSON.parse(fs.readFileSync(path.join(outputDir, 'manifest.json'), 'utf-8'));
     assert.ok(manifest.backup_id, 'manifest should have backup_id');
     assert.ok(manifest.timestamp, 'manifest should have timestamp');
@@ -175,14 +190,14 @@ describe('Backup Creation and Verification', () => {
 
   test('B4: checksum verification succeeds', async () => {
     const outputDir = tmpDir('backup-b4-');
-    runBackupScript({ db: 'moling_test', output: outputDir });
+    runBackupScript({ db: testDb(), output: outputDir });
     const verifyResult = runVerifyScript(outputDir);
     assert.equal(verifyResult.status, 0, `Checksum verification should pass: ${verifyResult.stdout}\n${verifyResult.stderr}`);
   });
 
   test('B5: checksum corruption detected', async () => {
     const outputDir = tmpDir('backup-b5-');
-    runBackupScript({ db: 'moling_test', output: outputDir });
+    runBackupScript({ db: testDb(), output: outputDir });
     const checksumPath = path.join(outputDir, 'checksums.sha256');
     const original = fs.readFileSync(checksumPath, 'utf-8');
     // Corrupt a checksum by replacing first 8 hex chars with garbage
@@ -218,7 +233,7 @@ describe('Backup Creation and Verification', () => {
 describe('Restore Operations', () => {
   test('B6: fresh restore succeeds', async () => {
     const outputDir = tmpDir('backup-b6-');
-    runBackupScript({ db: 'moling_test', output: outputDir });
+    runBackupScript({ db: testDb(), output: outputDir });
 
     const restoreDb = 'moling_restore_b6_test';
     await ensureDbExists(restoreDb);
@@ -235,7 +250,7 @@ describe('Restore Operations', () => {
 
   test('B7: restore data parity', async () => {
     const outputDir = tmpDir('backup-b7-');
-    runBackupScript({ db: 'moling_test', output: outputDir });
+    runBackupScript({ db: testDb(), output: outputDir });
 
     const restoreDb = 'moling_restore_b7_test';
     await ensureDbExists(restoreDb);
@@ -247,7 +262,7 @@ describe('Restore Operations', () => {
     });
 
     // Compare row counts
-    const sourcePool = poolFor('moling_test');
+    const sourcePool = poolFor(testDb());
     const restorePool = poolFor(restoreDb);
 
     const tablesResult = await sourcePool.query(
@@ -277,7 +292,7 @@ describe('Restore Operations', () => {
 
   test('B8: migration history restored', async () => {
     const outputDir = tmpDir('backup-b8-');
-    runBackupScript({ db: 'moling_test', output: outputDir });
+    runBackupScript({ db: testDb(), output: outputDir });
 
     const restoreDb = 'moling_restore_b8_test';
     await ensureDbExists(restoreDb);
@@ -292,7 +307,7 @@ describe('Restore Operations', () => {
     // Check schema_migrations table exists and has data
     try {
       const r = await restorePool.query('SELECT COUNT(*)::int FROM schema_migrations');
-      const sourceR = await poolFor('moling_test').query('SELECT COUNT(*)::int FROM schema_migrations');
+      const sourceR = await poolFor(testDb()).query('SELECT COUNT(*)::int FROM schema_migrations');
       assert.equal(
         parseInt(r.rows[0].count),
         parseInt(sourceR.rows[0].count),
@@ -309,7 +324,7 @@ describe('Restore Operations', () => {
 
   test('B12: app boots on restored DB', async () => {
     const outputDir = tmpDir('backup-b12-');
-    runBackupScript({ db: 'moling_test', output: outputDir });
+    runBackupScript({ db: testDb(), output: outputDir });
 
     const restoreDb = 'moling_restore_b12_test';
     await ensureDbExists(restoreDb);
@@ -334,7 +349,7 @@ describe('Restore Operations', () => {
 describe('Manifest Integrity', () => {
   test('B17: manifest binds Git SHA', async () => {
     const outputDir = tmpDir('backup-b17-');
-    runBackupScript({ db: 'moling_test', output: outputDir });
+    runBackupScript({ db: testDb(), output: outputDir });
     const manifest = JSON.parse(fs.readFileSync(path.join(outputDir, 'manifest.json'), 'utf-8'));
     assert.ok(manifest.git_commit && manifest.git_commit !== 'unknown',
       'Manifest should contain git_commit');
@@ -344,7 +359,7 @@ describe('Manifest Integrity', () => {
 
   test('B18: manifest binds migration version', async () => {
     const outputDir = tmpDir('backup-b18-');
-    runBackupScript({ db: 'moling_test', output: outputDir });
+    runBackupScript({ db: testDb(), output: outputDir });
     const manifest = JSON.parse(fs.readFileSync(path.join(outputDir, 'manifest.json'), 'utf-8'));
     // migration_versions should be an array
     assert.ok(Array.isArray(manifest.migration_versions),
@@ -357,7 +372,7 @@ describe('Manifest Integrity', () => {
 describe('Billing Recovery', () => {
   test('B13: billing state parity after restore', async () => {
     const outputDir = tmpDir('backup-b13-');
-    runBackupScript({ db: 'moling_test', output: outputDir });
+    runBackupScript({ db: testDb(), output: outputDir });
 
     const restoreDb = 'moling_restore_b13_test';
     await ensureDbExists(restoreDb);
@@ -368,7 +383,7 @@ describe('Billing Recovery', () => {
       allowOverwrite: true,
     });
 
-    const sourcePool = poolFor('moling_test');
+    const sourcePool = poolFor(testDb());
     const restorePool = poolFor(restoreDb);
 
     // Compare credit_transactions
@@ -406,7 +421,7 @@ describe('Billing Recovery', () => {
 describe('Generation Recovery', () => {
   test('B14: generation state parity after restore', async () => {
     const outputDir = tmpDir('backup-b14-');
-    runBackupScript({ db: 'moling_test', output: outputDir });
+    runBackupScript({ db: testDb(), output: outputDir });
 
     const restoreDb = 'moling_restore_b14_test';
     await ensureDbExists(restoreDb);
@@ -417,7 +432,7 @@ describe('Generation Recovery', () => {
       allowOverwrite: true,
     });
 
-    const sourcePool = poolFor('moling_test');
+    const sourcePool = poolFor(testDb());
     const restorePool = poolFor(restoreDb);
 
     const checkTables = [
@@ -496,8 +511,8 @@ describe('Deterministic DR', () => {
     const outputDir1 = tmpDir('backup-b19-1-');
     const outputDir2 = tmpDir('backup-b19-2-');
 
-    runBackupScript({ db: 'moling_test', output: outputDir1 });
-    runBackupScript({ db: 'moling_test', output: outputDir2 });
+    runBackupScript({ db: testDb(), output: outputDir1 });
+    runBackupScript({ db: testDb(), output: outputDir2 });
 
     // Compare checksums — should be identical since DB didn't change
     const manifest1 = JSON.parse(fs.readFileSync(path.join(outputDir1, 'manifest.json'), 'utf-8'));
