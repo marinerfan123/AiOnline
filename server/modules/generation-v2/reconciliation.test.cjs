@@ -94,14 +94,14 @@ test('R1: reconciler resolves video SUCCESS via injected adapter → generated',
 
 // ─── R2: PENDING → retry_wait (recoverable) ───
 
-test('R2: reconciler resolves PENDING → retry_wait', async () => {
+test('R2: reconciler resolves PENDING → reconcile_wait', async () => {
   const result = await resolveReconcilingItem(pg, {
     item_id: 'i-r2', lease_version: 1, provider_request_id: 'pr-r2',
   }, {
     transitionItem: async (_, action) => ({ status: action.to }),
     queryProviderStatus: async () => ({ status: 'pending', errorCode: 'STILL_PROCESSING' }),
   });
-  assert.equal(result.status, 'retry_wait');
+  assert.equal(result.status, 'reconcile_wait');
 });
 
 // ─── R3: FAILED → retry_wait (terminal failure path) ───

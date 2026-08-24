@@ -31,7 +31,7 @@ CREATE TABLE IF NOT EXISTS generation_items_v2 (
   mode TEXT NOT NULL DEFAULT 'real' CHECK (mode IN ('real','shadow')),
   status TEXT NOT NULL DEFAULT 'queued'
     CHECK (status IN (
-      'queued','leased','generating','provider_accepted','reconciling',
+      'queued','leased','generating','provider_accepted','reconciling','reconcile_wait',
       'generated','uploading','retry_wait','review_required',
       'done','failed','canceled'
     )),

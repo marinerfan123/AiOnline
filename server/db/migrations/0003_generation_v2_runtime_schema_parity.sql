@@ -39,6 +39,14 @@ ALTER TABLE generation_items_v2 ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ;
 ALTER TABLE generation_items_v2 ADD COLUMN IF NOT EXISTS generated_at TIMESTAMPTZ;
 ALTER TABLE generation_items_v2 ADD COLUMN IF NOT EXISTS uploaded_at TIMESTAMPTZ;
 ALTER TABLE generation_items_v2 ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;
+DO $$
+BEGIN
+  ALTER TABLE generation_items_v2 DROP CONSTRAINT IF EXISTS generation_items_v2_status_check;
+  ALTER TABLE generation_items_v2 ADD CONSTRAINT generation_items_v2_status_check CHECK (status IN (
+    'queued','leased','generating','provider_accepted','reconciling','reconcile_wait',
+    'generated','uploading','retry_wait','review_required','done','failed','canceled'
+  ));
+END $$;
 
 DROP INDEX IF EXISTS idx_generation_items_v2_claim;
 CREATE INDEX IF NOT EXISTS idx_generation_items_v2_claim

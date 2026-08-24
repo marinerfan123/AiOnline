@@ -10,6 +10,7 @@ const STATES = new Set([
   'queued', 'leased', 'generating', 'provider_accepted', 'reconciling',
   'generated', 'uploading', 'retry_wait', 'review_required',
   'done', 'failed', 'canceled',
+  'reconcile_wait',
 ]);
 
 async function claimItems(pg, { workerId, limit = 10, leaseSeconds = 120 } = {}) {

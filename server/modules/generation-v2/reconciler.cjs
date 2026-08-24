@@ -8,8 +8,9 @@ async function claimReconciling(pg, { workerId, limit = 10, leaseSeconds = 300 }
   const r = await pg.query(
     `WITH picked AS (
        SELECT item_id FROM generation_items_v2
-        WHERE status='reconciling'
+        WHERE status IN ('reconciling','reconcile_wait')
           AND (lease_expires_at IS NULL OR lease_expires_at < NOW())
+          AND (status='reconciling' OR next_attempt_at <= NOW())
         ORDER BY created_at ASC FOR UPDATE SKIP LOCKED LIMIT $1
      )
      UPDATE generation_items_v2 i
@@ -47,10 +48,10 @@ async function resolveReconcilingItem(pg, item, injected = {}) {
   }
   if (providerResult.status === 'pending') {
     const row = await deps.transitionItem(pg, {
-      ...base, from: 'reconciling', to: 'retry_wait',
-      patch: { last_error_code: 'PROVIDER_PENDING', last_error: 'still processing', next_attempt_at: new Date(Date.now() + 15000), lease_expires_at: null },
+      ...base, from: 'reconciling', to: 'reconcile_wait',
+      patch: { last_error_code: 'PROVIDER_PENDING', last_error: 'still processing; reconciliation only', next_attempt_at: new Date(Date.now() + 15000), lease_expires_at: null },
     });
-    return row ? { status: 'retry_wait' } : { status: 'stale_lease' };
+    return row ? { status: 'reconcile_wait' } : { status: 'stale_lease' };
   }
   // unknown/ambiguous: freeze for human review, do NOT release funds
   const row = await deps.transitionItem(pg, {
