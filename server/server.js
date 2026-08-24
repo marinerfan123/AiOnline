@@ -144,6 +144,20 @@ async function initDB() {
     }
   }
   try {
+    // ── P1-05: Production API startup must NOT run structural migration DDL.
+    // All schema changes go through versioned migrations (server/db/migrations/).
+    // In production: verify schema_migrations table exists (proves migrations ran).
+    // In non-production: legacy inline DDL remains for dev/test convenience. ──
+    if (isProduction) {
+    const mig = await pgPool.query(
+      "SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_name='schema_migrations') AS has_migrations"
+    );
+    if (!mig.rows[0].has_migrations) {
+      console.error('[DB] ❌ Production startup: schema_migrations table missing. Run migrations before booting API — process exit.');
+      process.exit(1);
+    }
+    console.log('[DB] Production schema readiness verified (schema_migrations present)');
+  } else {
     await pgPool.query(`
       CREATE TABLE IF NOT EXISTS providers (id TEXT PRIMARY KEY, name TEXT NOT NULL, type TEXT DEFAULT 'official', base_url TEXT DEFAULT '', api_key TEXT DEFAULT '', supported_types TEXT[] DEFAULT '{}', enabled BOOLEAN DEFAULT TRUE, protocol TEXT DEFAULT 'openai-compatible', remark TEXT DEFAULT '', default_endpoint JSONB DEFAULT '{}', capacity_model TEXT DEFAULT 'limited', bucket_max INT, cooldown_ms INT DEFAULT 60000, created_at TIMESTAMPTZ DEFAULT NOW());
       CREATE TABLE IF NOT EXISTS models (id TEXT PRIMARY KEY, model_id TEXT NOT NULL, display_name TEXT NOT NULL, mapping_name TEXT DEFAULT '', type TEXT DEFAULT 'image', provider_id TEXT REFERENCES providers(id) ON DELETE CASCADE, enabled BOOLEAN DEFAULT TRUE, supported_resolutions TEXT[] DEFAULT '{}', capabilities JSONB DEFAULT '{}', endpoint JSONB DEFAULT '{}', param_template JSONB DEFAULT '{}'::jsonb, credit_cost NUMERIC(18,4) DEFAULT 0, supports_reward_balance BOOLEAN NOT NULL DEFAULT TRUE, reward_credits_required NUMERIC(18,4) NOT NULL DEFAULT 0, max_concurrent INT, created_at TIMESTAMPTZ DEFAULT NOW());
@@ -935,6 +949,8 @@ async function initDB() {
       );
       CREATE INDEX IF NOT EXISTS ix_studio_owner_updated ON studio_projects(owner_id, updated_at DESC);
     `);
+    console.log('[DB] Development schema initialization complete (inline DDL)');
+  }
 
     return true;
   } catch (e) {
