@@ -137,9 +137,11 @@ services:
       REDIS_PORT: 6379
       REDIS_PASSWORD: ${REDIS_PASSWORD:-}
       GENERATION_V2_WORKER_ENABLED: "true"
-      GENERATION_V2_EVIDENCE_FILE: /dev/null
+      GENERATION_V2_EVIDENCE_FILE: /run/generation-v2/evidence.json
       V2_GENERATION_CONCURRENCY: ${V2_GENERATION_CONCURRENCY:-10}
       V2_UPLOAD_CONCURRENCY: ${V2_UPLOAD_CONCURRENCY:-4}
+    volumes:
+      - ./generation-v2/evidence.json:/run/generation-v2/evidence.json:ro
     restart: unless-stopped
 
   # Worker-02 (generation only, no HTTP)
@@ -165,9 +167,11 @@ services:
       REDIS_PORT: 6379
       REDIS_PASSWORD: ${REDIS_PASSWORD:-}
       GENERATION_V2_WORKER_ENABLED: "true"
-      GENERATION_V2_EVIDENCE_FILE: /dev/null
+      GENERATION_V2_EVIDENCE_FILE: /run/generation-v2/evidence.json
       V2_GENERATION_CONCURRENCY: ${V2_GENERATION_CONCURRENCY:-10}
       V2_UPLOAD_CONCURRENCY: ${V2_UPLOAD_CONCURRENCY:-4}
+    volumes:
+      - ./generation-v2/evidence.json:/run/generation-v2/evidence.json:ro
     restart: unless-stopped
 
   # Nginx Load Balancer
