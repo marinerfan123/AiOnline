@@ -23,8 +23,8 @@ function makePool(label) {
   return new Pool({ ...pgConfig, application_name: `distributed-test-${label}` });
 }
 
-const lease = require('../modules/generation-v2/lease.cjs');
-const recon = require('../modules/generation-v2/reconciler.cjs');
+const lease = require('../../modules/generation-v2/lease.cjs');
+const recon = require('../../modules/generation-v2/reconciler.cjs');
 
 test('D1: API-01 dies — API-02 can still serve (health/readiness independence)', async (t) => {
   // Both pools connect to same PG. If one pool ends, the other still works.
@@ -64,7 +64,7 @@ test('D2: API requests distribute — both pools hit same DB', async (t) => {
 test('D3: Auth multi-node — JWT signed by API-01 verifiable by API-02', async (t) => {
   // Auth uses JWT_SECRET from env (shared). HMAC-SHA256 is stateless.
   // This test verifies the auth module's sign/verify round-trip.
-  const auth = require('../auth.cjs');
+  const auth = require('../../auth.cjs');
 
   const token = auth.signSession({ id: 'user-123', role: 'user' });
   assert.ok(token);
@@ -175,10 +175,9 @@ test('D7: 4-worker concurrency — all safely compete', async (t) => {
   }
 
   // 4 workers claim concurrently
-  const results = await Promise.all([
-    lease.claimItems(pg, { workerId: `worker-${i}`, limit: 10, leaseSeconds: 120 })
-    for (let i = 1; i <= 4; i++)
-  ]);
+  const results = await Promise.all(
+    [1,2,3,4].map(i => lease.claimItems(pg, { workerId: `worker-${i}`, limit: 10, leaseSeconds: 120 }))
+  );
 
   // Collect all claimed IDs
   const allClaimed = results.flat();
@@ -274,7 +273,7 @@ test('D12: Cross-node SSE — Redis pub/sub infrastructure exists', async (t) =>
   // Verify the realtime module uses Redis pub/sub (already audited).
   // In a real multi-node test, we'd publish on one instance and subscribe on another.
   // Here we verify the infrastructure is in place.
-  const realtime = require('../realtime.cjs');
+  const realtime = require('../../realtime.cjs');
   assert.ok(typeof realtime.emitTaskUpdate === 'function', 'emitTaskUpdate should exist');
   assert.ok(typeof realtime.subscribe === 'function', 'subscribe should exist');
 });
@@ -320,7 +319,7 @@ test('D15: Temporary DB disconnect — reconnect works', async (t) => {
 
 test('D16: Migration lock prevents concurrent migrators', async (t) => {
   // Verify the advisory lock mechanism exists in migration-store.cjs
-  const migrationStore = require('../db/migration-store.cjs');
+  const migrationStore = require('../../db/migration-store.cjs');
   assert.ok(migrationStore.acquireLock, 'acquireLock should exist');
 });
 
@@ -346,6 +345,6 @@ test('D18: Object storage ownership — cross-user safe via user-scoped keys', a
   // Verify OSS config stores per-user path prefixes or key namespaces.
   // The assetFinalize module uses user_id to scope uploads.
   // This is a structural check — the oss.cjs module generates signed URLs per-request.
-  const ossMod = require('../oss.cjs');
+  const ossMod = require('../../oss.cjs');
   assert.ok(typeof ossMod.generateSignedUrls === 'function', 'OSS should have signed URL generation');
 });
