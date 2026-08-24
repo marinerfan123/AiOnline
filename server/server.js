@@ -1821,10 +1821,20 @@ async function handleAPI(req, res) {
   }
 
   // /api/readiness — dependencies sufficient to serve traffic (readiness probe)
-  // Returns 200 only when PG pool and Redis are both available.
+  // Live PG probe (SELECT 1 with timeout), not just object existence.
   if (url === '/api/readiness' && method === 'GET') {
-    const pgReady = !!pgPool;
-    const redisReady = isRedisUp();
+    if (shuttingDown) {
+      return sendJSON(res, 503, { status: 'not_ready', pg: false, redis: false, node_id: NODE_ID, reason: 'shutting_down' });
+    }
+    let pgReady = false;
+    let redisReady = false;
+    try {
+      if (pgPool) {
+        const c = await pgPool.connect();
+        try { await c.query('SELECT 1'); pgReady = true; } catch { pgReady = false; } finally { c.release(); }
+      }
+      redisReady = isRedisUp();
+    } catch { pgReady = false; redisReady = false; }
     if (pgReady && redisReady) {
       return sendJSON(res, 200, { status: 'ready', pg: true, redis: true, node_id: NODE_ID });
     }
