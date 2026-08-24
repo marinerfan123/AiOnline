@@ -139,7 +139,7 @@ async function tryProviderBucket(pid, cost, cap, now) {
   try {
     const ok = await r.eval(bucketLua, 1, bucketKey(pid), String(cap), String(cost), String(now));
     return ok === 1;
-  } catch (e) { return true; } // 异常放行（降级），避免限流故障阻断生成
+  } catch (e) { return false; } // 商业共享凭据：Redis 令牌桶异常 fail-closed，避免多节点各自放大全量配额
 }
 async function refundProviderBucket(pid, cost, cap) {
   const r = redis();
