@@ -31,7 +31,7 @@ async function processItem(pg, item, injected = {}) {
     ...injected,
   };
   if (typeof deps.providerGenerate !== 'function') throw new TypeError('providerGenerate is required');
-  const base = { itemId:item.item_id, leaseVersion:Number(item.lease_version) };
+  const base = { itemId:item.item_id, leaseVersion:Number(item.lease_version), workerId:deps.workerId };
   const started = await deps.transitionItem(pg, { ...base, from:'leased', to:'generating', patch:{ started_at:new Date() } });
   if (!started) return { status:'stale_lease' };
 

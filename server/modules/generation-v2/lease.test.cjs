@@ -41,13 +41,15 @@ test('claimItems 限制领取数量，拒绝无 workerId', async () => {
 test('transitionItem 使用 itemId+leaseVersion+前置状态 CAS，旧worker不能回写', async () => {
   const pg = fakePg([{ item_id: 'gi-1', status: 'generating', lease_version: 4 }]);
   const row = await transitionItem(pg, {
-    itemId: 'gi-1', leaseVersion: 4, from: 'leased', to: 'generating',
+    itemId: 'gi-1', leaseVersion: 4, workerId: 'w1', from: 'leased', to: 'generating',
     patch: { provider_id: 'p1', key_id: 'k1' },
   });
   assert.equal(row.item_id, 'gi-1');
   const call = pg.calls[0];
   assert.match(call.sql, /WHERE item_id=\$1 AND lease_version=\$2 AND status=\$3/i);
-  assert.deepEqual(call.params.slice(0, 4), ['gi-1', 4, 'leased', 'generating']);
+  assert.match(call.sql, /lease_owner=\$5/i);
+  assert.match(call.sql, /lease_expires_at > NOW\(\)/i);
+  assert.deepEqual(call.params.slice(0, 5), ['gi-1', 4, 'leased', 'generating', 'w1']);
 });
 
 test('transitionItem CAS未命中返回null', async () => {

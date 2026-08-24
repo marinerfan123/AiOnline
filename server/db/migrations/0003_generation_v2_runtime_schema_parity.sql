@@ -106,7 +106,7 @@ ALTER TABLE generation_worker_heartbeats_v2 ADD COLUMN IF NOT EXISTS meta JSONB 
 
 -- Outbox: legacy 0002 modeled item/batch/user and boolean published; runtime uses aggregate fields and published_at.
 ALTER TABLE generation_outbox_v2 ALTER COLUMN event_id DROP DEFAULT;
-ALTER TABLE generation_outbox_v2 ALTER COLUMN event_id TYPE BIGINT USING CASE WHEN event_id ~ '^[0-9]+$' THEN event_id::bigint ELSE abs(hashtext(event_id))::bigint END;
+ALTER TABLE generation_outbox_v2 ALTER COLUMN event_id TYPE BIGINT USING CASE WHEN event_id::text ~ '^[0-9]+$' THEN event_id::bigint ELSE abs(hashtext(event_id::text))::bigint END;
 CREATE SEQUENCE IF NOT EXISTS generation_outbox_v2_event_id_seq;
 SELECT setval('generation_outbox_v2_event_id_seq', COALESCE((SELECT max(event_id) FROM generation_outbox_v2), 0) + 1, false);
 ALTER TABLE generation_outbox_v2 ALTER COLUMN event_id SET DEFAULT nextval('generation_outbox_v2_event_id_seq');

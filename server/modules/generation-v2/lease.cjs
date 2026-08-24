@@ -41,7 +41,7 @@ async function claimItems(pg, { workerId, limit = 10, leaseSeconds = 120 } = {})
   return result.rows || [];
 }
 
-async function transitionItem(pg, { itemId, leaseVersion, from, to, patch = {} } = {}) {
+async function transitionItem(pg, { itemId, leaseVersion, workerId, from, to, patch = {} } = {}) {
   if (!itemId || !Number.isInteger(Number(leaseVersion))) throw new TypeError('itemId and leaseVersion are required');
   if (!STATES.has(from) || !STATES.has(to)) throw new TypeError('invalid state');
   if (!isAllowedTransition(from, to)) throw new TypeError(`illegal state transition: ${from}->${to}`);
@@ -49,7 +49,7 @@ async function transitionItem(pg, { itemId, leaseVersion, from, to, patch = {} }
   for (const [field] of entries) {
     if (!PATCH_FIELDS.has(field)) throw new TypeError(`invalid patch field: ${field}`);
   }
-  const params = [itemId, Number(leaseVersion), from, to];
+  const params = [itemId, Number(leaseVersion), from, to, workerId || null];
   const sets = ['status=$4'];
   for (const [field, value] of entries) {
     params.push(value);
@@ -59,6 +59,8 @@ async function transitionItem(pg, { itemId, leaseVersion, from, to, patch = {} }
     `UPDATE generation_items_v2
         SET ${sets.join(', ')}
       WHERE item_id=$1 AND lease_version=$2 AND status=$3
+        AND ($5::text IS NULL OR lease_owner=$5)
+        AND lease_expires_at > NOW()
       RETURNING item_id,status,lease_version`,
     params,
   );
