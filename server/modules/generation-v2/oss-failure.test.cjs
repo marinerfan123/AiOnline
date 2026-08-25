@@ -115,8 +115,18 @@ test('E3: successful upload uses deterministic object key', async () => {
 // ─── E4: Credit commit only on success ───
 
 test('E4: credit commit only on final success path', async () => {
-  // Insert hold
+  // Insert parent item + hold (FK: holds.item_id → items.item_id)
   const itemId = `i-e4-${Date.now()}`;
+  await pg.query(
+    `INSERT INTO generation_batches_v2 (batch_id, user_id, model_id, requested_count, request_payload, content_type, unit_price, reserved_total, status, idempotency_key)
+     VALUES ($1, 'u-test', 'm-test', 1, '{}', 'image', 100, 100, 'running', $1)`,
+    [`b-e4`]
+  );
+  await pg.query(
+    `INSERT INTO generation_items_v2 (item_id, batch_id, item_index, status, mode)
+     VALUES ($1, 'b-e4', 0, 'queued', 'real')`,
+    [itemId]
+  );
   await pg.query(
     `INSERT INTO generation_credit_holds_v2 (item_id, user_id, pool, amount, status)
      VALUES ($1, 'u-test', 'reward', '1.00', 'held')`,

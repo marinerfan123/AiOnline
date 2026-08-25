@@ -66,8 +66,18 @@ test('G1: concurrent same batch reserve — only one succeeds', async () => {
 // ─── G2: Double commit — only charges once ───
 
 test('G2: double settleHold commit — only one takes effect', async () => {
-  // Insert hold directly
+  // Insert parent item + hold (FK: holds.item_id → items.item_id)
   const itemId = `i-g2-${Date.now()}`;
+  await pg.query(
+    `INSERT INTO generation_batches_v2 (batch_id, user_id, model_id, requested_count, request_payload, content_type, unit_price, reserved_total, status, idempotency_key)
+     VALUES ($1, 'u-test', 'm-test', 1, '{}', 'image', 100, 100, 'running', $1)`,
+    [`b-g2`]
+  );
+  await pg.query(
+    `INSERT INTO generation_items_v2 (item_id, batch_id, item_index, status, mode)
+     VALUES ($1, 'b-g2', 0, 'queued', 'real')`,
+    [itemId]
+  );
   await pg.query(
     `INSERT INTO generation_credit_holds_v2 (item_id, user_id, pool, amount, status)
      VALUES ($1, 'u-test', 'reward', '1.00', 'held')`,
@@ -89,6 +99,16 @@ test('G2: double settleHold commit — only one takes effect', async () => {
 test('G3: double settleHold release — only one takes effect', async () => {
   const itemId = `i-g3-${Date.now()}`;
   await pg.query(
+    `INSERT INTO generation_batches_v2 (batch_id, user_id, model_id, requested_count, request_payload, content_type, unit_price, reserved_total, status, idempotency_key)
+     VALUES ($1, 'u-test', 'm-test', 1, '{}', 'image', 100, 100, 'running', $1)`,
+    [`b-g3`]
+  );
+  await pg.query(
+    `INSERT INTO generation_items_v2 (item_id, batch_id, item_index, status, mode)
+     VALUES ($1, 'b-g3', 0, 'queued', 'real')`,
+    [itemId]
+  );
+  await pg.query(
     `INSERT INTO generation_credit_holds_v2 (item_id, user_id, pool, amount, status)
      VALUES ($1, 'u-test', 'reward', '1.00', 'held')`,
     [itemId]
@@ -107,6 +127,16 @@ test('G3: double settleHold release — only one takes effect', async () => {
 
 test('G4: commit vs release race — only one wins', async () => {
   const itemId = `i-g4-${Date.now()}`;
+  await pg.query(
+    `INSERT INTO generation_batches_v2 (batch_id, user_id, model_id, requested_count, request_payload, content_type, unit_price, reserved_total, status, idempotency_key)
+     VALUES ($1, 'u-test', 'm-test', 1, '{}', 'image', 100, 100, 'running', $1)`,
+    [`b-g4`]
+  );
+  await pg.query(
+    `INSERT INTO generation_items_v2 (item_id, batch_id, item_index, status, mode)
+     VALUES ($1, 'b-g4', 0, 'queued', 'real')`,
+    [itemId]
+  );
   await pg.query(
     `INSERT INTO generation_credit_holds_v2 (item_id, user_id, pool, amount, status)
      VALUES ($1, 'u-test', 'reward', '1.00', 'held')`,
@@ -131,6 +161,16 @@ test('G4: commit vs release race — only one wins', async () => {
 
 test('G5: settling already-settled hold returns changed:false', async () => {
   const itemId = `i-g5-${Date.now()}`;
+  await pg.query(
+    `INSERT INTO generation_batches_v2 (batch_id, user_id, model_id, requested_count, request_payload, content_type, unit_price, reserved_total, status, idempotency_key)
+     VALUES ($1, 'u-test', 'm-test', 1, '{}', 'image', 100, 100, 'running', $1)`,
+    [`b-g5`]
+  );
+  await pg.query(
+    `INSERT INTO generation_items_v2 (item_id, batch_id, item_index, status, mode)
+     VALUES ($1, 'b-g5', 0, 'queued', 'real')`,
+    [itemId]
+  );
   await pg.query(
     `INSERT INTO generation_credit_holds_v2 (item_id, user_id, pool, amount, status, settled_at)
      VALUES ($1, 'u-test', 'reward', '1.00', 'committed', NOW())`,

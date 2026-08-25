@@ -44,6 +44,7 @@ test('F4: redis.cjs same-instance outage/recovery with real Redis', async () => 
   process.env.REDIS_PASSWORD = '';
 
   const redis = require(redisPath);
+  const { execSync } = require('child_process');
 
   // Phase 1: connect
   const up = await redis.initRedis();
@@ -56,15 +57,23 @@ test('F4: redis.cjs same-instance outage/recovery with real Redis', async () => 
   assert.equal(val, 'hello', 'should read back what we wrote');
 
   // Phase 3: simulate Redis outage — kill the container
-  const { execSync } = require('child_process');
   try {
     execSync('docker stop test-redis-p1', { stdio: 'pipe' });
   } catch (_) {
     // Container may already be stopped
   }
 
-  // Wait for reconnection retries to exhaust
-  await new Promise(r => setTimeout(r, 3000));
+  // Probe the connection to trigger error detection — idle ioredis
+  // does not detect TCP closure until a command is sent.
+  // Wrap with timeout because ioredis may hold the command promise
+  // while running its reconnect cycle.
+  await Promise.race([
+    redis.kvGet('p102-probe'),
+    new Promise(r => setTimeout(() => r(null), 8000))
+  ]);
+  // Stop ioredis background reconnect attempts so the event loop
+  // can drain when the test finishes. We reconnect in Phase 7.
+  await redis.disconnect();
 
   // Phase 4: verify degradation — redisUp should be false, kv should use memory
   assert.equal(redis.isRedisUp(), false, 'isRedisUp should be false after outage');
@@ -89,11 +98,10 @@ test('F4: redis.cjs same-instance outage/recovery with real Redis', async () => 
     assert.fail('Failed to restart Redis container: ' + e.message);
   }
 
-  // Wait for connection
+  // Wait for container to boot
   await new Promise(r => setTimeout(r, 2000));
 
-  // Phase 7: ioredis auto-reconnects — verify recovery
-  // The redis client should reconnect automatically (ioredis retryStrategy)
+  // Phase 7: re-connect on same application instance
   const recovered = await redis.initRedis();
   assert.equal(recovered, true, 'Redis should recover on same application instance');
   assert.equal(redis.isRedisUp(), true, 'isRedisUp should be true after recovery');
@@ -102,6 +110,9 @@ test('F4: redis.cjs same-instance outage/recovery with real Redis', async () => 
   await redis.kvSet('p102-recovered', 'recovered-value', 60);
   const recoveredVal = await redis.kvGet('p102-recovered');
   assert.equal(recoveredVal, 'recovered-value', 'kv should work on recovered Redis');
+
+  // Cleanup: quit ioredis to drain event loop and prevent process hang
+  await redis.quit();
 
   // Restore env
   process.env.REDIS_HOST = origHost;
