@@ -4519,6 +4519,8 @@ if (cluster.isWorker || !CLUSTER_ENABLED) {
 const IS_LEADER = !CLUSTER_ENABLED || cluster.worker?.id === 1;
 await initDB();
 await initRedis();
+// Start SSE subscriber now that Redis is up (realtime.cjs loaded before Redis connected)
+if (realtime.ensureSubscriber) realtime.ensureSubscriber();
 cpuMonitor.start(); // 启动 CPU 自适应负载降级监控（每 worker 独立）
 
 // ─── 崩溃恢复：启动即扫描在途视频任务，续轮询崩溃前已提交但本进程未完成的任务 ───

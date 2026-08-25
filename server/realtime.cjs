@@ -27,10 +27,10 @@ let sub = null;
 let subStarted = false;
 
 function startSubscriber() {
-  if (subStarted) return;
-  subStarted = true;
+  if (sub) return; // already running
   const redis = getRedis();
   if (!redis) return;
+  subStarted = true;
   try {
     sub = redis.duplicate();
     // psubscribe 的消息走 pmessage(pattern, channel, message)
@@ -53,9 +53,15 @@ function startSubscriber() {
   }
 }
 
+// Start subscriber if not already running — Redis may connect after module load
+function ensureSubscriber() {
+  if (!sub) startSubscriber();
+}
+
 // dispatcher 完成回调里调用：把任务更新推给该用户的所有活跃连接（跨 worker 经 Redis，本地经 emitter）
 function emitTaskUpdate(userId, payload) {
   if (!userId) return;
+  ensureSubscriber(); // lazy: Redis may not have been ready at module load
   const redis = getRedis();
   if (redis && isRedisUp()) {
     try {
@@ -127,4 +133,4 @@ async function snapshotActive(pgPool, userId) {
 
 startSubscriber();
 
-module.exports = { emitTaskUpdate, subscribe, snapshotActive };
+module.exports = { emitTaskUpdate, subscribe, snapshotActive, ensureSubscriber };
