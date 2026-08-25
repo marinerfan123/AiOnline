@@ -60,10 +60,10 @@ async function ensureSchemaAndFixtures(pg) {
   // Create a test user for FK-dependent tests
   const dummyHash = crypto.scryptSync('password123', 'salt', 64).toString('hex');
   await pg.query(
-    `INSERT INTO users(id, email, display_name, password_hash, reward_credits, recharge_credits, credits, role, status)
-     VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9)
+    `INSERT INTO users(id, email, display_name, password_hash, reward_credits, recharge_credits, role, status)
+     VALUES($1, $2, $3, $4, $5, $6, $7, $8)
      ON CONFLICT (id) DO UPDATE SET password_hash = EXCLUDED.password_hash`,
-    ['test-user-d4', 'test-d4@example.com', 'Test User', dummyHash, 1000, 0, 1000, 'user', 'active']
+    ['test-user-d4', 'test-d4@example.com', 'Test User', dummyHash, 1000, 0, 'user', 'active']
   );
 
   // Seed settings for D2
@@ -425,7 +425,7 @@ test('D11: Worker-B completes API-A task — state transition via DB', async () 
   await seedItem(pg, { itemId, batchId, status: 'leased' });
   // Manually set lease_owner and lease_version to simulate Worker-A claimed it
   await pg.query(
-    `UPDATE generation_items_v2 SET lease_owner='worker-A', lease_version=1 WHERE item_id=$1`,
+    `UPDATE generation_items_v2 SET lease_owner='worker-A', lease_version=1, lease_expires_at=NOW()+'5min' WHERE item_id=$1`,
     [itemId]
   );
 
@@ -727,8 +727,8 @@ test('D20: SSE E2E — HTTP client receives Redis-published task event', async (
   const email = `sse-${Date.now()}@test.com`;
   const pwdHash = session.hashPassword('TestPass123!');
   await pg.query(
-    `INSERT INTO users(id,email,password_hash,reward_credits,recharge_credits,credits,role,status)
-     VALUES($1,$2,$3,0,0,0,'user','active') ON CONFLICT DO NOTHING`,
+    `INSERT INTO users(id,email,password_hash,reward_credits,recharge_credits,role,status)
+     VALUES($1,$2,$3,0,0,'user','active') ON CONFLICT DO NOTHING`,
     [userId, email, pwdHash]
   );
 
@@ -826,8 +826,8 @@ test('D21: SSE user isolation — User-B does not receive User-A events', async 
 
   for (const [uid, em] of [[userA, emailA], [userB, emailB]]) {
     await pg.query(
-      `INSERT INTO users(id,email,password_hash,reward_credits,recharge_credits,credits,role,status)
-       VALUES($1,$2,$3,0,0,0,'user','active') ON CONFLICT DO NOTHING`,
+      `INSERT INTO users(id,email,password_hash,reward_credits,recharge_credits,role,status)
+       VALUES($1,$2,$3,0,0,'user','active') ON CONFLICT DO NOTHING`,
       [uid, em, session.hashPassword('TestPass123!')]
     );
   }
@@ -924,8 +924,8 @@ test('D22: Payment concurrent callback — single credit/ledger effect', async (
   // Create test user (matching production recharge_orders: amount in 元=credits, id=TEXT PK)
   const userId = `pay-user-${Date.now()}`;
   await pg.query(
-    `INSERT INTO users(id,email,password_hash,reward_credits,recharge_credits,credits,role,status)
-     VALUES($1,$2,$3,0,0,0,'user','active')`,
+    `INSERT INTO users(id,email,password_hash,reward_credits,recharge_credits,role,status)
+     VALUES($1,$2,$3,0,0,'user','active')`,
     [userId, `pay-${Date.now()}@test.com`, session.hashPassword('TestPass123!')]
   );
 
@@ -942,7 +942,7 @@ test('D22: Payment concurrent callback — single credit/ledger effect', async (
   const orderAmount = 1; // 1 元 = 1 credit (production: amount in 元)
 
   // Reset user balance
-  await pg.query('UPDATE users SET credits=0, recharge_credits=0 WHERE id=$1', [userId]);
+  await pg.query('UPDATE users SET recharge_credits=0 WHERE id=$1', [userId]);
 
   // Insert pending order matching real schema
   await pg.query(
@@ -972,7 +972,7 @@ test('D22: Payment concurrent callback — single credit/ledger effect', async (
 
         // Production: amount in 元 = credits
         await client.query(`UPDATE recharge_orders SET status='paid',paid_at=NOW(),channel_trade_no=$1 WHERE pay_order_no=$2`, [channelTradeNo, orderNo]);
-        const bal = await client.query('UPDATE users SET recharge_credits=recharge_credits+$1 WHERE id=$2 RETURNING credits', [orderAmount, userId]);
+        const bal = await client.query('UPDATE users SET recharge_credits=recharge_credits+$1 WHERE id=$2 RETURNING recharge_credits', [orderAmount, userId]);
         await client.query(`INSERT INTO credit_transactions(user_id,kind,amount,ref,pool,balance_after) VALUES($1,'grant',$2,$3,'recharge',$4)`, [userId, orderAmount, orderNo, bal.rows[0].credits]);
         await client.query('COMMIT');
         return { ok: true, credits: bal.rows[0].credits };
@@ -996,7 +996,7 @@ test('D22: Payment concurrent callback — single credit/ledger effect', async (
         if (ins.rowCount === 0) { await client.query('COMMIT'); return { ok: true, alreadyPaid: true }; }
 
         await client.query(`UPDATE recharge_orders SET status='paid',paid_at=NOW(),channel_trade_no=$1 WHERE pay_order_no=$2`, [channelTradeNo, orderNo]);
-        const bal = await client.query('UPDATE users SET recharge_credits=recharge_credits+$1 WHERE id=$2 RETURNING credits', [orderAmount, userId]);
+        const bal = await client.query('UPDATE users SET recharge_credits=recharge_credits+$1 WHERE id=$2 RETURNING recharge_credits', [orderAmount, userId]);
         await client.query(`INSERT INTO credit_transactions(user_id,kind,amount,ref,pool,balance_after) VALUES($1,'grant',$2,$3,'recharge',$4)`, [userId, orderAmount, orderNo, bal.rows[0].credits]);
         await client.query('COMMIT');
         return { ok: true, credits: bal.rows[0].credits };
