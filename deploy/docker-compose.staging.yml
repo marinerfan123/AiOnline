@@ -1,0 +1,194 @@
+# Distributed Staging — Single-host multi-instance
+# Ports remapped to avoid conflicts with test infra (5432, 6379, 16379)
+#
+# Topology:
+#   nginx (LB) :8080 -> API-01 :3001, API-02 :3001
+#   Worker-01, Worker-02 (standalone)
+#   PostgreSQL :15432
+#   Redis      :16380
+
+services:
+  postgres:
+    image: postgres:17
+    container_name: staging-pg
+    environment:
+      POSTGRES_USER: ${PG_USER:-postgres}
+      POSTGRES_PASSWORD: ${PG_PASSWORD:-staging-pg-2026}
+      POSTGRES_DB: ${PG_DATABASE:-huabu_staging}
+    ports:
+      - "15432:5432"
+    volumes:
+      - staging_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PG_USER:-postgres}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7.2
+    container_name: staging-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "16380:6379"
+    volumes:
+      - staging_redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api-01:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: staging-api-01
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      ENABLE_CLUSTER: "false"
+      PORT: 3001
+      NODE_ID: api-01
+      PG_HOST: postgres
+      PG_PORT: 5432
+      PG_DATABASE: ${PG_DATABASE:-huabu_staging}
+      PG_USER: ${PG_USER:-postgres}
+      PG_PASSWORD: ${PG_PASSWORD:-staging-pg-2026}
+      PG_POOL_MAX: ${PG_POOL_MAX:-10}
+      PG_SSLMODE: disable
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      JWT_SECRET: ${JWT_SECRET:-staging-jwt-secret-not-production}
+      API_TOKEN: ${API_TOKEN:-staging-api-token}
+      CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:8080}
+    ports:
+      - "3001:3001"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3001/api/readiness').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  api-02:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: staging-api-02
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      ENABLE_CLUSTER: "false"
+      PORT: 3001
+      NODE_ID: api-02
+      PG_HOST: postgres
+      PG_PORT: 5432
+      PG_DATABASE: ${PG_DATABASE:-huabu_staging}
+      PG_USER: ${PG_USER:-postgres}
+      PG_PASSWORD: ${PG_PASSWORD:-staging-pg-2026}
+      PG_POOL_MAX: ${PG_POOL_MAX:-10}
+      PG_SSLMODE: disable
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      JWT_SECRET: ${JWT_SECRET:-staging-jwt-secret-not-production}
+      API_TOKEN: ${API_TOKEN:-staging-api-token}
+      CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:8080}
+    ports:
+      - "3002:3001"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3001/api/readiness').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  worker-01:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: staging-worker-01
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: ["node", "server/modules/generation-v2/entry.cjs"]
+    environment:
+      NODE_ENV: production
+      WORKER_ID: ${WORKER_ID:-staging-worker-01}
+      PG_HOST: postgres
+      PG_PORT: 5432
+      PG_DATABASE: ${PG_DATABASE:-huabu_staging}
+      PG_USER: ${PG_USER:-postgres}
+      PG_PASSWORD: ${PG_PASSWORD:-staging-pg-2026}
+      PG_SSLMODE: disable
+      V2_PG_POOL_MAX: ${V2_PG_POOL_MAX:-10}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      GENERATION_V2_WORKER_ENABLED: "true"
+      GENERATION_V2_EVIDENCE_FILE: /run/generation-v2/evidence.json
+      V2_GENERATION_CONCURRENCY: ${V2_GENERATION_CONCURRENCY:-10}
+      V2_UPLOAD_CONCURRENCY: ${V2_UPLOAD_CONCURRENCY:-4}
+    volumes:
+      - ./generation-v2/evidence.json:/run/generation-v2/evidence.json:ro
+
+  worker-02:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: staging-worker-02
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: ["node", "server/modules/generation-v2/entry.cjs"]
+    environment:
+      NODE_ENV: production
+      WORKER_ID: ${WORKER_ID_2:-staging-worker-02}
+      PG_HOST: postgres
+      PG_PORT: 5432
+      PG_DATABASE: ${PG_DATABASE:-huabu_staging}
+      PG_USER: ${PG_USER:-postgres}
+      PG_PASSWORD: ${PG_PASSWORD:-staging-pg-2026}
+      PG_SSLMODE: disable
+      V2_PG_POOL_MAX: ${V2_PG_POOL_MAX:-10}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      GENERATION_V2_WORKER_ENABLED: "true"
+      GENERATION_V2_EVIDENCE_FILE: /run/generation-v2/evidence.json
+      V2_GENERATION_CONCURRENCY: ${V2_GENERATION_CONCURRENCY:-10}
+      V2_UPLOAD_CONCURRENCY: ${V2_UPLOAD_CONCURRENCY:-4}
+    volumes:
+      - ./generation-v2/evidence.json:/run/generation-v2/evidence.json:ro
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: staging-lb
+    depends_on:
+      - api-01
+      - api-02
+    ports:
+      - "8080:80"
+    volumes:
+      - ./nginx-distributed.conf:/etc/nginx/nginx.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost/api/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  staging_pgdata:
+  staging_redisdata:

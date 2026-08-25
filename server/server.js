@@ -4666,6 +4666,7 @@ server.listen(PORT, '0.0.0.0', async () => {
 // 部署基线（#360）：ecosystem.config.cjs 已是单实例 fork（dispatcher RPM 令牌桶为进程内态，
 // 多实例会重复计数导致厂商 429 风暴）；此处负责进程内资源的有序释放。
 //
+let shuttingDown = false; // P1-06: must be module-scope so readiness probe can read it
 // P1-06: Shutdown lifecycle — the shuttingDown flag is set immediately so:
 //   1. /api/readiness returns 503 immediately
 //   2. runWorkerTick sees options.shuttingDown and stops claiming new V2 work
@@ -4677,7 +4678,6 @@ server.listen(PORT, '0.0.0.0', async () => {
 // Note: Generation V2 runs as a separate process (entry.cjs) with its own
 // SIGTERM handler (runtime.stop() → daemon.stop() → pg.end() → exit).
 // This shutdown handler covers the legacy dispatcher + API surface.
-let shuttingDown = false;
 function gracefulShutdown(sig) {
   if (shuttingDown) return;
   shuttingDown = true;
