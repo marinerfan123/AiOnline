@@ -68,9 +68,9 @@ async function createUser(pg, userDef) {
   const u = { ...userDef };
   const passwordHash = session.hashPassword(u.password || 'TestPass123!');
   const result = await pg.query(
-    `INSERT INTO users (id, email, display_name, password_hash, reward_credits, recharge_credits, credits, role, status, created_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'active', NOW())
-     RETURNING id, email, display_name, role`,
+    `INSERT INTO users (id, email, display_name, password_hash, reward_credits, recharge_credits, role, status, created_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, 'active', NOW())
+     RETURNING id, email, display_name, role, credits`,
     [
       u.id || crypto.randomUUID(),
       u.email || `fx${crypto.randomUUID().slice(0, 8)}@example.com`,
@@ -78,7 +78,6 @@ async function createUser(pg, userDef) {
       passwordHash,
       u.rewardCredits || 0,
       u.rechargeCredits || 50,
-      (u.rewardCredits || 0) + (u.rechargeCredits || 50),
       u.role || 'user',
     ]
   );

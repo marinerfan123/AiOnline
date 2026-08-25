@@ -240,7 +240,7 @@ test('API Integration Tests', { concurrency: 1 }, async (t) => {
         const { hashPassword } = require('../../auth.cjs');
         const { createTestPool } = require('../helpers/test-db.cjs');
         const pg = createTestPool();
-        await pg.query(`INSERT INTO users (id, email, password_hash, role, credits, created_at) VALUES ($1, $2, $3, 'admin', 0, NOW()) ON CONFLICT DO NOTHING`, [`u-oss-admin-${Date.now()}`, adminEmail, hashPassword('InitPass123!')]);
+        await pg.query(`INSERT INTO users (id, email, password_hash, role, created_at) VALUES ($1, $2, $3, 'admin', NOW()) ON CONFLICT DO NOTHING`, [`u-oss-admin-${Date.now()}`, adminEmail, hashPassword('InitPass123!')]);
         await pg.end();
       }
       const lr = await request(server.baseUrl, { method: 'POST', path: '/api/auth/login', body: { email: adminEmail, password: 'InitPass123!' } });

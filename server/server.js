@@ -1623,14 +1623,14 @@ async function handleRegister(req, res) {
   );
   if (reward > 0) {
     await pgPool.query(
-      `INSERT INTO credit_transactions (user_id, kind, amount, ref, pool) VALUES ($1, 'grant', ${reward}, 'signup-bonus', 'reward')`,
-      [id],
+      `INSERT INTO credit_transactions (user_id, kind, amount, ref, pool) VALUES ($1, 'grant', $2, $3, 'reward')`,
+      [id, reward, `signup-bonus:${id}`],
     );
   }
   if (recharge > 0) {
     await pgPool.query(
-      `INSERT INTO credit_transactions (user_id, kind, amount, ref, pool) VALUES ($1, 'grant', ${recharge}, 'signup-bonus-recharge', 'recharge')`,
-      [id],
+      `INSERT INTO credit_transactions (user_id, kind, amount, ref, pool) VALUES ($1, 'grant', $2, $3, 'recharge')`,
+      [id, recharge, `signup-bonus-recharge:${id}`],
     );
   }
   // 注册即拷贝公共默认资产到个人素材库（幂等）

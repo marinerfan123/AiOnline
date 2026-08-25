@@ -16,6 +16,7 @@ function spawnTestServer() {
       NODE_ENV: 'test',
       TEST_PG_DATABASE: process.env.TEST_PG_DATABASE || 'moling_test',
       PG_DATABASE: process.env.TEST_PG_DATABASE || 'moling_test',
+      PG_SSLMODE: 'disable',
       PORT: '0', // OS-assigned ephemeral port
       ENABLE_CLUSTER: 'false',
     };
