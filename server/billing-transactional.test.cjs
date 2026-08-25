@@ -22,7 +22,7 @@ const pgPort = Number(process.env.TEST_PG_PORT || process.env.PG_PORT || '5432')
 const pgUser = process.env.TEST_PG_USER || process.env.PG_USER || 'postgres';
 const pgPass = process.env.TEST_PG_PASSWORD || process.env.PG_PASSWORD || '0.0.1abcd';
 const pgDb = process.env.TEST_PG_DATABASE || process.env.PG_DATABASE || 'moling_test';
-const pgUrl = `postgresql://${pgUser}:***@${pgHost}:${pgPort}/postgres`;
+const pgUrl = `postgresql://${pgUser}:${encodeURIComponent(pgPass)}@${pgHost}:${pgPort}/postgres`;
 
 const adminPool = new Pool({ connectionString: pgUrl, max: 1 });
 

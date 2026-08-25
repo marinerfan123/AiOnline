@@ -100,12 +100,17 @@ async function initDB() {
   for (let attempt = 1; attempt <= PG_MAX_RETRY; attempt++) {
     try {
       // PG SSL/TLS support — accurate mode semantics (P1-08):
-      //   disable  → no SSL
-      //   prefer   → SSL if offered, no cert check
-      //   require  → encrypted transport, no CA verification
-      //   verify-ca → encrypted + CA validation (rejectUnauthorized)
+      //   disable     → no SSL
+      //   prefer      → SSL if offered, no cert check
+      //   require     → encrypted transport, no CA verification
+      //   verify-ca   → encrypted + CA validation (rejectUnauthorized: true)
       //   verify-full → CA validation + hostname verification
+      //                 (rejectUnauthorized: true + servername for SNI/hostname check)
+      // Note: Node.js TLS 'servername' enables hostname verification when
+      // rejectAuthorization: true. Without servername, verify-ca and verify-full
+      // behave identically (CA-only). We set servername to PG_HOST for verify-full.
       const pgSslMode = process.env.PG_SSLMODE || 'prefer';
+      const pgHostForSsl = process.env.PG_HOST || 'localhost';
       let pgSsl = undefined;
       if (pgSslMode === 'disable') {
         pgSsl = undefined;
@@ -116,7 +121,7 @@ async function initDB() {
       } else if (pgSslMode === 'verify-ca') {
         pgSsl = { rejectUnauthorized: true };
       } else if (pgSslMode === 'verify-full') {
-        pgSsl = { rejectUnauthorized: true };
+        pgSsl = { rejectUnauthorized: true, servername: pgHostForSsl };
       }
       pgPool = new Pool({
         host: process.env.PG_HOST || 'localhost',
@@ -4660,18 +4665,32 @@ server.listen(PORT, '0.0.0.0', async () => {
 // PM2/容器发 SIGTERM：停 worker → 关闭 HTTP（不再接新连接，等在途完成）→ 关 Redis/PG → 退出。
 // 部署基线（#360）：ecosystem.config.cjs 已是单实例 fork（dispatcher RPM 令牌桶为进程内态，
 // 多实例会重复计数导致厂商 429 风暴）；此处负责进程内资源的有序释放。
+//
+// P1-06: Shutdown lifecycle — the shuttingDown flag is set immediately so:
+//   1. /api/readiness returns 503 immediately
+//   2. runWorkerTick sees options.shuttingDown and stops claiming new V2 work
+//   3. V2 worker-daemon stops() after current tick completes
+//   4. Legacy dispatcher respects shuttingDown for new generation requests
+//   5. In-flight operations are allowed to complete within the grace period
+//   6. PG/Redis are closed ONLY after in-flight work has resolved
+//
+// Note: Generation V2 runs as a separate process (entry.cjs) with its own
+// SIGTERM handler (runtime.stop() → daemon.stop() → pg.end() → exit).
+// This shutdown handler covers the legacy dispatcher + API surface.
 let shuttingDown = false;
 function gracefulShutdown(sig) {
   if (shuttingDown) return;
   shuttingDown = true;
   console.log(`\n[shutdown] 收到 ${sig}，开始优雅关闭...`);
   orderExpiry.stop();
+  // P1-06: Stop waiting-area pump so no new provider calls are enqueued
+  try { dispatcher.stopWaitingPump?.(); } catch (_) {}
 
-  // 兜底：10s 内未自然退出则强制退出，避免 PM2 kill_timeout 前残留
+  // 兜底：30s 内未自然退出则强制退出（加长到 30s 以等待长 Provider 操作完成）
   const forceExit = setTimeout(() => {
     console.error('[shutdown] 等待超时，强制退出');
     process.exit(1);
-  }, 10000);
+  }, 30000);
   if (forceExit.unref) forceExit.unref();
 
   const done = (label) => {

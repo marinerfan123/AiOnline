@@ -1123,7 +1123,18 @@ async function generateAsync(pgPool, opts) {
   }
   // 注入 taskId + canonicalModelId + onSubmitted：视频提交后立即持久化 provider task id（崩溃恢复地基）。
   // runOpts 透传到 generate → dispatchOne → attemptOnAccount → videoGenerate，视频任务提交成功后即写库。
-  const runOpts = { ...opts, taskId, canonicalModelId, onSubmitted: (info) => persistProviderTaskId(pgPool, taskId, info) };
+  // P1-04: 生成并持久化 client_request_id，确保图片任务在 provider 调用前即有稳定提交标识。
+  // 若进程在 provider 调用后崩溃，recovery 可据此判断 provider 已接受请求，不会盲目重提。
+  const clientRequestId = `cr-${taskId}-${crypto.randomUUID().slice(0, 8)}`;
+  try {
+    await pgPool.query(
+      `UPDATE generation_tasks SET client_request_id=$1 WHERE task_id=$2`,
+      [clientRequestId, taskId],
+    );
+  } catch (e) {
+    console.warn('[dispatcher] 持久化 client_request_id 失败:', e.message);
+  }
+  const runOpts = { ...opts, taskId, canonicalModelId, clientRequestId, onSubmitted: (info) => persistProviderTaskId(pgPool, taskId, info) };
 
   // 后台跑：完成后更新 PG（不再 await）
   generate(pgPool, runOpts)
@@ -1275,14 +1286,33 @@ async function resumeWaitingArea(pgPool) {
   if (!pgPool) return { resumed: 0 };
   try {
     const r = await pgPool.query(
-      `SELECT task_id, model, prompt, count, content_type, user_id, cost, cost_pool, idempotency_key, resume_meta
+      `SELECT task_id, model, prompt, count, content_type, user_id, cost, cost_pool, idempotency_key, resume_meta, client_request_id
          FROM generation_tasks
         WHERE status='running'
           AND (resume_meta->'waitingOpts' IS NOT NULL OR error LIKE '%等待区%')
           AND created_at > NOW() - INTERVAL '3 hours'`,
     );
     let resumed = 0;
+    let reviewCount = 0;
     for (const row of r.rows) {
+      // P1-04: if client_request_id is set, provider was already called — do not re-enqueue for resubmit
+      if (row.client_request_id) {
+        try {
+          await pgPool.query(
+            `UPDATE generation_tasks
+               SET status='review_required',
+                   error='crash_recovery: provider already accepted (client_request_id=' || $1 || '). Waiting-area resubmit blocked to prevent duplicate provider charge. Requires manual review.',
+                   updated_at=NOW()
+             WHERE task_id=$2 AND status='running'`,
+            [row.client_request_id, row.task_id],
+          );
+          reviewCount++;
+          console.warn('[waiting] 阻塞等待区重提 taskId=%s client_request_id=%s → review_required', row.task_id, row.client_request_id);
+        } catch (e) {
+          console.warn('[waiting] review_required 写入失败:', row.task_id, e.message);
+        }
+        continue;
+      }
       let opts;
       if (row.resume_meta && row.resume_meta.waitingOpts) {
         opts = row.resume_meta.waitingOpts;            // 新任务：完整 opts（含 ratio/resolution 等）
@@ -1319,15 +1349,18 @@ async function resumeWaitingArea(pgPool) {
 //       （见上方 resumeRunningTasks 注释）。本函数在启动时把"真实在途的图片任务"
 //       重新驱动一遍 generate()，并做与 generateAsync 一致的终态处理（成功 commit + 资产最终化
 //       落 OSS/media、超时/限流保留待复核或入等待区、失败释放 held 积分），与视频恢复口径对齐。
-// 选择条件：status='running' AND content_type='image' AND provider_task_id IS NULL
-//           AND resume_meta->'waitingOpts' IS NULL（排除等待区任务，避免与 resumeWaitingArea 重复入队）
-//           AND created_at < NOW() - INTERVAL '1 minute'（避免与刚提交、本进程正在处理的任务竞态）
+// 选择条件：status='running' AND content_type='image'
+// P1-04 修复：区分「从未提交到 provider」和「已提交但未完成」两种崩溃恢复场景。
+//   - client_request_id IS NOT NULL：provider 可能已接受，禁止自动重提 → review_required
+//   - client_request_id IS NULL：确认从未提交，安全重驱
+//   - resume_meta->'waitingOpts' IS NULL（排除等待区任务，避免与 resumeWaitingArea 重复入队）
+//   - created_at < NOW() - INTERVAL '1 minute'（避免与刚提交、本进程正在处理的任务竞态）
 async function resumeRunningImageTasks(pgPool) {
   if (!pgPool) return { resumed: 0 };
   try {
     const r = await pgPool.query(
       `SELECT task_id, model, prompt, count, content_type, user_id, cost, cost_pool,
-              idempotency_key, pending_ids, client_meta, created_at
+              idempotency_key, pending_ids, client_meta, created_at, client_request_id
          FROM generation_tasks
         WHERE status='running'
           AND content_type='image'
@@ -1337,7 +1370,27 @@ async function resumeRunningImageTasks(pgPool) {
           AND created_at > NOW() - INTERVAL '6 hours'`,
     );
     let resumed = 0;
+    let reviewCount = 0;
     for (const row of r.rows) {
+      // P1-04: 如果 client_request_id 已持久化，说明 provider 调用已发出，
+      // 自动重提可能导致 provider 端重复计费。进入 review_required 等待人工处理。
+      if (row.client_request_id) {
+        try {
+          await pgPool.query(
+            `UPDATE generation_tasks
+               SET status='review_required',
+                   error='crash_recovery: provider already accepted (client_request_id=' || $1 || '). Automatic resubmit blocked to prevent duplicate provider charge. Requires manual review.',
+                   updated_at=NOW()
+             WHERE task_id=$2 AND status='running'`,
+            [row.client_request_id, row.task_id],
+          );
+          reviewCount++;
+          console.warn('[resume-image] 阻塞重提 taskId=%s client_request_id=%s → review_required (防重复计费)', row.task_id, row.client_request_id);
+        } catch (e) {
+          console.warn('[resume-image] review_required 写入失败:', row.task_id, e.message);
+        }
+        continue;
+      }
       const cm = row.client_meta || {};
       const opts = {
         model: row.model,
@@ -1360,8 +1413,8 @@ async function resumeRunningImageTasks(pgPool) {
       resumeOneImageTask(pgPool, row, opts).catch((e) => console.warn('[resume-image] 重驱异常:', row.task_id, e.message));
       resumed++;
     }
-    if (resumed) console.log(`[resume-image] 已重驱 ${resumed} 个崩溃前在途图片任务`);
-    return { resumed };
+    if (resumed || reviewCount) console.log(`[resume-image] 已重驱 ${resumed} 个崩溃前在途图片任务，${reviewCount} 个进入 review_required (防重复计费)`);
+    return { resumed, reviewBlocked: reviewCount };
   } catch (e) {
     console.warn('[resume-image] 扫描在途图片任务失败:', e.message);
     return { resumed: 0, error: e.message };
