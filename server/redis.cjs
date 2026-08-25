@@ -45,8 +45,33 @@ try {
 }
 
 // 启动期尝试连接；失败不影响服务启动（后续 kv* 走内存兜底）
+// If the existing client is stuck in reconnecting/closed state, replace it.
 async function initRedis() {
-  if (!redis) { redisUp = false; return false; }
+  // If the client exists but is unrecoverable, replace it with a fresh one.
+  if (redis && ['reconnecting', 'close', 'end'].includes(redis.status)) {
+    try { redis.disconnect(); } catch (_) {}
+    redis = null;
+  }
+  if (!redis) {
+    try {
+      redis = new Redis({
+        host: REDIS_HOST,
+        port: REDIS_PORT,
+        password: REDIS_PASSWORD,
+        maxRetriesPerRequest: 2,
+        lazyConnect: true,
+        retryStrategy: (times) => (times > 4 ? null : Math.min(times * 200, 1000)),
+      });
+      redis.on('error', (err) => {
+        if (redisUp) console.warn('[Redis] 连接断开，降级内存:', err.message);
+        redisUp = false;
+      });
+    } catch (e) {
+      console.warn('[Redis] 初始化失败，使用内存兜底:', e.message);
+      redisUp = false;
+      return false;
+    }
+  }
   try {
     await redis.connect();
     redisUp = true;
@@ -128,4 +153,26 @@ async function kvExpire(key, ttlSec) {
   if (e) e.expiresAt = ttlSec && ttlSec > 0 ? Date.now() + ttlSec * 1000 : null;
 }
 
-module.exports = { initRedis, isRedisUp, kvGet, kvSet, kvIncr, kvExpire, getRedis: () => redis };
+// Graceful shutdown — disconnects ioredis and prevents background reconnect retries.
+// Call this at process exit or test cleanup to drain the event loop.
+async function quit() {
+  if (!redis) return;
+  try {
+    redisUp = false;
+    await redis.quit();
+  } catch (e) {
+    // quit may fail if already disconnected — that's fine
+  }
+  redis = null;
+}
+
+// Hard disconnect — stops reconnect attempts immediately.
+// Use this during outage simulation to prevent ioredis background timers
+// from keeping the event loop alive. Reconnect with initRedis() later.
+async function disconnect() {
+  if (!redis) return;
+  redisUp = false;
+  try { redis.disconnect(); } catch (_) {}
+}
+
+module.exports = { initRedis, isRedisUp, kvGet, kvSet, kvIncr, kvExpire, getRedis: () => redisUp ? redis : null, disconnect, quit };
