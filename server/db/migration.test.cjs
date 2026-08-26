@@ -526,6 +526,51 @@ test('M15: fresh migrations create legacy runtime tables (order-expiry dependenc
   }
 }, { timeout: 60000 });
 
+// M16: fresh migrations align api_keys with the certified key-pool runtime
+// schema (label/weight columns + UNIQUE(provider_id, api_key) for ON CONFLICT).
+// Regression: server.js "[startup] Key pool init failed: column label does
+// not exist" on freshly migrated prod DBs (0006 created api_keys too narrow).
+test('M16: api_keys key-pool schema (label, weight, unique provider/api_key)', async () => {
+  const suffix = randomSuffix();
+  const dbName = await createTestDb(suffix);
+  const pg = createPool(dbName);
+  try {
+    await migrate(pg);
+
+    const cols = await getTableColumns(pg, 'api_keys');
+    const names = new Set(cols.map(c => c.column_name));
+    for (const required of ['id', 'provider_id', 'api_key', 'label', 'status', 'weight', 'created_at']) {
+      assert.ok(names.has(required), `api_keys must have column ${required}`);
+    }
+
+    // Exact query the key pool runs at startup — must not hit a missing column.
+    const r = await pg.query(
+      'SELECT provider_id, id, api_key, label, status, weight, created_at FROM api_keys ORDER BY provider_id, created_at'
+    );
+    assert.equal(r.rows.length, 0, 'fresh api_keys is empty');
+    assert.ok(r.rows.every(row => 'label' in row && 'weight' in row), 'result shape has label+weight');
+
+    // ON CONFLICT (provider_id, api_key) requires the unique index to exist.
+    const idx = await pg.query(`
+      SELECT 1 FROM pg_indexes
+      WHERE tablename = 'api_keys' AND indexdef ILIKE '%UNIQUE%provider_id%api_key%'
+    `);
+    assert.equal(idx.rows.length, 1, 'UNIQUE(provider_id, api_key) index must exist for ON CONFLICT');
+
+    // Prove ON CONFLICT (provider_id, api_key) actually works (insert twice).
+    const ins = `INSERT INTO api_keys (provider_id, api_key, label, status, weight)
+                 VALUES ($1,$2,$3,'active',100) ON CONFLICT (provider_id, api_key) DO NOTHING RETURNING id`;
+    await pg.query(ins, ['p1', 'secret-1', 'k']);
+    const dup = await pg.query(ins, ['p1', 'secret-1', 'k']);
+    assert.equal(dup.rows.length, 0, 'duplicate (provider_id, api_key) must be a no-op');
+    const final = await pg.query('SELECT count(*)::int AS n FROM api_keys WHERE provider_id=$1 AND api_key=$2', ['p1', 'secret-1']);
+    assert.equal(final.rows[0].n, 1, 'exactly one row for the unique key');
+  } finally {
+    await pg.end();
+    await dropTestDb(dbName);
+  }
+}, { timeout: 60000 });
+
 // Cleanup
 test.after(async () => {
   await adminPool.end();
