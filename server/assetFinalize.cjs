@@ -312,8 +312,8 @@ async function finalizeUrl(pgPool, opts) {
 // media 表 INSERT（或幂等 UPSERT）
 async function insertMedia(pgPool, row) {
   const id = row.mediaId;
-  const fields = `(id, task_id, type, thumbnail, full_url, prompt, model, ratio, source, is_favorite, is_deleted, oss_url, oss_object_key, oss_uploaded, status, error_message, file_size, user_id, category)`;
-  const values = `($1,$2,$3,$4,$5,$6,$7,$8,'user',FALSE,FALSE,$9,$10,$11,$12,$13,$14,$15,'generated')`;
+  const fields = `(id, task_id, type, thumbnail, full_url, prompt, model, ratio, source, is_favorite, is_deleted, oss_url, oss_object_key, oss_uploaded, status, error_message, file_size, user_id, category, provider_url)`;
+  const values = `($1,$2,$3,$4,$5,$6,$7,$8,'user',FALSE,FALSE,$9,$10,$11,$12,$13,$14,$15,'generated',$16)`;
   // 用 ON CONFLICT (id) DO UPDATE 保证幂等（重入不重复插入）
   const params = [
     id, row.taskId, row.type,
@@ -323,6 +323,7 @@ async function insertMedia(pgPool, row) {
     row.ossUrl || '', row.ossObjectKey || '', row.ossUploaded || false,
     row.status, row.errorMessage || '', row.fileSize || 0,
     row.userId,
+    row.providerUrl || '', // P0 修复：持久化 provider_url，供 reaper 续传（此前字段缺失导致 pending_upload 行永久 failed）
   ];
   await pgPool.query(
     `INSERT INTO media ${fields} VALUES ${values}
@@ -341,7 +342,8 @@ async function insertMedia(pgPool, row) {
        error_message = EXCLUDED.error_message,
        file_size = EXCLUDED.file_size,
        user_id = EXCLUDED.user_id,
-       category = EXCLUDED.category`,
+       category = EXCLUDED.category,
+       provider_url = EXCLUDED.provider_url`,
     params,
   );
 }
