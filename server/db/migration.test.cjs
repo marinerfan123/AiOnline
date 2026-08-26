@@ -474,6 +474,58 @@ test('M14: database already at 0002 upgrades to runtime Generation V2 schema', a
   }
 }, { timeout: 60000 });
 
+// M15: fresh migrations create legacy runtime tables (P0: order-expiry tick
+// failed on migrated production DBs because this schema only ever came from the
+// legacy inline DDL removed in f6b2c7b; 0007+0008 move it to the migration chain).
+test('M15: fresh migrations create legacy runtime tables (order-expiry dependency)', async () => {
+  const suffix = randomSuffix();
+  const dbName = await createTestDb(suffix);
+  const pg = createPool(dbName);
+  try {
+    await migrate(pg);
+
+    const tables = await pg.query(`
+      SELECT table_name FROM information_schema.tables
+      WHERE table_schema = 'public'
+        AND table_name IN (
+          -- 0007: recharge/payment
+          'recharge_orders','topup_packages','payment_settings','payment_providers',
+          -- 0008: remaining legacy runtime tables
+          'characters','webhook_events','payment_audit','skill_registry','products',
+          'user_skills','model_cost_rates','consumption_ledger','model_price_history',
+          'model_pricing','provider_model_costs','cron_marker','feedback','reports',
+          'system_error_logs','studio_projects','agent_rule_logs'
+        )
+      ORDER BY table_name
+    `);
+    const expected = [
+      'agent_rule_logs','characters','consumption_ledger','cron_marker','feedback',
+      'model_cost_rates','model_pricing','model_price_history','payment_audit',
+      'payment_providers','payment_settings','products','provider_model_costs',
+      'recharge_orders','reports','skill_registry','studio_projects',
+      'system_error_logs','topup_packages','user_skills','webhook_events',
+    ].sort();
+    assert.deepEqual(
+      tables.rows.map(r => r.table_name),
+      expected,
+      '0007+0008 must create all legacy runtime tables on a fresh migrated DB'
+    );
+
+    // Exact query the order-expiry ticker runs — must not hit a missing relation.
+    const s = await pg.query('SELECT default_expires_min, enabled FROM payment_settings WHERE id=1');
+    assert.equal(s.rows.length, 1, 'payment_settings seed row (id=1) must exist');
+    assert.equal(s.rows[0].default_expires_min, 15);
+    assert.equal(s.rows[0].enabled, true);
+
+    // Migration chain reports 0008 as the head on a fresh DB.
+    const head = await pg.query(`SELECT max(version) AS v FROM schema_migrations`);
+    assert.ok(head.rows[0].v >= '0008', `fresh DB migration head should be >= 0008, got ${head.rows[0].v}`);
+  } finally {
+    await pg.end();
+    await dropTestDb(dbName);
+  }
+}, { timeout: 60000 });
+
 // Cleanup
 test.after(async () => {
   await adminPool.end();
