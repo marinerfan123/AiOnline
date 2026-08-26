@@ -31,9 +31,10 @@ const stages = [
   { name: 'V2', cmd: 'npm', args: ['run', 'test:v2'], env: {
       NODE_ENV: 'test',
       TEST_PG_DATABASE: process.env.TEST_PG_DATABASE || 'moling_test',
+      TEST_PG_PORT: process.env.TEST_PG_PORT || process.env.PG_PORT,
       PG_DATABASE: process.env.TEST_PG_DATABASE || 'moling_test',
       PG_HOST: process.env.PG_HOST,
-      PG_PORT: process.env.PG_PORT,
+      PG_PORT: process.env.TEST_PG_PORT || process.env.PG_PORT,
       PG_PASSWORD: process.env.PG_PASSWORD,
       PG_USER: process.env.PG_USER,
       REDIS_HOST: process.env.REDIS_HOST,
@@ -42,9 +43,10 @@ const stages = [
   { name: 'API', cmd: 'npm', args: ['run', 'test:api'], env: {
       NODE_ENV: 'test',
       TEST_PG_DATABASE: process.env.TEST_PG_DATABASE || 'moling_test',
+      TEST_PG_PORT: process.env.TEST_PG_PORT || process.env.PG_PORT,
       PG_DATABASE: process.env.TEST_PG_DATABASE || 'moling_test',
       PG_HOST: process.env.PG_HOST,
-      PG_PORT: process.env.PG_PORT,
+      PG_PORT: process.env.TEST_PG_PORT || process.env.PG_PORT,
       PG_PASSWORD: process.env.PG_PASSWORD,
       PG_USER: process.env.PG_USER,
       REDIS_HOST: process.env.REDIS_HOST,

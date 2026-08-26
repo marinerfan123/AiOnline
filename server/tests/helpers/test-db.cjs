@@ -57,7 +57,7 @@ async function initTestSchema(pg) {
       password_hash TEXT NOT NULL,
       reward_credits NUMERIC(18,4) NOT NULL DEFAULT 0,
       recharge_credits NUMERIC(18,4) NOT NULL DEFAULT 0,
-      credits NUMERIC(18,4) NOT NULL DEFAULT 0,
+      credits NUMERIC(18,4) GENERATED ALWAYS AS (reward_credits + recharge_credits) STORED,
       role TEXT NOT NULL DEFAULT 'user' CHECK (role IN ('user','admin')),
       status TEXT NOT NULL DEFAULT 'active',
       plan TEXT DEFAULT 'free',
