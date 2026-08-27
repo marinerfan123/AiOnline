@@ -29,15 +29,44 @@ paths:
       summary: List providers with masked key pool + counts
       security:
         - cookieAuth: []
+      parameters:
+        - { name: q, in: query, required: false, schema: { type: string }, description: search by id/name/protocol }
+        - { name: enabled, in: query, required: false, schema: { type: string, enum: ['true', 'false'] }, description: filter by enabled state }
       responses:
         '200':
           description: Providers (secret-free)
           content:
             application/json:
               schema:
-                type: array
-                items:
-                  $ref: '#/components/schemas/ProviderView'
+                type: object
+                properties:
+                  providers:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ProviderView'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      tags: [ai-control-admin]
+      operationId: createProvider
+      summary: Create a provider (apiKey is write-boundary only, never returned)
+      security:
+        - cookieAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProviderCreateRequest'
+      responses:
+        '201':
+          description: Created provider (masked view)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProviderMutationResult'
+        '409':
+          description: Provider id already exists
         '401':
           $ref: '#/components/responses/Unauthorized'
   /api/v2/ai-control/providers/{providerId}:
@@ -55,11 +84,189 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ProviderView'
+                type: object
+                properties:
+                  provider:
+                    $ref: '#/components/schemas/ProviderView'
         '404':
           description: Not found
         '401':
           $ref: '#/components/responses/Unauthorized'
+    patch:
+      tags: [ai-control-admin]
+      operationId: updateProvider
+      summary: Update provider fields (optimistic lock via revision; 409 on mismatch)
+      security:
+        - cookieAuth: []
+      parameters:
+        - { name: providerId, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProviderUpdateRequest'
+      responses:
+        '200':
+          description: Updated provider (masked view)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProviderMutationResult'
+        '404':
+          description: Not found
+        '409':
+          description: Revision conflict
+  /api/v2/ai-control/providers/{providerId}/enable:
+    post:
+      tags: [ai-control-admin]
+      operationId: setProviderEnabled
+      summary: Enable/disable a provider (optimistic lock via revision)
+      security:
+        - cookieAuth: []
+      parameters:
+        - { name: providerId, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [enabled]
+              properties:
+                enabled: { type: boolean }
+      responses:
+        '200':
+          description: Updated provider
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProviderMutationResult'
+        '404':
+          description: Not found
+        '409':
+          description: Revision conflict
+  /api/v2/ai-control/providers/{providerId}/keys:
+    get:
+      tags: [ai-control-admin]
+      operationId: listProviderKeys
+      summary: Masked key-pool list + credential source classification
+      security:
+        - cookieAuth: []
+      parameters:
+        - { name: providerId, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Keys (masked only)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KeyPoolView'
+        '404':
+          description: Provider not found
+    post:
+      tags: [ai-control-admin]
+      operationId: addProviderKeys
+      summary: Add one or many keys (deduped on provider+key; single call = batch)
+      security:
+        - cookieAuth: []
+      parameters:
+        - { name: providerId, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/KeysAddRequest'
+      responses:
+        '201':
+          description: Added/skipped counts + masked keys
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KeysAddResult'
+        '404':
+          description: Provider not found
+  /api/v2/ai-control/providers/{providerId}/keys/{keyId}:
+    patch:
+      tags: [ai-control-admin]
+      operationId: updateProviderKey
+      summary: Update key metadata (label/status/weight/rpm/concurrency)
+      security:
+        - cookieAuth: []
+      parameters:
+        - { name: providerId, in: path, required: true, schema: { type: string } }
+        - { name: keyId, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/KeyUpdateRequest'
+      responses:
+        '200':
+          description: Updated masked key
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  key: { $ref: '#/components/schemas/MaskedKey' }
+        '404':
+          description: Key not found
+    delete:
+      tags: [ai-control-admin]
+      operationId: deleteProviderKey
+      summary: Delete a key from the pool
+      security:
+        - cookieAuth: []
+      parameters:
+        - { name: providerId, in: path, required: true, schema: { type: string } }
+        - { name: keyId, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  deleted: { type: string }
+        '404':
+          description: Key not found
+  /api/v2/ai-control/providers/{providerId}/keys/{keyId}/cooldown:
+    post:
+      tags: [ai-control-admin]
+      operationId: setKeyCooldown
+      summary: Set/clear a key cooldown (cooldownMs=0 clears)
+      security:
+        - cookieAuth: []
+      parameters:
+        - { name: providerId, in: path, required: true, schema: { type: string } }
+        - { name: keyId, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                cooldownMs: { type: integer, minimum: 0 }
+      responses:
+        '200':
+          description: Cooldown state
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  key_id: { type: string }
+                  cooldown_until: { type: ['string', 'null'], format: date-time }
+        '404':
+          description: Key not found
   /api/v2/ai-control/providers/{providerId}/health:
     get:
       tags: [ai-control-admin]
@@ -227,6 +434,126 @@ components:
           items: { $ref: '#/components/schemas/MaskedKey' }
         key_pool_count: { type: integer }
         active_key_count: { type: integer }
+        credential_source:
+          $ref: '#/components/schemas/CredentialSource'
+        bindings:
+          type: array
+          items:
+            type: object
+            properties:
+              binding_id: { type: string }
+              model_id: { type: string }
+              model_name: { type: ['string', 'null'] }
+              provider_model_code: { type: string }
+              enabled: { type: boolean }
+              priority: { type: integer }
+              weight: { type: integer }
+        models:
+          type: array
+          items:
+            type: object
+            properties:
+              model_id: { type: string }
+              display_name: { type: string }
+              type: { type: string }
+              enabled: { type: boolean }
+        revision: { type: integer }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: ['string', 'null'], format: date-time }
+    CredentialSource:
+      type: object
+      description: >
+        Effective credential source classification (B5). POOL = api_keys pool has
+        eligible keys (preferred); LEGACY_FALLBACK = pool empty/unusable but
+        providers.api_key present; NONE = no usable credential.
+      required: [source, pool_count, eligible_count, has_legacy_key]
+      properties:
+        source: { type: string, enum: [POOL, LEGACY_FALLBACK, NONE] }
+        pool_count: { type: integer }
+        eligible_count: { type: integer }
+        has_legacy_key: { type: boolean }
+    KeyPoolView:
+      type: object
+      required: [keys, key_pool_count, active_key_count, credential_source]
+      properties:
+        keys:
+          type: array
+          items: { $ref: '#/components/schemas/MaskedKey' }
+        key_pool_count: { type: integer }
+        active_key_count: { type: integer }
+        credential_source: { $ref: '#/components/schemas/CredentialSource' }
+    ProviderCreateRequest:
+      type: object
+      required: [id, name]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        type: { type: string, default: official }
+        baseUrl: { type: string }
+        protocol: { type: string, default: openai-compatible }
+        enabled: { type: boolean, default: true }
+        supportedTypes:
+          oneOf:
+            - type: array
+              items: { type: string }
+            - type: string
+        remark: { type: string }
+        apiKey:
+          type: string
+          description: >
+            Write-boundary only. NEVER returned in any response; placeholder values
+            (containing '*' or fewer than 6 chars) are stored as empty.
+    ProviderUpdateRequest:
+      type: object
+      required: [revision]
+      properties:
+        revision: { type: integer, description: optimistic-lock baseline }
+        name: { type: string }
+        baseUrl: { type: string }
+        protocol: { type: string }
+        remark: { type: string }
+        type: { type: string }
+        enabled: { type: boolean }
+        apiKey:
+          type: string
+          description: Write-boundary only; placeholder means existing value preserved.
+    ProviderMutationResult:
+      type: object
+      required: [ok, provider]
+      properties:
+        ok: { type: boolean }
+        provider: { $ref: '#/components/schemas/ProviderView' }
+        revision: { type: integer }
+    KeysAddRequest:
+      type: object
+      description: "Provide ONE of: apiKey (single), apiKeys (array), keys (newline-separated text)."
+      properties:
+        apiKey: { type: string }
+        apiKeys:
+          type: array
+          items: { type: string }
+        keys: { type: string }
+        label: { type: string, default: '' }
+        weight: { type: integer, default: 100 }
+    KeysAddResult:
+      type: object
+      required: [ok, added, skipped, total, keys]
+      properties:
+        ok: { type: boolean }
+        added: { type: integer }
+        skipped: { type: integer, description: duplicates already in pool }
+        total: { type: integer }
+        keys:
+          type: array
+          items: { $ref: '#/components/schemas/MaskedKey' }
+    KeyUpdateRequest:
+      type: object
+      properties:
+        label: { type: string }
+        status: { type: string, enum: [active, disabled] }
+        weight: { type: integer, minimum: 0 }
+        rpm: { type: ['integer', 'null'], minimum: 1 }
+        concurrency: { type: ['integer', 'null'], minimum: 1 }
     ProviderHealth:
       type: object
       required: [provider_id, state]

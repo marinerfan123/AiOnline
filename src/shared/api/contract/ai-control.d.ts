@@ -14,7 +14,8 @@ export interface paths {
         /** List providers with masked key pool + counts */
         get: operations["listProviders"];
         put?: never;
-        post?: never;
+        /** Create a provider (apiKey is write-boundary only, never returned) */
+        post: operations["createProvider"];
         delete?: never;
         options?: never;
         head?: never;
@@ -32,6 +33,77 @@ export interface paths {
         get: operations["getProvider"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /** Update provider fields (optimistic lock via revision; 409 on mismatch) */
+        patch: operations["updateProvider"];
+        trace?: never;
+    };
+    "/api/v2/ai-control/providers/{providerId}/enable": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Enable/disable a provider (optimistic lock via revision) */
+        post: operations["setProviderEnabled"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v2/ai-control/providers/{providerId}/keys": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Masked key-pool list + credential source classification */
+        get: operations["listProviderKeys"];
+        put?: never;
+        /** Add one or many keys (deduped on provider+key; single call = batch) */
+        post: operations["addProviderKeys"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v2/ai-control/providers/{providerId}/keys/{keyId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Delete a key from the pool */
+        delete: operations["deleteProviderKey"];
+        options?: never;
+        head?: never;
+        /** Update key metadata (label/status/weight/rpm/concurrency) */
+        patch: operations["updateProviderKey"];
+        trace?: never;
+    };
+    "/api/v2/ai-control/providers/{providerId}/keys/{keyId}/cooldown": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Set/clear a key cooldown (cooldownMs=0 clears) */
+        post: operations["setKeyCooldown"];
         delete?: never;
         options?: never;
         head?: never;
@@ -192,6 +264,99 @@ export interface components {
             key_pool?: components["schemas"]["MaskedKey"][];
             key_pool_count?: number;
             active_key_count?: number;
+            credential_source?: components["schemas"]["CredentialSource"];
+            bindings?: {
+                binding_id?: string;
+                model_id?: string;
+                model_name?: string | null;
+                provider_model_code?: string;
+                enabled?: boolean;
+                priority?: number;
+                weight?: number;
+            }[];
+            models?: {
+                model_id?: string;
+                display_name?: string;
+                type?: string;
+                enabled?: boolean;
+            }[];
+            revision?: number;
+            /** Format: date-time */
+            created_at?: string;
+            /** Format: date-time */
+            updated_at?: string | null;
+        };
+        /** @description Effective credential source classification (B5). POOL = api_keys pool has eligible keys (preferred); LEGACY_FALLBACK = pool empty/unusable but providers.api_key present; NONE = no usable credential. */
+        CredentialSource: {
+            /** @enum {string} */
+            source: "POOL" | "LEGACY_FALLBACK" | "NONE";
+            pool_count: number;
+            eligible_count: number;
+            has_legacy_key: boolean;
+        };
+        KeyPoolView: {
+            keys: components["schemas"]["MaskedKey"][];
+            key_pool_count: number;
+            active_key_count: number;
+            credential_source: components["schemas"]["CredentialSource"];
+        };
+        ProviderCreateRequest: {
+            id: string;
+            name: string;
+            /** @default official */
+            type: string;
+            baseUrl?: string;
+            /** @default openai-compatible */
+            protocol: string;
+            /** @default true */
+            enabled: boolean;
+            supportedTypes?: string[] | string;
+            remark?: string;
+            /** @description Write-boundary only. NEVER returned in any response; placeholder values (containing '*' or fewer than 6 chars) are stored as empty. */
+            apiKey?: string;
+        };
+        ProviderUpdateRequest: {
+            /** @description optimistic-lock baseline */
+            revision: number;
+            name?: string;
+            baseUrl?: string;
+            protocol?: string;
+            remark?: string;
+            type?: string;
+            enabled?: boolean;
+            /** @description Write-boundary only; placeholder means existing value preserved. */
+            apiKey?: string;
+        };
+        ProviderMutationResult: {
+            ok: boolean;
+            provider: components["schemas"]["ProviderView"];
+            revision?: number;
+        };
+        /** @description Provide ONE of: apiKey (single), apiKeys (array), keys (newline-separated text). */
+        KeysAddRequest: {
+            apiKey?: string;
+            apiKeys?: string[];
+            keys?: string;
+            /** @default  */
+            label: string;
+            /** @default 100 */
+            weight: number;
+        };
+        KeysAddResult: {
+            ok: boolean;
+            added: number;
+            /** @description duplicates already in pool */
+            skipped: number;
+            total: number;
+            keys: components["schemas"]["MaskedKey"][];
+        };
+        KeyUpdateRequest: {
+            label?: string;
+            /** @enum {string} */
+            status?: "active" | "disabled";
+            weight?: number;
+            rpm?: number | null;
+            concurrency?: number | null;
         };
         ProviderHealth: {
             provider_id: string;
@@ -334,7 +499,12 @@ export type $defs = Record<string, never>;
 export interface operations {
     listProviders: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description search by id/name/protocol */
+                q?: string;
+                /** @description filter by enabled state */
+                enabled?: "true" | "false";
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -347,10 +517,44 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ProviderView"][];
+                    "application/json": {
+                        providers?: components["schemas"]["ProviderView"][];
+                    };
                 };
             };
             401: components["responses"]["Unauthorized"];
+        };
+    };
+    createProvider: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ProviderCreateRequest"];
+            };
+        };
+        responses: {
+            /** @description Created provider (masked view) */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProviderMutationResult"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            /** @description Provider id already exists */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
         };
     };
     getProvider: {
@@ -370,11 +574,268 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ProviderView"];
+                    "application/json": {
+                        provider?: components["schemas"]["ProviderView"];
+                    };
                 };
             };
             401: components["responses"]["Unauthorized"];
             /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    updateProvider: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                providerId: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ProviderUpdateRequest"];
+            };
+        };
+        responses: {
+            /** @description Updated provider (masked view) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProviderMutationResult"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Revision conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    setProviderEnabled: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                providerId: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    enabled: boolean;
+                };
+            };
+        };
+        responses: {
+            /** @description Updated provider */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProviderMutationResult"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Revision conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    listProviderKeys: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                providerId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Keys (masked only) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["KeyPoolView"];
+                };
+            };
+            /** @description Provider not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    addProviderKeys: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                providerId: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["KeysAddRequest"];
+            };
+        };
+        responses: {
+            /** @description Added/skipped counts + masked keys */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["KeysAddResult"];
+                };
+            };
+            /** @description Provider not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    deleteProviderKey: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                providerId: string;
+                keyId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        ok?: boolean;
+                        deleted?: string;
+                    };
+                };
+            };
+            /** @description Key not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    updateProviderKey: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                providerId: string;
+                keyId: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["KeyUpdateRequest"];
+            };
+        };
+        responses: {
+            /** @description Updated masked key */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        ok?: boolean;
+                        key?: components["schemas"]["MaskedKey"];
+                    };
+                };
+            };
+            /** @description Key not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    setKeyCooldown: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                providerId: string;
+                keyId: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    cooldownMs?: number;
+                };
+            };
+        };
+        responses: {
+            /** @description Cooldown state */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        ok?: boolean;
+                        key_id?: string;
+                        /** Format: date-time */
+                        cooldown_until?: string | null;
+                    };
+                };
+            };
+            /** @description Key not found */
             404: {
                 headers: {
                     [name: string]: unknown;

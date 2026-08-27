@@ -13,6 +13,7 @@ import {
   Wallet,
   Settings,
   Sparkles,
+  Server,
 } from 'lucide-react';
 import type { FeatureFlagName } from '@/shared/config/featureFlags';
 
@@ -28,6 +29,7 @@ export interface NavItem {
 
 export const V2_NAV: NavItem[] = [
   { key: 'dashboard', label: 'Dashboard', icon: LayoutDashboard, path: '/__v2' },
+  { key: 'providers', label: 'Providers', icon: Server, path: '/__v2/admin/providers', perm: 'requireAdmin' },
   { key: 'projects', label: 'Projects', icon: FolderKanban, path: '/__v2/projects' },
   { key: 'create', label: 'Create', icon: Sparkles, path: '/__v2/create' },
   { key: 'studio', label: 'Studio', icon: Clapperboard, path: '/__v2/studio', flag: 'V2_STUDIO' as FeatureFlagName },

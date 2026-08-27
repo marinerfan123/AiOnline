@@ -120,6 +120,7 @@ async function initTestSchema(pg) {
       bucket_max INT,
       cooldown_ms INT DEFAULT 60000,
       revision INT NOT NULL DEFAULT 1,
+      updated_by TEXT DEFAULT '',
       updated_at TIMESTAMPTZ DEFAULT NOW(),
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
@@ -187,6 +188,31 @@ async function initTestSchema(pg) {
     );
     CREATE UNIQUE INDEX IF NOT EXISTS uq_credit_transactions_v2_ref_kind
       ON credit_transactions (ref, kind) WHERE ref LIKE 'v2:%';
+
+    -- api_keys: canonical key-pool table (0006 + 0009 parity + 0010 runtime columns).
+    -- Older local test DBs predate 0006 and lack it; the M02-B key-pool service
+    -- and dispatcher sync require it. IF NOT EXISTS → no-op on migrated DBs.
+    CREATE TABLE IF NOT EXISTS api_keys (
+      id TEXT PRIMARY KEY DEFAULT ('k-' || gen_random_uuid()),
+      provider_id TEXT NOT NULL,
+      api_key TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'isolated', 'disabled')),
+      remark TEXT DEFAULT '',
+      label TEXT DEFAULT '',
+      weight INT NOT NULL DEFAULT 100,
+      rpm INT,
+      concurrency INT,
+      cooldown_until TIMESTAMPTZ,
+      last_used_at TIMESTAMPTZ,
+      last_error_code TEXT,
+      health TEXT NOT NULL DEFAULT 'UNKNOWN' CHECK (health IN ('UNKNOWN','HEALTHY','DEGRADED','UNHEALTHY','DISABLED')),
+      updated_at TIMESTAMPTZ DEFAULT NOW(),
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_api_keys_provider_api_key
+      ON api_keys (provider_id, api_key);
+    CREATE INDEX IF NOT EXISTS ix_api_keys_provider ON api_keys(provider_id);
+    CREATE INDEX IF NOT EXISTS ix_api_keys_status ON api_keys(status) WHERE status = 'active';
 
     CREATE TABLE IF NOT EXISTS settings (
       key TEXT PRIMARY KEY,
@@ -357,6 +383,7 @@ async function truncateAll(pg) {
     'system_error_logs',
     'provider_model_bindings',
     'credit_transactions',
+    'api_keys',
     'settings',
     'generation_tasks',
     'media',

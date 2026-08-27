@@ -649,14 +649,73 @@ test('M19: 0009 -> 0010 forward upgrade path', async () => {
     const preCols = new Set((await getTableColumns(pg, 'api_keys')).map((c) => c.column_name));
     assert.ok(!preCols.has('health'), 'api_keys must NOT have M02 health col before 0010');
 
+    // Forward migrate from 0009 to current tip. M02-A (0010) and M02-B (0011)
+    // are both pending; 0011 is a no-op backfill here (no providers seeded).
+    const pendingCount = all.filter((m) => m.version > '0009').length;
     const result = await migrate(pg);
-    assert.equal(result.applied, 1, 'forward migrate should apply exactly 0010');
+    assert.equal(result.applied, pendingCount, 'forward migrate should apply exactly the pending migrations');
     const postCols = new Set((await getTableColumns(pg, 'api_keys')).map((c) => c.column_name));
     for (const c of ['health', 'rpm', 'cooldown_until', 'last_error_code']) {
       assert.ok(postCols.has(c), `api_keys must have ${c} after 0010`);
     }
     const t = await pg.query(`SELECT 1 FROM information_schema.tables WHERE table_name='ai_routing_decisions'`);
     assert.equal(t.rows.length, 1, 'ai_routing_decisions must exist after upgrade');
+  } finally {
+    await pg.end();
+    await dropTestDb(dbName);
+  }
+}, { timeout: 60000 });
+
+// M20: 0011 legacy key backfill — a DB at 0010 with a provider holding a
+// legacy api_key (and no pool rows) gains exactly one 'legacy-backfill' pool
+// row; a second run is a no-op; a provider whose key is already in the pool
+// is never duplicated.
+test('M20: 0011 legacy key backfill (forward, idempotent, dedupe)', async () => {
+  const suffix = randomSuffix();
+  const dbName = await createTestDb(suffix);
+  const pg = createPool(dbName);
+  try {
+    const all = discoverMigrations();
+    const before = all.filter((m) => m.version <= '0010');
+    await store.ensureMigrationTable(pg);
+    for (const m of before) {
+      const sql = fs.readFileSync(m.filePath, 'utf8');
+      await pg.query('BEGIN');
+      await pg.query(sql);
+      await store.recordMigration(pg, m.version, m.name, store.computeChecksum(sql));
+      await pg.query('COMMIT');
+    }
+
+    // Two providers: P1 has a legacy key, no pool rows. P2 has a legacy key
+    // that is ALSO already in the pool (dedupe case). P3 has no key.
+    const legacy1 = 'legacy-one-' + Math.random().toString(36).slice(2, 12);
+    const legacy2 = 'legacy-two-' + Math.random().toString(36).slice(2, 12);
+    await pg.query(`INSERT INTO providers (id,name,base_url,api_key) VALUES ('p1','P1','','${legacy1}')`);
+    await pg.query(`INSERT INTO providers (id,name,base_url,api_key) VALUES ('p2','P2','','${legacy2}')`);
+    await pg.query(`INSERT INTO providers (id,name,base_url,api_key) VALUES ('p3','P3','','')`);
+    await pg.query(`INSERT INTO api_keys (id,provider_id,api_key,label) VALUES ('k-p2','p2','${legacy2}','existing')`);
+
+    const m11 = all.find((x) => x.version === '0011');
+    assert.ok(m11, '0011 migration must exist');
+    await pg.query(fs.readFileSync(m11.filePath, 'utf8'));
+
+    const p1 = await pg.query(`SELECT id, label, status, weight FROM api_keys WHERE provider_id='p1'`);
+    assert.equal(p1.rows.length, 1, 'p1 legacy key backfilled exactly once');
+    assert.equal(p1.rows[0].label, 'legacy-backfill');
+    assert.equal(p1.rows[0].status, 'active');
+    assert.equal(p1.rows[0].weight, 100);
+    const p2 = await pg.query(`SELECT COUNT(*) c FROM api_keys WHERE provider_id='p2'`);
+    assert.equal(Number(p2.rows[0].c), 1, 'p2 not duplicated (key already in pool)');
+    const p3 = await pg.query(`SELECT COUNT(*) c FROM api_keys WHERE provider_id='p3'`);
+    assert.equal(Number(p3.rows[0].c), 0, 'p3 (no legacy key) untouched');
+    // providers.api_key must be UNTOUCHED (fallback stays intact)
+    const prov = await pg.query(`SELECT api_key FROM providers WHERE id='p1'`);
+    assert.equal(prov.rows[0].api_key, legacy1, 'legacy column preserved');
+
+    // Idempotency: re-run 0011 → no new rows.
+    await pg.query(fs.readFileSync(m11.filePath, 'utf8'));
+    const again = await pg.query(`SELECT COUNT(*) c FROM api_keys WHERE label='legacy-backfill'`);
+    assert.equal(Number(again.rows[0].c), 1, 'second 0011 run adds nothing');
   } finally {
     await pg.end();
     await dropTestDb(dbName);

@@ -27,6 +27,10 @@ const repositories = {
 };
 const services = {
   aiControl: require('./services/aiControlService.cjs'),
+  provider: require('./services/providerService.cjs'),
+};
+const routes = {
+  aiControl: require('./routes/aiControlRoutes.cjs'),
 };
 
 const adapters = {
@@ -45,6 +49,7 @@ module.exports = {
   contracts,
   repositories,
   services,
+  routes,
   adapters,
   createAdapterRegistry,
 };

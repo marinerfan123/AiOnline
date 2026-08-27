@@ -47,6 +47,7 @@ import pgLib from 'pg';
 const { Pool } = pgLib;
 let pgPool = null;
 import dispatcher from './dispatcher.cjs';
+import aiControlRouterMod from './modules/ai-control/routes/aiControlRoutes.cjs';
 import generationV2Shadow from './modules/generation-v2/shadow.cjs';
 // ModelHub V3 Phase 1 — 唯一模型身份 resolver（server.js 仅在此一处调用，不再散落处理 display_name）
 import modelHubResolver from './modules/modelhub/resolver.cjs';
@@ -1420,6 +1421,23 @@ const admin = adminMod.createAdmin({
   syslog: syslogMod,                          // 注入 syslog：核心错误历史查询/清理用(/api/admin/errors)
 });
 
+// M02-B — AI Control Plane provider/key-pool routes (/api/v2/ai-control/*).
+// Instantiated once; per-request auth via session/admin closures, pgPool via
+// live wrapper (null until DB init → routes 503 gracefully). onPoolChanged
+// syncs the dispatcher key pool exactly like the legacy key routes.
+const aiControlRouter = aiControlRouterMod.createAiControlRouter({
+  pg: {
+    query: (sql, params) => pgPool
+      ? pgPool.query(sql, params)
+      : Promise.reject(Object.assign(new Error('数据库未就绪'), { status: 503 })),
+  },
+  adminRequire: (req) => !!admin && admin.requireAdmin(req),
+  sessionUser: (req) => session.getUserFromCookie(req),
+  onPoolChanged: (providerId, rows) => dispatcher.syncKeyPool(providerId, rows),
+  sendJSON,
+  parseBody,
+});
+
 const referenceStyles = referenceStylesMod.createReferenceStyles({
   getPg: () => pgPool,
   session,
@@ -2330,6 +2348,12 @@ async function handleAPI(req, res) {
       return sendJSON(res, 500, { error: '查询模型参与度失败：' + (e?.message || e) });
     }
   }
+  // ── M02-B AI Control Plane（/api/v2/ai-control/*）── 管理面 provider/key pool；
+  // 必须早于 /api/admin/* 委托。未命中前缀 → 继续后续路由。
+  if (url.startsWith('/api/v2/ai-control/') && method !== 'OPTIONS') {
+    if (await aiControlRouter.handle(req, res, url.split('?')[0], method)) return;
+  }
+
   if (url.startsWith('/api/admin/') && method !== 'OPTIONS') return admin.handleAdmin(req, res, url.split('?')[0], method);
 
   // ── 电商模块（AI 市集 / 技能注册表 / 试用台）── 命中即处理（内部自行鉴权：目录/商品公开，试用/获取/我的技能需登录）
