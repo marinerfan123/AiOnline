@@ -186,3 +186,9 @@ scripts/prod-keys.json
 
 # 调试备份副本（bak 后无点）
 *.bak-*
+
+# Storybook build output
+storybook-static/
+# Playwright artifacts
+playwright-report/
+test-results/

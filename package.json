@@ -25,7 +25,12 @@
     "restore:db": "node scripts/restore-db.cjs",
     "backup:verify": "node scripts/verify-backup.cjs",
     "dr:test": "NODE_ENV=test node scripts/dr-drill.cjs",
-    "test:dr": "NODE_ENV=test node --test --test-concurrency=1 server/tests/backup/disaster-recovery.test.cjs"
+    "test:dr": "NODE_ENV=test node --test server/tests/backup/disaster-recovery.test.cjs",
+    "contract:generate": "openapi-typescript contracts/openapi/moling-v2.yaml -o src/shared/api/contract/generated.d.ts",
+    "storybook": "storybook dev -p 6006",
+    "storybook:build": "storybook build -o storybook-static",
+    "e2e": "playwright test",
+    "e2e:install": "playwright install chromium"
   },
   "dependencies": {
     "@formkit/auto-animate": "^0.9.0",
@@ -58,6 +63,7 @@
     "@radix-ui/react-toggle-group": "^1.1.10",
     "@radix-ui/react-tooltip": "^1.1.18",
     "@tailwindcss/typography": "^0.5.19",
+    "@tanstack/react-query": "^5.102.6",
     "@xyflow/react": "^12.11.0",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
@@ -90,10 +96,13 @@
     "tailwindcss": "^4.2.2",
     "tw-animate-css": "^1.2.0",
     "vaul": "^1.1.2",
-    "zod": "^4.3.6"
+    "zod": "^4.3.6",
+    "zustand": "^5.0.15"
   },
   "devDependencies": {
     "@lark-apaas/coding-presets-react": "^0.1.0",
+    "@playwright/test": "^1.62.1",
+    "@storybook/react-vite": "^10.5.10",
     "@tailwindcss/vite": "^4.3.2",
     "@testing-library/jest-dom": "^6.6.3",
     "@testing-library/react": "^16.3.0",
@@ -105,6 +114,8 @@
     "concurrently": "^9",
     "eslint": "^9",
     "jsdom": "^26.1.0",
+    "openapi-typescript": "^7.13.0",
+    "storybook": "^10.5.10",
     "typescript": "~5.9",
     "vite": "^8",
     "vitest": "^3.2.0"

@@ -1,7 +1,23 @@
-import { useEffect, type ReactNode } from 'react';
+import { useEffect, type ReactNode, lazy, Suspense } from 'react';
 import { Routes, Route, useNavigate } from 'react-router-dom';
 import { Layout } from '@/components/Layout';
 import { ErrorBoundary } from '@/components/ErrorBoundary';
+
+// V2 (M00 platform foundation) — lazy-loaded preview shell. Additive only:
+// lives behind /__v2/* and the V2_APP_SHELL flag (default OFF in prod), so the
+// legacy bundle and production behavior are untouched.
+const V2App = lazy(() => import('@/app/router/V2App'));
+function V2Suspense({ children }: { children: ReactNode }) {
+  return (
+    <Suspense
+      fallback={
+        <div className="grid h-screen place-items-center bg-black text-sm text-zinc-500">载入 V2…</div>
+      }
+    >
+      {children}
+    </Suspense>
+  );
+}
 import LandingPage from '@/pages/LandingPage/LandingPage';
 import WorkspacePage from '@/pages/WorkspacePage/WorkspacePage';
 import ImageEditorPage from '@/pages/ImageEditorPage/ImageEditorPage';
@@ -173,6 +189,9 @@ export default function App() {
           <Route path="orders" element={<RequireAuth><OrdersPage /></RequireAuth>} />
           <Route path="seller" element={<RequireAuth><SellerPage /></RequireAuth>} />
         </Route>
+
+        {/* V2 preview shell (M00) — additive, feature-flag + dev gated. */}
+        <Route path="/__v2/*" element={<V2Suspense><V2App /></V2Suspense>} />
 
         <Route path="*" element={<NotFoundPage />} />
       </Routes>

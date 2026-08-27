@@ -1,0 +1,147 @@
+openapi: 3.1.0
+info:
+  title: Moling V2 API Contract (foundation)
+  version: 0.1.0
+  description: >
+    Contract-first slice for M00. Proves the schema -> validation -> generated
+    typed-client workflow on a low-risk endpoint before scaling. Architecture
+    target is OpenAPI; tooling (openapi-typescript 7.13) consumes 3.1, so we
+    emit 3.1.0. Endpoints added here must already exist on the production API
+    (no backend behavior change in M00).
+  x-owner: moling-v2
+servers:
+  - url: /
+    description: Same-origin (production)
+tags:
+  - name: platform
+  - name: auth
+paths:
+  /api/healthz:
+    get:
+      tags: [platform]
+      operationId: getHealth
+      summary: Liveness + CPU shedding signal
+      security: []
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+  /api/readiness:
+    get:
+      tags: [platform]
+      operationId: getReadiness
+      summary: Readiness (DB/Redis up)
+      security: []
+      responses:
+        '200':
+          description: Ready
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Readiness'
+        '503':
+          description: Not ready
+  /api/auth/me:
+    get:
+      tags: [auth]
+      operationId: getMe
+      summary: Current session user
+      security:
+        - cookieAuth: []
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Session user
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MeResponse'
+        '401':
+          description: No session
+components:
+  securitySchemes:
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: sid
+    bearerAuth:
+      type: http
+      scheme: bearer
+  schemas:
+    Health:
+      type: object
+      additionalProperties: true
+      description: "Liveness + CPU shedding signal. Real shape: /api/healthz"
+      properties:
+        status:
+          type: string
+          example: ok
+        pg:
+          type: boolean
+        redis:
+          type: boolean
+        node_id:
+          type: string
+        uptime:
+          type: number
+        version:
+          type: string
+        ts:
+          type: number
+        ok:
+          type: boolean
+          description: compatibility alias for status=ok
+        cpu:
+          type: object
+          additionalProperties: true
+          properties:
+            percent:
+              type: number
+            shedding:
+              type: boolean
+    Readiness:
+      type: object
+      additionalProperties: true
+      description: "Real shape: /api/readiness"
+      properties:
+        status:
+          type: string
+          example: ready
+        pg:
+          type: boolean
+        redis:
+          type: boolean
+        node_id:
+          type: string
+        ready:
+          type: boolean
+          description: derived (status === 'ready'); kept for compat
+    MeResponse:
+      type: object
+      properties:
+        user:
+          oneOf:
+            - $ref: '#/components/schemas/User'
+            - type: 'null'
+    User:
+      type: object
+      required: [id, email, role]
+      properties:
+        id:
+          type: string
+        email:
+          type: string
+          format: email
+        displayName:
+          type: string
+        role:
+          type: string
+          enum: [user, admin, system]
+        credits:
+          type: number
+        createdAt:
+          type: string
+          format: date-time
