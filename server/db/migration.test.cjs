@@ -571,6 +571,98 @@ test('M16: api_keys key-pool schema (label, weight, unique provider/api_key)', a
   }
 }, { timeout: 60000 });
 
+// M17: 0010 adds the AI control-plane foundation schema on a fresh DB
+// (capability registry on logical model, key-pool runtime projection columns,
+//  routing decision + provider health tables) WITHOUT touching legacy/GV2 schema.
+test('M17: ai control-plane foundation schema (0010) fresh path', async () => {
+  const suffix = randomSuffix();
+  const dbName = await createTestDb(suffix);
+  const pg = createPool(dbName);
+  try {
+    await migrate(pg);
+    const cols = async (t) => new Set((await getTableColumns(pg, t)).map((c) => c.column_name));
+    const models = await cols('models');
+    for (const c of ['ai_capabilities', 'ai_parameter_schemas', 'capability_version']) {
+      assert.ok(models.has(c), `models must have ${c}`);
+    }
+    const keys = await cols('api_keys');
+    for (const c of ['rpm', 'concurrency', 'cooldown_until', 'last_used_at', 'last_error_code', 'health', 'updated_at']) {
+      assert.ok(keys.has(c), `api_keys must have ${c}`);
+    }
+    for (const t of ['ai_routing_decisions', 'ai_provider_health']) {
+      const r = await pg.query(`SELECT 1 FROM information_schema.tables WHERE table_name=$1`, [t]);
+      assert.equal(r.rows.length, 1, `table ${t} must exist`);
+    }
+    // health column CHECK constraint must enforce the 5-state enum
+    await pg.query(`INSERT INTO ai_provider_health (provider_id, state) VALUES ('p1','HEALTHY')`);
+    await assert.rejects(
+      () => pg.query(`INSERT INTO ai_provider_health (provider_id, state) VALUES ('p1','BOGUS')`),
+      /check/i,
+      'invalid health state must be rejected by CHECK'
+    );
+    // legacy + GV2 business schema untouched (spot check)
+    for (const t of ['provider_model_bindings', 'generation_items_v2', 'model_pricing', 'provider_model_costs']) {
+      const r = await pg.query(`SELECT 1 FROM information_schema.tables WHERE table_name=$1`, [t]);
+      assert.equal(r.rows.length, 1, `pre-existing table ${t} must still exist`);
+    }
+  } finally {
+    await pg.end();
+    await dropTestDb(dbName);
+  }
+}, { timeout: 60000 });
+
+// M18: 0010 is idempotent — second migrate run applies 0 and skips all.
+test('M18: ai control-plane schema idempotent (second run no-op)', async () => {
+  const suffix = randomSuffix();
+  const dbName = await createTestDb(suffix);
+  const pg = createPool(dbName);
+  try {
+    await migrate(pg);
+    const r2 = await migrate(pg);
+    assert.equal(r2.applied, 0, 'second run must apply 0 migrations');
+    assert.ok(r2.skipped >= 10, 'second run must skip all');
+  } finally {
+    await pg.end();
+    await dropTestDb(dbName);
+  }
+}, { timeout: 60000 });
+
+// M19: upgrade path — a DB already at 0009 (pre-M02) upgrades to 0010 cleanly,
+// proving M02-A is a forward migration that does not break an existing key-pool runtime.
+test('M19: 0009 -> 0010 forward upgrade path', async () => {
+  const suffix = randomSuffix();
+  const dbName = await createTestDb(suffix);
+  const pg = createPool(dbName);
+  try {
+    const all = discoverMigrations();
+    const before = all.filter((m) => m.version <= '0009');
+    assert.equal(before.length, 9, 'setup should apply 0001..0009');
+    await store.ensureMigrationTable(pg);
+    for (const m of before) {
+      const sql = fs.readFileSync(m.filePath, 'utf8');
+      await pg.query('BEGIN');
+      await pg.query(sql);
+      await store.recordMigration(pg, m.version, m.name, store.computeChecksum(sql));
+      await pg.query('COMMIT');
+    }
+    // Pre-M02 state: api_keys has the 0009 columns but NOT the M02 runtime columns.
+    const preCols = new Set((await getTableColumns(pg, 'api_keys')).map((c) => c.column_name));
+    assert.ok(!preCols.has('health'), 'api_keys must NOT have M02 health col before 0010');
+
+    const result = await migrate(pg);
+    assert.equal(result.applied, 1, 'forward migrate should apply exactly 0010');
+    const postCols = new Set((await getTableColumns(pg, 'api_keys')).map((c) => c.column_name));
+    for (const c of ['health', 'rpm', 'cooldown_until', 'last_error_code']) {
+      assert.ok(postCols.has(c), `api_keys must have ${c} after 0010`);
+    }
+    const t = await pg.query(`SELECT 1 FROM information_schema.tables WHERE table_name='ai_routing_decisions'`);
+    assert.equal(t.rows.length, 1, 'ai_routing_decisions must exist after upgrade');
+  } finally {
+    await pg.end();
+    await dropTestDb(dbName);
+  }
+}, { timeout: 60000 });
+
 // Cleanup
 test.after(async () => {
   await adminPool.end();

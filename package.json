@@ -27,6 +27,7 @@
     "dr:test": "NODE_ENV=test node scripts/dr-drill.cjs",
     "test:dr": "NODE_ENV=test node --test server/tests/backup/disaster-recovery.test.cjs",
     "contract:generate": "openapi-typescript contracts/openapi/moling-v2.yaml -o src/shared/api/contract/generated.d.ts",
+    "contract:generate:ai-control": "openapi-typescript contracts/openapi/moling-v2-ai-control.yaml -o src/shared/api/contract/ai-control.d.ts",
     "storybook": "storybook dev -p 6006",
     "storybook:build": "storybook build -o storybook-static",
     "e2e": "playwright test",

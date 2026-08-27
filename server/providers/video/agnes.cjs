@@ -142,4 +142,4 @@ async function submitAndPoll(provider, model, opts) {
   return poll(provider, model, s.taskId);
 }
 
-module.exports = { submit, poll, submitAndPoll, resolveAgnesEndpoint, agnesRootBase };
+module.exports = { submit, poll, submitAndPoll, resolveAgnesEndpoint, agnesRootBase, buildAgnesVars };

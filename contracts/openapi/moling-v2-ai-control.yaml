@@ -1,0 +1,371 @@
+openapi: 3.1.0
+info:
+  title: Moling V2 — AI Control Plane Contract (M02-A)
+  version: 0.1.0
+  description: >
+    Contract for the M02-A AI Control Plane foundation. Consumes the same
+    openapi-typescript 7.13 / 3.1 toolchain as the M00 foundation slice.
+    Admin/internal endpoints are designed separately. Key data is ALWAYS masked
+    (never full secret); provider cost & margin are admin-only projections.
+    No production behavior change in M02-A: this documents the new control-plane
+    service boundary; the live runtime (dispatcher/modelhub) remains the
+    execution authority until M02-B/C/D/E.
+  x-owner: moling-v2-ai-control
+servers:
+  - url: /
+    description: Same-origin (production)
+tags:
+  - name: ai-control-admin
+    description: Admin-only (provider/key/model control-plane management)
+  - name: ai-control-internal
+    description: Internal machine-to-machine (routing decision, capability resolution)
+  - name: ai-control-public
+    description: User-facing (logical model catalog, no provider cost)
+paths:
+  /api/v2/ai-control/providers:
+    get:
+      tags: [ai-control-admin]
+      operationId: listProviders
+      summary: List providers with masked key pool + counts
+      security:
+        - cookieAuth: []
+      responses:
+        '200':
+          description: Providers (secret-free)
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ProviderView'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/v2/ai-control/providers/{providerId}:
+    get:
+      tags: [ai-control-admin]
+      operationId: getProvider
+      summary: Provider detail with masked key pool
+      security:
+        - cookieAuth: []
+      parameters:
+        - { name: providerId, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Provider (secret-free)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProviderView'
+        '404':
+          description: Not found
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/v2/ai-control/providers/{providerId}/health:
+    get:
+      tags: [ai-control-admin]
+      operationId: getProviderHealth
+      summary: Derived 5-state provider health snapshot
+      security:
+        - cookieAuth: []
+      parameters:
+        - { name: providerId, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Health
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProviderHealth'
+  /api/v2/ai-control/models:
+    get:
+      tags: [ai-control-public]
+      operationId: listModels
+      summary: Logical model catalog (user sees provider count, not per-route cost)
+      security:
+        - cookieAuth: []
+      responses:
+        '200':
+          description: Logical models
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/LogicalModelView'
+  /api/v2/ai-control/models/{modelId}:
+    get:
+      tags: [ai-control-public]
+      operationId: getModel
+      summary: Logical model detail (bindings incl. admin-only route params)
+      security:
+        - cookieAuth: []
+      parameters:
+        - { name: modelId, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Logical model
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LogicalModelView'
+        '404':
+          description: Not found
+  /api/v2/ai-control/capabilities:
+    get:
+      tags: [ai-control-public]
+      operationId: listCapabilities
+      summary: Machine-readable capability registry for logical models
+      security:
+        - cookieAuth: []
+      responses:
+        '200':
+          description: Capability registry
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/CapabilityDoc'
+  /api/v2/ai-control/quote:
+    post:
+      tags: [ai-control-admin]
+      operationId: quoteGeneration
+      summary: Estimated quote (provider cost admin-only; user projection strips it)
+      security:
+        - cookieAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QuoteRequest'
+      responses:
+        '200':
+          description: Quote
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Quote'
+  /api/v2/ai-control/internal/routing-decision:
+    post:
+      tags: [ai-control-internal]
+      operationId: recordRoutingDecision
+      summary: Record + return an auditable routing decision
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RoutingDecisionInput'
+      responses:
+        '200':
+          description: Recorded decision
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RoutingDecision'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+components:
+  responses:
+    Unauthorized:
+      description: No session
+  securitySchemes:
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: sid
+    bearerAuth:
+      type: http
+      scheme: bearer
+  schemas:
+    MaskedKey:
+      type: object
+      description: Secret-free key metadata. Full api_key NEVER appears in any response.
+      required: [id, provider_id, masked, enabled]
+      properties:
+        id: { type: string }
+        provider_id: { type: string }
+        masked: { type: string, example: '••••1234' }
+        fingerprint: { type: string, example: 'a1b2c3d4e5f6', description: sha256 前 12 hex（不可反推） }
+        label: { type: string }
+        enabled: { type: boolean }
+        status: { type: string, enum: [active, isolated, disabled] }
+        weight: { type: integer }
+        rpm: { type: ['integer', 'null'] }
+        concurrency: { type: ['integer', 'null'] }
+        health: { type: string, enum: [UNKNOWN, HEALTHY, DEGRADED, UNHEALTHY, DISABLED] }
+        cooldown_until: { type: ['string', 'null'], format: date-time }
+        last_used_at: { type: ['string', 'null'], format: date-time }
+        last_error_code: { type: ['string', 'null'] }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: ['string', 'null'], format: date-time }
+    ProviderView:
+      type: object
+      required: [id, name, enabled]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        type: { type: string }
+        base_url: { type: string }
+        protocol: { type: string }
+        enabled: { type: boolean }
+        supported_types:
+          type: array
+          items: { type: string }
+        capacity_model: { type: string }
+        credential:
+          type: object
+          description: Legacy single-key fallback (masked). api_keys pool is the authority.
+          properties:
+            has_legacy_key: { type: boolean }
+            masked_legacy_key: { type: string, example: '••••abcd' }
+        key_pool:
+          type: array
+          items: { $ref: '#/components/schemas/MaskedKey' }
+        key_pool_count: { type: integer }
+        active_key_count: { type: integer }
+    ProviderHealth:
+      type: object
+      required: [provider_id, state]
+      properties:
+        provider_id: { type: string }
+        state: { type: string, enum: [UNKNOWN, HEALTHY, DEGRADED, UNHEALTHY, DISABLED] }
+        reasons:
+          type: array
+          items: { type: string }
+        circuit_state: { type: ['string', 'null'], enum: [CLOSED, OPEN, HALF_OPEN, null] }
+        success_rate: { type: ['number', 'null'] }
+        p95_latency_ms: { type: ['integer', 'null'] }
+        rate_limited: { type: ['boolean', 'null'] }
+        key_availability: { type: ['number', 'null'] }
+        consecutive_failures: { type: integer }
+        updated_at: { type: string, format: date-time }
+    BindingView:
+      type: object
+      required: [binding_id, provider_id, provider_model_code, enabled]
+      properties:
+        binding_id: { type: string }
+        provider_id: { type: string }
+        provider_model_code: { type: string }
+        enabled: { type: boolean }
+        priority: { type: integer }
+        weight: { type: number }
+        legacy_fallback: { type: boolean }
+        # admin-only route params (service layer omits for non-admin viewer)
+        parameter_overrides: { type: ['object', 'null'], additionalProperties: true }
+        endpoint: { type: ['object', 'null'], additionalProperties: true }
+        base_url: { type: ['string', 'null'] }
+    LogicalModelView:
+      type: object
+      required: [model_id, type, capabilities, bindings]
+      properties:
+        model_id: { type: string, description: canonical 逻辑模型身份 }
+        display_name: { type: string, description: 仅 UI 展示，不参与路由 }
+        type: { type: string }
+        enabled: { type: boolean }
+        capabilities: { $ref: '#/components/schemas/CapabilityDoc' }
+        capability_version: { type: integer }
+        parameter_schema:
+          type: object
+          additionalProperties: true
+        credit_cost: { type: ['number', 'null'], description: 平台积分价（用户可见） }
+        bindings:
+          type: array
+          items: { $ref: '#/components/schemas/BindingView' }
+    CapabilityDoc:
+      type: object
+      description: >
+        Machine-readable, versionable capability. Lives on the logical model;
+        provider bindings can only NARROW (never extend).
+      required: [type]
+      properties:
+        type:
+          type: string
+          enum: [text, text_to_image, image_to_image, image_edit, text_to_video, image_to_video, first_last_frame, reference_video, audio, tts]
+        capabilities:
+          type: object
+          additionalProperties: { type: boolean }
+        input_modalities:
+          type: array
+          items: { type: string, enum: [text, image, video, audio] }
+        output_modalities:
+          type: array
+          items: { type: string, enum: [text, image, video, audio] }
+        parameter_schema:
+          type: object
+          additionalProperties: true
+        pricing_dimensions:
+          type: array
+          items: { type: string, enum: [per_asset, per_1k_input_token, per_1k_output_token, per_second, per_char] }
+        version: { type: integer, minimum: 1 }
+    QuoteRequest:
+      type: object
+      required: [model_id]
+      properties:
+        model_id: { type: string }
+        count: { type: integer, minimum: 1, default: 1 }
+        binding_id: { type: ['string', 'null'], description: 可选：锁定逐线路成本估算 }
+    Quote:
+      type: object
+      description: 完整报价（admin）；user projection 由服务端剥离 provider cost/margin。
+      properties:
+        estimated_provider_cost: { type: number, description: admin-only }
+        estimated_platform_price: { type: number }
+        estimated_credits: { type: number }
+        margin: { type: number, description: admin-only }
+        currency: { type: string }
+        pricing_rule_id: { type: ['string', 'null'] }
+        pricing_source: { type: string }
+    RoutingDecisionInput:
+      type: object
+      required: [model_id]
+      properties:
+        model_id: { type: string }
+        capability: { type: ['string', 'null'] }
+        content_type: { type: ['string', 'null'] }
+        region: { type: ['string', 'null'] }
+        cost_preference: { type: ['string', 'null'] }
+        latency_preference: { type: ['string', 'null'] }
+        request_id: { type: ['string', 'null'] }
+        generation_task_id: { type: ['string', 'null'] }
+    RoutingDecision:
+      type: object
+      required: [routing_decision_id, model_id, selected, fallback_candidates, rejected]
+      properties:
+        routing_decision_id: { type: string, example: 'rd-1a2b3c4d5e6f7890' }
+        ts: { type: integer }
+        model_id: { type: string }
+        capability: { type: ['string', 'null'] }
+        region: { type: ['string', 'null'] }
+        selected:
+          oneOf:
+            - $ref: '#/components/schemas/CandidateSummary'
+            - type: 'null'
+        reason: { type: string }
+        fallback_candidates:
+          type: array
+          items: { $ref: '#/components/schemas/CandidateSummary' }
+        rejected:
+          type: array
+          items:
+            type: object
+            properties:
+              bindingId: { type: string }
+              modelId: { type: string }
+              providerId: { type: string }
+              rejectedAt: { type: string }
+              reason: { type: string }
+        weights: { type: ['object', 'null'], additionalProperties: true }
+        seed: { type: ['integer', 'null'] }
+    CandidateSummary:
+      type: object
+      required: [bindingId, providerId]
+      properties:
+        bindingId: { type: string }
+        modelId: { type: string }
+        providerId: { type: string }
+        score: { type: ['number', 'null'] }
+        components: { type: ['object', 'null'], additionalProperties: true }
