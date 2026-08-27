@@ -33,6 +33,40 @@ function createTestPool() {
 }
 
 /**
+ * Self-heal a pre-existing stale users.credits column to the product's derived
+ * column.
+ *
+ * users.credits is REQUIRED to be GENERATED ALWAYS AS (reward_credits +
+ * recharge_credits) STORED — that is the migration 0001 definition, the CI
+ * schema, and every production balance mutation (they write the two pool
+ * columns and read credits as derived). A test DB provisioned before that fix
+ * (commit 890b745) can still carry a plain `credits ... DEFAULT 0` column.
+ * initTestSchema uses CREATE TABLE IF NOT EXISTS, so such a stale table is
+ * never repaired and createUser() then leaves credits at 0.
+ *
+ * This is idempotent: no-op when the column is already stored-generated (fresh
+ * DBs, CI, port 5433), and a safe drop+re-add when it is a plain column.
+ */
+async function repairUsersCreditsColumn(pg) {
+  const exists = await pg.query(
+    "SELECT 1 FROM information_schema.tables WHERE table_name='users'",
+  );
+  if (!exists.rows.length) return; // fresh DB → coreSchema creates it correctly
+  const meta = await pg.query(
+    "SELECT attgenerated FROM pg_attribute WHERE attrelid='users'::regclass AND attname='credits' AND NOT attisdropped",
+  );
+  const gen = meta.rows[0] && meta.rows[0].attgenerated;
+  if (gen === 's') return; // already stored-generated → correct, no-op
+  if (gen === 'u') { console.warn('[test-db] users.credits is a VIRTUAL generated column; leaving as-is'); return; }
+  // gen === null → plain column (stale). Drop + re-add as derived. No index
+  // references users.credits (only users_pkey / users_email_key), so this is safe.
+  await pg.query('ALTER TABLE users DROP COLUMN credits');
+  await pg.query(
+    'ALTER TABLE users ADD COLUMN credits NUMERIC(18,4) GENERATED ALWAYS AS (reward_credits + recharge_credits) STORED',
+  );
+}
+
+/**
  * Initialize the test database schema by running the same DDL that server.js
  * runs on startup. Uses a lightweight approach: connect to the test DB and
  * execute the schema migration SQL from schema.cjs if available, otherwise
@@ -46,6 +80,9 @@ async function initTestSchema(pg) {
   } catch (_) {
     // V2 schema may not exist in older baselines; non-fatal
   }
+
+  // Repair any pre-existing stale users.credits before the core DDL (idempotent).
+  await repairUsersCreditsColumn(pg);
 
   // Run the core schema from server.js initDB equivalent
   // We import server.js's DDL by executing the same CREATE TABLE IF NOT EXISTS statements
