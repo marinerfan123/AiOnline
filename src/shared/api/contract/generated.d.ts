@@ -142,6 +142,61 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v2/projects/{projectId}/assets": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List assets attached to a project (paginated, filterable) */
+        get: operations["listProjectAssets"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v2/assets": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List the current user's assets (paginated, filterable) */
+        get: operations["listMyAssets"];
+        put?: never;
+        /**
+         * Provision a new durable asset into a project, or re-scope an existing asset
+         * @description With `url` in the body a new media row is created (durable asset authority = media table). With `assetId` an existing media row owned by the caller is attached to the project. The Asset identity is the assetId (media.id) — never a provider temporary URL.
+         */
+        post: operations["createOrRegisterAsset"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v2/assets/{assetId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Asset detail with provenance summary */
+        get: operations["getAsset"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -266,6 +321,92 @@ export interface components {
             canArchive: boolean;
             canRestore: boolean;
             canDelete: boolean;
+        };
+        /**
+         * @description Normalized asset type (projected from media.type/mime_type).
+         * @enum {string}
+         */
+        AssetType: "IMAGE" | "VIDEO" | "AUDIO" | "OTHER";
+        /**
+         * @description Projected from media.status/is_deleted (authority stays in media).
+         * @enum {string}
+         */
+        AssetStatus: "PROCESSING" | "READY" | "FAILED" | "ARCHIVED";
+        /**
+         * @description Minimum provenance; full lineage graph is a later Studio concern.
+         * @enum {string}
+         */
+        AssetOrigin: "UPLOAD" | "GENERATION" | "IMPORT" | "DERIVED";
+        /** @description The stable, permanent reference to an asset. Canvas nodes and Studio contracts MUST store assetId (media.id) — never provider temporary URLs, signed URLs, base64 payloads, or storage credentials. */
+        AssetRef: {
+            assetId: string;
+            workspaceId: string | null;
+            projectId: string | null;
+            ownerId: string | null;
+            assetType: components["schemas"]["AssetType"];
+            mimeType: string | null;
+            status: components["schemas"]["AssetStatus"];
+            /** @enum {string} */
+            storageProvider: "oss" | "provider";
+            width: number | null;
+            height: number | null;
+            durationMs: number | null;
+            sizeBytes: number | null;
+            title: string;
+            /** @description Resolved preview URL (may be empty when storage is disabled). Not an identity. */
+            url: string;
+            /** @description Resolved thumbnail (image thumb / video snapshot). Empty until resolution available. */
+            thumbnailUrl: string;
+            origin: components["schemas"]["AssetOrigin"];
+            /** Format: date-time */
+            createdAt: string | null;
+            /** Format: date-time */
+            updatedAt: string | null;
+        };
+        AssetSummary: components["schemas"]["AssetRef"];
+        AssetProvenanceSummary: {
+            origin: components["schemas"]["AssetOrigin"];
+            generationTaskId: string | null;
+            generationBatchId: string | null;
+            prompt: string | null;
+            model: string | null;
+        };
+        AssetDetail: components["schemas"]["AssetRef"] & {
+            ratio: string | null;
+            tags: string[];
+            isFavorite: boolean;
+            ossUploaded: boolean;
+            errorMessage: string | null;
+            /** Format: date-time */
+            failedAt: string | null;
+            provenance: components["schemas"]["AssetProvenanceSummary"];
+        };
+        AssetListResponse: {
+            projectId?: string | null;
+            assets: components["schemas"]["AssetSummary"][];
+            pagination: {
+                limit: number;
+                offset: number;
+                total: number;
+                hasMore: boolean;
+            };
+        };
+        AssetDetailResponse: {
+            asset: components["schemas"]["AssetDetail"];
+        };
+        /** @description Exactly one write mode: `url` present → provision a new asset; `assetId` present → re-scope an existing caller-owned asset. */
+        AssetWriteRequest: {
+            projectId: string;
+            assetId?: string;
+            /** @description Public http(s) source URL for a newly provisioned asset. */
+            url?: string;
+            title?: string;
+            assetType?: components["schemas"]["AssetType"];
+            mimeType?: string;
+            width?: number;
+            height?: number;
+            durationMs?: number;
+            sizeBytes?: number;
         };
     };
     responses: never;
@@ -637,6 +778,211 @@ export interface operations {
                 content?: never;
             };
             /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    listProjectAssets: {
+        parameters: {
+            query?: {
+                /** @description filter by asset type */
+                type?: "IMAGE" | "VIDEO" | "AUDIO" | "OTHER";
+                /** @description filter by asset status */
+                status?: "PROCESSING" | "READY" | "FAILED" | "ARCHIVED";
+                /** @description search by title or prompt */
+                search?: string;
+                /** @description page size */
+                limit?: number;
+                /** @description page offset */
+                offset?: number;
+            };
+            header?: never;
+            path: {
+                projectId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Project assets */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AssetListResponse"];
+                };
+            };
+            /** @description Validation error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Forbidden */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Project not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    listMyAssets: {
+        parameters: {
+            query?: {
+                type?: "IMAGE" | "VIDEO" | "AUDIO" | "OTHER";
+                status?: "PROCESSING" | "READY" | "FAILED" | "ARCHIVED";
+                search?: string;
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Asset list */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AssetListResponse"];
+                };
+            };
+            /** @description Validation error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    createOrRegisterAsset: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AssetWriteRequest"];
+            };
+        };
+        responses: {
+            /** @description Registered asset */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AssetDetailResponse"];
+                };
+            };
+            /** @description Created asset */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AssetDetailResponse"];
+                };
+            };
+            /** @description Validation error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Forbidden */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Asset or project not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    getAsset: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                assetId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Asset detail */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AssetDetailResponse"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Forbidden */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Asset not found */
             404: {
                 headers: {
                     [name: string]: unknown;

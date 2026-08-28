@@ -722,6 +722,63 @@ test('M20: 0011 legacy key backfill (forward, idempotent, dedupe)', async () => 
   }
 }, { timeout: 60000 });
 
+test('M21: 0013 asset foundation preserves existing media.updated_at semantics', async () => {
+  const suffix = randomSuffix();
+  const dbName = await createTestDb(suffix);
+  const pg = createPool(dbName);
+  try {
+    const all = discoverMigrations();
+    const before = all.filter((m) => m.version <= '0012');
+    await store.ensureMigrationTable(pg);
+    for (const m of before) {
+      const sql = fs.readFileSync(m.filePath, 'utf8');
+      await pg.query('BEGIN');
+      await pg.query(sql);
+      await store.recordMigration(pg, m.version, m.name, store.computeChecksum(sql));
+      await pg.query('COMMIT');
+    }
+
+    await pg.query(`ALTER TABLE media ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ`);
+    await pg.query(`INSERT INTO media (id, title, created_at, updated_at) VALUES ('m-old-updated', 'kept', '2026-01-01T00:00:00Z', '2026-02-01T00:00:00Z')`);
+    await pg.query(`INSERT INTO media (id, title, created_at, updated_at) VALUES ('m-null-updated', 'filled', '2026-03-01T00:00:00Z', NULL)`);
+
+    const m13 = all.find((m) => m.version === '0013');
+    assert.ok(m13, '0013 migration must exist');
+    await pg.query(fs.readFileSync(m13.filePath, 'utf8'));
+
+    const rows = await pg.query(`SELECT id, updated_at FROM media WHERE id IN ('m-old-updated','m-null-updated') ORDER BY id`);
+    const kept = rows.rows.find((r) => r.id === 'm-old-updated');
+    const filled = rows.rows.find((r) => r.id === 'm-null-updated');
+    assert.equal(kept.updated_at.toISOString(), '2026-02-01T00:00:00.000Z', '0013 must not overwrite existing updated_at');
+    assert.equal(filled.updated_at.toISOString(), '2026-03-01T00:00:00.000Z', '0013 should backfill NULL updated_at from created_at');
+  } finally {
+    await pg.end();
+    await dropTestDb(dbName);
+  }
+}, { timeout: 60000 });
+
+test('M22: 0013 asset foundation creates hot-path indexes and relation table', async () => {
+  const suffix = randomSuffix();
+  const dbName = await createTestDb(suffix);
+  const pg = createPool(dbName);
+  try {
+    await migrate(pg);
+    const mediaCols = new Set((await getTableColumns(pg, 'media')).map((c) => c.column_name));
+    for (const c of ['workspace_id', 'project_id', 'mime_type', 'width', 'height', 'duration_ms', 'origin', 'generation_batch_id', 'updated_at']) {
+      assert.ok(mediaCols.has(c), `media must have asset column ${c}`);
+    }
+    const rel = await pg.query(`SELECT 1 FROM information_schema.tables WHERE table_name='project_assets'`);
+    assert.equal(rel.rows.length, 1, 'project_assets relation table must exist');
+    const idxNames = new Set((await getTableIndexes(pg, 'media')).map((i) => i.indexname));
+    for (const idx of ['ix_media_project', 'ix_media_workspace', 'ix_media_owner_project', 'ix_media_project_updated', 'ix_media_owner_status']) {
+      assert.ok(idxNames.has(idx), `media hot-path index ${idx} must exist`);
+    }
+  } finally {
+    await pg.end();
+    await dropTestDb(dbName);
+  }
+}, { timeout: 60000 });
+
 // Cleanup
 test.after(async () => {
   await adminPool.end();

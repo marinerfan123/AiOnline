@@ -117,6 +117,85 @@ export const UpdateProjectRequestSchema = z.object({
   coverAssetId: z.string().nullable().optional(),
 });
 
+// ── M04-S Asset Foundation ─────────────────────────────────────────────────
+export const AssetTypeSchema = z.enum(['IMAGE', 'VIDEO', 'AUDIO', 'OTHER']);
+export const AssetStatusSchema = z.enum(['PROCESSING', 'READY', 'FAILED', 'ARCHIVED']);
+export const AssetOriginSchema = z.enum(['UPLOAD', 'GENERATION', 'IMPORT', 'DERIVED']);
+export const AssetStorageProviderSchema = z.enum(['oss', 'provider']);
+
+export const AssetRefSchema = z.object({
+  assetId: z.string(),
+  workspaceId: z.string().nullable(),
+  projectId: z.string().nullable(),
+  ownerId: z.string().nullable(),
+  assetType: AssetTypeSchema,
+  mimeType: z.string().nullable(),
+  status: AssetStatusSchema,
+  storageProvider: AssetStorageProviderSchema,
+  width: z.number().nullable(),
+  height: z.number().nullable(),
+  durationMs: z.number().nullable(),
+  sizeBytes: z.number().nullable(),
+  title: z.string(),
+  url: z.string(),
+  thumbnailUrl: z.string(),
+  origin: AssetOriginSchema,
+  createdAt: z.string().nullable(),
+  updatedAt: z.string().nullable(),
+});
+
+export const AssetSummarySchema = AssetRefSchema;
+
+export const AssetProvenanceSummarySchema = z.object({
+  origin: AssetOriginSchema,
+  generationTaskId: z.string().nullable(),
+  generationBatchId: z.string().nullable(),
+  prompt: z.string().nullable(),
+  model: z.string().nullable(),
+});
+
+export const AssetDetailSchema = AssetRefSchema.extend({
+  ratio: z.string().nullable(),
+  tags: z.array(z.string()),
+  isFavorite: z.boolean(),
+  ossUploaded: z.boolean(),
+  errorMessage: z.string().nullable(),
+  failedAt: z.string().nullable(),
+  provenance: AssetProvenanceSummarySchema,
+});
+
+export const AssetListResponseSchema = z.object({
+  projectId: z.string().nullable().optional(),
+  assets: z.array(AssetSummarySchema),
+  pagination: z.object({
+    limit: z.number(),
+    offset: z.number(),
+    total: z.number(),
+    hasMore: z.boolean(),
+  }),
+});
+
+export const AssetDetailResponseSchema = z.object({
+  asset: AssetDetailSchema,
+});
+
+export const AssetWriteRequestSchema = z
+  .object({
+    projectId: z.string().min(1),
+    assetId: z.string().optional(),
+    url: z.string().url().optional(),
+    title: z.string().max(200).optional(),
+    assetType: AssetTypeSchema.optional(),
+    mimeType: z.string().max(100).optional(),
+    width: z.number().int().positive().optional(),
+    height: z.number().int().positive().optional(),
+    durationMs: z.number().int().positive().optional(),
+    sizeBytes: z.number().int().positive().optional(),
+  })
+  .refine((b) => Boolean(b.assetId) !== Boolean(b.url), {
+    message: 'Provide exactly one of assetId (register) or url (create)',
+  });
+
 export type Health = z.infer<typeof HealthSchema>;
 export type Readiness = z.infer<typeof ReadinessSchema>;
 export type User = z.infer<typeof UserSchema>;
@@ -129,6 +208,16 @@ export type ProjectListResponse = z.infer<typeof ProjectListResponseSchema>;
 export type ProjectPermissions = z.infer<typeof ProjectPermissionsSchema>;
 export type CreateProjectRequest = z.infer<typeof CreateProjectRequestSchema>;
 export type UpdateProjectRequest = z.infer<typeof UpdateProjectRequestSchema>;
+export type AssetType = z.infer<typeof AssetTypeSchema>;
+export type AssetStatus = z.infer<typeof AssetStatusSchema>;
+export type AssetOrigin = z.infer<typeof AssetOriginSchema>;
+export type AssetRef = z.infer<typeof AssetRefSchema>;
+export type AssetSummary = z.infer<typeof AssetSummarySchema>;
+export type AssetProvenanceSummary = z.infer<typeof AssetProvenanceSummarySchema>;
+export type AssetDetail = z.infer<typeof AssetDetailSchema>;
+export type AssetListResponse = z.infer<typeof AssetListResponseSchema>;
+export type AssetDetailResponse = z.infer<typeof AssetDetailResponseSchema>;
+export type AssetWriteRequest = z.infer<typeof AssetWriteRequestSchema>;
 
 /**
  * Parse a raw value at the boundary. On failure returns a safe fallback

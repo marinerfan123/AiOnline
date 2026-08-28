@@ -38,7 +38,7 @@ const NAV_ITEMS: NavItem[] = [
   { key: 'scenes', label: '镜头', path: 'scenes', icon: Image, disabled: true },
   { key: 'storyboard', label: '分镜', path: 'storyboard', icon: Images, disabled: true },
   { key: 'studio', label: 'Studio', path: 'studio', icon: Clapperboard },
-  { key: 'assets', label: '素材', path: 'assets', icon: Images, disabled: true },
+  { key: 'assets', label: '素材', path: 'assets', icon: Images },
   { key: 'tasks', label: '任务', path: 'tasks', icon: ListChecks, disabled: true },
   { key: 'export', label: '导出', path: 'export', icon: Download, disabled: true },
 ];

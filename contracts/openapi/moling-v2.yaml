@@ -221,6 +221,119 @@ paths:
           description: Forbidden
         '404':
           description: Not found
+  /api/v2/projects/{projectId}/assets:
+    get:
+      tags: [asset]
+      operationId: listProjectAssets
+      summary: List assets attached to a project (paginated, filterable)
+      security:
+        - cookieAuth: []
+      parameters:
+        - { name: projectId, in: path, required: true, schema: { type: string } }
+        - { name: type, in: query, required: false, schema: { type: string, enum: [IMAGE, VIDEO, AUDIO, OTHER] }, description: filter by asset type }
+        - { name: status, in: query, required: false, schema: { type: string, enum: [PROCESSING, READY, FAILED, ARCHIVED] }, description: filter by asset status }
+        - { name: search, in: query, required: false, schema: { type: string }, description: search by title or prompt }
+        - { name: limit, in: query, required: false, schema: { type: integer, default: 20, maximum: 100 }, description: page size }
+        - { name: offset, in: query, required: false, schema: { type: integer, default: 0 }, description: page offset }
+      responses:
+        '200':
+          description: Project assets
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AssetListResponse'
+        '400':
+          description: Validation error
+        '401':
+          description: Unauthorized
+        '403':
+          description: Forbidden
+        '404':
+          description: Project not found
+  /api/v2/assets:
+    get:
+      tags: [asset]
+      operationId: listMyAssets
+      summary: List the current user's assets (paginated, filterable)
+      security:
+        - cookieAuth: []
+      parameters:
+        - { name: type, in: query, required: false, schema: { type: string, enum: [IMAGE, VIDEO, AUDIO, OTHER] } }
+        - { name: status, in: query, required: false, schema: { type: string, enum: [PROCESSING, READY, FAILED, ARCHIVED] } }
+        - { name: search, in: query, required: false, schema: { type: string } }
+        - { name: limit, in: query, required: false, schema: { type: integer, default: 20, maximum: 100 } }
+        - { name: offset, in: query, required: false, schema: { type: integer, default: 0 } }
+      responses:
+        '200':
+          description: Asset list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AssetListResponse'
+        '400':
+          description: Validation error
+        '401':
+          description: Unauthorized
+    post:
+      tags: [asset]
+      operationId: createOrRegisterAsset
+      summary: Provision a new durable asset into a project, or re-scope an existing asset
+      description: >
+        With `url` in the body a new media row is created (durable asset
+        authority = media table). With `assetId` an existing media row owned
+        by the caller is attached to the project. The Asset identity is the
+        assetId (media.id) — never a provider temporary URL.
+      security:
+        - cookieAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AssetWriteRequest'
+      responses:
+        '200':
+          description: Registered asset
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AssetDetailResponse'
+        '201':
+          description: Created asset
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AssetDetailResponse'
+        '400':
+          description: Validation error
+        '401':
+          description: Unauthorized
+        '403':
+          description: Forbidden
+        '404':
+          description: Asset or project not found
+  /api/v2/assets/{assetId}:
+    get:
+      tags: [asset]
+      operationId: getAsset
+      summary: Asset detail with provenance summary
+      security:
+        - cookieAuth: []
+      parameters:
+        - { name: assetId, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Asset detail
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AssetDetailResponse'
+        '401':
+          description: Unauthorized
+        '403':
+          description: Forbidden
+        '404':
+          description: Asset not found
 components:
   securitySchemes:
     cookieAuth:
@@ -394,3 +507,118 @@ components:
         canArchive: { type: boolean }
         canRestore: { type: boolean }
         canDelete: { type: boolean }
+    # ── M04-S Asset Foundation ──────────────────────────────────────────────
+    AssetType:
+      type: string
+      enum: [IMAGE, VIDEO, AUDIO, OTHER]
+      description: Normalized asset type (projected from media.type/mime_type).
+    AssetStatus:
+      type: string
+      enum: [PROCESSING, READY, FAILED, ARCHIVED]
+      description: Projected from media.status/is_deleted (authority stays in media).
+    AssetOrigin:
+      type: string
+      enum: [UPLOAD, GENERATION, IMPORT, DERIVED]
+      description: Minimum provenance; full lineage graph is a later Studio concern.
+    AssetRef:
+      type: object
+      description: >
+        The stable, permanent reference to an asset. Canvas nodes and Studio
+        contracts MUST store assetId (media.id) — never provider temporary
+        URLs, signed URLs, base64 payloads, or storage credentials.
+      required: [assetId, workspaceId, projectId, ownerId, assetType, mimeType, status, storageProvider, width, height, durationMs, sizeBytes, title, url, thumbnailUrl, origin, createdAt, updatedAt]
+      properties:
+        assetId: { type: string }
+        workspaceId: { type: ['string', 'null'] }
+        projectId: { type: ['string', 'null'] }
+        ownerId: { type: ['string', 'null'] }
+        assetType: { $ref: '#/components/schemas/AssetType' }
+        mimeType: { type: ['string', 'null'] }
+        status: { $ref: '#/components/schemas/AssetStatus' }
+        storageProvider:
+          type: string
+          enum: [oss, provider]
+        width: { type: ['integer', 'null'] }
+        height: { type: ['integer', 'null'] }
+        durationMs: { type: ['integer', 'null'] }
+        sizeBytes: { type: ['integer', 'null'] }
+        title: { type: string }
+        url:
+          type: string
+          description: Resolved preview URL (may be empty when storage is disabled). Not an identity.
+        thumbnailUrl:
+          type: string
+          description: Resolved thumbnail (image thumb / video snapshot). Empty until resolution available.
+        origin: { $ref: '#/components/schemas/AssetOrigin' }
+        createdAt: { type: ['string', 'null'], format: date-time }
+        updatedAt: { type: ['string', 'null'], format: date-time }
+    AssetSummary:
+      allOf:
+        - $ref: '#/components/schemas/AssetRef'
+    AssetProvenanceSummary:
+      type: object
+      required: [origin, generationTaskId, generationBatchId, prompt, model]
+      properties:
+        origin: { $ref: '#/components/schemas/AssetOrigin' }
+        generationTaskId: { type: ['string', 'null'] }
+        generationBatchId: { type: ['string', 'null'] }
+        prompt: { type: ['string', 'null'] }
+        model: { type: ['string', 'null'] }
+    AssetDetail:
+      allOf:
+        - $ref: '#/components/schemas/AssetRef'
+        - type: object
+          required: [ratio, tags, isFavorite, ossUploaded, errorMessage, failedAt, provenance]
+          properties:
+            ratio: { type: ['string', 'null'] }
+            tags:
+              type: array
+              items: { type: string }
+            isFavorite: { type: boolean }
+            ossUploaded: { type: boolean }
+            errorMessage: { type: ['string', 'null'] }
+            failedAt: { type: ['string', 'null'], format: date-time }
+            provenance:
+              $ref: '#/components/schemas/AssetProvenanceSummary'
+    AssetListResponse:
+      type: object
+      required: [assets, pagination]
+      properties:
+        projectId: { type: ['string', 'null'] }
+        assets:
+          type: array
+          items:
+            $ref: '#/components/schemas/AssetSummary'
+        pagination:
+          type: object
+          required: [limit, offset, total, hasMore]
+          properties:
+            limit: { type: integer }
+            offset: { type: integer }
+            total: { type: integer }
+            hasMore: { type: boolean }
+    AssetDetailResponse:
+      type: object
+      required: [asset]
+      properties:
+        asset:
+          $ref: '#/components/schemas/AssetDetail'
+    AssetWriteRequest:
+      type: object
+      description: >
+        Exactly one write mode: `url` present → provision a new asset;
+        `assetId` present → re-scope an existing caller-owned asset.
+      required: [projectId]
+      properties:
+        projectId: { type: string }
+        assetId: { type: string }
+        url:
+          type: string
+          description: Public http(s) source URL for a newly provisioned asset.
+        title: { type: string, maxLength: 200 }
+        assetType: { $ref: '#/components/schemas/AssetType' }
+        mimeType: { type: string, maxLength: 100 }
+        width: { type: integer }
+        height: { type: integer }
+        durationMs: { type: integer }
+        sizeBytes: { type: integer }
