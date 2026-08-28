@@ -12,8 +12,8 @@ import { V2AdminProviderDetailPage } from '@/features/admin-v2/V2AdminProviderDe
 import ProjectsPage from '@/pages/ProjectsPage/ProjectsPage';
 import CreateProjectPage from '@/pages/ProjectsPage/CreateProjectPage';
 import ProjectOverviewPage from '@/pages/ProjectsPage/ProjectOverviewPage';
-import ProjectStudioPlaceholder from '@/pages/ProjectsPage/ProjectStudioPlaceholder';
 import ProjectAssetsPage from '@/pages/ProjectsPage/ProjectAssetsPage';
+import StudioPage from '@/features/studio-v2/StudioPage';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/shared/ui/v2/Card';
 import { Button } from '@/shared/ui/v2/Button';
 import { StatusBadge } from '@/shared/ui/v2/StatusBadge';
@@ -137,7 +137,7 @@ function V2AppInner() {
         <Route path="projects/new" element={<CreateProjectPage />} />
         <Route path="projects/:projectId" element={<ProjectOverviewPage />} />
         <Route path="projects/:projectId/assets" element={<ProjectAssetsPage />} />
-        <Route path="projects/:projectId/studio" element={<ProjectStudioPlaceholder />} />
+        <Route path="projects/:projectId/studio" element={<StudioPage />} />
         <Route path="create" element={<Placeholder title="Create" note="快速创作（Phase C）" />} />
         <Route path="assets" element={<Placeholder title="Assets" note="资产模块（Phase D）" />} />
         <Route path="characters" element={<Placeholder title="Characters" note="角色模块（Phase D）" />} />

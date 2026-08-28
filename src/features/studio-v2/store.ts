@@ -1,0 +1,453 @@
+// M05-A — Canvas Session State (zustand).
+//
+// STATE RULE (M05-A): this store is EPHEMERAL CLIENT SESSION STATE —
+// selected nodes, viewport, positions, undo stack. It is NOT durable
+// authority. Canvas persistence/versioning lands in M05-C (shared
+// PostgreSQL). Nothing here is written to localStorage/IndexedDB, and the
+// UI states that explicitly.
+//
+// PERFORMANCE CONTRACT (1000-node design):
+// - bounded undo history (UNDO_LIMIT) — no unbounded growth
+// - drag updates mutate node position only; expensive graph metadata is
+//   never recomputed per frame
+// - all mutations are batched in a single set()
+
+import { create } from 'zustand';
+import {
+  applyNodeChanges,
+  applyEdgeChanges,
+  addEdge,
+  type Node,
+  type Edge,
+  type NodeChange,
+  type EdgeChange,
+  type Connection,
+  type Viewport,
+} from '@xyflow/react';
+import {
+  canConnect,
+  getNodeDef,
+  type NodeDef,
+} from './registry';
+import {
+  mintNodeId,
+  type StudioNodeData,
+  type StudioEdgeData,
+  type StudioNodeKind,
+  type PortSpec,
+} from './types';
+
+export type StudioNode = Node<StudioNodeData>;
+export type StudioEdge = Edge<StudioEdgeData>;
+
+export const UNDO_LIMIT = 100; // bounded: 100 ops keeps memory flat on large canvases
+export const PASTE_OFFSET = 32;
+
+interface Snapshot {
+  nodes: StudioNode[];
+  edges: StudioEdge[];
+}
+
+export interface InvalidConnectionInfo {
+  message: string;
+  at: number;
+}
+
+interface StudioState {
+  nodes: StudioNode[];
+  edges: StudioEdge[];
+  viewport: Viewport;
+  undoStack: Snapshot[];
+  redoStack: Snapshot[];
+  clipboard: { nodes: StudioNode[]; edges: StudioEdge[] } | null;
+  invalidConnection: InvalidConnectionInfo | null;
+  /** drag bookkeeping: pre-drag snapshot for one undo entry */
+  dragSnapshot: Snapshot | null;
+  /** inspector transaction: pre-edit snapshot committed on blur/apply */
+  editSnapshot: Snapshot | null;
+
+  // ── react-flow wiring ──
+  onNodesChange: (changes: NodeChange<StudioNode>[]) => void;
+  onEdgesChange: (changes: EdgeChange<StudioEdge>[]) => void;
+  onConnect: (c: Connection) => void;
+  onViewportChange: (v: Viewport) => void;
+  onNodeDragStart: () => void;
+  onNodeDragStop: () => void;
+
+  // ── operations (undoable) ──
+  addNode: (kind: StudioNodeKind, position: { x: number; y: number }) => string | null;
+  removeSelection: () => void;
+  duplicateSelection: () => void;
+  copySelection: () => void;
+  selectAll: () => void;
+  paste: () => void;
+  alignSelection: (kind: 'left' | 'middle' | 'right') => void;
+  groupSelection: () => string | null;
+  beginEdit: () => void;
+  endEdit: () => void;
+  updateNodeData: (id: string, patch: Partial<StudioNodeData>) => void;
+  undo: () => void;
+  redo: () => void;
+  setViewport: (v: Viewport) => void;
+  clearInvalidConnection: () => void;
+  /** benchmark/test helper — replace whole graph in one batch (no undo push) */
+  loadGraph: (nodes: StudioNode[], edges: StudioEdge[]) => void;
+}
+
+/**
+ * Bridge for "add at the CURRENT viewport center". Only a component inside
+ * ReactFlowProvider knows the live viewport + container size, so CanvasCore
+ * populates this on mount. Consumers OUTSIDE the provider (Node Library) call
+ * it instead of guessing a fixed flow offset — this keeps new nodes visible
+ * even with onlyRenderVisibleElements culling.
+ */
+export const studioCanvasActions: {
+  addAtViewportCenter: (kind: StudioNodeKind) => string | null;
+} = {
+  addAtViewportCenter: () => null,
+};
+
+function snapshot(s: StudioState): Snapshot {
+  return { nodes: s.nodes, edges: s.edges };
+}
+
+function pushUndo(s: { undoStack: Snapshot[]; redoStack: Snapshot[] }, snap: Snapshot) {
+  const undoStack = [...s.undoStack, snap];
+  if (undoStack.length > UNDO_LIMIT) undoStack.shift(); // bounded
+  return { undoStack, redoStack: [] as Snapshot[] }; // new op clears redo
+}
+
+/** push a typed edge with portType carried in edge data. */
+function buildEdge(c: Connection, portType: PortSpec['type']): StudioEdge {
+  return {
+    id: `e-${c.source}-${c.sourceHandle ?? 'out'}-${c.target}-${c.targetHandle ?? 'in'}`,
+    source: c.source!,
+    sourceHandle: c.sourceHandle ?? undefined,
+    target: c.target!,
+    targetHandle: c.targetHandle ?? undefined,
+    data: { portType },
+  } as StudioEdge;
+}
+
+function findPort(node: StudioNode | undefined, handleId: string | null | undefined, input: boolean): PortSpec | null {
+  if (!node || !handleId) return null;
+  const def = getNodeDef(node.data.nodeKind);
+  if (!def) return null;
+  const ports = input ? def.inputPorts : def.outputPorts;
+  return ports.find((p) => p.id === handleId) ?? ports[0] ?? null;
+}
+
+/** ids of non-frame nodes whose position falls inside a frame's bounds. */
+function childrenOfFrame(nodes: StudioNode[], frameId: string): Set<string> {
+  const frame = nodes.find((n) => n.id === frameId);
+  if (!frame) return new Set();
+  const w = frame.width ?? (frame.measured?.width ?? 320);
+  const h = frame.height ?? (frame.measured?.height ?? 220);
+  const out = new Set<string>();
+  for (const n of nodes) {
+    if (n.id === frameId || n.data.nodeKind === 'frame') continue;
+    const nw = n.width ?? (n.measured?.width ?? 240);
+    const nh = n.height ?? (n.measured?.height ?? 160);
+    const cx = n.position.x + nw / 2;
+    const cy = n.position.y + nh / 2;
+    if (cx >= frame.position.x && cx <= frame.position.x + w && cy >= frame.position.y && cy <= frame.position.y + h) {
+      out.add(n.id);
+    }
+  }
+  return out;
+}
+
+export const useStudioStore = create<StudioState>((set, get) => ({
+  nodes: [],
+  edges: [],
+  viewport: { x: 0, y: 0, zoom: 1 },
+  undoStack: [],
+  redoStack: [],
+  clipboard: null,
+  invalidConnection: null,
+  dragSnapshot: null,
+  editSnapshot: null,
+
+  onNodesChange: (changes) =>
+    set((s) => {
+      // Frame grouping: dragging a frame moves all contained nodes by the same delta.
+      let nodes = applyNodeChanges(changes, s.nodes) as StudioNode[];
+      for (const ch of changes) {
+        if (ch.type === 'position' && ch.position && ch.dragging === false) {
+          const frame = nodes.find((n) => n.id === ch.id && n.data.nodeKind === 'frame');
+          if (frame) {
+            const before = s.nodes.find((n) => n.id === ch.id);
+            if (!before) continue;
+            const dx = frame.position.x - before.position.x;
+            const dy = frame.position.y - before.position.y;
+            if (dx === 0 && dy === 0) continue;
+            const kids = childrenOfFrame(nodes, frame.id);
+            if (kids.size > 0) {
+              nodes = nodes.map((n) =>
+                kids.has(n.id) ? { ...n, position: { x: n.position.x + dx, y: n.position.y + dy } } : n,
+              );
+            }
+          }
+        }
+      }
+      return { nodes };
+    }),
+  onEdgesChange: (changes) =>
+    set((s) => ({ edges: applyEdgeChanges(changes, s.edges) as StudioEdge[] })),
+
+  onConnect: (c) => {
+    const s = get();
+    if (!c.source || !c.target) return;
+    const sourceNode = s.nodes.find((n) => n.id === c.source);
+    const targetNode = s.nodes.find((n) => n.id === c.target);
+    const outPort = findPort(sourceNode, c.sourceHandle, false);
+    const inPort = findPort(targetNode, c.targetHandle, true);
+    if (!outPort || !inPort) return;
+    // typed port gate
+    if (!canConnect(outPort.type, inPort.type)) {
+      set({
+        invalidConnection: {
+          message: `无法连接：${outPort.label}(${outPort.type}) → ${inPort.label}(${inPort.type}) 类型不兼容`,
+          at: Date.now(),
+        },
+      });
+      return;
+    }
+    // duplicate edge gate
+    if (s.edges.some((e) => e.source === c.source && e.target === c.target && e.sourceHandle === c.sourceHandle && e.targetHandle === c.targetHandle)) {
+      return;
+    }
+    const edge = buildEdge(c, outPort.type);
+    set((st) => ({
+      ...pushUndo(st, snapshot(st)),
+      edges: addEdge(edge, st.edges) as StudioEdge[],
+    }));
+  },
+
+  onViewportChange: (v) => set({ viewport: v }),
+  onNodeDragStart: () => set((s) => ({ dragSnapshot: snapshot(s) })),
+  onNodeDragStop: () =>
+    set((s) => (s.dragSnapshot ? { ...pushUndo(s, s.dragSnapshot), dragSnapshot: null } : { dragSnapshot: null })),
+
+  addNode: (kind, position) => {
+    const def: NodeDef | undefined = getNodeDef(kind);
+    if (!def) return null;
+    const id = mintNodeId(kind);
+    const node: StudioNode = {
+      id,
+      type: 'studio',
+      position,
+      data: { ...def.defaultData, title: def.title },
+      width: def.width,
+    };
+    set((s) => ({ ...pushUndo(s, snapshot(s)), nodes: [...s.nodes, node] }));
+    return id;
+  },
+
+  removeSelection: () => {
+    const s = get();
+    const selected = new Set(s.nodes.filter((n) => n.selected).map((n) => n.id));
+    const selectedEdges = new Set(s.edges.filter((e) => e.selected).map((e) => e.id));
+    if (selected.size === 0 && selectedEdges.size === 0) return;
+    // deleting a frame also deletes the nodes contained in it
+    const frameKids = new Set<string>();
+    for (const fid of selected) {
+      const f = s.nodes.find((n) => n.id === fid);
+      if (f?.data.nodeKind === 'frame') {
+        for (const kid of childrenOfFrame(s.nodes, fid)) frameKids.add(kid);
+      }
+    }
+    const remove = (id: string) => selected.has(id) || frameKids.has(id);
+    set((st) => ({
+      ...pushUndo(st, snapshot(st)),
+      nodes: st.nodes.filter((n) => !remove(n.id)),
+      edges: st.edges.filter((e) => !selectedEdges.has(e.id) && !remove(e.source) && !remove(e.target)),
+    }));
+  },
+
+  duplicateSelection: () => {
+    const s = get();
+    const selectedNodes = s.nodes.filter((n) => n.selected && n.type !== 'studio-frame-container');
+    if (selectedNodes.length === 0) return;
+    const idMap = new Map<string, string>();
+    const clones: StudioNode[] = selectedNodes.map((n) => {
+      const nid = mintNodeId(n.data.nodeKind);
+      idMap.set(n.id, nid);
+      return {
+        ...n,
+        id: nid,
+        position: { x: n.position.x + PASTE_OFFSET, y: n.position.y + PASTE_OFFSET },
+        selected: true,
+        data: { ...n.data },
+      };
+    });
+    const cloneEdges: StudioEdge[] = s.edges
+      .filter((e) => idMap.has(e.source) && idMap.has(e.target))
+      .map((e) => ({
+        ...e,
+        id: `e-${idMap.get(e.source)}-${e.sourceHandle ?? 'out'}-${idMap.get(e.target)}-${e.targetHandle ?? 'in'}`,
+        source: idMap.get(e.source)!,
+        target: idMap.get(e.target)!,
+        selected: false,
+      }));
+    set((st) => ({
+      ...pushUndo(st, snapshot(st)),
+      nodes: [...st.nodes.map((n) => (n.selected ? { ...n, selected: false } : n)), ...clones],
+      edges: [...st.edges.map((e) => (e.selected ? { ...e, selected: false } : e)), ...cloneEdges],
+    }));
+  },
+
+  copySelection: () => {
+    const s = get();
+    const selectedNodes = s.nodes.filter((n) => n.selected);
+    if (selectedNodes.length === 0) return;
+    const ids = new Set(selectedNodes.map((n) => n.id));
+    const edges = s.edges.filter((e) => ids.has(e.source) && ids.has(e.target));
+    set({ clipboard: { nodes: selectedNodes.map((n) => ({ ...n, selected: false, data: { ...n.data } })), edges } });
+  },
+
+  selectAll: () =>
+    set((s) => ({
+      nodes: s.nodes.map((n) => ({ ...n, selected: true })),
+      edges: s.edges.map((e) => ({ ...e, selected: false })),
+    })),
+
+  paste: () => {
+    const s = get();
+    if (!s.clipboard || s.clipboard.nodes.length === 0) return;
+    const idMap = new Map<string, string>();
+    const clones: StudioNode[] = s.clipboard.nodes.map((n) => {
+      const nid = mintNodeId(n.data.nodeKind);
+      idMap.set(n.id, nid);
+      return {
+        ...n,
+        id: nid,
+        position: { x: n.position.x + PASTE_OFFSET, y: n.position.y + PASTE_OFFSET },
+        selected: true,
+        data: { ...n.data },
+      };
+    });
+    const cloneEdges: StudioEdge[] = s.clipboard.edges
+      .filter((e) => idMap.has(e.source) && idMap.has(e.target))
+      .map((e) => ({
+        ...e,
+        id: `e-${idMap.get(e.source)}-${e.sourceHandle ?? 'out'}-${idMap.get(e.target)}-${e.targetHandle ?? 'in'}`,
+        source: idMap.get(e.source)!,
+        target: idMap.get(e.target)!,
+        selected: false,
+      }));
+    set((st) => ({
+      ...pushUndo(st, snapshot(st)),
+      nodes: [...st.nodes.map((n) => (n.selected ? { ...n, selected: false } : n)), ...clones],
+      edges: [...st.edges.map((e) => (e.selected ? { ...e, selected: false } : e)), ...cloneEdges],
+    }));
+  },
+
+  alignSelection: (kind) =>
+    set((st) => {
+      const selected = st.nodes.filter((n) => n.selected && n.data.nodeKind !== 'frame');
+      if (selected.length < 2) return st;
+      const xs = selected.map((n) => n.position.x);
+      const target =
+        kind === 'left'
+          ? Math.min(...xs)
+          : kind === 'right'
+            ? Math.max(...xs)
+            : xs.reduce((a, b) => a + b, 0) / xs.length;
+      const { undoStack, redoStack } = pushUndo(st, snapshot(st));
+      return {
+        ...st,
+        undoStack,
+        redoStack,
+        nodes: st.nodes.map((n) =>
+          n.selected && n.data.nodeKind !== 'frame' ? { ...n, position: { ...n.position, x: target } } : n,
+        ),
+      };
+    }),
+
+  groupSelection: () => {
+    const s = get();
+    const selected = s.nodes.filter((n) => n.selected && n.data.nodeKind !== 'frame');
+    if (selected.length < 2) return null;
+    const xs = selected.map((n) => n.position.x);
+    const ys = selected.map((n) => n.position.y);
+    const minX = Math.min(...xs) - 24;
+    const minY = Math.min(...ys) - 40;
+    const w = Math.max(...xs) + 300 - minX;
+    const h = Math.max(...ys) + 220 - minY;
+    const id = mintNodeId('frame');
+    const frame: StudioNode = {
+      id,
+      type: 'studio',
+      position: { x: minX, y: minY },
+      data: { nodeKind: 'frame', title: 'Frame / Group', status: 'idle', frameLabel: `Group of ${selected.length}` },
+      width: w,
+      height: h,
+      className: 'studio-frame',
+      selected: true,
+    };
+    set((st) => ({
+      ...pushUndo(st, snapshot(st)),
+      nodes: [
+        ...st.nodes.map((n) => (n.selected ? { ...n, selected: false } : n)),
+        frame,
+      ],
+    }));
+    return id;
+  },
+
+  beginEdit: () => set((s) => (s.editSnapshot ? s : { editSnapshot: snapshot(s) })),
+  endEdit: () =>
+    set((s) => {
+      if (!s.editSnapshot) return s;
+      const changed =
+        s.editSnapshot.nodes !== s.nodes || s.editSnapshot.edges !== s.edges;
+      return changed ? { ...pushUndo(s, s.editSnapshot), editSnapshot: null } : { editSnapshot: null };
+    }),
+
+  updateNodeData: (id, patch) =>
+    set((s) => ({
+      nodes: s.nodes.map((n) => (n.id === id ? { ...n, data: { ...n.data, ...patch } } : n)),
+    })),
+
+  undo: () =>
+    set((s) => {
+      const prev = s.undoStack[s.undoStack.length - 1];
+      if (!prev) return s;
+      const cur = snapshot(s);
+      return {
+        nodes: prev.nodes,
+        edges: prev.edges,
+        undoStack: s.undoStack.slice(0, -1),
+        redoStack: [...s.redoStack, cur],
+        dragSnapshot: null,
+        editSnapshot: null,
+      };
+    }),
+
+  redo: () =>
+    set((s) => {
+      const next = s.redoStack[s.redoStack.length - 1];
+      if (!next) return s;
+      const cur = snapshot(s);
+      return {
+        nodes: next.nodes,
+        edges: next.edges,
+        redoStack: s.redoStack.slice(0, -1),
+        undoStack: [...s.undoStack, cur],
+      };
+    }),
+
+  setViewport: (v) => set({ viewport: v }),
+
+  clearInvalidConnection: () => set({ invalidConnection: null }),
+
+  loadGraph: (nodes, edges) => set({ nodes, edges, undoStack: [], redoStack: [] }),
+}));
+
+// ── Convenience selectors ─────────────────────────────────────────────────
+export const selectSelectedCount = (s: StudioState) =>
+  s.nodes.filter((n) => n.selected).length;
+
+export const selectCanUndo = (s: StudioState) => s.undoStack.length > 0;
+export const selectCanRedo = (s: StudioState) => s.redoStack.length > 0;

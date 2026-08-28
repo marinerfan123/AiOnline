@@ -1,0 +1,68 @@
+/* M05-A — Moling Studio canvas theme (scoped to the V2 studio page).
+   Overrides React Flow light defaults to match the ml2 dark design system. */
+
+[data-test='studio-page'] .react-flow {
+  --xy-color-bg: var(--ml2-surface-0);
+  --xy-color-text: var(--ml2-text-primary);
+  --xy-color-edge-stroke: #52525b;
+  --xy-color-edge-stroke-selected: var(--ml2-accent);
+  background: var(--ml2-surface-0);
+}
+
+[data-test='studio-page'] .react-flow__controls {
+  border-radius: 8px;
+  overflow: hidden;
+  border: 1px solid var(--ml2-border);
+  box-shadow: none;
+}
+[data-test='studio-page'] .react-flow__controls button {
+  background: var(--ml2-surface-1);
+  border-bottom: 1px solid var(--ml2-border);
+  color: var(--ml2-text-secondary);
+  width: 26px;
+  height: 26px;
+  fill: var(--ml2-text-secondary);
+}
+[data-test='studio-page'] .react-flow__controls button:hover {
+  background: var(--ml2-surface-2);
+  color: var(--ml2-text-primary);
+  fill: var(--ml2-text-primary);
+}
+[data-test='studio-page'] .react-flow__controls button svg {
+  fill: currentColor;
+}
+
+[data-test='studio-page'] .react-flow__minimap {
+  border-radius: 8px;
+  overflow: hidden;
+}
+[data-test='studio-page'] .react-flow__minimap .react-flow__minimap-mask {
+  fill: rgba(0, 0, 0, 0.55);
+}
+[data-test='studio-page'] .react-flow__minimap-node {
+  stroke: var(--ml2-border-strong);
+}
+
+[data-test='studio-page'] .react-flow__edge-path {
+  stroke: #52525b;
+}
+[data-test='studio-page'] .react-flow__edge.selected .react-flow__edge-path {
+  stroke: var(--ml2-accent);
+}
+[data-test='studio-page'] .react-flow__connection-path {
+  stroke: var(--ml2-accent);
+  stroke-width: 1.5;
+  stroke-dasharray: 5;
+}
+
+/* Frame / group node: container look (className 'studio-frame' lands on the RF node wrapper) */
+[data-test='studio-page'] .react-flow__node.studio-frame {
+  background: color-mix(in srgb, var(--ml2-surface-2) 45%, transparent);
+  border: 1px dashed var(--ml2-border-strong);
+  border-radius: 12px;
+}
+
+/* keep node handles above content */
+[data-test='studio-page'] .react-flow__handle {
+  z-index: 10;
+}

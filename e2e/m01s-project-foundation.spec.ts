@@ -63,11 +63,12 @@ test.describe('M01-S Project Foundation E2E', () => {
     await expect(page.getByTestId('project-overview')).toBeVisible({ timeout: 15_000 });
     await expect(page.getByTestId('project-overview').getByText(projectName)).toBeVisible();
 
-    // Studio entry contract
+    // Studio entry contract (M05-A: placeholder replaced by the real Studio shell)
     await page.getByRole('button', { name: 'Open Studio' }).click();
     await expect(page).toHaveURL(/\/__v2\/projects\/[^/]+\/studio/);
-    await expect(page.getByTestId('studio-placeholder')).toBeVisible();
-    await expect(page.getByText('Coming in Studio Fast Track')).toBeVisible();
+    await expect(page.getByTestId('studio-page')).toBeVisible({ timeout: 15_000 });
+    await expect(page.getByTestId('studio-canvas')).toBeVisible();
+    await expect(page.getByTestId('studio-persistence-flag')).toBeVisible();
 
     // Back to overview and archive
     await page.goto('/__v2/projects');

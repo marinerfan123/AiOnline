@@ -56,7 +56,7 @@ function statusBadgeStatus(status: string) {
   }
 }
 
-function ProjectShellInner({ children }: { children?: ReactNode }) {
+function ProjectShellInner({ children, bareContent = false }: { children?: ReactNode; bareContent?: boolean }) {
   const { projectId } = useParams();
   const ctx = useProjectContext();
 
@@ -142,17 +142,20 @@ function ProjectShellInner({ children }: { children?: ReactNode }) {
       </header>
 
       {/* Page content */}
-      <main className="min-h-0 flex-1 overflow-auto p-4" data-test="project-shell-content">
+      <main
+        className={bareContent ? 'min-h-0 flex-1 overflow-hidden' : 'min-h-0 flex-1 overflow-auto p-4'}
+        data-test="project-shell-content"
+      >
         {children ?? <Outlet />}
       </main>
     </div>
   );
 }
 
-export function ProjectShell({ children }: { children?: ReactNode }) {
+export function ProjectShell({ children, bareContent = false }: { children?: ReactNode; bareContent?: boolean }) {
   return (
     <ProjectProvider>
-      <ProjectShellInner>{children}</ProjectShellInner>
+      <ProjectShellInner bareContent={bareContent}>{children}</ProjectShellInner>
     </ProjectProvider>
   );
 }
