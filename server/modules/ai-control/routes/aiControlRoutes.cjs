@@ -19,6 +19,7 @@
  */
 
 const service = require('../services/providerService.cjs');
+const catalogService = require('../services/aiControlService.cjs');
 const keypool = require('../domain/keypool.cjs');
 
 const PREFIX = '/api/v2/ai-control';
@@ -48,10 +49,29 @@ function createAiControlRouter(deps) {
     if (!urlPath.startsWith(PREFIX)) return false;
     if (method === 'OPTIONS') return true;
     const sub = urlPath.slice(PREFIX.length).replace(/\/+$/, '');
-    const user = await guard(req, res, method);
-    if (!user) return true;
+    const session = sessionUser(req);
+    if (!session) { sendJSON(res, 401, { ok: false, error: '未登录' }); return true; }
 
     try {
+      // ── User-safe logical model catalog (M02 authority; no provider secrets) ──
+      if (sub === '/models' && method === 'GET') {
+        const models = await catalogService.listModelsForUser(pg, session);
+        return finish(res, 200, models);
+      }
+      const modelMatch = sub.match(/^\/models\/([^/]+)$/);
+      if (modelMatch && method === 'GET') {
+        const model = await catalogService.getModelForUser(pg, decodeURIComponent(modelMatch[1]), session);
+        if (!model) return finish(res, 404, { ok: false, error: '模型不存在' });
+        return finish(res, 200, model);
+      }
+      if (sub === '/capabilities' && method === 'GET') {
+        const capabilities = await catalogService.listCapabilities(pg);
+        return finish(res, 200, capabilities);
+      }
+
+      const user = await guard(req, res, method);
+      if (!user) return true;
+
       // ── Providers ──
       if (sub === '/providers' && method === 'GET') {
         const q = req.query ? req.query.q : undefined;

@@ -86,6 +86,7 @@ interface StudioState {
   beginEdit: () => void;
   endEdit: () => void;
   updateNodeData: (id: string, patch: Partial<StudioNodeData>) => void;
+  updateNodeParameter: (id: string, key: string, value: unknown) => void;
   undo: () => void;
   redo: () => void;
   setViewport: (v: Viewport) => void;
@@ -240,7 +241,10 @@ export const useStudioStore = create<StudioState>((set, get) => ({
       data: { ...def.defaultData, title: def.title },
       width: def.width,
     };
-    set((s) => ({ ...pushUndo(s, snapshot(s)), nodes: [...s.nodes, node] }));
+    set((s) => ({
+      ...pushUndo(s, snapshot(s)),
+      nodes: [...s.nodes.map((n) => (n.selected ? { ...n, selected: false } : n)), { ...node, selected: true }],
+    }));
     return id;
   },
 
@@ -380,7 +384,7 @@ export const useStudioStore = create<StudioState>((set, get) => ({
       id,
       type: 'studio',
       position: { x: minX, y: minY },
-      data: { nodeKind: 'frame', title: 'Frame / Group', status: 'idle', frameLabel: `Group of ${selected.length}` },
+      data: { nodeKind: 'frame', nodeType: 'frame', schemaVersion: 1, title: 'Frame / Group', status: 'IDLE', parameters: { frameLabel: `Group of ${selected.length}` }, frameLabel: `Group of ${selected.length}` },
       width: w,
       height: h,
       className: 'studio-frame',
@@ -408,6 +412,19 @@ export const useStudioStore = create<StudioState>((set, get) => ({
   updateNodeData: (id, patch) =>
     set((s) => ({
       nodes: s.nodes.map((n) => (n.id === id ? { ...n, data: { ...n.data, ...patch } } : n)),
+    })),
+
+  updateNodeParameter: (id, key, value) =>
+    set((s) => ({
+      nodes: s.nodes.map((n) => {
+        if (n.id !== id) return n;
+        const parameters = { ...(n.data.parameters ?? {}), [key]: value };
+        const patch: Partial<StudioNodeData> = { parameters };
+        if (key === 'prompt' && typeof value === 'string') patch.prompt = value;
+        if (key === 'assetId' && (typeof value === 'string' || value === null)) patch.assetId = value as string | null;
+        if (key === 'frameLabel' && typeof value === 'string') patch.frameLabel = value;
+        return { ...n, data: { ...n.data, ...patch } };
+      }),
     })),
 
   undo: () =>

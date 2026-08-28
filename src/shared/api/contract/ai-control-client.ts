@@ -31,6 +31,7 @@ export type KeysAddRequest = Omit<Schemas['KeysAddRequest'], 'weight'> & {
 };
 export type KeysAddResult = Schemas['KeysAddResult'];
 export type KeyUpdateRequest = Schemas['KeyUpdateRequest'];
+export type LogicalModelView = Schemas['LogicalModelView'];
 
 /**
  * Thrown with a stable .status so UI can branch on 401/403/404/409.
@@ -60,6 +61,11 @@ async function call<T>(fn: () => Promise<T>, op: string): Promise<T> {
 }
 
 export const v2ai = {
+  /** GET /api/v2/ai-control/models — user-safe logical model catalog */
+  listModels() {
+    return call(() => api.get<LogicalModelView[]>('/api/v2/ai-control/models'), 'listModels');
+  },
+
   /** GET /api/v2/ai-control/providers?q=&enabled= */
   listProviders(params: { q?: string; enabled?: 'true' | 'false' } = {}) {
     const qs = new URLSearchParams();

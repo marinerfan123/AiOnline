@@ -19,6 +19,14 @@ function mockFetch(responses: Array<{ status: number; body?: string }>) {
 }
 
 describe('v2ai client (M02-B)', () => {
+  it('listModels reads the user-safe logical model catalog', async () => {
+    const fn = mockFetch([{ status: 200, body: '[{"model_id":"m1","type":"image","capabilities":{"type":"text_to_image"},"bindings":[]}]' }]);
+    const out = await v2ai.listModels();
+    expect(fn).toHaveBeenCalledTimes(1);
+    expect(String(fn.mock.calls[0][0])).toContain('/api/v2/ai-control/models');
+    expect(JSON.stringify(out)).not.toMatch(/apiKey|credential|secret/i);
+  });
+
   it('listProviders builds query string for q + enabled', async () => {
     const fn = mockFetch([{ status: 200, body: '{"providers":[]}' }]);
     await v2ai.listProviders({ q: 'agnes', enabled: 'true' });

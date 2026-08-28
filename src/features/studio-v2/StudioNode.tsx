@@ -15,6 +15,13 @@ import type { StudioNode, StudioEdge } from './store';
 import { cn } from '@/lib/utils';
 
 const STATUS_META: Record<string, { label: string; className: string }> = {
+  IDLE: { label: '待配置', className: 'bg-ml2-surface-3 text-ml2-text-3' },
+  READY: { label: '就绪', className: 'bg-emerald-500/15 text-emerald-400' },
+  INVALID: { label: '无效', className: 'bg-red-500/15 text-red-400' },
+  STALE: { label: '待刷新', className: 'bg-amber-500/15 text-amber-400' },
+  RUNNING: { label: '运行中', className: 'bg-ml2-accent/15 text-ml2-accent' },
+  SUCCEEDED: { label: '成功', className: 'bg-emerald-500/15 text-emerald-400' },
+  FAILED: { label: '失败', className: 'bg-red-500/15 text-red-400' },
   idle: { label: '待配置', className: 'bg-ml2-surface-3 text-ml2-text-3' },
   ready: { label: '就绪', className: 'bg-emerald-500/15 text-emerald-400' },
   generating: { label: '生成中', className: 'bg-ml2-accent/15 text-ml2-accent' },

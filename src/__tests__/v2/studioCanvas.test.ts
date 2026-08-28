@@ -121,7 +121,9 @@ describe('Canvas session store — operations', () => {
     const n = useStudioStore.getState().nodes.find((x) => x.id === id);
     expect(n).toBeDefined();
     expect(n!.data.nodeKind).toBe('prompt');
-    expect(n!.data.status).toBe('idle');
+    expect(n!.data.status).toBe('IDLE');
+    expect(n!.data.schemaVersion).toBe(1);
+    expect(n!.data.parameters).toEqual(expect.objectContaining({ prompt: '' }));
     expect(useStudioStore.getState().undoStack.length).toBe(1);
     void nodes; void undoStack;
   });

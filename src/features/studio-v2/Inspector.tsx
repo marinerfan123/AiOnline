@@ -1,23 +1,17 @@
-// M05-A — Studio Inspector (right rail).
-// No selection: canvas/project summary. Single node: per-node inspector
-// derived from registry. Multi: selection summary + actions.
-// Detail parameters live HERE, not on node cards (M05-B will extend).
+// M05-B1 — Studio Inspector (right rail).
+// Schema-driven production inspector: identity header, validation, parameters,
+// IO summary, and actions. Per-node parameter controls come from registry
+// parameterSchema, not node-type branching.
 
 import { useMemo } from 'react';
 import { Trash2, Copy, Group, AlignStartVertical, AlignCenterVertical, AlignEndVertical } from 'lucide-react';
 import { useStudioStore } from './store';
 import { getNodeDef } from './registry';
 import { NodeIcon } from './NodeIcon';
-import { AssetPicker } from '@/features/project-foundation/AssetPicker';
-import type { AssetType } from '@/shared/api/contract/schemas';
 import { Button } from '@/shared/ui/v2/Button';
 import { Input } from '@/shared/ui/v2/Input';
-
-const ASSET_TYPES_BY_KIND: Record<string, AssetType[]> = {
-  reference: [], // all types allowed as reference
-  image: ['IMAGE'],
-  video: ['VIDEO'],
-};
+import { ParameterInspector } from './ParameterInspector';
+import { validateNode } from './validation';
 
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (
@@ -43,6 +37,7 @@ export function Inspector({ projectId }: { projectId: string }) {
   const selected = useMemo(() => nodes.filter((n) => n.selected), [nodes]);
   const single = selected.length === 1 ? selected[0] : null;
   const def = single ? getNodeDef(single.data.nodeKind) : null;
+  const validation = single && def ? validateNode(single, def, edges) : null;
 
   return (
     <aside data-test="studio-inspector" className="flex h-full w-60 shrink-0 flex-col overflow-y-auto border-l border-ml2-border bg-ml2-surface-1 xl:w-64 2xl:w-72">
@@ -57,7 +52,7 @@ export function Inspector({ projectId }: { projectId: string }) {
           </Section>
           <Section title="Persistence">
             <p className="text-[11px] leading-relaxed text-ml2-text-3">
-              当前为 M05-A 会话态 Canvas（内存，可 undo/redo）。
+              当前为 M05-A/M05-B1 会话态 Canvas（内存，可 undo/redo）。
               正式保存与版本将在 M05-C 接入 shared PostgreSQL。
               刷新页面将丢失未保存的画布内容。
             </p>
@@ -80,7 +75,7 @@ export function Inspector({ projectId }: { projectId: string }) {
 
       {single && def && (
         <>
-          <Section title={def.title}>
+          <Section title="Node identity">
             <div className="flex items-center gap-2">
               <span className="grid size-7 place-items-center rounded bg-ml2-surface-3">
                 <NodeIcon name={def.icon} className="size-4 text-ml2-accent" />
@@ -94,54 +89,51 @@ export function Inspector({ projectId }: { projectId: string }) {
                   onChange={(e) => updateNodeData(single.id, { title: e.target.value })}
                   className="h-6 px-1.5 text-[11px]"
                 />
-                <p className="mt-1 text-[10px] text-ml2-text-3">{def.description}</p>
+                <p className="mt-1 text-[10px] text-ml2-text-3">{def.title} · schema v{single.data.schemaVersion ?? def.version}</p>
               </div>
             </div>
           </Section>
 
-          {(def.id === 'prompt' || def.id === 'script') && (
-            <Section title="Prompt">
-              <textarea
-                data-test="inspector-prompt"
-                value={single.data.prompt ?? ''}
-                onFocus={beginEdit}
-                onBlur={endEdit}
-                onChange={(e) => updateNodeData(single.id, { prompt: e.target.value })}
-                placeholder="输入提示词…（编辑不会触发后端请求，生成由 M05-C Run Engine 控制）"
-                rows={6}
-                className="w-full resize-none rounded-md bg-ml2-surface-3 p-2 text-[11px] leading-relaxed text-ml2-text outline-none placeholder:text-ml2-text-3 focus:ring-1 focus:ring-ml2-accent"
-              />
-            </Section>
-          )}
+          <Section title="Validation">
+            <div data-test="inspector-validation" className="space-y-1 text-[11px]">
+              {validation?.valid ? <p className="text-emerald-400">valid</p> : <p className="text-red-400">invalid</p>}
+              {validation?.errors.map((e) => <p key={`${e.code}-${e.field ?? e.port}`} className="text-red-400">{e.message}</p>)}
+              {validation?.warnings.map((e) => <p key={`${e.code}-${e.field ?? e.port}`} className="text-amber-400">{e.message}</p>)}
+            </div>
+          </Section>
 
-          {(def.id === 'reference' || def.id === 'image' || def.id === 'video') && (
-            <Section title="Asset (M04-S)">
-              <p className="mb-2 text-[10px] text-ml2-text-3">
-                节点仅引用 assetId（永久 identity）。当前：
-                <span className="block truncate font-mono text-ml2-text-2">{single.data.assetId ?? '未选择'}</span>
-              </p>
-              <AssetPicker projectId={projectId} allowedTypes={ASSET_TYPES_BY_KIND[def.id] ?? []} initialAssetId={(single.data.assetId as string | null) ?? undefined}
-                onPick={(a) => { beginEdit(); updateNodeData(single.id, { assetId: a.assetId, status: 'ready' }); endEdit(); }}
-              >
-                {(open) => (
-                  <Button data-test="inspector-open-asset-picker" size="sm" variant="secondary" className="w-full" onClick={open}>
-                    {single.data.assetId ? '更换素材…' : '从素材库选择…'}
-                  </Button>
-                )}
-              </AssetPicker>
-              {single.data.assetId && (
-                <Button size="sm" variant="ghost" className="mt-1 w-full text-ml2-text-3" onClick={() => { beginEdit(); updateNodeData(single.id, { assetId: null, status: 'idle' }); endEdit(); }}>
-                  移除引用
-                </Button>
-              )}
-            </Section>
-          )}
+          <Section title="Parameters">
+            <ParameterInspector node={single} def={def} projectId={projectId} />
+          </Section>
+
+          <Section title="Inputs / Outputs">
+            <div className="space-y-1 text-[11px] text-ml2-text-2">
+              <p>Inputs: {def.inputPorts.length ? def.inputPorts.map((p) => `${p.label}:${p.type}`).join(' · ') : 'none'}</p>
+              <p>Outputs: {def.outputPorts.length ? def.outputPorts.map((p) => `${p.label}:${p.type}`).join(' · ') : 'none'}</p>
+              <p>Execution: contract only · no real generation in M05-B1</p>
+            </div>
+          </Section>
 
           <Section title="Actions">
             <div className="grid grid-cols-2 gap-1.5">
               <Button size="sm" variant="secondary" onClick={() => { copySelection(); }}><Copy className="size-3" />复制</Button>
               <Button size="sm" variant="destructive" onClick={removeSelection}><Trash2 className="size-3" />删除</Button>
             </div>
+          </Section>
+        </>
+      )}
+
+      {single && !def && (
+        <>
+          <Section title="Unknown Node">
+            <div data-test="unknown-node-inspector" className="space-y-1 text-[11px] text-ml2-text-2">
+              <p>node type: {String(single.data.nodeKind)}</p>
+              <p>schema version: {String(single.data.schemaVersion ?? 'unknown')}</p>
+              <p className="text-amber-400">unsupported · execution disabled</p>
+            </div>
+          </Section>
+          <Section title="Actions">
+            <Button size="sm" variant="destructive" onClick={removeSelection}><Trash2 className="size-3" />删除</Button>
           </Section>
         </>
       )}
