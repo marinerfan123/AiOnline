@@ -48,6 +48,7 @@ const { Pool } = pgLib;
 let pgPool = null;
 import dispatcher from './dispatcher.cjs';
 import aiControlRouterMod from './modules/ai-control/routes/aiControlRoutes.cjs';
+import projectFoundationMod from './modules/project-foundation/projectFoundation.cjs';
 import generationV2Shadow from './modules/generation-v2/shadow.cjs';
 // ModelHub V3 Phase 1 — 唯一模型身份 resolver（server.js 仅在此一处调用，不再散落处理 display_name）
 import modelHubResolver from './modules/modelhub/resolver.cjs';
@@ -1438,6 +1439,21 @@ const aiControlRouter = aiControlRouterMod.createAiControlRouter({
   parseBody,
 });
 
+// M01-S — V2 Project / Workspace Foundation routes (/api/v2/workspaces, /api/v2/projects).
+const projectFoundation = projectFoundationMod.createProjectFoundation({
+  pg: {
+    query: (sql, params) => pgPool
+      ? pgPool.query(sql, params)
+      : Promise.reject(Object.assign(new Error('数据库未就绪'), { status: 503 })),
+    connect: () => pgPool
+      ? pgPool.connect()
+      : Promise.reject(Object.assign(new Error('数据库未就绪'), { status: 503 })),
+  },
+  sessionUser: (req) => session.getUserFromCookie(req),
+  sendJSON,
+  parseBody,
+});
+
 const referenceStyles = referenceStylesMod.createReferenceStyles({
   getPg: () => pgPool,
   session,
@@ -2352,6 +2368,11 @@ async function handleAPI(req, res) {
   // 必须早于 /api/admin/* 委托。未命中前缀 → 继续后续路由。
   if (url.startsWith('/api/v2/ai-control/') && method !== 'OPTIONS') {
     if (await aiControlRouter.handle(req, res, url.split('?')[0], method)) return;
+  }
+
+  // ── M01-S Project / Workspace Foundation（/api/v2/workspaces, /api/v2/projects）──
+  if (url.startsWith('/api/v2/workspaces') || url.startsWith('/api/v2/projects')) {
+    if (await projectFoundation.handle(req, res, url.split('?')[0], method)) return;
   }
 
   if (url.startsWith('/api/admin/') && method !== 'OPTIONS') return admin.handleAdmin(req, res, url.split('?')[0], method);

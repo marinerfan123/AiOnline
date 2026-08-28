@@ -32,6 +32,8 @@ function spawnTestServer() {
       stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
     });
 
+    child.stderr?.on('data', (data) => process.stderr.write(data));
+
     let resolved = false;
     let baseUrl = null;
     const timeout = setTimeout(() => {

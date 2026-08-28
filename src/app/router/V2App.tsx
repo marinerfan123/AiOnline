@@ -9,6 +9,10 @@ import { isFeatureEnabled } from '@/shared/config/featureFlags';
 import { RequireAuthV2, RequireAdminV2 } from '@/shared/auth/permissions';
 import { V2AdminProvidersPage } from '@/features/admin-v2/V2AdminProviders';
 import { V2AdminProviderDetailPage } from '@/features/admin-v2/V2AdminProviderDetail';
+import ProjectsPage from '@/pages/ProjectsPage/ProjectsPage';
+import CreateProjectPage from '@/pages/ProjectsPage/CreateProjectPage';
+import ProjectOverviewPage from '@/pages/ProjectsPage/ProjectOverviewPage';
+import ProjectStudioPlaceholder from '@/pages/ProjectsPage/ProjectStudioPlaceholder';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/shared/ui/v2/Card';
 import { Button } from '@/shared/ui/v2/Button';
 import { StatusBadge } from '@/shared/ui/v2/StatusBadge';
@@ -128,7 +132,10 @@ function V2AppInner() {
         <Route index element={<Dashboard />} />
         <Route path="admin/providers" element={<RequireAdminV2><V2AdminProvidersPage /></RequireAdminV2>} />
         <Route path="admin/providers/:providerId" element={<RequireAdminV2><V2AdminProviderDetailPage /></RequireAdminV2>} />
-        <Route path="projects" element={<Placeholder title="Projects" note="项目模块（Phase C）" />} />
+        <Route path="projects" element={<ProjectsPage />} />
+        <Route path="projects/new" element={<CreateProjectPage />} />
+        <Route path="projects/:projectId" element={<ProjectOverviewPage />} />
+        <Route path="projects/:projectId/studio" element={<ProjectStudioPlaceholder />} />
         <Route path="create" element={<Placeholder title="Create" note="快速创作（Phase C）" />} />
         <Route path="assets" element={<Placeholder title="Assets" note="资产模块（Phase D）" />} />
         <Route path="characters" element={<Placeholder title="Characters" note="角色模块（Phase D）" />} />

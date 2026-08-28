@@ -1,8 +1,13 @@
 import { defineConfig } from '@playwright/test';
+import path from 'path';
+import { fileURLToPath } from 'url';
 
-// M00 smoke — drives the Vite dev server (5199) against the local backend
-// (default 3001, overridable via API_PROXY_TARGET). Playwright manages the
-// dev server lifecycle via webServer; nothing is deployed anywhere.
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// M00/M01-S E2E — global setup spins up a backend pointing at the local test
+// database (port 3002), then registers a local-only test account. The Vite dev
+// server proxies /api to that backend so all tests run against test data only.
 export default defineConfig({
   testDir: './e2e',
   timeout: 45_000,
@@ -11,20 +16,10 @@ export default defineConfig({
   workers: 1,
   retries: 0,
   reporter: [['list']],
+  globalSetup: path.resolve(__dirname, 'e2e', 'global-setup.cjs'),
   use: {
     baseURL: 'http://localhost:5199',
     trace: 'retain-on-failure',
-    // V2 M00 shell components use the `data-test` attribute (legacy pages use
-    // none), so test-id locators resolve against it.
     testIdAttribute: 'data-test',
-  },
-  webServer: {
-    command: 'npx vite --port 5199 --strictPort',
-    url: 'http://localhost:5199',
-    timeout: 60_000,
-    reuseExistingServer: false,
-    env: {
-      API_PROXY_TARGET: process.env.API_PROXY_TARGET || 'http://127.0.0.1:3001',
-    },
   },
 });
