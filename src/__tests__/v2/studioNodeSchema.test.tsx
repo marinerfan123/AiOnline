@@ -51,7 +51,7 @@ describe('NodeDefinition V2 registry contract', () => {
   });
 
   it('image node is schema/capability driven without provider credential fields', () => {
-    const image = getNodeDef('image')!;
+    const image = getNodeDef('image-generation')!;
     expect(image.capabilityRequirements).toContain('text_to_image');
     expect(image.parameterSchema.map((f) => f.key)).toEqual(expect.arrayContaining(['logicalModelId', 'aspectRatio', 'resolution', 'seed']));
     expect(JSON.stringify(image)).not.toMatch(/apiKey|credential|provider_model_code|binding_id/i);
@@ -68,22 +68,22 @@ describe('NodeDefinition V2 registry contract', () => {
 
 describe('Parameter validation and effective schema', () => {
   it('validates required/range/unsupported fields with structured errors', () => {
-    const def = getNodeDef('image')!;
+    const def = getNodeDef('image-generation')!;
     const invalid = { logicalModelId: '', aspectRatio: '1:1', resolution: '1024x1024', seed: 999999999999, rogue: true };
-    const result = validateNode(node('image', 'img1', { parameters: invalid }), def);
+    const result = validateNode(node('image-generation', 'img1', { parameters: invalid }), def);
     expect(result.valid).toBe(false);
     expect(result.errors.map((e) => e.code)).toEqual(expect.arrayContaining(['REQUIRED_PARAMETER', 'PARAMETER_RANGE', 'UNSUPPORTED_PARAMETER']));
     expect(result.errors.every((e) => e.field || e.port || e.code)).toBe(true);
   });
 
   it('validates individual schema values', () => {
-    const seed = getNodeDef('image')!.parameterSchema.find((f) => f.key === 'seed')!;
+    const seed = getNodeDef('image-generation')!.parameterSchema.find((f) => f.key === 'seed')!;
     expect(validateParameterValue(seed, 123).valid).toBe(true);
     expect(validateParameterValue(seed, -2).errors[0].code).toBe('PARAMETER_RANGE');
   });
 
   it('merges logical model constraints without mutating base schema', () => {
-    const base = getNodeDef('image')!;
+    const base = getNodeDef('image-generation')!;
     const effective = getEffectiveParameterSchema(base, { parameter_schema: { fields: { seed: { disabled: true }, steps: { type: 'integer', label: 'Steps', min: 1, max: 50 } } } });
     expect(effective.find((f) => f.key === 'seed')?.disabledWhen).toBeTruthy();
     expect(effective.find((f) => f.key === 'steps')?.key).toBe('steps');
@@ -107,9 +107,9 @@ describe('Schema-driven ParameterInspector', () => {
       { model_id: 'img-safe', display_name: 'Image Safe', type: 'image', enabled: true, capabilities: { type: 'text_to_image' }, bindings: [] },
       { model_id: 'vid-safe', display_name: 'Video Safe', type: 'video', enabled: true, capabilities: { type: 'text_to_video' }, bindings: [] },
     ] as any);
-    const n = node('image', 'img1');
+    const n = node('image-generation', 'img1');
     reset([n]);
-    render(qc(<ParameterInspector node={n} def={getNodeDef('image')!} projectId="proj-1" />));
+    render(qc(<ParameterInspector node={n} def={getNodeDef('image-generation')!} projectId="proj-1" />));
     const model = await screen.findByLabelText('Logical Model');
     expect(model.textContent).toContain('Image Safe');
     expect(model.textContent).not.toContain('Video Safe');
@@ -119,14 +119,14 @@ describe('Schema-driven ParameterInspector', () => {
 
   it('shows model loading empty and error states with retry', async () => {
     vi.mocked(v2ai.listModels).mockRejectedValueOnce(new Error('boom'));
-    const n = node('image', 'img1');
-    render(qc(<ParameterInspector node={n} def={getNodeDef('image')!} projectId="proj-1" />));
+    const n = node('image-generation', 'img1');
+    render(qc(<ParameterInspector node={n} def={getNodeDef('image-generation')!} projectId="proj-1" />));
     expect(await screen.findByText('模型加载失败')).toBeTruthy();
     expect(screen.getByRole('button', { name: /重试/ })).toBeTruthy();
 
     cleanup();
     vi.mocked(v2ai.listModels).mockResolvedValueOnce([] as any);
-    render(qc(<ParameterInspector node={n} def={getNodeDef('image')!} projectId="proj-1" />));
-    expect(await screen.findByText('没有可用 Logical Model')).toBeTruthy();
+    render(qc(<ParameterInspector node={n} def={getNodeDef('image-generation')!} projectId="proj-1" />));
+    expect(await screen.findByText('No compatible model configured')).toBeTruthy();
   });
 });

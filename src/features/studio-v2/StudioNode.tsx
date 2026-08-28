@@ -1,13 +1,17 @@
-// M05-A — Studio node card (compact).
+// M05-A/B2 — Studio node card (compact).
 // Derived entirely from the Node Registry: ports come from NODE_DEFS, no
 // per-kind branching. Memoized for 1000-node scale. Asset previews resolve
 // through the M04-S Asset API (assetId is the identity; the URL is display
 // only and lazy-loaded).
+//
+// M05-B2: generation node cards show honest result placeholders
+// ("Ready to run" / "Invalid configuration" / "Stale") — NEVER fake media.
+// Structural (frame) nodes render as pure containers.
 
 import { memo } from 'react';
 import { Handle, Position, type NodeProps } from '@xyflow/react';
 import { useQuery } from '@tanstack/react-query';
-import { Loader2, AlertCircle } from 'lucide-react';
+import { Loader2, AlertCircle, User } from 'lucide-react';
 import { getNodeDef } from './registry';
 import { NodeIcon } from './NodeIcon';
 import { v2asset } from '@/shared/api/contract/asset-client';
@@ -19,9 +23,11 @@ const STATUS_META: Record<string, { label: string; className: string }> = {
   READY: { label: '就绪', className: 'bg-emerald-500/15 text-emerald-400' },
   INVALID: { label: '无效', className: 'bg-red-500/15 text-red-400' },
   STALE: { label: '待刷新', className: 'bg-amber-500/15 text-amber-400' },
+  QUEUED: { label: '排队中', className: 'bg-ml2-accent/15 text-ml2-accent' },
   RUNNING: { label: '运行中', className: 'bg-ml2-accent/15 text-ml2-accent' },
   SUCCEEDED: { label: '成功', className: 'bg-emerald-500/15 text-emerald-400' },
   FAILED: { label: '失败', className: 'bg-red-500/15 text-red-400' },
+  CANCELLED: { label: '已取消', className: 'bg-ml2-surface-3 text-ml2-text-3' },
   idle: { label: '待配置', className: 'bg-ml2-surface-3 text-ml2-text-3' },
   ready: { label: '就绪', className: 'bg-emerald-500/15 text-emerald-400' },
   generating: { label: '生成中', className: 'bg-ml2-accent/15 text-ml2-accent' },
@@ -53,11 +59,28 @@ function AssetPreview({ assetId, kind }: { assetId: string; kind: string }) {
   );
 }
 
-function PromptPreview({ prompt }: { prompt?: string }) {
+function TextPreview({ text, hint }: { text?: string; hint: string }) {
   return (
     <p className="line-clamp-3 whitespace-pre-wrap px-2 py-1.5 text-[11px] leading-relaxed text-ml2-text-2">
-      {prompt?.trim() || <span className="text-ml2-text-3">在右侧 Inspector 编辑提示词</span>}
+      {text?.trim() || <span className="text-ml2-text-3">{hint}</span>}
     </p>
+  );
+}
+
+/** M05-B2 honest result placeholder for generation nodes — never fake media. */
+function GenerationPlaceholder({ status }: { status: string }) {
+  const label =
+    status === 'STALE' || status === 'stale'
+      ? 'Stale — upstream changed'
+      : status === 'INVALID' || status === 'error'
+        ? 'Invalid configuration'
+        : status === 'READY' || status === 'ready'
+          ? 'Ready to run'
+          : '待配置 (not ready)';
+  return (
+    <div data-test="generation-placeholder" className="grid h-24 place-items-center bg-ml2-surface-3 text-center">
+      <span className="px-2 text-[10px] leading-relaxed text-ml2-text-3">{label}</span>
+    </div>
   );
 }
 
@@ -74,7 +97,9 @@ function StudioNodeInner({ id, data, selected }: NodeProps<StudioNode>) {
     );
   }
   const status = STATUS_META[data.status] ?? STATUS_META.idle;
-  const isFrame = def.category === 'Structure';
+  const isFrame = def.executionKind === 'STRUCTURAL';
+  const params = (data.parameters ?? {}) as Record<string, unknown>;
+  const text = (params.prompt ?? params.scriptText ?? params.name ?? params.description ?? data.prompt) as string | undefined;
 
   return (
     <div
@@ -97,10 +122,28 @@ function StudioNodeInner({ id, data, selected }: NodeProps<StudioNode>) {
       </div>
 
       <div className="p-1.5">
-        {def.id === 'prompt' && <PromptPreview prompt={data.prompt} />}
-        {(def.id === 'reference' || def.id === 'image' || def.id === 'video') &&
+        {def.id === 'prompt' && <TextPreview text={text} hint="在右侧 Inspector 编辑提示词" />}
+        {def.id === 'script' && <TextPreview text={text} hint="在右侧 Inspector 编辑脚本" />}
+        {def.id === 'character' && (
+          <>
+            <div className="flex items-center gap-2 px-2 py-1.5">
+              <span className="grid size-7 shrink-0 place-items-center rounded-full bg-ml2-surface-3 text-ml2-accent">
+                <User className="size-4" />
+              </span>
+              <span className="min-w-0">
+                <span className="block truncate text-[11px] text-ml2-text">{String(params.name ?? '未命名角色')}</span>
+                {params.assetId ? (
+                  <AssetPreview assetId={String(params.assetId)} kind="image" />
+                ) : (
+                  <span className="block truncate text-[10px] text-ml2-text-3">{String(params.description ?? '') || '可选素材 / 描述'}</span>
+                )}
+              </span>
+            </div>
+          </>
+        )}
+        {(def.id === 'reference' || def.id === 'video') &&
           (data.assetId ? (
-            <AssetPreview assetId={data.assetId} kind={def.id} />
+            <AssetPreview assetId={data.assetId} kind={def.id === 'video' ? 'video' : 'image'} />
           ) : (
             <div className="grid h-24 place-items-center bg-ml2-surface-3 text-center">
               <span className="px-2 text-[10px] leading-relaxed text-ml2-text-3">
@@ -110,12 +153,21 @@ function StudioNodeInner({ id, data, selected }: NodeProps<StudioNode>) {
               </span>
             </div>
           ))}
+        {def.id === 'image-generation' && (
+          data.assetId
+            ? <AssetPreview assetId={data.assetId} kind="image" />
+            : <GenerationPlaceholder status={data.status} />
+        )}
+        {(def.id === 'image-to-video' || def.id === 'text-to-video') && (
+          data.assetId
+            ? <AssetPreview assetId={data.assetId} kind="video" />
+            : <GenerationPlaceholder status={data.status} />
+        )}
         {def.id === 'output' && (
           <div className="grid h-24 place-items-center bg-ml2-surface-3">
-            <span className="text-[10px] text-ml2-text-3">产出汇集（M05-C 接入 Run）</span>
+            <span className="text-[10px] text-ml2-text-3">产出边界（M05-C+ 接入 Run / Export）</span>
           </div>
         )}
-        {def.id === 'script' && <PromptPreview prompt={data.prompt} />}
         {isFrame && (
           <div className="grid h-16 place-items-center rounded-md border border-dashed border-ml2-border bg-ml2-surface-0">
             <span className="text-[10px] text-ml2-text-3">{data.frameLabel || 'Frame / Group'}</span>
@@ -123,23 +175,28 @@ function StudioNodeInner({ id, data, selected }: NodeProps<StudioNode>) {
         )}
       </div>
 
-      {def.inputPorts.map((p) => (
+      {def.inputPorts.map((p, i) => (
         <Handle
           key={p.id}
           id={p.id}
           type="target"
           position={Position.Left}
           title={p.label}
+          // M05-B2: distribute multiple input ports down the left edge so each
+          // handle is individually reachable (stacked handles would overlap and
+          // make the drop land on the wrong port).
+          style={{ top: `${((i + 1) * 100) / (def.inputPorts.length + 1)}%` }}
           className="!h-2.5 !w-2.5 !rounded-full !border-2 !border-ml2-surface-0 !bg-ml2-accent"
         />
       ))}
-      {def.outputPorts.map((p) => (
+      {def.outputPorts.map((p, i) => (
         <Handle
           key={p.id}
           id={p.id}
           type="source"
           position={Position.Right}
           title={p.label}
+          style={{ top: `${((i + 1) * 100) / (def.outputPorts.length + 1)}%` }}
           className="!h-2.5 !w-2.5 !rounded-full !border-2 !border-ml2-surface-0 !bg-ml2-accent"
         />
       ))}

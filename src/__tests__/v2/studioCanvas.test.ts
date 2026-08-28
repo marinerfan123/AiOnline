@@ -213,7 +213,7 @@ describe('Canvas session store — operations', () => {
     useStudioStore.setState({
       nodes: [
         node('prompt', 'a', 100, 100, { selected: true }),
-        node('image', 'b', 500, 100, { selected: true }),
+        node('image-generation', 'b', 500, 100, { selected: true }),
       ],
     });
     const { groupSelection } = useStudioStore.getState();
@@ -231,7 +231,7 @@ describe('Canvas session store — operations', () => {
       nodes: [
         { ...node('frame', 'f', 0, 0), width: 800, height: 800 },
         node('prompt', 'k1', 100, 100),
-        node('image', 'k2', 300, 300),
+        node('image-generation', 'k2', 300, 300),
         node('prompt', 'out', 5000, 5000),
       ],
     });

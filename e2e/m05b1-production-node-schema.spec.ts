@@ -95,7 +95,7 @@ test.describe('M05-B1 Production Node Schema E2E', () => {
     await page.getByTestId('inspector-prompt').blur();
     await expect(page.getByTestId('inspector-validation')).toContainText('valid');
 
-    await page.getByTestId('node-library-item-image').click();
+    await page.getByTestId('node-library-item-image-generation').click();
     await expect(page.getByTestId('schema-parameter-inspector')).toBeVisible();
     await expect(page.getByTestId('inspector-validation')).toContainText('Logical Model is required');
     const modelSelect = page.getByLabel('Logical Model');

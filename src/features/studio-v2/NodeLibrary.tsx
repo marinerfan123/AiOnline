@@ -1,12 +1,16 @@
-// M05-A — Studio Node Library (left rail).
+// M05-A/B2 — Studio Node Library (left rail).
 // DERIVED FROM THE NODE REGISTRY — never hardcoded node components.
-// Supports: search, category collapse, click-to-add, drag-to-canvas.
+// M05-B2: production sections (INPUT / CREATIVE / GENERATE / MEDIA / OUTPUT /
+// STRUCTURE) computed from def.executionKind + def.category via
+// librarySectionOf — one source of truth (the registry).
+// Supports: search, section collapse, click-to-add, drag-to-canvas.
 
 import { useMemo, useState } from 'react';
 import { ChevronDown, ChevronRight, Search } from 'lucide-react';
 import {
-  CATEGORY_ORDER,
+  LIBRARY_SECTIONS,
   NODE_DEFS_LIST,
+  librarySectionOf,
   type NodeDef,
 } from './registry';
 import type { StudioNodeKind } from './types';
@@ -49,21 +53,21 @@ export function NodeLibrary({ onAdd }: NodeLibraryProps) {
 
   const groups = useMemo(() => {
     const q = search.trim().toLowerCase();
-    return CATEGORY_ORDER.map((cat) => ({
-      cat,
+    return LIBRARY_SECTIONS.map((sec) => ({
+      sec,
       defs: NODE_DEFS_LIST.filter(
         (d) =>
-          d.category === cat &&
+          librarySectionOf(d) === sec.id &&
           (!q || d.title.toLowerCase().includes(q) || d.description.toLowerCase().includes(q)),
       ),
     })).filter((g) => g.defs.length > 0);
   }, [search]);
 
-  const toggle = (cat: string) =>
+  const toggle = (id: string) =>
     setCollapsed((prev) => {
       const next = new Set(prev);
-      if (next.has(cat)) next.delete(cat);
-      else next.add(cat);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
       return next;
     });
 
@@ -88,18 +92,18 @@ export function NodeLibrary({ onAdd }: NodeLibraryProps) {
         {groups.length === 0 && (
           <p className="px-2 py-6 text-center text-[11px] text-ml2-text-3">没有匹配的节点</p>
         )}
-        {groups.map(({ cat, defs }) => {
-          const isCollapsed = collapsed.has(cat);
+        {groups.map(({ sec, defs }) => {
+          const isCollapsed = collapsed.has(sec.id);
           return (
-            <div key={cat} className="mb-1">
+            <div key={sec.id} className="mb-1">
               <button
                 type="button"
-                data-test={`node-library-category-${cat}`}
-                onClick={() => toggle(cat)}
+                data-test={`node-library-category-${sec.id}`}
+                onClick={() => toggle(sec.id)}
                 className="flex w-full items-center gap-1 rounded px-2 py-1 text-[10px] font-semibold uppercase tracking-wide text-ml2-text-3 hover:text-ml2-text-2"
               >
                 {isCollapsed ? <ChevronRight className="size-3" /> : <ChevronDown className="size-3" />}
-                {cat}
+                {sec.label}
               </button>
               {!isCollapsed && (
                 <div className="flex flex-col gap-0.5 py-0.5">

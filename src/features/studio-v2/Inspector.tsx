@@ -1,9 +1,17 @@
-// M05-B1 — Studio Inspector (right rail).
+// M05-B1/B2 — Studio Inspector (right rail).
 // Schema-driven production inspector: identity header, validation, parameters,
-// IO summary, and actions. Per-node parameter controls come from registry
+// required-inputs summary (CONNECTED/MISSING/OPTIONAL), execution status,
+// and actions. Per-node parameter controls come from registry
 // parameterSchema, not node-type branching.
+//
+// M05-B2: validation now feeds the M02 logical model catalog (TanStack Query
+// cache — no per-keystroke server traffic) so MODEL_UNAVAILABLE /
+// capability mismatch surface here; generation nodes show
+// "Ready to run" / "Invalid configuration" / "Stale" result placeholders
+// (never fake media).
 
 import { useMemo } from 'react';
+import { useQuery } from '@tanstack/react-query';
 import { Trash2, Copy, Group, AlignStartVertical, AlignCenterVertical, AlignEndVertical } from 'lucide-react';
 import { useStudioStore } from './store';
 import { getNodeDef } from './registry';
@@ -11,7 +19,9 @@ import { NodeIcon } from './NodeIcon';
 import { Button } from '@/shared/ui/v2/Button';
 import { Input } from '@/shared/ui/v2/Input';
 import { ParameterInspector } from './ParameterInspector';
-import { validateNode } from './validation';
+import { computeReadiness, validateNode } from './validation';
+import { v2ai } from '@/shared/api/contract/ai-control-client';
+import { cn } from '@/lib/utils';
 
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (
@@ -37,7 +47,46 @@ export function Inspector({ projectId }: { projectId: string }) {
   const selected = useMemo(() => nodes.filter((n) => n.selected), [nodes]);
   const single = selected.length === 1 ? selected[0] : null;
   const def = single ? getNodeDef(single.data.nodeKind) : null;
-  const validation = single && def ? validateNode(single, def, edges) : null;
+
+  // M02 logical model catalog (cached; generation nodes only)
+  const modelField = def?.modelField ? def.parameterSchema.find((f) => f.key === def.modelField) : undefined;
+  const modelsQuery = useQuery({
+    queryKey: ['v2', 'ai-control', 'models', modelField?.capability ?? 'all'],
+    queryFn: () => v2ai.listModels(),
+    retry: 0,
+    enabled: Boolean(single && def?.isGeneration),
+  });
+
+  const selectedModel = useMemo(() => {
+    if (!single || !def?.isGeneration || !def.modelField) return null;
+    const id = String((single.data.parameters ?? {})[def.modelField] ?? '');
+    if (!id) return null;
+    return (modelsQuery.data ?? []).find((m) => m.model_id === id) ?? null;
+  }, [modelsQuery.data, single, def]);
+
+  const validation = useMemo(() => {
+    if (!single || !def) return null;
+    const validModelIds = modelsQuery.data ? modelsQuery.data.filter((m) => m.enabled !== false).map((m) => m.model_id) : undefined;
+    return validateNode(single, def, edges, {
+      validModelIds,
+      model: selectedModel ?? null,
+      assetExists: null,
+    });
+  }, [single, def, edges, modelsQuery.data, selectedModel]);
+
+  const readiness = useMemo(() => {
+    if (!single || !def) return null;
+    const validModelIds = modelsQuery.data ? modelsQuery.data.filter((m) => m.enabled !== false).map((m) => m.model_id) : undefined;
+    return computeReadiness(single, def, edges, { validModelIds, model: selectedModel ?? null, assetExists: null });
+  }, [single, def, edges, modelsQuery.data, selectedModel]);
+
+  const inputSummary = useMemo(() => {
+    if (!single || !def) return [];
+    return def.inputPorts.map((p) => {
+      const connected = edges.some((e) => e.target === single.id && e.targetHandle === p.id);
+      return { port: p, connected };
+    });
+  }, [single, def, edges]);
 
   return (
     <aside data-test="studio-inspector" className="flex h-full w-60 shrink-0 flex-col overflow-y-auto border-l border-ml2-border bg-ml2-surface-1 xl:w-64 2xl:w-72">
@@ -52,7 +101,7 @@ export function Inspector({ projectId }: { projectId: string }) {
           </Section>
           <Section title="Persistence">
             <p className="text-[11px] leading-relaxed text-ml2-text-3">
-              当前为 M05-A/M05-B1 会话态 Canvas（内存，可 undo/redo）。
+              当前为 M05-A/M05-B 会话态 Canvas（内存，可 undo/redo）。
               正式保存与版本将在 M05-C 接入 shared PostgreSQL。
               刷新页面将丢失未保存的画布内容。
             </p>
@@ -89,10 +138,29 @@ export function Inspector({ projectId }: { projectId: string }) {
                   onChange={(e) => updateNodeData(single.id, { title: e.target.value })}
                   className="h-6 px-1.5 text-[11px]"
                 />
-                <p className="mt-1 text-[10px] text-ml2-text-3">{def.title} · schema v{single.data.schemaVersion ?? def.version}</p>
+                <p className="mt-1 text-[10px] text-ml2-text-3">
+                  {def.title} · {def.executionKind} · schema v{single.data.schemaVersion ?? def.version}
+                </p>
               </div>
             </div>
           </Section>
+
+          {def.isGeneration && (
+            <Section title="Status">
+              <div data-test="inspector-status" className="space-y-1 text-[11px]">
+                {single.data.status === 'STALE' ? (
+                  <p className="text-amber-400">Stale — upstream changed (upstream 变更后待重跑)</p>
+                ) : validation && !validation.valid ? (
+                  <p className="text-red-400">Invalid configuration（配置无效）</p>
+                ) : readiness ? (
+                  <p className={cn('text-emerald-400')}>Ready to run（就绪 · 本阶段不执行）</p>
+                ) : (
+                  <p className="text-ml2-text-3">Loading…</p>
+                )}
+                <p className="text-[10px] text-ml2-text-3">M05-B2：纯配置图，不触发真实生成。</p>
+              </div>
+            </Section>
+          )}
 
           <Section title="Validation">
             <div data-test="inspector-validation" className="space-y-1 text-[11px]">
@@ -102,15 +170,44 @@ export function Inspector({ projectId }: { projectId: string }) {
             </div>
           </Section>
 
+          {def.inputPorts.length > 0 && (
+            <Section title="Required Inputs">
+              <div data-test="inspector-ports" className="space-y-1 text-[11px]">
+                {inputSummary.map(({ port, connected }) => (
+                  <div key={port.id} className="flex items-center justify-between gap-2">
+                    <span className="text-ml2-text-2">
+                      {port.label}
+                      <span className="ml-1 text-[9px] text-ml2-text-3">{port.type}</span>
+                    </span>
+                    <span
+                      data-test={`port-summary-${port.id}`}
+                      className={cn(
+                        'rounded-full px-1.5 py-px text-[9px] font-medium',
+                        port.required
+                          ? connected
+                            ? 'bg-emerald-500/15 text-emerald-400'
+                            : 'bg-red-500/15 text-red-400'
+                          : 'bg-ml2-surface-3 text-ml2-text-3',
+                      )}
+                    >
+                      {port.required ? (connected ? 'CONNECTED' : 'MISSING') : connected ? 'CONNECTED' : 'OPTIONAL'}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </Section>
+          )}
+
           <Section title="Parameters">
             <ParameterInspector node={single} def={def} projectId={projectId} />
           </Section>
 
-          <Section title="Inputs / Outputs">
+          <Section title="Outputs">
             <div className="space-y-1 text-[11px] text-ml2-text-2">
-              <p>Inputs: {def.inputPorts.length ? def.inputPorts.map((p) => `${p.label}:${p.type}`).join(' · ') : 'none'}</p>
-              <p>Outputs: {def.outputPorts.length ? def.outputPorts.map((p) => `${p.label}:${p.type}`).join(' · ') : 'none'}</p>
-              <p>Execution: contract only · no real generation in M05-B1</p>
+              <p data-test="inspector-output-type">
+                Output: {def.outputPorts.length ? def.outputPorts.map((p) => `${p.label}:${p.type}`).join(' · ') : 'none'}
+              </p>
+              <p className="text-[10px] text-ml2-text-3">Result contract: durable assetId only（provider 临时 URL 不作为最终 authority）</p>
             </div>
           </Section>
 

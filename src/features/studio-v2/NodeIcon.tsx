@@ -1,4 +1,4 @@
-// M05-A — node icon resolver (registry icon key → lucide component).
+// M05-A/B2 — node icon resolver (registry icon key → lucide component).
 import {
   Type,
   Clapperboard,
@@ -7,6 +7,8 @@ import {
   Film,
   Package,
   Frame,
+  User,
+  Play,
   type LucideIcon,
 } from 'lucide-react';
 
@@ -18,6 +20,9 @@ const ICONS: Record<string, LucideIcon> = {
   film: Film,
   package: Package,
   frame: Frame,
+  user: User,
+  'clapperboard-image': ImagePlus,
+  'film-play': Play,
 };
 
 export function NodeIcon({ name, className }: { name: string; className?: string }) {

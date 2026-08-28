@@ -25,10 +25,15 @@ import {
   type Viewport,
 } from '@xyflow/react';
 import {
-  canConnect,
+  canConnectToPort,
   getNodeDef,
   type NodeDef,
 } from './registry';
+import {
+  computeStoredStatus,
+  directDownstreamIds,
+  isIdentityChange,
+} from './validation';
 import {
   mintNodeId,
   type StudioNodeData,
@@ -87,6 +92,8 @@ interface StudioState {
   endEdit: () => void;
   updateNodeData: (id: string, patch: Partial<StudioNodeData>) => void;
   updateNodeParameter: (id: string, key: string, value: unknown) => void;
+  /** M05-B2 model switch: replace the whole parameter set in ONE set() (deterministic normalization). */
+  replaceNodeParameters: (id: string, parameters: StudioNodeData['parameters'], changedKeys: string[]) => void;
   undo: () => void;
   redo: () => void;
   setViewport: (v: Viewport) => void;
@@ -136,6 +143,26 @@ function findPort(node: StudioNode | undefined, handleId: string | null | undefi
   if (!def) return null;
   const ports = input ? def.inputPorts : def.outputPorts;
   return ports.find((p) => p.id === handleId) ?? ports[0] ?? null;
+}
+
+/**
+ * M05-B2 node-local status recompute. Only the affected node ids are touched —
+ * never a graph-wide sweep (1000-node contract). Catalog availability
+ * (validModelIds) is NOT applied here: the store is network-free, and model
+ * availability is surfaced by the Inspector (which owns the TanStack Query
+ * cache). Local semantics only: IDLE (structural) / INVALID / STALE (sticky)
+ * / READY.
+ */
+function recomputeStatus(nodes: StudioNode[], affectedIds: Iterable<string>, edges: StudioEdge[]): StudioNode[] {
+  const ids = new Set(affectedIds);
+  if (ids.size === 0) return nodes;
+  return nodes.map((n) => {
+    if (!ids.has(n.id)) return n;
+    const def = getNodeDef(n.data.nodeKind);
+    if (!def) return n;
+    const status = computeStoredStatus(n, def, edges);
+    return status === n.data.status ? n : { ...n, data: { ...n.data, status } };
+  });
 }
 
 /** ids of non-frame nodes whose position falls inside a frame's bounds. */
@@ -194,7 +221,17 @@ export const useStudioStore = create<StudioState>((set, get) => ({
       return { nodes };
     }),
   onEdgesChange: (changes) =>
-    set((s) => ({ edges: applyEdgeChanges(changes, s.edges) as StudioEdge[] })),
+    set((s) => {
+      const removed = changes.filter((c) => c.type === 'remove').map((c) => c.id);
+      if (removed.length === 0) {
+        return { edges: applyEdgeChanges(changes, s.edges) as StudioEdge[] };
+      }
+      const edges = applyEdgeChanges(changes, s.edges) as StudioEdge[];
+      // edge removal can flip a target from READY→INVALID: recompute only the
+      // affected targets (node-local, no graph-wide sweep)
+      const affected = new Set(s.edges.filter((e) => removed.includes(e.id)).map((e) => e.target));
+      return { edges, nodes: recomputeStatus(s.nodes, affected, edges) };
+    }),
 
   onConnect: (c) => {
     const s = get();
@@ -204,8 +241,8 @@ export const useStudioStore = create<StudioState>((set, get) => ({
     const outPort = findPort(sourceNode, c.sourceHandle, false);
     const inPort = findPort(targetNode, c.targetHandle, true);
     if (!outPort || !inPort) return;
-    // typed port gate
-    if (!canConnect(outPort.type, inPort.type)) {
+    // typed port gate (M05-B2: port-level acceptedTypes, else base table)
+    if (!canConnectToPort(outPort.type, inPort)) {
       set({
         invalidConnection: {
           message: `无法连接：${outPort.label}(${outPort.type}) → ${inPort.label}(${inPort.type}) 类型不兼容`,
@@ -219,10 +256,14 @@ export const useStudioStore = create<StudioState>((set, get) => ({
       return;
     }
     const edge = buildEdge(c, outPort.type);
-    set((st) => ({
-      ...pushUndo(st, snapshot(st)),
-      edges: addEdge(edge, st.edges) as StudioEdge[],
-    }));
+    set((st) => {
+      const edges = addEdge(edge, st.edges) as StudioEdge[];
+      return {
+        ...pushUndo(st, snapshot(st)),
+        edges,
+        nodes: recomputeStatus(st.nodes, [c.source, c.target], edges),
+      };
+    });
   },
 
   onViewportChange: (v) => set({ viewport: v }),
@@ -415,17 +456,53 @@ export const useStudioStore = create<StudioState>((set, get) => ({
     })),
 
   updateNodeParameter: (id, key, value) =>
-    set((s) => ({
-      nodes: s.nodes.map((n) => {
+    set((s) => {
+      const nodes = s.nodes.map((n) => {
         if (n.id !== id) return n;
         const parameters = { ...(n.data.parameters ?? {}), [key]: value };
         const patch: Partial<StudioNodeData> = { parameters };
         if (key === 'prompt' && typeof value === 'string') patch.prompt = value;
+        if (key === 'scriptText' && typeof value === 'string') patch.prompt = value;
         if (key === 'assetId' && (typeof value === 'string' || value === null)) patch.assetId = value as string | null;
         if (key === 'frameLabel' && typeof value === 'string') patch.frameLabel = value;
         return { ...n, data: { ...n.data, ...patch } };
-      }),
-    })),
+      });
+      // M05-B2 stale propagation contract: an identity change (parameters /
+      // assetId) marks DIRECT downstream nodes STALE (in-memory, no auto-run).
+      let downstream = new Set<string>();
+      if (isIdentityChange({ changedNodeId: id, changedKeys: [key] })) {
+        downstream = new Set(directDownstreamIds(s.edges, { changedNodeId: id, changedKeys: [key] }));
+      }
+      const staleNodes = downstream.size > 0
+        ? nodes.map((n) =>
+            downstream.has(n.id) && n.data.status !== 'STALE' ? { ...n, data: { ...n.data, status: 'STALE' as const } } : n,
+          )
+        : nodes;
+      return { nodes: recomputeStatus(staleNodes, [id, ...downstream], s.edges) };
+    }),
+
+  replaceNodeParameters: (id, parameters, changedKeys) =>
+    set((s) => {
+      const nodes = s.nodes.map((n) => {
+        if (n.id !== id) return n;
+        const patch: Partial<StudioNodeData> = { parameters };
+        if (typeof parameters.prompt === 'string') patch.prompt = parameters.prompt;
+        if (parameters.assetId === null || typeof parameters.assetId === 'string') patch.assetId = parameters.assetId as string | null;
+        if (typeof parameters.frameLabel === 'string') patch.frameLabel = parameters.frameLabel;
+        return { ...n, data: { ...n.data, ...patch } };
+      });
+      const downstream = new Set(
+        isIdentityChange({ changedNodeId: id, changedKeys })
+          ? directDownstreamIds(s.edges, { changedNodeId: id, changedKeys })
+          : [],
+      );
+      const staleNodes = downstream.size > 0
+        ? nodes.map((n) =>
+            downstream.has(n.id) && n.data.status !== 'STALE' ? { ...n, data: { ...n.data, status: 'STALE' as const } } : n,
+          )
+        : nodes;
+      return { nodes: recomputeStatus(staleNodes, [id, ...downstream], s.edges) };
+    }),
 
   undo: () =>
     set((s) => {

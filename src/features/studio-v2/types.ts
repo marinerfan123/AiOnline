@@ -1,4 +1,4 @@
-// M05-B1 — Studio production node schema/types.
+// M05-B1/B2 — Studio production node schema/types.
 // Canvas nodes store durable-ready identity + parameters + references only.
 // Browser/UI state (selection, viewport, undo) stays outside node data.
 
@@ -18,23 +18,46 @@ export type PortType =
 
 export type NodeCategory = 'Input' | 'Creative' | 'Media' | 'Output' | 'Structure';
 
+/**
+ * M05-B2 stable production node identities. UI labels are display-only and
+ * NEVER used as node identity. The old `image` id is a generation node;
+ * video assets keep the `video` id from M05-A for backward compatibility.
+ */
 export type StudioNodeKind =
   | 'prompt'
-  | 'reference'
-  | 'image'
-  | 'video'
-  | 'output'
   | 'script'
+  | 'character'
+  | 'reference'
+  | 'image-generation'
+  | 'image-to-video'
+  | 'text-to-video'
+  | 'video' // Video Asset (kept: M05-A persisted/tested identity)
+  | 'output'
   | 'frame';
+
+/**
+ * M05-B2 execution classification. The future M05-D DAG compiler MUST read
+ * this — never infer from node names. STRUCTURAL nodes never enter execution.
+ */
+export type NodeExecutionKind =
+  | 'SOURCE'
+  | 'TRANSFORM'
+  | 'GENERATION'
+  | 'ASSET'
+  | 'OUTPUT'
+  | 'STRUCTURAL';
 
 export type NodeRuntimeStatus =
   | 'IDLE'
   | 'READY'
   | 'INVALID'
   | 'STALE'
+  // reserved for the future Run Engine (M05-B2 never produces these)
+  | 'QUEUED'
   | 'RUNNING'
   | 'SUCCEEDED'
   | 'FAILED'
+  | 'CANCELLED'
   // compatibility with M05-A sessions/tests
   | 'idle'
   | 'ready'
@@ -59,9 +82,13 @@ export interface PortSpec {
   id: string;
   label: string;
   type: PortType;
+  /** accepted upstream port types; defaults to [type] when omitted */
+  acceptedTypes?: PortType[];
   /** true = input (target), false = output (source) */
   input: boolean;
   required?: boolean;
+  /** true = port may hold multiple edges */
+  multiple?: boolean;
 }
 
 export type ParameterFieldType =
@@ -78,6 +105,7 @@ export type ParameterFieldType =
   | 'aspect-ratio'
   | 'resolution'
   | 'seed'
+  | 'duration'
   | 'json';
 
 export interface ParameterOption {
@@ -140,6 +168,7 @@ export interface NodeExecutionRequest {
 
 export interface NodeExecutionResult {
   status: 'SUCCEEDED' | 'FAILED' | 'RUNNING';
+  /** M05-B2 asset result contract: durable assetIds only — provider temporary URLs are never the final authority. */
   assetIds?: string[];
   structuredOutput?: unknown;
   metadata?: Record<string, unknown>;
@@ -155,6 +184,23 @@ export interface ExecutorContract {
 export interface ResultContract {
   outputs: PortType[];
   durableRefs: 'assetId';
+}
+
+/**
+ * M05-B2 execution readiness — computed state only, never a real invocation.
+ * executionReady = valid parameters + required inputs connected +
+ * logical model available + (generation) model capability match.
+ */
+export interface NodeReadiness {
+  executionReady: boolean;
+  reasons: ValidationIssue[];
+}
+
+/** M05-B2 stale propagation contract (direct downstream, in-memory only). */
+export interface StalePropagationInput {
+  changedNodeId: string;
+  /** stable identity inputs that matter: parameters / assetId */
+  changedKeys?: string[];
 }
 
 export interface StudioNodeData extends Record<string, unknown> {

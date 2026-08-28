@@ -2,7 +2,7 @@
 // pan/zoom/minimap/controls, drag-from-library, context menu, invalid
 // connection feedback, empty state, keyboard shortcuts, node error isolation.
 
-import { useCallback, useEffect, useRef, useState, Component, type ReactNode } from 'react';
+import { useCallback, useEffect, useRef, useState, useMemo, Component, type ReactNode } from 'react';
 import {
   ReactFlow,
   ReactFlowProvider,
@@ -21,6 +21,7 @@ import {
   studioCanvasActions,
 } from './store';
 import { StudioNodeComponent } from './StudioNode';
+import { NODE_DEFS_LIST } from './registry';
 import type { StudioNodeKind } from './types';
 import { Button } from '@/shared/ui/v2/Button';
 import { IconButton } from '@/shared/ui/v2/IconButton';
@@ -51,7 +52,8 @@ class StudioErrorBoundary extends Component<{ children: ReactNode }, { hasError:
 }
 
 function ContextMenu({ at, onAdd, onClose }: { at: { x: number; y: number }; onAdd: (k: StudioNodeKind) => void; onClose: () => void }) {
-  const kinds: StudioNodeKind[] = ['prompt', 'reference', 'image', 'video', 'script', 'output', 'frame'];
+  // M05-B2: derived from the registry (never a hardcoded second node list).
+  const kinds = useMemo(() => NODE_DEFS_LIST.map((d) => d.id), []);
   return (
     <div
       data-test="canvas-context-menu"
@@ -60,12 +62,15 @@ function ContextMenu({ at, onAdd, onClose }: { at: { x: number; y: number }; onA
       onContextMenu={(e) => { e.preventDefault(); onClose(); }}
     >
       <div className="px-3 py-1 text-[10px] text-ml2-text-3">在此处添加节点</div>
-      {kinds.map((k) => (
-        <button key={k} data-test={`context-menu-${k}`} onClick={() => { onAdd(k); onClose(); }}
-          className="block w-full px-3 py-1.5 text-left text-xs capitalize text-ml2-text-2 hover:bg-ml2-surface-2 hover:text-ml2-text">
-          {k}
-        </button>
-      ))}
+      {kinds.map((k) => {
+        const def = NODE_DEFS_LIST.find((d) => d.id === k);
+        return (
+          <button key={k} data-test={`context-menu-${k}`} onClick={() => { onAdd(k); onClose(); }}
+            className="block w-full px-3 py-1.5 text-left text-xs text-ml2-text-2 hover:bg-ml2-surface-2 hover:text-ml2-text">
+            {def?.title ?? k}
+          </button>
+        );
+      })}
     </div>
   );
 }
@@ -97,7 +102,7 @@ function EmptyState({ onAdd }: { onAdd: (k: StudioNodeKind) => void }) {
         <div className="mt-4 grid grid-cols-3 gap-1.5">
           <Button size="sm" variant="primary" data-test="empty-add-prompt" onClick={() => onAdd('prompt')}>Start with Prompt</Button>
           <Button size="sm" variant="secondary" data-test="empty-add-reference" onClick={() => onAdd('reference')}>Add Reference</Button>
-          <Button size="sm" variant="secondary" data-test="empty-add-image" onClick={() => onAdd('image')}>Add Image</Button>
+          <Button size="sm" variant="secondary" data-test="empty-add-image" onClick={() => onAdd('image-generation')}>Add Image Generation</Button>
         </div>
         <p className="mt-3 text-[10px] text-ml2-text-3">或在左侧 Node Library 拖拽 · 或双击画布空白处快速添加</p>
       </div>
@@ -147,8 +152,11 @@ function CanvasCore() {
     const col = i % 3;
     const row = Math.floor(i / 3);
     const id = addNode(kind, {
-      x: flow.x - 160 + col * 340,
-      y: flow.y - 120 + row * 240,
+      // M05-B2: wide cascade (>= card width + handle gutter) so input handles of
+      // a newly added node never overlap the output handles of the previous one
+      // — connection drags must start/end on the handle, not on a card body.
+      x: flow.x - 160 + col * 420,
+      y: flow.y - 120 + row * 300,
     });
     // Focus the newly added node so it is always visible and reachable, even
     // under onlyRenderVisibleElements culling. maxZoom:1 keeps zoom sane
