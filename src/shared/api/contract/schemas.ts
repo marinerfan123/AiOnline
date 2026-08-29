@@ -196,6 +196,89 @@ export const AssetWriteRequestSchema = z
     message: 'Provide exactly one of assetId (register) or url (create)',
   });
 
+// ── M05-C Studio Canvas Persistence ────────────────────────────────────────
+export const StudioCanvasViewportSchema = z.object({ x: z.number(), y: z.number(), zoom: z.number() });
+export const StudioCanvasNodeSchema = z.object({
+  nodeId: z.string(),
+  nodeType: z.string(),
+  nodeSchemaVersion: z.number().int().positive(),
+  position: z.object({ x: z.number(), y: z.number() }),
+  size: z.object({ width: z.number().nullable(), height: z.number().nullable() }).optional(),
+  zIndex: z.number().int().nullable().optional(),
+  data: z.object({
+    nodeKind: z.string(),
+    nodeType: z.string().optional(),
+    schemaVersion: z.number().int().positive(),
+    title: z.string(),
+    status: z.string(),
+    parameters: z.record(z.string(), z.unknown()),
+    assetId: z.string().nullable().optional(),
+    prompt: z.string().optional(),
+    validation: z.unknown().optional(),
+    frameLabel: z.string().optional(),
+  }).passthrough(),
+});
+export const StudioCanvasEdgeSchema = z.object({
+  edgeId: z.string(),
+  sourceNodeId: z.string(),
+  sourceHandle: z.string().nullable().optional(),
+  targetNodeId: z.string(),
+  targetHandle: z.string().nullable().optional(),
+  edgeType: z.string().nullable().optional(),
+  data: z.record(z.string(), z.unknown()),
+});
+export const StudioCanvasMetaSchema = z.object({
+  id: z.string(),
+  projectId: z.string(),
+  workspaceId: z.string(),
+  name: z.string(),
+  revision: z.number().int().positive(),
+  schemaVersion: z.number().int().positive(),
+  archivedAt: z.string().nullable().optional(),
+  createdAt: z.string().nullable(),
+  updatedAt: z.string().nullable(),
+  restoredFromVersionId: z.string().nullable().optional(),
+});
+export const StudioCanvasResponseSchema = z.object({
+  canvas: StudioCanvasMetaSchema.nullable(),
+  nodes: z.array(StudioCanvasNodeSchema),
+  edges: z.array(StudioCanvasEdgeSchema),
+  viewport: StudioCanvasViewportSchema.nullable(),
+  permissions: ProjectPermissionsSchema.optional(),
+}).passthrough();
+export const CanvasPatchRequestSchema = z.object({
+  baseRevision: z.number().int().positive(),
+  clientMutationId: z.string().min(1),
+  upsertNodes: z.array(StudioCanvasNodeSchema).optional(),
+  deleteNodeIds: z.array(z.string()).optional(),
+  upsertEdges: z.array(StudioCanvasEdgeSchema).optional(),
+  deleteEdgeIds: z.array(z.string()).optional(),
+  viewport: StudioCanvasViewportSchema.optional(),
+});
+export const CanvasConflictResponseSchema = z.object({
+  error: z.literal('CONFLICT'),
+  serverRevision: z.number().int().positive(),
+  canvasId: z.string(),
+}).passthrough();
+export const StudioCanvasVersionSummarySchema = z.object({
+  id: z.string(),
+  canvasId: z.string(),
+  revision: z.number().int().positive(),
+  versionNumber: z.number().int().positive(),
+  name: z.string().nullable().optional(),
+  description: z.string().nullable().optional(),
+  createdBy: z.string(),
+  createdAt: z.string().nullable(),
+  restoredFromVersionId: z.string().nullable().optional(),
+  nodeCount: z.number().int().nonnegative(),
+  edgeCount: z.number().int().nonnegative(),
+});
+export const StudioCanvasVersionResponseSchema = z.object({ version: StudioCanvasVersionSummarySchema });
+export const StudioCanvasVersionListResponseSchema = z.object({
+  versions: z.array(StudioCanvasVersionSummarySchema),
+  pagination: z.object({ limit: z.number(), offset: z.number(), total: z.number(), hasMore: z.boolean() }),
+});
+
 export type Health = z.infer<typeof HealthSchema>;
 export type Readiness = z.infer<typeof ReadinessSchema>;
 export type User = z.infer<typeof UserSchema>;
@@ -218,6 +301,16 @@ export type AssetDetail = z.infer<typeof AssetDetailSchema>;
 export type AssetListResponse = z.infer<typeof AssetListResponseSchema>;
 export type AssetDetailResponse = z.infer<typeof AssetDetailResponseSchema>;
 export type AssetWriteRequest = z.infer<typeof AssetWriteRequestSchema>;
+export type StudioCanvasViewport = z.infer<typeof StudioCanvasViewportSchema>;
+export type StudioCanvasNode = z.infer<typeof StudioCanvasNodeSchema>;
+export type StudioCanvasEdge = z.infer<typeof StudioCanvasEdgeSchema>;
+export type StudioCanvasMeta = z.infer<typeof StudioCanvasMetaSchema>;
+export type StudioCanvasResponse = z.infer<typeof StudioCanvasResponseSchema>;
+export type CanvasPatchRequest = z.infer<typeof CanvasPatchRequestSchema>;
+export type CanvasConflictResponse = z.infer<typeof CanvasConflictResponseSchema>;
+export type StudioCanvasVersionSummary = z.infer<typeof StudioCanvasVersionSummarySchema>;
+export type StudioCanvasVersionResponse = z.infer<typeof StudioCanvasVersionResponseSchema>;
+export type StudioCanvasVersionListResponse = z.infer<typeof StudioCanvasVersionListResponseSchema>;
 
 /**
  * Parse a raw value at the boundary. On failure returns a safe fallback

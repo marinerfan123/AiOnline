@@ -50,6 +50,7 @@ import dispatcher from './dispatcher.cjs';
 import aiControlRouterMod from './modules/ai-control/routes/aiControlRoutes.cjs';
 import projectFoundationMod from './modules/project-foundation/projectFoundation.cjs';
 import assetFoundationMod from './modules/project-foundation/assetFoundation.cjs';
+import studioCanvasPersistenceMod from './modules/project-foundation/studioCanvasPersistence.cjs';
 import generationV2Shadow from './modules/generation-v2/shadow.cjs';
 // ModelHub V3 Phase 1 — 唯一模型身份 resolver（server.js 仅在此一处调用，不再散落处理 display_name）
 import modelHubResolver from './modules/modelhub/resolver.cjs';
@@ -1470,6 +1471,21 @@ const assetFoundation = assetFoundationMod.createAssetFoundation({
   oss: ossMod,
 });
 
+// M05-C — V2 Studio Canvas persistence (/api/v2/projects/:id/studio/canvas).
+const studioCanvasPersistence = studioCanvasPersistenceMod.createStudioCanvasPersistence({
+  pg: {
+    query: (sql, params) => pgPool
+      ? pgPool.query(sql, params)
+      : Promise.reject(Object.assign(new Error('数据库未就绪'), { status: 503 })),
+    connect: () => pgPool
+      ? pgPool.connect()
+      : Promise.reject(Object.assign(new Error('数据库未就绪'), { status: 503 })),
+  },
+  sessionUser: (req) => session.getUserFromCookie(req),
+  sendJSON,
+  parseBody,
+});
+
 const referenceStyles = referenceStylesMod.createReferenceStyles({
   getPg: () => pgPool,
   session,
@@ -2384,6 +2400,11 @@ async function handleAPI(req, res) {
   // 必须早于 /api/admin/* 委托。未命中前缀 → 继续后续路由。
   if (url.startsWith('/api/v2/ai-control/') && method !== 'OPTIONS') {
     if (await aiControlRouter.handle(req, res, url.split('?')[0], method)) return;
+  }
+
+  // ── M05-C Studio Canvas Persistence（/api/v2/projects/:id/studio/canvas）──
+  if (/\/api\/v2\/projects\/[^/]+\/studio\/canvas/.test(url)) {
+    if (await studioCanvasPersistence.handle(req, res, url.split('?')[0], method)) return;
   }
 
   // ── M04-S Asset Foundation（/api/v2/assets, /api/v2/projects/:id/assets）──

@@ -5,8 +5,9 @@ import { Clapperboard, ChevronRight } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import { useProjectContext } from '@/features/project-foundation/ProjectContext';
 import { Badge } from '@/shared/ui/v2/Badge';
+import type { SaveStatus } from './useStudioCanvasPersistence';
 
-export function TopToolbar() {
+export function TopToolbar({ saveStatus = 'Saved', lastSavedAt, onRetry, onReload }: { saveStatus?: SaveStatus; lastSavedAt?: string | null; onRetry?: () => void; onReload?: () => void }) {
   const { projectName, projectType, projectId } = useProjectContext();
   return (
     <header
@@ -29,9 +30,13 @@ export function TopToolbar() {
       <Badge tone="neutral" className="ml-1 hidden text-[10px] sm:inline-flex">
         {projectType}
       </Badge>
-      <span data-test="studio-persistence-flag" className="ml-auto hidden items-center gap-1 rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-[10px] text-amber-400 md:flex">
-        会话态 · 正式保存在 M05-C 接入
-      </span>
+      <div className="ml-auto flex items-center gap-2">
+        <span data-test="studio-save-status" className="rounded-full border border-ml2-border bg-ml2-surface-2 px-2 py-0.5 text-[10px] text-ml2-text-2">
+          {saveStatus}{lastSavedAt && saveStatus === 'Saved' ? ` · ${new Date(lastSavedAt).toLocaleTimeString()}` : ''}
+        </span>
+        {(saveStatus === 'Save failed' || saveStatus === 'Offline') && <button data-test="studio-save-retry" onClick={onRetry} className="rounded bg-ml2-surface-3 px-2 py-0.5 text-[10px] text-ml2-text">Retry</button>}
+        {saveStatus === 'Conflict' && <button data-test="studio-conflict-reload" onClick={onReload} className="rounded bg-red-500/20 px-2 py-0.5 text-[10px] text-red-300">Reload server version</button>}
+      </div>
     </header>
   );
 }

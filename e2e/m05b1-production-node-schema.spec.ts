@@ -139,6 +139,6 @@ test.describe('M05-B1 Production Node Schema E2E', () => {
     expect(forbiddenCalls).toEqual([]);
     await page.reload();
     await expect(page.getByTestId('studio-empty-state')).toBeVisible({ timeout: 15_000 });
-    await expect(page.getByTestId('studio-persistence-flag')).toBeVisible();
+    await expect(page.getByTestId('studio-save-status')).toBeVisible();
   });
 });

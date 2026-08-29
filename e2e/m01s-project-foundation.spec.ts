@@ -68,7 +68,7 @@ test.describe('M01-S Project Foundation E2E', () => {
     await expect(page).toHaveURL(/\/__v2\/projects\/[^/]+\/studio/);
     await expect(page.getByTestId('studio-page')).toBeVisible({ timeout: 15_000 });
     await expect(page.getByTestId('studio-canvas')).toBeVisible();
-    await expect(page.getByTestId('studio-persistence-flag')).toBeVisible();
+    await expect(page.getByTestId('studio-save-status')).toBeVisible();
 
     // Back to overview and archive
     await page.goto('/__v2/projects');

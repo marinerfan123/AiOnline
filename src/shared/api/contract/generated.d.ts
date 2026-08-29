@@ -197,10 +197,163 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v2/projects/{projectId}/studio/canvas": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Load primary Studio canvas graph */
+        get: operations["getStudioCanvas"];
+        put?: never;
+        /** Create idempotent primary Studio canvas */
+        post: operations["createStudioCanvas"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        /** Apply transactional incremental canvas patch with optimistic concurrency */
+        patch: operations["patchStudioCanvas"];
+        trace?: never;
+    };
+    "/api/v2/projects/{projectId}/studio/canvas/versions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Studio canvas immutable snapshots */
+        get: operations["listStudioCanvasVersions"];
+        put?: never;
+        /** Create immutable Studio canvas snapshot */
+        post: operations["createStudioCanvasVersion"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v2/projects/{projectId}/studio/canvas/versions/{versionId}/restore": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Restore snapshot into current canvas with monotonic revision */
+        post: operations["restoreStudioCanvasVersion"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        StudioCanvasViewport: {
+            x: number;
+            y: number;
+            zoom: number;
+        };
+        StudioCanvasNode: {
+            nodeId: string;
+            nodeType: string;
+            nodeSchemaVersion: number;
+            position: {
+                x: number;
+                y: number;
+            };
+            size?: {
+                width?: number | null;
+                height?: number | null;
+            };
+            zIndex?: number | null;
+            data: {
+                [key: string]: unknown;
+            };
+        };
+        StudioCanvasEdge: {
+            edgeId: string;
+            sourceNodeId: string;
+            sourceHandle?: string | null;
+            targetNodeId: string;
+            targetHandle?: string | null;
+            edgeType?: string | null;
+            data: {
+                [key: string]: unknown;
+            };
+        };
+        StudioCanvas: {
+            id: string;
+            projectId: string;
+            workspaceId: string;
+            name: string;
+            revision: number;
+            schemaVersion: number;
+            archivedAt?: string | null;
+            createdAt: string | null;
+            updatedAt: string | null;
+            restoredFromVersionId?: string | null;
+        };
+        StudioCanvasResponse: {
+            canvas: components["schemas"]["StudioCanvas"] | null;
+            nodes: components["schemas"]["StudioCanvasNode"][];
+            edges: components["schemas"]["StudioCanvasEdge"][];
+            viewport: components["schemas"]["StudioCanvasViewport"] | null;
+            permissions?: components["schemas"]["ProjectPermissions"];
+        };
+        CanvasPatchRequest: {
+            baseRevision: number;
+            clientMutationId: string;
+            upsertNodes?: components["schemas"]["StudioCanvasNode"][];
+            deleteNodeIds?: string[];
+            upsertEdges?: components["schemas"]["StudioCanvasEdge"][];
+            deleteEdgeIds?: string[];
+            viewport?: components["schemas"]["StudioCanvasViewport"];
+        };
+        CanvasConflictResponse: {
+            /** @constant */
+            error: "CONFLICT";
+            serverRevision: number;
+            canvasId: string;
+        };
+        CanvasVersionSummary: {
+            id: string;
+            canvasId: string;
+            revision: number;
+            versionNumber: number;
+            name?: string | null;
+            description?: string | null;
+            createdBy: string;
+            createdAt: string | null;
+            restoredFromVersionId?: string | null;
+            nodeCount: number;
+            edgeCount: number;
+        };
+        StudioCanvasVersionResponse: {
+            version: components["schemas"]["CanvasVersionSummary"];
+        };
+        StudioCanvasVersionListResponse: {
+            versions: components["schemas"]["CanvasVersionSummary"][];
+            pagination: {
+                limit: number;
+                offset: number;
+                total: number;
+                hasMore: boolean;
+            };
+        };
+        CreateCanvasVersionRequest: {
+            name?: string;
+            description?: string;
+        };
+        RestoreCanvasVersionRequest: {
+            baseRevision: number;
+        };
         /** @description Liveness + CPU shedding signal. Real shape: /api/healthz */
         Health: {
             /** @example ok */
@@ -988,6 +1141,181 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+        };
+    };
+    getStudioCanvas: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                projectId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Studio canvas */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StudioCanvasResponse"];
+                };
+            };
+        };
+    };
+    createStudioCanvas: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                projectId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Already exists */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StudioCanvasResponse"];
+                };
+            };
+            /** @description Created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StudioCanvasResponse"];
+                };
+            };
+        };
+    };
+    patchStudioCanvas: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                projectId: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CanvasPatchRequest"];
+            };
+        };
+        responses: {
+            /** @description Patched */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StudioCanvasResponse"];
+                };
+            };
+            /** @description Conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CanvasConflictResponse"];
+                };
+            };
+        };
+    };
+    listStudioCanvasVersions: {
+        parameters: {
+            query?: {
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path: {
+                projectId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Versions */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StudioCanvasVersionListResponse"];
+                };
+            };
+        };
+    };
+    createStudioCanvasVersion: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                projectId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["CreateCanvasVersionRequest"];
+            };
+        };
+        responses: {
+            /** @description Version */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StudioCanvasVersionResponse"];
+                };
+            };
+        };
+    };
+    restoreStudioCanvasVersion: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                projectId: string;
+                versionId: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RestoreCanvasVersionRequest"];
+            };
+        };
+        responses: {
+            /** @description Restored */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StudioCanvasResponse"];
+                };
+            };
+            /** @description Conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CanvasConflictResponse"];
+                };
             };
         };
     };

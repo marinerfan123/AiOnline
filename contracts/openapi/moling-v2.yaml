@@ -334,6 +334,73 @@ paths:
           description: Forbidden
         '404':
           description: Asset not found
+
+  /api/v2/projects/{projectId}/studio/canvas:
+    get:
+      tags: [studio]
+      operationId: getStudioCanvas
+      summary: Load primary Studio canvas graph
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - { name: projectId, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: Studio canvas, content: { application/json: { schema: { $ref: '#/components/schemas/StudioCanvasResponse' } } } }
+    post:
+      tags: [studio]
+      operationId: createStudioCanvas
+      summary: Create idempotent primary Studio canvas
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - { name: projectId, in: path, required: true, schema: { type: string } }
+      responses:
+        '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/StudioCanvasResponse' } } } }
+        '200': { description: Already exists, content: { application/json: { schema: { $ref: '#/components/schemas/StudioCanvasResponse' } } } }
+    patch:
+      tags: [studio]
+      operationId: patchStudioCanvas
+      summary: Apply transactional incremental canvas patch with optimistic concurrency
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - { name: projectId, in: path, required: true, schema: { type: string } }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/CanvasPatchRequest' } } } }
+      responses:
+        '200': { description: Patched, content: { application/json: { schema: { $ref: '#/components/schemas/StudioCanvasResponse' } } } }
+        '409': { description: Conflict, content: { application/json: { schema: { $ref: '#/components/schemas/CanvasConflictResponse' } } } }
+  /api/v2/projects/{projectId}/studio/canvas/versions:
+    get:
+      tags: [studio]
+      operationId: listStudioCanvasVersions
+      summary: List Studio canvas immutable snapshots
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - { name: projectId, in: path, required: true, schema: { type: string } }
+        - { name: limit, in: query, required: false, schema: { type: integer, default: 20, maximum: 100 } }
+        - { name: offset, in: query, required: false, schema: { type: integer, default: 0 } }
+      responses:
+        '200': { description: Versions, content: { application/json: { schema: { $ref: '#/components/schemas/StudioCanvasVersionListResponse' } } } }
+    post:
+      tags: [studio]
+      operationId: createStudioCanvasVersion
+      summary: Create immutable Studio canvas snapshot
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - { name: projectId, in: path, required: true, schema: { type: string } }
+      requestBody: { required: false, content: { application/json: { schema: { $ref: '#/components/schemas/CreateCanvasVersionRequest' } } } }
+      responses:
+        '201': { description: Version, content: { application/json: { schema: { $ref: '#/components/schemas/StudioCanvasVersionResponse' } } } }
+  /api/v2/projects/{projectId}/studio/canvas/versions/{versionId}/restore:
+    post:
+      tags: [studio]
+      operationId: restoreStudioCanvasVersion
+      summary: Restore snapshot into current canvas with monotonic revision
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - { name: projectId, in: path, required: true, schema: { type: string } }
+        - { name: versionId, in: path, required: true, schema: { type: string } }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/RestoreCanvasVersionRequest' } } } }
+      responses:
+        '200': { description: Restored, content: { application/json: { schema: { $ref: '#/components/schemas/StudioCanvasResponse' } } } }
+        '409': { description: Conflict, content: { application/json: { schema: { $ref: '#/components/schemas/CanvasConflictResponse' } } } }
 components:
   securitySchemes:
     cookieAuth:
@@ -344,6 +411,103 @@ components:
       type: http
       scheme: bearer
   schemas:
+
+    StudioCanvasViewport:
+      type: object
+      required: [x, y, zoom]
+      properties: { x: { type: number }, y: { type: number }, zoom: { type: number } }
+    StudioCanvasNode:
+      type: object
+      required: [nodeId, nodeType, nodeSchemaVersion, position, data]
+      properties:
+        nodeId: { type: string }
+        nodeType: { type: string }
+        nodeSchemaVersion: { type: integer, minimum: 1 }
+        position: { type: object, required: [x, y], properties: { x: { type: number }, y: { type: number } } }
+        size: { type: object, properties: { width: { type: [number, 'null'] }, height: { type: [number, 'null'] } } }
+        zIndex: { type: [integer, 'null'] }
+        data: { type: object, additionalProperties: true }
+    StudioCanvasEdge:
+      type: object
+      required: [edgeId, sourceNodeId, targetNodeId, data]
+      properties:
+        edgeId: { type: string }
+        sourceNodeId: { type: string }
+        sourceHandle: { type: [string, 'null'] }
+        targetNodeId: { type: string }
+        targetHandle: { type: [string, 'null'] }
+        edgeType: { type: [string, 'null'] }
+        data: { type: object, additionalProperties: true }
+    StudioCanvas:
+      type: object
+      required: [id, projectId, workspaceId, name, revision, schemaVersion, createdAt, updatedAt]
+      properties:
+        id: { type: string }
+        projectId: { type: string }
+        workspaceId: { type: string }
+        name: { type: string }
+        revision: { type: integer, minimum: 1 }
+        schemaVersion: { type: integer, minimum: 1 }
+        archivedAt: { type: [string, 'null'] }
+        createdAt: { type: [string, 'null'] }
+        updatedAt: { type: [string, 'null'] }
+        restoredFromVersionId: { type: [string, 'null'] }
+    StudioCanvasResponse:
+      type: object
+      required: [canvas, nodes, edges, viewport]
+      properties:
+        canvas: { anyOf: [{ $ref: '#/components/schemas/StudioCanvas' }, { type: 'null' }] }
+        nodes: { type: array, items: { $ref: '#/components/schemas/StudioCanvasNode' } }
+        edges: { type: array, items: { $ref: '#/components/schemas/StudioCanvasEdge' } }
+        viewport: { anyOf: [{ $ref: '#/components/schemas/StudioCanvasViewport' }, { type: 'null' }] }
+        permissions: { $ref: '#/components/schemas/ProjectPermissions' }
+    CanvasPatchRequest:
+      type: object
+      required: [baseRevision, clientMutationId]
+      properties:
+        baseRevision: { type: integer, minimum: 1 }
+        clientMutationId: { type: string }
+        upsertNodes: { type: array, items: { $ref: '#/components/schemas/StudioCanvasNode' } }
+        deleteNodeIds: { type: array, items: { type: string } }
+        upsertEdges: { type: array, items: { $ref: '#/components/schemas/StudioCanvasEdge' } }
+        deleteEdgeIds: { type: array, items: { type: string } }
+        viewport: { $ref: '#/components/schemas/StudioCanvasViewport' }
+    CanvasConflictResponse:
+      type: object
+      required: [error, serverRevision, canvasId]
+      properties: { error: { const: CONFLICT }, serverRevision: { type: integer }, canvasId: { type: string } }
+    CanvasVersionSummary:
+      type: object
+      required: [id, canvasId, revision, versionNumber, createdBy, createdAt, nodeCount, edgeCount]
+      properties:
+        id: { type: string }
+        canvasId: { type: string }
+        revision: { type: integer }
+        versionNumber: { type: integer }
+        name: { type: [string, 'null'] }
+        description: { type: [string, 'null'] }
+        createdBy: { type: string }
+        createdAt: { type: [string, 'null'] }
+        restoredFromVersionId: { type: [string, 'null'] }
+        nodeCount: { type: integer }
+        edgeCount: { type: integer }
+    StudioCanvasVersionResponse:
+      type: object
+      required: [version]
+      properties: { version: { $ref: '#/components/schemas/CanvasVersionSummary' } }
+    StudioCanvasVersionListResponse:
+      type: object
+      required: [versions, pagination]
+      properties:
+        versions: { type: array, items: { $ref: '#/components/schemas/CanvasVersionSummary' } }
+        pagination: { type: object, required: [limit, offset, total, hasMore], properties: { limit: { type: integer }, offset: { type: integer }, total: { type: integer }, hasMore: { type: boolean } } }
+    CreateCanvasVersionRequest:
+      type: object
+      properties: { name: { type: string, maxLength: 120 }, description: { type: string, maxLength: 1000 } }
+    RestoreCanvasVersionRequest:
+      type: object
+      required: [baseRevision]
+      properties: { baseRevision: { type: integer, minimum: 1 } }
     Health:
       type: object
       additionalProperties: true

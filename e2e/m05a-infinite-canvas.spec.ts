@@ -70,8 +70,7 @@ test.describe('M05-A Infinite Canvas E2E', () => {
     await expect(page.getByTestId('studio-node-library')).toBeVisible();
     await expect(page.getByTestId('studio-inspector')).toBeVisible();
     await expect(page.getByTestId('studio-bottom-dock')).toBeVisible();
-    // honest persistence phase flag (M05-A session state, M05-C persistence)
-    await expect(page.getByTestId('studio-persistence-flag')).toBeVisible();
+    await expect(page.getByTestId('studio-save-status')).toBeVisible();
 
     // ── empty state ──
     await expect(page.getByTestId('studio-empty-state')).toBeVisible();
@@ -203,25 +202,28 @@ test.describe('M05-A Infinite Canvas E2E', () => {
     await page.getByTestId('canvas-redo').click();
     await expect(page.getByTestId('studio-node-card')).toHaveCount(0);
 
-    // ── reload honesty: M05-A has NO persistence; canvas must be empty after reload ──
+    // ── M05-C persistence: created prompt survives reload after server ACK ──
     await page.getByTestId('node-library-item-prompt').click();
     expect(await page.getByTestId('studio-node-card').count()).toBe(1);
+    await expect(page.getByTestId('studio-save-status')).toContainText('Saved', { timeout: 10_000 });
     await page.reload();
     await expect(page.getByTestId('studio-page')).toBeVisible({ timeout: 15_000 });
-    await expect(page.getByTestId('studio-empty-state')).toBeVisible();
-    // ...and the honest flag is present, so the UI never claims "saved"
-    await expect(page.getByTestId('studio-persistence-flag')).toBeVisible();
+    await expect(page.getByTestId('studio-node-card').first()).toBeVisible({ timeout: 10_000 });
+    await expect(page.getByTestId('studio-save-status')).toBeVisible();
   });
 
   test('bottom dock tabs are reserved placeholders, not fake features', async ({ page }) => {
     projectId = await createProject(page);
     await page.goto(`/__v2/projects/${projectId}/studio`);
     await expect(page.getByTestId('studio-bottom-dock')).toBeVisible({ timeout: 15_000 });
-    for (const t of ['shots', 'timeline', 'runs', 'versions']) {
+    for (const t of ['shots', 'timeline', 'runs']) {
       await page.getByTestId(`dock-tab-${t}`).click();
       await expect(page.getByTestId('studio-bottom-dock')).toContainText('M05');
       await page.getByTestId('dock-close').click();
     }
+    await page.getByTestId('dock-tab-versions').click();
+    await expect(page.getByTestId('studio-versions-panel')).toBeVisible();
+    await page.getByTestId('dock-close').click();
   });
 
   test('studio layout keeps canvas primary across commercial desktop viewports', async ({ page }) => {
