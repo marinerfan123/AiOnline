@@ -272,3 +272,54 @@ test('M05-C 1000-node persistence benchmark and 100-node batch patch', { concurr
     await dropDb(dbName);
   }
 });
+
+
+test('M05-C commercial hardening: concurrent version numbering + set-based bulk restore', { concurrency: 1 }, async () => {
+  const { dbName, pg } = await bootstrapDb();
+  let server;
+  try {
+    process.env.TEST_PG_DATABASE = dbName;
+    server = await spawnTestServer();
+    const user = await register(server.baseUrl, { email: `m05c-hard-${Date.now()}@test.local` });
+    const { project } = await newProject(server.baseUrl, user, 'Hardening');
+    const c = await createCanvas(server.baseUrl, user.cookies, project.id);
+    assert.equal(c.status, 201);
+    const p = await patchCanvas(server.baseUrl, user.cookies, project.id, {
+      baseRevision: 1, clientMutationId: crypto.randomUUID(),
+      upsertNodes: Array.from({ length: 100 }, (_, i) => promptNode(`h-${i}`, i, i, `node ${i}`)),
+    });
+    assert.equal(p.status, 200, JSON.stringify(p.body));
+
+    // (B) 12 concurrent Create Version: all succeed with distinct sequential numbers (row-locked, no silent overwrite).
+    const results = await Promise.all(Array.from({ length: 12 }, (_, i) => authRequest(server.baseUrl, { method: 'POST', path: `/api/v2/projects/${project.id}/studio/canvas/versions`, body: { name: `conc-${i}` } }, user.cookies)));
+    assert.ok(results.every((r) => r.status === 201), JSON.stringify(results.map((r) => ({ status: r.status, body: r.body }))));
+    const nums = results.map((r) => r.body.version.versionNumber).sort((a, b) => a - b);
+    assert.deepEqual(nums, Array.from({ length: 12 }, (_, i) => i + 1));
+    const list = await authRequest(server.baseUrl, { method: 'GET', path: `/api/v2/projects/${project.id}/studio/canvas/versions?limit=100` }, user.cookies);
+    assert.equal(list.body.versions.length, 12);
+
+    // (A) restore is set-based: direct module proof that 100 nodes hydrate in ONE query, not 100.
+    const { bulkInsertNodes } = require('../../modules/project-foundation/studioCanvasPersistence.cjs');
+    const snapshot = { nodes: Array.from({ length: 100 }, (_, i) => promptNode(`s-${i}`, i, i, `snap ${i}`)), edges: [] };
+    let queryCount = 0;
+    const spyClient = { query: async (sql, params) => { queryCount += 1; assert.match(sql, /jsonb_to_recordset/); return { rowCount: 100 }; } };
+    await bulkInsertNodes(spyClient, 'canvas-x', snapshot.nodes);
+    assert.equal(queryCount, 1, 'bulk restore must issue a single set-based query for 100 nodes');
+
+    // End-to-end: version -> mutate -> restore -> 100 nodes back with correct content.
+    const v = await authRequest(server.baseUrl, { method: 'POST', path: `/api/v2/projects/${project.id}/studio/canvas/versions`, body: { name: 'hard checkpoint' } }, user.cookies);
+    assert.equal(v.status, 201);
+    const mutate = await patchCanvas(server.baseUrl, user.cookies, project.id, { baseRevision: 2, clientMutationId: crypto.randomUUID(), deleteNodeIds: ['h-0', 'h-1'] });
+    assert.equal(mutate.status, 200);
+    const restore = await authRequest(server.baseUrl, { method: 'POST', path: `/api/v2/projects/${project.id}/studio/canvas/versions/${v.body.version.id}/restore`, body: { baseRevision: mutate.body.canvas.revision } }, user.cookies);
+    assert.equal(restore.status, 200, JSON.stringify(restore.body));
+    assert.equal(restore.body.nodes.length, 100);
+    assert.equal(restore.body.nodes.some((n) => n.nodeId === 'h-0'), true);
+    assert.equal(restore.body.nodes[99].data.prompt, 'node 99');
+  } finally {
+    if (server) await server.stop();
+    delete process.env.TEST_PG_DATABASE;
+    await pg.end();
+    await dropDb(dbName);
+  }
+});
