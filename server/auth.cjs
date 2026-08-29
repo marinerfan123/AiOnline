@@ -119,4 +119,8 @@ module.exports = {
   signSession, verifySession,
   parseCookies, setCookie, clearCookie,
   getUserFromCookie,
+  // SECURITY (Q5-B): 暴露当前实际生效的签名密钥，供启动自检 fail-closed。
+  // 自检必须校验「真实运行时值」而非只看 process.env —— env 为空时本模块
+  // 会回退 dev 字面量，仅查 env 会漏掉该路径。
+  getSecret: () => SECRET,
 };

@@ -15,15 +15,14 @@ export function initApi(baseUrl: string, token: string) {
 }
 
 function headers(): Record<string, string> {
-  return {
-    'Content-Type': 'application/json',
-    Authorization: `Bearer ${API_TOKEN}`,
-  };
+  const h: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (API_TOKEN) h.Authorization = `Bearer ${API_TOKEN}`;
+  return h;
 }
 
 async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
-  // 确保 API 已连接（首次调用时自动发现后端 + 获取 token）
-  if (!API_TOKEN) await ensureApi();
+  // 确保 API 已连接（首次调用时自动发现后端）
+  if (!API_BASE) await ensureApi();
   // credentials:'include' → 浏览器自动携带会话 cookie（后端 set-cookie 的 sid），用于 /api/generate 等需登录接口归属用户
   const res = await fetch(`${API_BASE}${path}`, { ...options, credentials: 'include', headers: { ...headers(), ...options?.headers } });
   if (!res.ok) {
@@ -35,11 +34,15 @@ async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
 
 /**
  * 确保 API 已连接（模块级缓存，只发现一次）。
- * 根据当前访问地址自动推导后端：http://<hostname>:3001 并获取 token。
+ * 根据当前访问地址自动推导后端：http://<hostname>:3001。
+ *
+ * SECURITY (Q5-B P0): 探测改用 /api/healthz（liveness，无凭据）。
+ * 原先的 /api/token 会把共享 system API_TOKEN 明文发给任何匿名访问者，已移除。
+ * 浏览器调用一律走会话 cookie（credentials:'include'），不再依赖 Bearer token。
  * 后端不可用时返回 false，调用方降级到内置默认数据（仅内存，不落盘）。
  */
 export function ensureApi(): Promise<boolean> {
-  if (API_BASE && API_TOKEN) return Promise.resolve(true);
+  if (API_BASE) return Promise.resolve(true);
   if (!discoverPromise) {
     discoverPromise = (async () => {
       try {
@@ -49,10 +52,9 @@ export function ensureApi(): Promise<boolean> {
           const { protocol, host } = window.location;
           apiBase = `${protocol}//${host}`;
         }
-        const res = await fetch(`${apiBase}/api/token`, { headers: { 'Content-Type': 'application/json' }, credentials: 'include' });
+        const res = await fetch(`${apiBase}/api/healthz`, { headers: { 'Content-Type': 'application/json' }, credentials: 'include' });
         if (res.ok) {
-          const { token } = await res.json();
-          initApi(apiBase, token);
+          initApi(apiBase, '');
           console.log(`[API] 已连接 ${apiBase}`);
           return true;
         }

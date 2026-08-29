@@ -15,6 +15,49 @@
 
 const LEVELS = { INFO: 0, WARN: 1, ERROR: 2 };
 
+// ─── 凭据脱敏（Q5-B FIX5）──────────────────────────────────────────────
+// 最小共享边界：所有经 logbus.emit 的日志（内存环形缓冲 / SSE 广播 /
+// persistError 落库 system_error_logs）在此统一脱敏。只替换「值」，保留
+// 字段名与错误码等诊断信息 —— 不吞错误，只去凭据。
+// 覆盖：Bearer 令牌、Authorization 头、key/secret/token/password 等
+// 字段的值、sk-/LTAI(阿里云)/AKID(腾讯云) 前缀凭据、OSS/COS 签名 URL 参数。
+const CRED_FIELD_RE = /(^|[^a-z0-9_])(api[_-]?key|apikey|access[_-]?key[_-]?secret|access[_-]?key[_-]?id|secret[_-]?key|secret[_-]?id|client[_-]?secret|auth[_-]?token|access[_-]?token|refresh[_-]?token|password|passwd|signature)(["']?\s*[:=]\s*)(["']?)([^"'\s,;)}\]]{4,})/gi;
+const BEARER_RE = /\b(Bearer|Basic)\s+[A-Za-z0-9\-_./+=]{6,}/gi;
+const SK_PREFIX_RE = /\b(?:sk-|akm-)[A-Za-z0-9\-_]{8,}\b|\b(?:LTAI|AKID)[A-Z0-9]{10,}\b/g;
+const OSS_SIG_PARAM_RE = /([?&](?:Signature|X-Amz-Signature|q-signature|q-ak)=)[^&\s"']+/gi;
+
+function redactString(s) {
+  if (typeof s !== 'string' || !s) return s;
+  return s
+    .replace(BEARER_RE, (m, scheme) => `${scheme} [REDACTED]`)
+    .replace(CRED_FIELD_RE, (m, pre, field, sep, q) => `${pre}${field}${sep}${q}[REDACTED]`)
+    .replace(SK_PREFIX_RE, '[REDACTED]')
+    .replace(OSS_SIG_PARAM_RE, '$1[REDACTED]');
+}
+
+// 深拷贝 meta 并脱敏：凭据字段名整体置 REDACTED；其余字符串值走 redactString。
+function redactMeta(meta) {
+  if (meta === null || meta === undefined) return meta;
+  if (typeof meta === 'string') return redactString(meta);
+  if (Array.isArray(meta)) return meta.map(redactMeta);
+  if (typeof meta === 'object') {
+    const out = {};
+    for (const [k, v] of Object.entries(meta)) {
+      if (typeof v === 'string') {
+        out[k] = /key|secret|token|password|passwd|authorization|credential|signature/i.test(k)
+          ? (v ? '[REDACTED]' : v)
+          : redactString(v);
+      } else if (v && typeof v === 'object') {
+        out[k] = redactMeta(v);
+      } else {
+        out[k] = v;
+      }
+    }
+    return out;
+  }
+  return meta;
+}
+
 function stringify(arg) {
   if (typeof arg === 'string') return arg;
   if (arg instanceof Error) return arg.stack || arg.message;
@@ -35,8 +78,10 @@ function createLogBus({ maxBuffer = 1000, skipPath = (u) => u.startsWith('/api/a
       ts: Date.now(),
       level,
       source: source || 'app',
-      message: typeof message === 'string' ? message : stringify(message),
-      meta: meta || null,
+      // Q5-B FIX5: 统一脱敏边界 —— message/meta 在此去凭据，之后才进
+      // 环形缓冲 / SSE 广播 / persistError（system_error_logs），一处覆盖全链路。
+      message: redactString(typeof message === 'string' ? message : stringify(message)),
+      meta: redactMeta(meta || null),
     };
     lines.push(line);
     if (lines.length > maxBuffer) lines.shift();
@@ -178,4 +223,4 @@ function createLogBus({ maxBuffer = 1000, skipPath = (u) => u.startsWith('/api/a
   };
 }
 
-module.exports = { createLogBus };
+module.exports = { createLogBus, redactString, redactMeta };
