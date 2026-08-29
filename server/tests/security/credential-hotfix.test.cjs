@@ -212,4 +212,88 @@ test('Q5-B credential hotfix regression', { concurrency: 1 }, async (t) => {
     assert.equal(typeof s, 'string');
     assert.ok(s.length > 0);
   });
+
+  // ─────────────────────────────────────────────────────────────────
+  // FIX 6 — providers list is admin-gated and never returns a raw key
+  //   (Q5-C port: GET /api/providers + PATCH /api/providers/:id read-back)
+  // ─────────────────────────────────────────────────────────────────
+  test('F6 GET /api/providers is admin-gated and masks keys', async (t) => {
+    const { createProvider: seedProvider } = require('../helpers/fixtures.cjs');
+    const provider = makeProvider({ apiKey: 'supers…ey-1' });
+    await seedProvider(pg, provider);
+
+    // anonymous — must be blocked, and even if a body is returned it must
+    // not carry the raw api key or a token.
+    const anon = await request(server.baseUrl, { method: 'GET', path: '/api/providers' });
+    assert.ok(anon.status === 403 || anon.status === 401,
+      `anon GET /api/providers must be blocked (got ${anon.status})`);
+    assert.ok(!findString(anon.body, 'supers…ey-1'),
+      `anon /api/providers must not leak the raw provider key`);
+
+    // normal user — also blocked (not admin).
+    const userDef = makeUser();
+    await createUser(pg, userDef);
+    const login = await request(server.baseUrl, {
+      method: 'POST', path: '/api/auth/login',
+      body: { email: userDef.email, password: userDef.password },
+    });
+    const userCookies = buildCookieHeader(getCookies(login.cookies));
+    const asUser = await request(server.baseUrl, {
+      method: 'GET', path: '/api/providers', headers: { Cookie: userCookies },
+    });
+    assert.ok(asUser.status === 403,
+      `normal-user GET /api/providers must be 403 (got ${asUser.status})`);
+    assert.ok(!findString(asUser.body, 'supers…ey-1'),
+      `user /api/providers must not leak the raw provider key`);
+
+    // admin — allowed, but key still masked.
+    const adminDef = makeAdmin();
+    await createUser(pg, adminDef);
+    const alogin = await request(server.baseUrl, {
+      method: 'POST', path: '/api/auth/login',
+      body: { email: adminDef.email, password: adminDef.password },
+    });
+    const adminCookies = buildCookieHeader(getCookies(alogin.cookies));
+    const asAdmin = await request(server.baseUrl, {
+      method: 'GET', path: '/api/providers', headers: { Cookie: adminCookies },
+    });
+    assert.equal(asAdmin.status, 200, `admin GET /api/providers should be 200 (got ${asAdmin.status})`);
+    assert.ok(!findString(asAdmin.body, 'supers…ey-1'),
+      `admin /api/providers must not return the raw key: ${JSON.stringify(asAdmin.body).slice(0, 200)}`);
+  });
+
+  test('F6 PATCH /api/providers/:id read-back masks apiKey', async (t) => {
+    const { createProvider: seedProvider } = require('../helpers/fixtures.cjs');
+    const provider = makeProvider({ apiKey: 'patchm…ey-2' });
+    await seedProvider(pg, provider);
+
+    const adminDef = makeAdmin();
+    await createUser(pg, adminDef);
+    const alogin = await request(server.baseUrl, {
+      method: 'POST', path: '/api/auth/login',
+      body: { email: adminDef.email, password: adminDef.password },
+    });
+    const adminCookies = buildCookieHeader(getCookies(alogin.cookies));
+
+    // read current revision
+    const list = await request(server.baseUrl, {
+      method: 'GET', path: '/api/providers', headers: { Cookie: adminCookies },
+    });
+    const row = (list.body || []).find((p) => p.id === provider.id);
+    assert.ok(row, 'provider must be present for admin');
+    assert.equal(row.revision, 1, 'fresh provider revision should be 1');
+
+    // PATCH a benign field (name) — must not echo the raw key back
+    const r = await request(server.baseUrl, {
+      method: 'PATCH', path: `/api/providers/${provider.id}`,
+      headers: { Cookie: adminCookies, 'Content-Type': 'application/json' },
+      body: { name: 'Patched Name', revision: row.revision },
+    });
+    assert.equal(r.status, 200, `admin PATCH provider should be 200 (got ${r.status}): ${JSON.stringify(r.body).slice(0, 200)}`);
+    assert.ok(!findString(r.body, 'patchm…ey-2'),
+      `PATCH read-back must not return the raw api key: ${JSON.stringify(r.body).slice(0, 200)}`);
+    const pk = r.body?.provider?.apiKey;
+    assert.ok(typeof pk === 'string' && (pk === '' || pk.includes('***')),
+      `PATCH read-back apiKey must be masked/empty, got: ${JSON.stringify(pk)}`);
+  });
 });

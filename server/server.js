@@ -3053,6 +3053,9 @@ async function handleAPI(req, res) {
   }
 
   if (url === '/api/providers' && method === 'GET') {
+    // SECURITY (Q5-C): providers 列表暴露 base_url/限流等供给侧信息 → 仅限 admin，
+    // 与 POST/PATCH/DELETE /api/providers 及 /api/providers/:id/keys 闸门保持一致。
+    if (!admin.requireAdmin(req)) return sendJSON(res, 403, { error: '需要管理员权限' });
     const maskKey = (p) => ({ ...p, apiKey: p.apiKey ? '***' + p.apiKey.slice(-4) : '' });
     if (pgPool) {
       const r = await pgPool.query('SELECT * FROM providers ORDER BY created_at');
@@ -3171,7 +3174,10 @@ async function handleAPI(req, res) {
     if (r.status === 'conflict') return sendJSON(res, 409, { error: '数据已被其他管理员修改（revision 不匹配），请刷新后重试', currentRevision: r.currentRevision });
     const row = await pgPool.query('SELECT * FROM providers WHERE id=$1', [id]);
     if (!row.rows[0]) return sendJSON(res, 404, { error: '服务商不存在' });
-    return sendJSON(res, 200, { ok: true, provider: fromSnake(row.rows[0]), revision: r.revision });
+    // SECURITY (Q5-C): PATCH 回显与 GET 列表同口径 —— apiKey 只回掩码，绝不回明文。
+    const patched = fromSnake(row.rows[0]);
+    if (patched.apiKey) patched.apiKey = '***' + String(patched.apiKey).slice(-4);
+    return sendJSON(res, 200, { ok: true, provider: patched, revision: r.revision });
   }
   // 账号冷热状态快照（内存态，供管理面板展示 + 手动强切）
   if (url === '/api/providers/states' && method === 'GET') {
