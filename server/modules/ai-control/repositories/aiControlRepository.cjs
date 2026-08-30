@@ -8,12 +8,16 @@
  *
  * 演进现有表：providers / models / provider_model_bindings / api_keys +
  * 0010 新增列与 ai_routing_decisions / ai_provider_health。
+ * M02-C 新增：ai_model_revisions / ai_model_capability_grants / ai_routing_policy。
  */
 
 const keypool = require('../domain/keypool.cjs');
 const { toBinding, validateBinding } = require('../domain/binding.cjs');
 const { deriveHealth } = require('../domain/health.cjs');
 const { validateCapability } = require('../domain/capability.cjs');
+const { validateRevision, computeContentHash, toRevision } = require('../domain/revision.cjs');
+const { validateGrant, toGrant } = require('../domain/grant.cjs');
+const { validatePolicy, toPolicy } = require('../domain/routing-policy.cjs');
 
 function logicalModel(row) {
   if (!row) return null;
@@ -37,7 +41,6 @@ async function listProviders(pg) {
     const { api_key, ...rest } = p; // strip secret before projection
     return {
       ...rest,
-      // providers.api_key 是 legacy 回退权威 —— 只暴露 masked，完整 secret 不出 repository
       credential: {
         has_legacy_key: !!(api_key && String(api_key).length >= 6),
         masked_legacy_key: keypool.maskKey(api_key),
@@ -177,9 +180,191 @@ async function getProviderHealth(pg, providerId) {
   return (r.rows && r.rows[0]) || null;
 }
 
+// ── M02-C: Model Revisions ───────────────────────────────────────────────────
+
+async function listModelRevisions(pg, modelId) {
+  const r = await pg.query(
+    'SELECT * FROM ai_model_revisions WHERE model_id=$1 ORDER BY revision DESC',
+    [modelId],
+  );
+  return (r.rows || []).map(toRevision);
+}
+
+async function getActiveRevision(pg, modelId) {
+  const r = await pg.query(
+    "SELECT * FROM ai_model_revisions WHERE model_id=$1 AND status='active' ORDER BY revision DESC LIMIT 1",
+    [modelId],
+  );
+  return toRevision(r.rows && r.rows[0]);
+}
+
+async function publishRevision(pg, modelId, manifest, publishedBy) {
+  const check = validateRevision({ model_id: modelId, manifest, published_by: publishedBy });
+  if (!check.ok) throw new Error('revision 校验失败: ' + check.errors.join('; '));
+
+  const contentHash = computeContentHash(manifest);
+
+  const maxR = await pg.query(
+    'SELECT COALESCE(MAX(revision), 0) AS max_rev FROM ai_model_revisions WHERE model_id=$1',
+    [modelId],
+  );
+  const nextRev = (maxR.rows && maxR.rows[0] && Number(maxR.rows[0].max_rev) || 0) + 1;
+
+  // Retire existing active revision
+  await pg.query(
+    "UPDATE ai_model_revisions SET status='retired', retired_at=NOW() WHERE model_id=$1 AND status='active'",
+    [modelId],
+  );
+
+  const prevActive = await pg.query(
+    "SELECT id FROM ai_model_revisions WHERE model_id=$1 AND status='active' LIMIT 1",
+    [modelId],
+  );
+
+  const r = await pg.query(
+    `INSERT INTO ai_model_revisions (model_id, revision, content_hash, manifest, status, supersedes, published_by, published_at)
+     VALUES ($1, $2, $3, $4, 'active', $5, $6, NOW())
+     RETURNING *`,
+    [modelId, nextRev, contentHash, JSON.stringify(manifest),
+     (prevActive.rows && prevActive.rows[0] && prevActive.rows[0].id) || null,
+     publishedBy || null],
+  );
+  return toRevision(r.rows && r.rows[0]);
+}
+
+async function retireRevision(pg, revisionId) {
+  const r = await pg.query(
+    `UPDATE ai_model_revisions SET status='retired', retired_at=NOW()
+     WHERE id=$1 AND status='active' RETURNING *`,
+    [revisionId],
+  );
+  return toRevision(r.rows && r.rows[0]);
+}
+
+// ── M02-C: Capability Grants ─────────────────────────────────────────────────
+
+async function listGrantsForModel(pg, modelId) {
+  const r = await pg.query(
+    'SELECT * FROM ai_model_capability_grants WHERE model_id=$1 ORDER BY created_at',
+    [modelId],
+  );
+  return (r.rows || []).map(toGrant);
+}
+
+async function createGrant(pg, grantInput, actor) {
+  const check = validateGrant(grantInput);
+  if (!check.ok) throw new Error('grant 校验失败: ' + check.errors.join('; '));
+
+  const { workspace_id, user_id, model_id, capability, granted_by } = grantInput;
+  const r = await pg.query(
+    `INSERT INTO ai_model_capability_grants (workspace_id, user_id, model_id, capability, granted_by, expires_at, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
+     RETURNING *`,
+    [workspace_id || null, user_id || null, model_id, capability || null, granted_by || actor || null, null],
+  );
+  return toGrant(r.rows && r.rows[0]);
+}
+
+async function revokeGrant(pg, grantId) {
+  const r = await pg.query(
+    `UPDATE ai_model_capability_grants SET status='revoked', updated_at=NOW()
+     WHERE id=$1 AND status='granted' RETURNING *`,
+    [grantId],
+  );
+  return toGrant(r.rows && r.rows[0]);
+}
+
+async function deleteGrant(pg, grantId) {
+  const r = await pg.query('DELETE FROM ai_model_capability_grants WHERE id=$1 RETURNING id', [grantId]);
+  return r.rows[0] ? { id: grantId } : null;
+}
+
+// ── M02-C: Routing Policies ──────────────────────────────────────────────────
+
+async function listRoutingPolicies(pg, modelId) {
+  const r = await pg.query(
+    'SELECT * FROM ai_routing_policy WHERE model_id=$1 ORDER BY created_at',
+    [modelId],
+  );
+  return (r.rows || []).map(toPolicy);
+}
+
+async function createRoutingPolicy(pg, policyInput, actor) {
+  const check = validatePolicy(policyInput);
+  if (!check.ok) throw new Error('routing policy 校验失败: ' + check.errors.join('; '));
+
+  const { model_id, target_binding_id, capability, percent, salt, updated_by } = policyInput;
+  const r = await pg.query(
+    `INSERT INTO ai_routing_policy (model_id, capability, target_binding_id, percent, salt, status, revision, updated_by, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, 'active', 1, $6, NOW(), NOW())
+     RETURNING *`,
+    [model_id, capability || null, target_binding_id, percent != null ? percent : 0, salt || '', updated_by || actor || null],
+  );
+  return toPolicy(r.rows && r.rows[0]);
+}
+
+async function updateRoutingPolicy(pg, policyId, patch, actor) {
+  const allowed = {
+    percent: (v) => Math.max(0, Math.min(100, Math.floor(Number(v) || 0))),
+    salt: (v) => String(v || ''),
+    status: (v) => (v === 'paused' ? 'paused' : 'active'),
+  };
+
+  const cols = []; const vals = [];
+  for (const [col, conv] of Object.entries(allowed)) {
+    if (!(col in patch)) continue;
+    cols.push(col); vals.push(conv(patch[col]));
+  }
+  if (!cols.length) throw new Error('无可更新字段');
+
+  const n = cols.length;
+  const setClause = cols.map((c, i) => `${c}=$${i + 1}`).join(', ');
+  const r = await pg.query(
+    `UPDATE ai_routing_policy SET ${setClause}, revision=revision+1, updated_at=NOW(), updated_by=$${n + 1}
+     WHERE id=$${n + 2} RETURNING *`,
+    [...vals, actor || null, policyId],
+  );
+  return toPolicy(r.rows && r.rows[0]);
+}
+
+async function getRoutingPolicy(pg, policyId) {
+  const r = await pg.query('SELECT * FROM ai_routing_policy WHERE id=$1', [policyId]);
+  return toPolicy(r.rows && r.rows[0]);
+}
+
+// ── M02-C: Binding revisions to routing decisions ────────────────────────────
+
+async function recordRoutingDecisionWithRevision(pg, decision, { requestId, generationTaskId, modelRevisionId, routingPolicyId } = {}) {
+  const r = await pg.query(
+    `INSERT INTO ai_routing_decisions (id, model_id, capability, region, selected_binding_id, selected_provider_id, reason, fallback_candidates, rejected, weights, seed, request_id, generation_task_id, routing_policy, model_revision_id)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING id, created_at`,
+    [
+      decision.routing_decision_id, decision.model_id, decision.capability, decision.region,
+      decision.selected ? decision.selected.bindingId : null,
+      decision.selected ? decision.selected.providerId : null,
+      decision.reason,
+      JSON.stringify(decision.fallback_candidates || []),
+      JSON.stringify(decision.rejected || []),
+      decision.weights ? JSON.stringify(decision.weights) : null,
+      decision.seed, requestId || null, generationTaskId || null,
+      routingPolicyId || null, modelRevisionId || null,
+    ],
+  );
+  return (r.rows && r.rows[0]) || { id: decision.routing_decision_id };
+}
+
 module.exports = {
+  // Legacy M02-A
   listProviders, getProvider, attachKeyPool,
   listLogicalModels, getLogicalModel, upsertModelCapability,
   recordRoutingDecision, upsertProviderHealth, getProviderHealth,
   keypool, toBinding, validateBinding,
+  // M02-C: Revisions
+  listModelRevisions, getActiveRevision, publishRevision, retireRevision,
+  // M02-C: Grants
+  listGrantsForModel, createGrant, revokeGrant, deleteGrant,
+  // M02-C: Routing Policies
+  listRoutingPolicies, createRoutingPolicy, updateRoutingPolicy, getRoutingPolicy,
+  // M02-C: Decisions with revision binding
+  recordRoutingDecisionWithRevision,
 };

@@ -1,13 +1,12 @@
 'use strict';
 /**
- * M02-A AI Control Plane — module index / composition root
+ * M02-A/C AI Control Plane — module index / composition root
  *
  * 装配 domain + contracts + repository + service + 已认证 adapter（Agnes）。
  * 这是 control-plane 的唯一入口；server.js / Generation V2 上游配置解析层从这里
  * 拿 service（API projection）与 adapter registry（出站执行边界）。
  *
- * 不在此处搬迁旧 runtime；dispatcher/modelhub 仍是执行权威。本模块是它们的
- * 上游配置/解析/审计层（见 docs/system-v2/modules/M02A-ai-control-foundation.md）。
+ * M02-C 新增 domain: revision, grant, routing-policy
  */
 
 const domain = {
@@ -18,6 +17,9 @@ const domain = {
   pricing: require('./domain/pricing.cjs'),
   routing: require('./domain/routing.cjs'),
   binding: require('./domain/binding.cjs'),
+  revision: require('./domain/revision.cjs'),
+  grant: require('./domain/grant.cjs'),
+  'routing-policy': require('./domain/routing-policy.cjs'),
 };
 const contracts = {
   adapter: require('./contracts/adapter.cjs'),
