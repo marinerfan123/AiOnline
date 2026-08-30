@@ -5,7 +5,8 @@
 // standard error normalization, JSON + 204 handling, GET/idempotent retry.
 //
 // Session: mirrors production — httpOnly cookie (credentials:'include') for the
-// `sid` session, plus the optional bearer token discovered from /api/token.
+// `sid` session (httpOnly cookie). The bearer token is OPTIONAL and only
+// used when explicitly provided via getAuthToken (Q5-B: /api/token removed).
 
 import { ApiError, codeFromStatus, parseErrorPayload, type ApiErrorPayload } from './errors';
 import { newRequestId } from '@/shared/telemetry/correlation';
@@ -26,7 +27,7 @@ export interface RequestOptions {
   headers?: Record<string, string>;
   /** When true, transient failures (network/5xx/429) are retried (GET-only by default). */
   retry?: boolean;
-  /** Bypass the bearer token (e.g. /api/token itself). */
+  /** Bypass the bearer token (session cookie still applies). */
   auth?: boolean;
 }
 
@@ -57,22 +58,24 @@ export class ApiClient {
     this.onUnauthorized = cfg.onUnauthorized;
   }
 
-  /** Auto-discover same-origin backend + bearer token (idempotent). */
+  /**
+   * Auto-discover same-origin backend (idempotent).
+   * SECURITY (Q5-B P0): probe is /api/healthz (liveness, no credentials).
+   * The former /api/token endpoint returned the shared system API_TOKEN to
+   * ANY anonymous caller and has been removed; browser calls rely on the
+   * httpOnly session cookie. The optional bearer token (getAuthToken /
+   * injected) is still sent when one is explicitly provided.
+   */
   ensureConnected(): Promise<boolean> {
     if (this.token || this.discoverPromise) return this.discoverPromise ?? Promise.resolve(true);
     this.discoverPromise = (async () => {
       try {
         const base = this.baseUrl || `${window.location.protocol}//${window.location.host}`;
-        const res = await fetch(`${base}/api/token`, {
+        const res = await fetch(`${base}/api/healthz`, {
           headers: { 'Content-Type': 'application/json' },
           credentials: 'include',
         });
-        if (res.ok) {
-          const { token } = await res.json();
-          if (token) this.token = token;
-          return true;
-        }
-        return false;
+        return res.ok;
       } catch {
         return false;
       }

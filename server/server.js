@@ -3053,6 +3053,9 @@ async function handleAPI(req, res) {
   }
 
   if (url === '/api/providers' && method === 'GET') {
+    // SECURITY (Q5-C): providers 列表暴露 base_url/限流等供给侧信息 → 仅限 admin，
+    // 与 POST/PATCH/DELETE /api/providers 及 /api/providers/:id/keys 闸门保持一致。
+    if (!admin.requireAdmin(req)) return sendJSON(res, 403, { error: '需要管理员权限' });
     const maskKey = (p) => ({ ...p, apiKey: p.apiKey ? '***' + p.apiKey.slice(-4) : '' });
     if (pgPool) {
       const r = await pgPool.query('SELECT * FROM providers ORDER BY created_at');
@@ -3171,7 +3174,10 @@ async function handleAPI(req, res) {
     if (r.status === 'conflict') return sendJSON(res, 409, { error: '数据已被其他管理员修改（revision 不匹配），请刷新后重试', currentRevision: r.currentRevision });
     const row = await pgPool.query('SELECT * FROM providers WHERE id=$1', [id]);
     if (!row.rows[0]) return sendJSON(res, 404, { error: '服务商不存在' });
-    return sendJSON(res, 200, { ok: true, provider: fromSnake(row.rows[0]), revision: r.revision });
+    // SECURITY (Q5-C): PATCH 回显与 GET 列表同口径 —— apiKey 只回掩码，绝不回明文。
+    const patched = fromSnake(row.rows[0]);
+    if (patched.apiKey) patched.apiKey = '***' + String(patched.apiKey).slice(-4);
+    return sendJSON(res, 200, { ok: true, provider: patched, revision: r.revision });
   }
   // 账号冷热状态快照（内存态，供管理面板展示 + 手动强切）
   if (url === '/api/providers/states' && method === 'GET') {
@@ -3788,6 +3794,8 @@ async function handleAPI(req, res) {
 
   // ── 同步服务商模型列表（后端代理，避免前端持有真实 Key）──
   if (url.match(/^\/api\/providers\/[^/]+\/sync$/) && method === 'POST') {
+    // SECURITY (Q5-B): 消耗商用配额 + 返回上游原始响应 → 仅限 admin
+    if (!admin.requireAdmin(req)) return sendJSON(res, 403, { error: '需要管理员权限' });
     const id = url.split('/')[3];
     if (!pgPool) return sendJSON(res, 200, { success: false, message: '数据库不可用' });
     const r = await pgPool.query('SELECT * FROM providers WHERE id=$1', [id]);
@@ -3819,6 +3827,8 @@ async function handleAPI(req, res) {
 
   // ── 测试服务商端点（后端代理，避免前端持有真实 Key）──
   if (url.match(/^\/api\/providers\/[^/]+\/test-endpoint$/) && method === 'POST') {
+    // SECURITY (Q5-B): 消耗商用配额 + 返回上游原始响应 → 仅限 admin
+    if (!admin.requireAdmin(req)) return sendJSON(res, 403, { error: '需要管理员权限' });
     const id = url.split('/')[3];
     const body = await parseBody(req);
     if (!pgPool) return sendJSON(res, 200, { success: false, message: '数据库不可用' });
@@ -3836,6 +3846,8 @@ async function handleAPI(req, res) {
     }
   }
   if (url.match(/^\/api\/providers\/[^/]+\/test-default$/) && method === 'POST') {
+    // SECURITY (Q5-B): 用真实 key 发起上游 chat/completions（消耗商用配额）→ 仅限 admin
+    if (!admin.requireAdmin(req)) return sendJSON(res, 403, { error: '需要管理员权限' });
     const id = url.split('/')[3];
     const body = await parseBody(req);
     if (!pgPool) return sendJSON(res, 200, { success: false, message: '数据库不可用' });
@@ -4133,25 +4145,30 @@ async function handleAPI(req, res) {
   const adminId = (req) => req.user?.id || req.user?.email || 'guest';
 
   // ── OSS 总览（enabled + active + configs 列表）── 仅限 admin ──
+  // SECURITY (Q5-B): 读回绝不暴露完整凭据。accessKeySecret 永不返回；
+  // accessKeyId 仅返回首尾 4 位掩码（标识符，非机密，但避免全量回显）。
+  // 前端保存表单留空 secret 时，PUT 分支保留 DB 原值（见下方 PUT configs）。
   if (url === '/api/oss' && method === 'GET') {
     if (!admin.requireAdmin(req)) return sendJSON(res, 403, { error: '需要管理员权限' });
     const t0 = Date.now();
     const { enabled, activeId, list } = await ossMod.loadOssConfigs(pgPool);
     const active = list.find(c => c.id === activeId) || null;
+    const maskAkId = (v) => (v && v.length >= 8 ? `${v.slice(0, 4)}***${v.slice(-4)}` : (v ? '***' : ''));
+    const publicRow = (c) => (c ? { ...c, accessKeyId: maskAkId(c.accessKeyId), accessKeySecret: '' } : c);
     ossMod.log('info', 'list', `读取 OSS 总览：${list.length} 个槽位，活跃 ${active?.bucket || '无'}`, { durationMs: Date.now() - t0, slotCount: list.length, activeBucket: active?.bucket });
     return sendJSON(res, 200, {
       enabled,
       activeId,
-      active,
-      configs: list,
+      active: publicRow(active),
+      configs: list.map(publicRow),
       // 兼容旧字段：把 active 当成"主配置"暴露（保持前端上一版兼容）
       provider: active?.providerType || 'aliyun-oss',
       bucket: active?.bucket || '',
       region: active?.region || '',
       regionLabel: active?.regionLabel || '',
       appId: active?.appId || '',
-      accessKeyId: active?.accessKeyId || '',
-      accessKeySecret: active?.accessKeySecret || '',
+      accessKeyId: maskAkId(active?.accessKeyId || ''),
+      accessKeySecret: '',
       endpointExternal: active?.endpointExternal || '',
       pathPrefix: active?.pathPrefix || 'images/',
       customDomain: active?.customDomain || '',
@@ -4184,6 +4201,15 @@ async function handleAPI(req, res) {
       ossMod.log('warn', 'save', `保存槽位 ${id} 失败：providerType 非法`, { id });
       return sendJSON(res, 200, { ok: false, error: 'providerType 必须为 aliyun-oss 或 tencent-cos' });
     }
+    // SECURITY (Q5-B): GET 读回已脱敏（accessKeyId 掩码、accessKeySecret 为空）。
+    // 表单未改凭据时回传的正是掩码/空值 —— 此时保留 DB 原值，绝不把掩码写回库。
+    const existingRow = (await pgPool.query('SELECT access_key_id, access_key_secret FROM oss_configs WHERE id=$1', [id])).rows[0] || null;
+    let akIn = String(body.accessKeyId || '');
+    let skIn = String(body.accessKeySecret || '');
+    const keepAk = akIn === '' || akIn.includes('***');
+    const keepSk = skIn === '';
+    if (keepAk) akIn = existingRow ? existingRow.access_key_id : '';
+    if (keepSk) skIn = existingRow ? existingRow.access_key_secret : '';
     const row = {
       id,
       providerType: body.providerType,
@@ -4192,8 +4218,8 @@ async function handleAPI(req, res) {
       region: body.region || '',
       regionLabel: body.regionLabel || '',
       appId: body.appId || '',
-      accessKeyId: body.accessKeyId || '',
-      accessKeySecret: body.accessKeySecret || '',
+      accessKeyId: akIn,
+      accessKeySecret: skIn,
       endpointExternal: body.endpointExternal || '',
       pathPrefix: body.pathPrefix || 'images/',
       customDomain: body.customDomain || '',
@@ -4278,6 +4304,9 @@ async function handleAPI(req, res) {
   const cfgTestMatch = url.match(/^\/api\/oss\/configs\/([^/]+)\/test$/);
   let cfg = null;
   if (testMatch || cfgTestMatch) {
+    // SECURITY (Q5-B): /api/oss/test（用户传 AK 探活）同样消耗外部配额并回显
+    // 上游错误细节 → 仅限 admin（configs/:id/test 分支下方已有独立闸门）。
+    if (testMatch && !admin.requireAdmin(req)) return sendJSON(res, 403, { error: '需要管理员权限' });
     const paramCfg = await parseBody(req) || {};
     if (testMatch && (cfgMatch || cfgTestMatch)) {/* not here */}
     let testSlotId = null;
@@ -4532,8 +4561,11 @@ app.use((req, res, next) => {
   next();
 });
 
-// API token（网关探针）
-app.get('/api/token', (req, res) => sendJSON(res, 200, { token: API_TOKEN }));
+// SECURITY (Q5-B P0): GET /api/token 已移除。
+// 该端点曾在鉴权网关之前把共享 system API_TOKEN 以明文返回给任何匿名调用者，
+// 而 Bearer API_TOKEN = {id:'__system__', role:'system'} 可通过所有 requireAdmin。
+// 前端原先用它做「后端探测 + 取 token」；现在探测改为 /api/healthz（无凭据），
+// API 调用一律走会话 cookie（sid），system 身份只保留给内部/受控部署。
 
 // API 路由 → handleAPI（含流量采样）
 app.use((req, res, next) => {
@@ -4575,6 +4607,20 @@ const CLUSTER_ENABLED = process.env.ENABLE_CLUSTER !== 'false';
 const NUM_WORKERS = process.env.WEB_CONCURRENCY
   ? Math.max(1, parseInt(process.env.WEB_CONCURRENCY, 10) || 1)
   : Math.max(1, os.cpus().length);
+
+// SECURITY (Q5-B): 生产 JWT fail-closed 必须在 fork 之前由主进程判定 ——
+// 若放进 worker，exit(1) 会被主进程自动重启成 crash-loop。
+// 单进程模式（ENABLE_CLUSTER=false）没有主进程，worker 侧自检仍是最终防线。
+if (isProduction && cluster.isPrimary) {
+  const preSecret = session.getSecret();
+  if (!preSecret || !preSecret.trim()
+    || preSecret === 'dev-only-change-me'
+    || preSecret === 'change-me-to-a-long-random-string'
+    || preSecret === '***') {
+    console.error('[SECURITY] JWT_SECRET 未设置/空白/为已知默认值，生产环境拒绝启动（会话令牌可被伪造）。请通过环境变量设置强随机值后重试。');
+    process.exit(1);
+  }
+}
 
 if (CLUSTER_ENABLED && cluster.isPrimary) {
   console.log(`[cluster] 主进程 pid=${process.pid} 启动 ${NUM_WORKERS} 个 worker（共 ${os.cpus().length} 核）`);
@@ -4688,11 +4734,21 @@ if (redisClient) {
 
 // ─── 生产安全自检（仅 production）───
 if (isProduction) {
-  const unsafeJwt = !process.env.JWT_SECRET
-    || process.env.JWT_SECRET === 'dev-only-change-me'
-    || process.env.JWT_SECRET === 'change-me-to-a-long-random-string';
+  // SECURITY (Q5-B): 校验 auth.cjs 实际生效的签名密钥（运行时真值），而非只看
+  // process.env —— env 为空/空白时模块会回退 'dev-only-change-me' 字面量，仅查
+  // env 会漏掉该路径。已知默认值一律拒绝启动（fail closed）。
+  const effectiveSecret = session.getSecret();
+  const unsafeJwt = !effectiveSecret || !effectiveSecret.trim()
+    || effectiveSecret === 'dev-only-change-me'
+    || effectiveSecret === 'change-me-to-a-long-random-string'
+    || effectiveSecret === '***';
   if (unsafeJwt) {
-    console.error('[SECURITY] JWT_SECRET 未设置或使用默认值，生产环境拒绝启动（会话令牌可被伪造）。请设置强随机值后重试。');
+    console.error('[SECURITY] JWT_SECRET 未设置/空白/为已知默认值，生产环境拒绝启动（会话令牌可被伪造）。请通过环境变量设置强随机值后重试。');
+    // SECURITY (Q5-B): cluster 模式下 worker 退出会被主进程自动重启（crash-loop），
+    // 自检失败必须带外杀死主进程 → 全簇干净退出，而不是无限重启。
+    if (typeof cluster !== 'undefined' && cluster.isWorker) {
+      try { cluster.worker.process.kill('SIGTERM'); } catch { /* ignore */ }
+    }
     process.exit(1);
   }
   // SIGN_SECRET 保护充值订单 HMAC 完整性标记。生产环境若配置了支付通道，缺失该密钥会导致订单签名缺失（本地防篡改失效）。
