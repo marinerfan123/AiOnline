@@ -32,8 +32,13 @@ test('normalizeProviderResult抽取单图URL和provider元数据', () => {
 });
 
 test('normalizeProviderResult保留429/Retry-After错误语义', () => {
-  const r=normalizeProviderResult({status:'error',rateLimited:true,httpStatus:429,retryAfter:'20',providerId:'p',error:'busy'});
+  const r=normalizeProviderResult({status:'error',rateLimited:true,httpStatus:429,retryAfter:'20',providerId:'p',errorCode:'RATE_LIMITED'});
   assert.equal(r.status,'error');assert.equal(r.httpStatus,429);assert.equal(r.errorCode,'RATE_LIMITED');assert.equal(r.retryAfter,'20');
+});
+
+test('normalizeProviderResult处理准入拒绝并保留httpStatus', () => {
+  const r=normalizeProviderResult({status:'error',errorCode:'RATE_LIMITED',errorMessage:'rpm exhausted',retryAfterMs:5000});
+  assert.equal(r.status,'error');assert.equal(r.httpStatus,429);assert.equal(r.errorCode,'RATE_LIMITED');assert.equal(r.retryAfter,5);
 });
 
 test('adapter调用注入dispatchSingle且永远count=1', async () => {
@@ -41,4 +46,62 @@ test('adapter调用注入dispatchSingle且永远count=1', async () => {
   const adapter=createProviderAdapter({dispatchSingle:async p=>{payload=p;return {status:'success',images:['u']};}});
   const result=await adapter({item_id:'gi-1',item_index:0,model_id:'m1',content_type:'image',request_payload:{count:4,prompt:'x'}});
   assert.equal(payload.count,1);assert.equal(result.providerUrl,'u');
+});
+
+test('adapter带Redis时准入成功注入providerId/keyId', async () => {
+  // Mock: Redis eval returns ['ok', 'k1', 't1', '123456']
+  const redis = {
+    eval: async () => ['ok', 'k1', 't1', '123456'],
+  };
+  const adapter = createProviderAdapter({
+    dispatchSingle: async (p, ctx) => { return { status: 'success', images: ['https://img.url'], providerId: 'p1' }; },
+    redis,
+    providerId: 'p1',
+    keys: [{ id: 'k1', maxConcurrent: 2 }],
+  });
+  const result = await adapter({ item_id: 'gi-1', item_index: 0, model_id: 'm1', content_type: 'image', request_payload: { prompt: 'x' } });
+  assert.equal(result.status, 'success');
+  assert.equal(result.providerUrl, 'https://img.url');
+  assert.equal(result.providerId, 'p1');
+  assert.equal(result.keyId, 'k1');
+});
+
+test('adapter带Redis时准入失败返回error', async () => {
+  // Mock: Redis eval returns ['deny', '5000'] -> rpm denial
+  const redis = {
+    eval: async () => ['deny', '5000'],
+  };
+  const adapter = createProviderAdapter({
+    dispatchSingle: async () => ({ status: 'success', images: ['url'] }),
+    redis,
+    providerId: 'p1',
+    keys: [{ id: 'k1' }],
+  });
+  const result = await adapter({ item_id: 'gi-1', item_index: 0, model_id: 'm1', content_type: 'image', request_payload: { prompt: 'x' } });
+  assert.equal(result.status, 'error');
+  assert.equal(result.errorCode, 'RATE_LIMITED');
+});
+
+test('adapter无Redis时退化为直出路径', async () => {
+  let called = false;
+  const adapter = createProviderAdapter({
+    dispatchSingle: async () => { called = true; return { status: 'success', images: ['url'] }; },
+    redis: null,
+  });
+  const result = await adapter({ item_id: 'gi-1', item_index: 0, model_id: 'm1', content_type: 'image', request_payload: { prompt: 'x' } });
+  assert.ok(called);
+  assert.equal(result.status, 'success');
+});
+
+test('adapter带Redis但无providerId时退化为直出路径', async () => {
+  let called = false;
+  const adapter = createProviderAdapter({
+    dispatchSingle: async () => { called = true; return { status: 'success', images: ['url'] }; },
+    redis: { eval: async () => ['deny', '5000'] },
+    providerId: null,
+    keys: [],
+  });
+  const result = await adapter({ item_id: 'gi-1', item_index: 0, model_id: 'm1', content_type: 'image', request_payload: { prompt: 'x' } });
+  assert.ok(called);
+  assert.equal(result.status, 'success');
 });
