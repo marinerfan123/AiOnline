@@ -779,6 +779,28 @@ test('M22: 0013 asset foundation creates hot-path indexes and relation table', a
   }
 }, { timeout: 60000 });
 
+test('M23: 0015 model control plane M02-C creates revisions, grants, routing_policy tables', async () => {
+  const suffix = randomSuffix();
+  const dbName = await createTestDb(suffix);
+  const pg = createPool(dbName);
+  try {
+    await migrate(pg);
+    const required = ['ai_model_revisions', 'ai_model_capability_grants', 'ai_routing_policy'];
+    for (const table of required) {
+      const r = await pg.query(`SELECT 1 FROM information_schema.tables WHERE table_name = $1`, [table]);
+      assert.equal(r.rows.length, 1, `table ${table} should exist`);
+    }
+    // Verify audit columns on ai_routing_decisions
+    const cols = await getTableColumns(pg, 'ai_routing_decisions');
+    const colNames = cols.map((c) => c.column_name);
+    assert.ok(colNames.includes('routing_policy'), 'ai_routing_decisions should have routing_policy column');
+    assert.ok(colNames.includes('model_revision_id'), 'ai_routing_decisions should have model_revision_id column');
+  } finally {
+    await pg.end();
+    await dropTestDb(dbName);
+  }
+}, { timeout: 60000 });
+
 // Cleanup
 test.after(async () => {
   await adminPool.end();
