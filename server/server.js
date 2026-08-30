@@ -3452,7 +3452,8 @@ async function handleAPI(req, res) {
 
   // GET /api/generate/stream — SSE 实时通道（主流异步生成做法）
   // 任务终态切换（done/waiting/failed）由 dispatcher.emitTaskUpdate 推送，替代前端固定 2s 轮询；
-  // 连接即回灌在途快照，解决「刷新/连接前」漏事件。前端另有轮询兜底，SSE 异常不影响完成判定。
+  // 连接即回灌在途快照，解决「刷新/连接前」漏事件。前端另有轮询兜底，SSE 异常也不影响完成判定。
+  // P1 修复：支持 Last-Event-ID 重连语义，多副本 LB 下重连不同 worker 时可补齐缺失事件。
   if (url === '/api/generate/stream' && method === 'GET') {
     if (!realUser) return sendJSON(res, 401, { error: '未登录' });
     res.writeHead(200, {
@@ -3462,12 +3463,25 @@ async function handleAPI(req, res) {
       'X-Accel-Buffering': 'no', // 关闭反代缓冲，避免事件被攒批
     });
     res.write('retry: 3000\n\n'); // 断线后客户端（EventSource）自动重连间隔
-    const unsub = realtime.subscribe(realUser.id, res);
+    const lastEventId = (req.headers && req.headers['last-event-id']) || '';
+    const unsub = realtime.subscribe(realUser.id, res, lastEventId);
     // 连接即回灌在途快照：字段形状对齐 getTaskStatus，前端无差别处理
+    // 快照事件带 id: 前缀以便 EventSource 记录位置，重连时可请求回放。
     try {
       const snap = await realtime.snapshotActive(pgPool, realUser.id);
-      for (const s of snap) res.write(`data: ${JSON.stringify(s)}\n\n`);
+      for (const s of snap) {
+        res.write(`data: ${JSON.stringify(s)}\n\n`);
+      }
     } catch (_) { /* 快照失败不致命 */ }
+    // Last-Event-ID 重放：服务端缓冲中可能有连接断开期间的新事件，补推给客户端
+    if (lastEventId) {
+      try {
+        const replay = realtime.getReplayEvents(realUser.id, lastEventId);
+        for (const ev of replay) {
+          res.write(`data: ${JSON.stringify(ev)}\n\n`);
+        }
+      } catch (_) { /* 回放失败不致命 */ }
+    }
     // 心跳：防止代理/中间件因空闲断开长连接
     const hb = setInterval(() => { try { res.write(': ping\n\n'); } catch (_) {} }, 20000);
     res.on('close', () => { clearInterval(hb); try { unsub(); } catch (_) {} });

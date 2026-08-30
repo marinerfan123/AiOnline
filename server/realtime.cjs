@@ -11,6 +11,12 @@
 //   - 现改为 Redis pub/sub：emitTaskUpdate 发布到 channel `task-updates:{userId}`，每个 worker 用独立
 //     订阅连接 psubscribe `task-updates:*` 后转发到本地 emitter（本地连接再分发给对应 userId）。
 //   - Redis 不可用时退化为本地 emit（单进程模式仍可用）；即便极少数启动期事件漏发，前端轮询兜底不影响完成判定。
+//
+// SSE 事件 ID 与断线重连（P1 修复）：
+//   - 每个推给前端的 data 事件都带一个单调递增的 event ID（服务器端序列号）。
+//   - 新连接时把最近 N 条事件暂存到环形缓冲（per-user），以便响应 Last-Event-ID 重放。
+//   - 重连时读取 req.headers['last-event-id']，从缓冲中回放该 ID 之后的事件。
+//   - 这解决了多副本 LB 下「重连落在不同 worker」时客户端无法自行补齐缺失事件的缺口。
 const { EventEmitter } = require('events');
 const { getRedis, isRedisUp } = require('./redis.cjs');
 
@@ -19,6 +25,13 @@ emitter.setMaxListeners(0); // 允许大量 SSE 连接同时订阅，避免 MaxL
 
 // userId -> Set(res)：活跃 SSE 连接注册表（按用户隔离，防多用户串看，G1）
 const conns = new Map();
+
+// per-user 近期事件环形缓冲，用于 Last-Event-ID 重放。
+// MAX_HISTORY_EVENTS 控制内存占用；时间窗口由事件时间戳判断。
+const MAX_HISTORY_EVENTS = 256;
+const HISTORY_TTL_MS = 60_000; // 60 秒内的历史有效
+// userId -> { nextId: number, buffer: Array<{id, ts, data}> }
+const eventHistory = new Map();
 
 const CHANNEL_PREFIX = 'task-updates:';
 
@@ -58,6 +71,40 @@ function ensureSubscriber() {
   if (!sub) startSubscriber();
 }
 
+/** 把 payload 追加进 per-user 历史缓冲，返回分配的 event ID。 */
+function appendEventHistory(userId, payload) {
+  let hist = eventHistory.get(userId);
+  if (!hist) {
+    hist = { nextId: 1, buffer: [] };
+    eventHistory.set(userId, hist);
+  }
+  const id = hist.nextId++;
+  const now = Date.now();
+  hist.buffer.push({ id, ts: now, data: payload });
+  // 清理超时的旧事件
+  while (hist.buffer.length > 0 && now - hist.buffer[0].ts > HISTORY_TTL_MS) {
+    hist.buffer.shift();
+  }
+  // 上限兜底
+  if (hist.buffer.length > MAX_HISTORY_EVENTS) {
+    hist.buffer.splice(0, hist.buffer.length - MAX_HISTORY_EVENTS);
+  }
+  return id;
+}
+
+/** 回放 userId 从 lastEventId(不含) 之后的历史事件。 */
+function replayEventsFrom(userId, lastEventId) {
+  const hist = eventHistory.get(userId);
+  if (!hist || hist.buffer.length === 0) return [];
+  const afterId = parseInt(lastEventId, 10);
+  if (isNaN(afterId)) return hist.buffer.map((e) => e);
+  const result = [];
+  for (const e of hist.buffer) {
+    if (e.id > afterId) result.push(e);
+  }
+  return result;
+}
+
 // dispatcher 完成回调里调用：把任务更新推给该用户的所有活跃连接（跨 worker 经 Redis，本地经 emitter）
 function emitTaskUpdate(userId, payload) {
   if (!userId) return;
@@ -74,17 +121,23 @@ function emitTaskUpdate(userId, payload) {
   } else {
     emitter.emit(`u:${userId}`, payload);
   }
+  // 追加到历史缓冲（无论 Redis 是否可用，本地连接都需要重放）
+  appendEventHistory(userId, payload);
 }
 
-// 注册一个 SSE 连接（res 为 Node http.ServerResponse）。返回取消订阅函数。
-function subscribe(userId, res) {
+// 注册一个 SSE 连接（res 为 Node http.ServerResponse，lastEventId 来自 req.headers['last-event-id']）。
+// 返回取消订阅函数。
+function subscribe(userId, res, lastEventId) {
   if (!userId) return () => {};
   const key = `u:${userId}`;
   if (!conns.has(userId)) conns.set(userId, new Set());
   const set = conns.get(userId);
   set.add(res);
   const onEvt = (payload) => {
+    const id = appendEventHistory(userId, payload);
     try {
+      // SSE spec: event-id 必须在 data 之前发送，格式为 "id:<value>\n"
+      res.write(`id: ${id}\n`);
       res.write(`data: ${JSON.stringify(payload)}\n\n`);
     } catch (_) {
       // 连接已断，onclose 会清理；这里静默忽略
@@ -96,6 +149,11 @@ function subscribe(userId, res) {
     set.delete(res);
     if (set.size === 0) conns.delete(userId);
   };
+}
+
+// 获取指定 userId 从 lastEventId(不含) 之后的历史事件。
+function getReplayEvents(userId, lastEventId) {
+  return replayEventsFrom(userId, lastEventId);
 }
 
 // 在途任务快照：连接建立时立即回灌，字段形状对齐 getTaskStatus / apiGetGenerationStatus，
@@ -133,4 +191,4 @@ async function snapshotActive(pgPool, userId) {
 
 startSubscriber();
 
-module.exports = { emitTaskUpdate, subscribe, snapshotActive, ensureSubscriber };
+module.exports = { emitTaskUpdate, subscribe, snapshotActive, ensureSubscriber, getReplayEvents };
