@@ -1,0 +1,43 @@
+{
+  "unitPass": true,
+  "migration": true,
+  "pgIntegration": true,
+  "shadowAudit": { "sampled": 13, "consistent": 13 },
+  "chaos": {
+    "workerKill": true,
+    "redisRestart": true,
+    "provider429": true
+  },
+  "load": {
+    "p95SubmitMs": 173,
+    "duplicateRate": 0,
+    "ledgerMismatch": 0,
+    "oldestQueueSec": 0
+  },
+  "secrets": false,
+  "dependencies": true,
+  "observability": true,
+  "realAgnesE2E": {
+    "passed": true,
+    "generationMs": 17214,
+    "imageCount": 1,
+    "ossUploaded": true,
+    "finalStatus": "done",
+    "holdStatus": "committed",
+    "commitTransactions": 1,
+    "cleanup": true
+  },
+  "certified": true,
+  "certifiedHead": "4e455ee2a290cf6b7b55e39208bc12ca21c89455",
+  "certifiedTag": "baseline/moling-commercial-correctness-certified",
+  "commercialCorrectness": {
+    "p0": 0,
+    "p1": 0,
+    "v2Tests": 213,
+    "migrationTests": 14,
+    "apiTests": 39,
+    "billingTests": 7,
+    "drTests": 20,
+    "verifyExit": 0
+  }
+}

@@ -1,0 +1,216 @@
+# Distributed Staging Topology — Multi-node simulation
+# PROOF-OF-CONCEPT ONLY: demonstrates multi-API/multi-worker behavior.
+# NOT the final production architecture (which uses managed PG/Redis/OSS + LB/WAF).
+#
+# Topology:
+#   nginx (LB) -> API-01, API-02
+#   Worker-01, Worker-02 (standalone processes)
+#   Shared PostgreSQL + Redis
+#
+# Usage:
+#   docker compose -f deploy/docker-compose.distributed-staging.yml up -d --build
+#   docker compose -f deploy/docker-compose.distributed-staging.yml down
+#
+# Pre-requirements:
+#   .env file with JWT_SECRET, API_TOKEN (shared), PG/Redis credentials
+
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: ${PG_USER:-postgres}
+      POSTGRES_PASSWORD: ${PG_PASSWORD:-0.0.1abcd}
+      POSTGRES_DB: ${PG_DATABASE:-huabu}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PG_USER:-postgres}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7.2
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # API-01
+  api-01:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: moling-api-01
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      ENABLE_CLUSTER: "false"
+      PORT: 3001
+      NODE_ID: api-01
+      PG_HOST: postgres
+      PG_PORT: 5432
+      PG_DATABASE: ${PG_DATABASE:-huabu}
+      PG_USER: ${PG_USER:-postgres}
+      PG_PASSWORD: ${PG_PASSWORD:-0.0.1abcd}
+      PG_POOL_MAX: ${PG_POOL_MAX:-10}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      JWT_SECRET: ${JWT_SECRET:-dev-only-change-me}
+      API_TOKEN: ${API_TOKEN:-distributed-staging-dev-token}
+      CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:8080}
+    ports:
+      - "3001:3001"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3001/api/readiness').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # API-02
+  api-02:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: moling-api-02
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      ENABLE_CLUSTER: "false"
+      PORT: 3001
+      NODE_ID: api-02
+      PG_HOST: postgres
+      PG_PORT: 5432
+      PG_DATABASE: ${PG_DATABASE:-huabu}
+      PG_USER: ${PG_USER:-postgres}
+      PG_PASSWORD: ${PG_PASSWORD:-0.0.1abcd}
+      PG_POOL_MAX: ${PG_POOL_MAX:-10}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      JWT_SECRET: ${JWT_SECRET:-dev-only-change-me}
+      API_TOKEN: ${API_TOKEN:-distributed-staging-dev-token}
+      CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:8080}
+    ports:
+      - "3002:3001"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3001/api/readiness').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Worker-01 (generation only, no HTTP)
+  worker-01:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: moling-worker-01
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: ["node", "server/modules/generation-v2/entry.cjs"]
+    environment:
+      NODE_ENV: production
+      WORKER_ID: ${WORKER_ID:-worker-01}
+      PG_HOST: postgres
+      PG_PORT: 5432
+      PG_DATABASE: ${PG_DATABASE:-huabu}
+      PG_USER: ${PG_USER:-postgres}
+      PG_PASSWORD: ${PG_PASSWORD:-0.0.1abcd}
+      V2_PG_POOL_MAX: ${V2_PG_POOL_MAX:-10}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      GENERATION_V2_WORKER_ENABLED: "true"
+      GENERATION_V2_EVIDENCE_FILE: /run/generation-v2/evidence.json
+      V2_GENERATION_CONCURRENCY: ${V2_GENERATION_CONCURRENCY:-10}
+      V2_UPLOAD_CONCURRENCY: ${V2_UPLOAD_CONCURRENCY:-4}
+    volumes:
+      - ./generation-v2/evidence.json:/run/generation-v2/evidence.json:ro
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"const{Pool}=require('pg');const r=new Pool({host:process.env.PG_HOST,port:Number(process.env.PG_PORT),database:process.env.PG_DATABASE,user:process.env.PG_USER,password:process.env.PG_PASSWORD});r.query('SELECT 1').then(()=>{r.end();process.exit(0)}).catch(()=>process.exit(1))\" 2>/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+
+  # Worker-02 (generation only, no HTTP)
+  worker-02:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: moling-worker-02
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: ["node", "server/modules/generation-v2/entry.cjs"]
+    environment:
+      NODE_ENV: production
+      WORKER_ID: ${WORKER_ID_2:-worker-02}
+      PG_HOST: postgres
+      PG_PORT: 5432
+      PG_DATABASE: ${PG_DATABASE:-huabu}
+      PG_USER: ${PG_USER:-postgres}
+      PG_PASSWORD: ${PG_PASSWORD:-0.0.1abcd}
+      V2_PG_POOL_MAX: ${V2_PG_POOL_MAX:-10}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      GENERATION_V2_WORKER_ENABLED: "true"
+      GENERATION_V2_EVIDENCE_FILE: /run/generation-v2/evidence.json
+      V2_GENERATION_CONCURRENCY: ${V2_GENERATION_CONCURRENCY:-10}
+      V2_UPLOAD_CONCURRENCY: ${V2_UPLOAD_CONCURRENCY:-4}
+    volumes:
+      - ./generation-v2/evidence.json:/run/generation-v2/evidence.json:ro
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"const{Pool}=require('pg');const r=new Pool({host:process.env.PG_HOST,port:Number(process.env.PG_PORT),database:process.env.PG_DATABASE,user:process.env.PG_USER,password:process.env.PG_PASSWORD});r.query('SELECT 1').then(()=>{r.end();process.exit(0)}).catch(()=>process.exit(1))\" 2>/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+
+  # Nginx Load Balancer
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: moling-lb
+    depends_on:
+      - api-01
+      - api-02
+    ports:
+      - "8080:80"
+    volumes:
+      - ./nginx-distributed.conf:/etc/nginx/nginx.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost/api/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  pgdata:
+  redisdata:

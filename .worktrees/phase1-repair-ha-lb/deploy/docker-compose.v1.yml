@@ -1,0 +1,152 @@
+# MOLING v1 FULL-RELEASE parallel stack (8.148.68.47)
+# Runs BESIDE the old prod stack. Reuses the EXISTING prod PostgreSQL + Redis
+# via the external moling_default network (container DNS names: postgres, redis).
+# This compose creates ONLY the new app/worker containers — no new PG/Redis.
+#
+# New API on high ports 18001/18002; dedicated V2 workers (internal only).
+#
+# Phased start (cutover runbook):
+#   1) docker compose -f docker-compose.v1.yml up -d api-01 api-02   # API first, workers OFF
+#   2) verify /api/readiness on 18001/18002
+#   3) stop old app, cutover nginx -> 18001/18002
+#   4) docker compose -f docker-compose.v1.yml up -d worker-01 worker-02
+#   5) verify V2 worker heartbeats in PG
+#
+# Secrets (PG_PASSWORD, REDIS_PASSWORD, JWT_SECRET, API_TOKEN, etc.) come from
+# .env (env_file) in this directory. Nothing secret is baked into this file.
+
+networks:
+  default:
+    external:
+      name: moling_default
+
+services:
+  api-01:
+    image: moling-app-v1:rc
+    container_name: moling-v1-api-01
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      PORT: "3001"
+      ENABLE_CLUSTER: "false"
+      NODE_ID: v1-api-01
+      PG_HOST: postgres
+      PG_PORT: "5432"
+      PG_DATABASE: huabu
+      PG_USER: moling
+      PG_SSLMODE: disable
+      PG_POOL_MAX: "10"
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      CORS_ORIGIN: ${CORS_ORIGIN:-https://tv.moling.fun,https://kk.moling.fun,http://8.148.68.47}
+      GENERATION_V2_WORKER_ENABLED: "false"   # API nodes never run the V2 worker
+    ports:
+      - "18001:3001"
+    volumes:
+      - /opt/moling-v1/v1-data:/app/server/data
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3001/api/readiness').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 25s
+    restart: unless-stopped
+
+  api-02:
+    image: moling-app-v1:rc
+    container_name: moling-v1-api-02
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      PORT: "3001"
+      ENABLE_CLUSTER: "false"
+      NODE_ID: v1-api-02
+      PG_HOST: postgres
+      PG_PORT: "5432"
+      PG_DATABASE: huabu
+      PG_USER: moling
+      PG_SSLMODE: disable
+      PG_POOL_MAX: "10"
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      CORS_ORIGIN: ${CORS_ORIGIN:-https://tv.moling.fun,https://kk.moling.fun,http://8.148.68.47}
+      GENERATION_V2_WORKER_ENABLED: "false"   # API nodes never run the V2 worker
+    ports:
+      - "18002:3001"
+    volumes:
+      - /opt/moling-v1/v1-data:/app/server/data
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3001/api/readiness').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 25s
+    restart: unless-stopped
+
+  worker-01:
+    image: moling-app-v1:rc
+    container_name: moling-v1-worker-01
+    env_file:
+      - .env
+    command: ["node", "server/modules/generation-v2/entry.cjs"]
+    environment:
+      NODE_ENV: production
+      PG_HOST: postgres
+      PG_PORT: "5432"
+      PG_DATABASE: huabu
+      PG_USER: moling
+      PG_SSLMODE: disable
+      V2_PG_POOL_MAX: "10"
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      WORKER_ID: v1-worker-01
+      GENERATION_V2_WORKER_ENABLED: "true"
+      GENERATION_V2_EVIDENCE_FILE: /app/v2-evidence.json
+      V2_GENERATION_CONCURRENCY: "10"
+      V2_UPLOAD_CONCURRENCY: "4"
+      V2_TICK_MS: "1000"
+    volumes:
+      - /opt/moling-v1/v2-evidence.json:/app/v2-evidence.json:ro
+      - /opt/moling-v1/v1-data:/app/server/data
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"const ioredis=require('ioredis');const r=new ioredis({host:'redis',port:6379});r.ping().then(()=>{r.disconnect();process.exit(0)}).catch(()=>process.exit(1))\" 2>/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+
+  worker-02:
+    image: moling-app-v1:rc
+    container_name: moling-v1-worker-02
+    env_file:
+      - .env
+    command: ["node", "server/modules/generation-v2/entry.cjs"]
+    environment:
+      NODE_ENV: production
+      PG_HOST: postgres
+      PG_PORT: "5432"
+      PG_DATABASE: huabu
+      PG_USER: moling
+      PG_SSLMODE: disable
+      V2_PG_POOL_MAX: "10"
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      WORKER_ID: v1-worker-02
+      GENERATION_V2_WORKER_ENABLED: "true"
+      GENERATION_V2_EVIDENCE_FILE: /app/v2-evidence.json
+      V2_GENERATION_CONCURRENCY: "10"
+      V2_UPLOAD_CONCURRENCY: "4"
+      V2_TICK_MS: "1000"
+    volumes:
+      - /opt/moling-v1/v2-evidence.json:/app/v2-evidence.json:ro
+      - /opt/moling-v1/v1-data:/app/server/data
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"const ioredis=require('ioredis');const r=new ioredis({host:'redis',port:6379});r.ping().then(()=>{r.disconnect();process.exit(0)}).catch(()=>process.exit(1))\" 2>/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
