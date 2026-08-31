@@ -86,6 +86,7 @@ function writeEvidence(evidenceDir, filename, data) {
 
 function runnerExitToStatus(exitCode, error) {
   if (error) return 'FAIL';
+  if (exitCode === 2) return 'NOT_READY';
   if (exitCode === 0) return 'PASS';
   return 'FAIL';
 }
@@ -112,8 +113,7 @@ function aggregate(input) {
     const runnerResult = runnerResults[key];
     let status;
     let steps = [];
-    let evidenceFile;
-    let stepFootprints = [];
+    let evidenceFile = '';
 
     if (!runnerResult) {
       // Runner was not invoked
@@ -129,7 +129,7 @@ function aggregate(input) {
     } else {
       status = runnerResult.status;
       steps = runnerResult.steps || [];
-      evidenceFile = runnerResult.evidence_file;
+      evidenceFile = runnerResult.evidence_file || writeEvidence(evidenceDir, `${key}.json`, runnerResult);
 
       // Write runner's own evidence
       if (evidenceFile) {
@@ -142,7 +142,7 @@ function aggregate(input) {
         status,
         runner: config.runner,
       });
-      stepFootprints.push(path.relative(process.cwd(), stepEvidence));
+      footprint.push(path.relative(process.cwd(), stepEvidence));
     }
 
     pathResults[config.id] = {
@@ -201,7 +201,7 @@ function aggregate(input) {
   ];
   for (const mk of requiredMetrics) {
     if (extraMetrics[mk] === undefined) {
-      extraMetrics[mk] = null;
+      extraMetrics[mk] = ['BROWSER_E2E', 'BACKUP_RESTORE_TEST'].includes(mk) ? 'NOT_READY' : null;
     }
   }
 
@@ -225,8 +225,8 @@ function aggregate(input) {
 
   // Write result
   const resultFile = path.join(evidenceDir, 'results.json');
-  fs.writeFileSync(resultFile, JSON.stringify(output, null, 2), 'utf8');
   footprint.push(path.relative(process.cwd(), resultFile));
+  fs.writeFileSync(resultFile, JSON.stringify(output, null, 2), 'utf8');
 
   return output;
 }
@@ -361,11 +361,7 @@ async function main() {
   if (output.summary.overall === 'FAIL') {
     process.exit(1);
   }
-  if (output.summary.overall === 'NOT_READY' && output.summary.pass === 0) {
-    // All not-ready with no passes = also fail (nothing was validated)
-    process.exit(1);
-  }
-  process.exit(0);
+  process.exit(output.summary.overall === 'FAIL' ? 1 : output.summary.overall === 'NOT_READY' ? 2 : 0);
 }
 
 // Export for programmatic use

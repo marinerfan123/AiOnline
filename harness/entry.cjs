@@ -13,7 +13,6 @@
  *   --dry-run            Show what would run without executing
  */
 
-const { spawnSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const { aggregate, PATH_CONFIGS } = require('./aggregator.cjs');
@@ -46,7 +45,7 @@ function parseArgs(argv) {
   return args;
 }
 
-function runRunner(config, dryRun) {
+function runRunner(config, dryRun, evidenceDir) {
   if (dryRun) {
     console.log(`  [dry-run] Would run: ${config.runner}`);
     return {
@@ -66,40 +65,13 @@ function runRunner(config, dryRun) {
   }
 
   console.log(`  Running ${config.label}...`);
-  const result = spawnSync('node', [runnerPath], {
-    cwd: path.join(__dirname, '..'),
-    encoding: 'utf8',
-    timeout: 300_000,
-    stdio: ['pipe', 'inherit', 'inherit'],
-  });
-
-  // Parse runner's JSON output to get actual status (not just exit code)
-  const lines = (result.stdout || '').split('\n').filter(l => l.trim().startsWith('{'));
-  if (lines.length > 0) {
-    try {
-      const parsed = JSON.parse(lines[lines.length - 1]);
-      return {
-        status: parsed.status || 'NOT_READY',
-        steps: parsed.steps || [],
-        evidence_file: parsed.evidence_file || null,
-        exit_code: result.status,
-        stdout: result.stdout,
-        stderr: result.stderr,
-      };
-    } catch {
-      // Fall through to exit-code-based status
-    }
+  try {
+    const result = require(runnerPath).run({ evidenceDir });
+    if (!result || !['PASS', 'FAIL', 'NOT_READY'].includes(result.status)) throw new Error('Runner returned an invalid status');
+    return result;
+  } catch (error) {
+    return { status: 'FAIL', steps: [], evidence_file: '', error: error instanceof Error ? error.message : String(error) };
   }
-
-  // Fallback: exit code based
-  const status = result.status === 0 ? 'PASS' : 'FAIL';
-  return {
-    status,
-    steps: [],
-    exit_code: result.status,
-    stdout: result.stdout,
-    stderr: result.stderr,
-  };
 }
 
 async function main() {
@@ -131,7 +103,7 @@ async function main() {
       console.error(`Unknown path key: ${key}`);
       continue;
     }
-    runnerResults[key] = runRunner(config, args.dryRun);
+    runnerResults[key] = runRunner(config, args.dryRun, args.evidenceDir);
   }
 
   // Aggregate
@@ -155,10 +127,7 @@ async function main() {
   if (output.summary.overall === 'FAIL') {
     process.exit(1);
   }
-  if (output.summary.overall === 'NOT_READY' && output.summary.pass === 0) {
-    process.exit(1);
-  }
-  process.exit(0);
+  process.exit(output.summary.overall === 'FAIL' ? 1 : output.summary.overall === 'NOT_READY' ? 2 : 0);
 }
 
 if (require.main === module) {

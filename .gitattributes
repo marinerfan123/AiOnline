@@ -1,2 +1,4 @@
-# 统一 LF 换行，避免 Windows/生产 CRLF↔LF 反复抖动
-* text=auto eol=lf
+package.json whitespace=cr-at-eol
+src/App.tsx whitespace=cr-at-eol
+src/components/ProductSwitcher.tsx whitespace=cr-at-eol
+src/components/navigationDockConfigs.ts whitespace=cr-at-eol

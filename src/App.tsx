@@ -2,6 +2,8 @@ import { useEffect, type ReactNode, lazy, Suspense } from 'react';
 import { Routes, Route, useNavigate } from 'react-router-dom';
 import { Layout } from '@/components/Layout';
 import { ErrorBoundary } from '@/components/ErrorBoundary';
+import { isFeatureEnabled } from '@/shared/config/featureFlags';
+import { FF } from '@/shared/config/featureFlags';
 
 // V2 (M00 platform foundation) — lazy-loaded preview shell. Additive only:
 // lives behind /__v2/* and the V2_APP_SHELL flag (default OFF in prod), so the
@@ -70,6 +72,7 @@ import CartPage from '@/pages/Shop/CartPage';
 import CheckoutPage from '@/pages/Shop/CheckoutPage';
 import OrdersPage from '@/pages/Shop/OrdersPage';
 import SellerPage from '@/pages/Shop/SellerPage';
+import ScopeDeniedPage from '@/pages/ScopeDeniedPage';
 
 // 登录 / 注册
 import AuthPage from '@/pages/Auth/AuthPage';
@@ -143,15 +146,15 @@ export default function App() {
             用户体验是"F5 立刻被丢到主页，看不到原因"，改为 RequireAuth 后，角色不符场景由 AdminLayout 自渲染提示页。 */}
         <Route path="/admin" element={<RequireAuth><AdminLayout /></RequireAuth>}>
           <Route index element={<ConsolePage />} />
-          <Route path="agents" element={<AgentsPage />} />
+          <Route path="agents" element={isFeatureEnabled(FF.AGENT_LAB_ENABLED) ? <AgentsPage /> : <ScopeDeniedPage title="Agent Lab（已锁定）" desc="通用智能体实验室不在 1.0 商业影像生产主路径内。" />} />
           <Route path="users" element={<UsersPage />} />
           <Route path="samples" element={<SamplesPage />} />
           <Route path="reference-styles" element={<ReferenceStylesReviewPage />} />
           <Route path="models" element={<ModelPricePage />} />
-          <Route path="routing" element={<RoutingPage />} />
+          <Route path="routing" element={isFeatureEnabled(FF.GENERIC_WORKFLOW_ENABLED) ? <RoutingPage /> : <ScopeDeniedPage title="通用工作流（已锁定）" desc="通用路由与工作流编排不在 1.0 默认产品路径内。" />} />
           <Route path="transactions" element={<TransactionsPage />} />
-          <Route path="skills" element={<SkillsPage />} />
-          <Route path="ecommerce" element={<EcommerceAdminPage />} />
+          <Route path="skills" element={isFeatureEnabled(FF.GENERIC_WORKFLOW_ENABLED) ? <SkillsPage /> : <ScopeDeniedPage title="通用能力注册（已锁定）" desc="通用技能与工作流能力注册不在 1.0 默认产品路径内。" />} />
+          <Route path="ecommerce" element={isFeatureEnabled(FF.SHOP_ENABLED) ? <EcommerceAdminPage /> : <ScopeDeniedPage title="电商后台（已锁定）" desc="商城与 Marketplace 不在 1.0 产品范围内。" />} />
           <Route path="monitor" element={<MonitorPage />} />
           <Route path="finance" element={<FinancePage />} />
           <Route path="payment-settings" element={<PaymentSettingsPage />} />
@@ -180,15 +183,21 @@ export default function App() {
           <Route path=":projectId" element={<StudioStagePage />} />
         </Route>
 
-        {/* 电商商城壳（首页/商品详情公开浏览；下单相关需登录） */}
-        <Route path="/shop" element={<ShopLayout />}>
-          <Route index element={<ShopHomePage />} />
-          <Route path="product/:id" element={<ProductDetailPage />} />
-          <Route path="cart" element={<RequireAuth><CartPage /></RequireAuth>} />
-          <Route path="checkout" element={<RequireAuth><CheckoutPage /></RequireAuth>} />
-          <Route path="orders" element={<RequireAuth><OrdersPage /></RequireAuth>} />
-          <Route path="seller" element={<RequireAuth><SellerPage /></RequireAuth>} />
-        </Route>
+        {/* 电商商城壳（M6）— S1 scope firewall: SHOP_ENABLED flag OFF by default.
+            When OFF, direct access to /shop/* shows ScopeDeniedPage; code is preserved.
+            Set VITE_FF_SHOP_ENABLED=1 to re-enable (dev/UAT only). */}
+        {isFeatureEnabled(FF.SHOP_ENABLED) ? (
+          <Route path="/shop" element={<ShopLayout />}>
+            <Route index element={<ShopHomePage />} />
+            <Route path="product/:id" element={<ProductDetailPage />} />
+            <Route path="cart" element={<RequireAuth><CartPage /></RequireAuth>} />
+            <Route path="checkout" element={<RequireAuth><CheckoutPage /></RequireAuth>} />
+            <Route path="orders" element={<RequireAuth><OrdersPage /></RequireAuth>} />
+            <Route path="seller" element={<RequireAuth><SellerPage /></RequireAuth>} />
+          </Route>
+        ) : (
+          <Route path="/shop" element={<ScopeDeniedPage title="AI 市集（已锁定）" desc="电商/市集功能不在当前 1.0 产品方向内，代码已保留但默认关闭。" />} />
+        )}
 
         {/* V2 preview shell (M00) — additive, feature-flag + dev gated. */}
         <Route path="/__v2/*" element={<V2Suspense><V2App /></V2Suspense>} />

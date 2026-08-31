@@ -103,12 +103,12 @@
         "SMOKE_GP02": { "type": "string", "enum": ["PASS", "FAIL", "NOT_READY"] },
         "SMOKE_GP03": { "type": "string", "enum": ["PASS", "FAIL", "NOT_READY"] },
         "BROWSER_E2E": { "type": "string", "enum": ["PASS", "FAIL", "NOT_READY"] },
-        "P0_COUNT": { "type": "integer" },
-        "P1_COUNT": { "type": "integer" },
-        "FAILED_MIGRATIONS": { "type": "integer" },
-        "UNRECONCILED_GENERATION_JOBS": { "type": "integer" },
-        "LEDGER_INCONSISTENCIES": { "type": "integer" },
-        "CRITICAL_ORPHAN_ASSETS": { "type": "integer" },
+        "P0_COUNT": { "type": ["integer", "null"] },
+        "P1_COUNT": { "type": ["integer", "null"] },
+        "FAILED_MIGRATIONS": { "type": ["integer", "null"] },
+        "UNRECONCILED_GENERATION_JOBS": { "type": ["integer", "null"] },
+        "LEDGER_INCONSISTENCIES": { "type": ["integer", "null"] },
+        "CRITICAL_ORPHAN_ASSETS": { "type": ["integer", "null"] },
         "BACKUP_RESTORE_TEST": { "type": "string", "enum": ["PASS", "FAIL", "NOT_READY"] }
       }
     },

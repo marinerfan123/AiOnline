@@ -11,6 +11,7 @@ This document establishes the governance rules for PostgreSQL schema migrations 
 | Current HEAD | `0016_studio_run_engine.sql` |
 | Total migrations | 15 |
 | Next available | `0017` |
+| Historical gap | `0015` (recorded; never backfilled) |
 | Anchor version | `0016` (Phase-1 Canvas, immutable) |
 
 ## Immutable Rules
@@ -19,7 +20,8 @@ This document establishes the governance rules for PostgreSQL schema migrations 
 2. **Never rewrite** historical migration content
 3. **Never delete** migration files
 4. **Never execute** migrations against production from this workflow
-5. **One writer per worktree** — use reservation system to claim versions
+5. **One writer per version** — atomic directory lock plus atomic registry replacement
+6. **Never backfill a historical gap** — new P1 allocation is numeric-head + 1
 
 ## Components
 
@@ -71,6 +73,23 @@ node server/db/migration-allocator.cjs list
 ```
 
 ## CI Gate
+
+Reservation verification is fail-closed and enabled by default. Local analysis
+may opt out only with `--no-require-reservation`; CI must never use that option.
+
+## Concurrency and lock limitations
+
+The JSON registry is protected by atomic `mkdir` and written via a
+same-directory temporary file followed by atomic rename. It requires a
+filesystem that guarantees those operations; object storage and weak network
+filesystems are unsupported. A killed lock holder can leave `<registry>.lock`;
+an operator must confirm the owner is dead before removing it. The allocator
+times out rather than stealing the lock.
+
+Preflight rejects migration-owned transaction control and warns on `ALTER
+TABLE` and non-concurrent index creation. These are static heuristics, not a
+production lock simulation; table size, lock timeout and rollout review remain
+mandatory.
 
 The CI pipeline runs `migration-preflight.cjs` on all new `.sql` files:
 

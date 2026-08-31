@@ -15,7 +15,7 @@ Migrations that ONLY add new tables, columns, or indexes without modifying exist
 - No `DROP`, `ALTER ... DROP`, `ALTER ... ALTER COLUMN`, or data modification
 - Checksum-stable: file content unchanged after application
 
-**Rollback strategy:** Create a companion `DOWN` migration that drops the added objects. The down migration must be verified against a fresh migrated database before being applied.
+**Rollback strategy:** A reviewed companion down migration may remove newly added schema objects only when dependency and data-loss analysis proves the change remains reversible. Test it on an isolated database first.
 
 **Examples in current chain:**
 - `0001_baseline_legacy_schema.sql` — REVERSIBLE (all CREATE IF NOT EXISTS)
@@ -40,7 +40,7 @@ Migrations that modify existing data, drop columns/tables, or change schema in w
 - Performs data migration (`UPDATE`, `INSERT ... ON CONFLICT`, data backfill)
 - References production data that cannot be restored from schema alone
 
-**Rollback strategy:** NO automated rollback. Must declare explicit forward-fix or restore strategy:
+**Rollback strategy:** NO automated or fake down migration. A same-name document under `docs/migrations/rollbacks/` must declare an explicit forward-fix or restore strategy:
 1. **Forward-fix**: Apply a new migration that corrects the state
 2. **Restore from backup**: Point-in-time recovery from known-good backup
 3. **Data reconstruction**: Re-seed from canonical source

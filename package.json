@@ -33,7 +33,9 @@
     "e2e": "playwright test",
     "e2e:install": "playwright install chromium",
     "golden-path": "node scripts/golden-path.cjs",
-    "golden-path:verify": "node --test scripts/golden-path.test.cjs"
+    "golden-path:verify": "node scripts/golden-path.test.cjs",
+    "test:migration-governance": "node server/db/migration-governance.test.cjs",
+    "test:scope-firewall": "node scripts/scope-firewall.test.cjs"
   },
   "dependencies": {
     "@formkit/auto-animate": "^0.9.0",

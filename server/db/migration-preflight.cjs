@@ -103,13 +103,14 @@ function checkSQLSanity(sql) {
     issues.push({ severity: 'WARNING', message: `Unbalanced parentheses: ${parenCount} opening(s) unclosed.` });
   }
 
-  // Check for COMMIT/ROLLBACK (should not be in migration files — handled by runner)
-  if (/\b(COMMIT|ROLLBACK)\b/i.test(sql)) {
+  if (/\b(BEGIN|START\s+TRANSACTION|COMMIT|ROLLBACK)\b/i.test(sql)) {
     issues.push({
-      severity: 'WARNING',
-      message: 'Migration contains COMMIT/ROLLBACK — these should be handled by the migration runner, not the SQL file.',
+      severity: 'ERROR',
+      message: 'Migration contains transaction control; the runner owns the transaction boundary.',
     });
   }
+  if (/CREATE\s+(UNIQUE\s+)?INDEX(?!\s+CONCURRENTLY)/i.test(sql)) issues.push({ severity: 'WARNING', message: 'CREATE INDEX without CONCURRENTLY may hold a write-blocking lock; document table size and maintenance window.' });
+  if (/ALTER\s+TABLE/i.test(sql)) issues.push({ severity: 'WARNING', message: 'ALTER TABLE may take ACCESS EXCLUSIVE locks; assess lock timeout, table size, and staged rollout.' });
 
   return issues;
 }
@@ -117,8 +118,7 @@ function checkSQLSanity(sql) {
 function classifyMigration(sql, issues) {
   const hasDrop = /DROP\s+(TABLE|COLUMN)/i.test(sql);
   const hasAlterDrop = /ALTER\s+TABLE.*DROP/i.test(sql);
-  const hasDataMigration = /\b(UPDATE|DELETE)\b.*\bFROM\b/i.test(sql) ||
-                           /ON\s+CONFLICT.*DO\s+(UPDATE|INSERT)/i.test(sql);
+  const hasDataMigration = /\b(INSERT\s+INTO|UPDATE|DELETE\s+FROM)\b/i.test(sql);
   const hasTypeChange = /ALTER\s+TABLE.*ALTER\s+COLUMN.*TYPE/i.test(sql);
 
   if (hasDrop || hasAlterDrop || hasDataMigration || hasTypeChange) {
@@ -138,18 +138,8 @@ function classifyMigration(sql, issues) {
   return 'IRREVERSIBLE';
 }
 
-function checkReservation(version, requireReservation) {
-  if (!requireReservation) return { passed: true };
-  const worktree = process.env.GIT_WORKTREE || 'unknown';
-  const result = verifyReservation(version, worktree);
-  if (!result.valid) {
-    return { passed: false, error: result.reason };
-  }
-  return { passed: true };
-}
-
 function runPreflight(filePath, options = {}) {
-  const { requireReservation = false } = options;
+  const { requireReservation = true, worktreeId = process.env.GIT_WORKTREE || 'unknown', rollbackDocsDir = path.join(__dirname, '..', '..', 'docs', 'migrations', 'rollbacks') } = options;
   const result = new PreflightResult();
 
   // Read file
@@ -204,12 +194,14 @@ function runPreflight(filePath, options = {}) {
     result.addWarning(
       'Migration classified as IRREVERSIBLE. Ensure rollback documentation exists at docs/migrations/rollbacks/'
     );
+    const rollbackDoc = path.join(rollbackDocsDir, `${version}_${versionCheck.name}.md`);
+    if (!fs.existsSync(rollbackDoc)) result.addError(`Irreversible migration requires a forward-fix/restore plan: ${rollbackDoc}`);
   }
 
   // 7. Reservation check
-  const resCheck = checkReservation(version, requireReservation);
-  if (!resCheck.passed) {
-    result.addError(resCheck.error);
+  const resCheck = requireReservation ? verifyReservation(version, worktreeId) : { valid: true };
+  if (!resCheck.valid) {
+    result.addError(resCheck.reason);
   }
 
   // Attach metadata
@@ -224,18 +216,18 @@ function runPreflight(filePath, options = {}) {
 function main() {
   const args = process.argv.slice(2);
   let filePath = null;
-  let requireReservation = false;
+  let requireReservation = true;
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--file' && args[i + 1]) {
       filePath = args[++i];
-    } else if (args[i] === '--require-reservation') {
-      requireReservation = true;
+    } else if (args[i] === '--no-require-reservation') {
+      requireReservation = false;
     }
   }
 
   if (!filePath) {
-    console.error('Usage: migration-preflight.cjs --file <path> [--require-reservation]');
+    console.error('Usage: migration-preflight.cjs --file <path> [--no-require-reservation]');
     process.exit(1);
   }
 

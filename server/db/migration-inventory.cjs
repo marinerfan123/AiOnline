@@ -40,13 +40,22 @@ function discoverMigrations() {
 
 function getHeadVersion(migrations) {
   if (!migrations.length) return '0000';
-  return migrations[migrations.length - 1].version;
+  return migrations.reduce((max, migration) => Number(migration.version) > Number(max) ? migration.version : max, '0000');
 }
 
 function getNextVersion(migrations) {
   if (!migrations.length) return '0017';
-  const head = parseInt(migrations[migrations.length - 1].version, 10);
+  const head = parseInt(getHeadVersion(migrations), 10);
   return String(head + 1).padStart(4, '0');
+}
+
+function analyzeHistory(migrations) {
+  const byVersion = new Map();
+  for (const migration of migrations) byVersion.set(migration.version, [...(byVersion.get(migration.version) || []), migration.filename]);
+  const duplicateVersions = [...byVersion].filter(([, files]) => files.length > 1).map(([version, files]) => ({ version, files }));
+  const head = Number(getHeadVersion(migrations)); const gaps = [];
+  for (let n = 1; n <= head; n++) { const version = String(n).padStart(4, '0'); if (!byVersion.has(version)) gaps.push(version); }
+  return { duplicateVersions, gaps, gapPolicy: 'Historical gaps are recorded and immutable; new P1 allocations append after numeric head and must be contiguous.' };
 }
 
 function buildInventory() {
@@ -57,6 +66,7 @@ function buildInventory() {
     nextVersion: getNextVersion(migrations),
     count: migrations.length,
     migrations,
+    history: analyzeHistory(migrations),
   };
 }
 
@@ -85,4 +95,4 @@ if (require.main === module) {
   main();
 }
 
-module.exports = { discoverMigrations, getHeadVersion, getNextVersion, buildInventory };
+module.exports = { discoverMigrations, getHeadVersion, getNextVersion, analyzeHistory, buildInventory };

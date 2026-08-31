@@ -4,11 +4,12 @@ import { NavLink } from 'react-router-dom';
 import { LayoutGrid, Clapperboard, ShoppingBag, ShieldAlert } from 'lucide-react';
 import { useAuth } from '@/services/authStore';
 import { cn } from '@/components/skeleton';
+import { isFeatureEnabled, FF } from '@/shared/config/featureFlags';
 
 const PRODUCTS = [
   { to: '/workspace', label: '工作台', icon: LayoutGrid },
   { to: '/studio', label: '创作工作室', icon: Clapperboard },
-  { to: '/shop', label: 'AI 市集', icon: ShoppingBag },
+  ...(isFeatureEnabled(FF.SHOP_ENABLED) ? [{ to: '/shop', label: 'AI 市集', icon: ShoppingBag }] : []),
 ];
 
 export function ProductSwitcher({ className = '' }: { className?: string }) {

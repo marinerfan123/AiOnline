@@ -8,6 +8,7 @@
 // 这是承接产品长期演进（11 → 30+ 模块）的地基：后端同步思路是把 handleAdmin /
 // handleFinance / handleShop 收口成统一的 registerModule 分发（见架构规划）。
 import type { LucideIcon } from 'lucide-react';
+import { FF, isFeatureEnabled } from '@/shared/config/featureFlags';
 import {
   LayoutDashboard,
   Activity,
@@ -58,7 +59,7 @@ export const ADMIN_GROUP_ORDER: { key: AdminGroup; title: string }[] = [
   { key: 'people', title: '用户与财务' },
 ];
 
-export const ADMIN_MODULES: AdminModule[] = [
+const ALL_ADMIN_MODULES: AdminModule[] = [
   // ── 总览 ──────────────────────────────────────────────
   { key: 'admin-console', label: '运营总控台', icon: LayoutDashboard, path: '/admin', group: 'overview', end: true },
 
@@ -95,3 +96,16 @@ export const ADMIN_MODULES: AdminModule[] = [
   { key: 'admin-payment-settings', label: '支付设置', icon: CreditCard, path: '/admin/payment-settings', group: 'people' },
   { key: 'admin-transactions', label: '积分流水', icon: Receipt, path: '/admin/transactions', group: 'people' },
 ];
+
+const OUT_OF_SCOPE_ADMIN_FLAGS: Partial<Record<string, (typeof FF)[keyof typeof FF]>> = {
+  'admin-agents': FF.AGENT_LAB_ENABLED,
+  'admin-routing': FF.GENERIC_WORKFLOW_ENABLED,
+  'admin-skills': FF.GENERIC_WORKFLOW_ENABLED,
+  'admin-ecommerce': FF.SHOP_ENABLED,
+  'admin-recommend': FF.SHOP_ENABLED,
+};
+
+export const ADMIN_MODULES = ALL_ADMIN_MODULES.filter(module => {
+  const flag = OUT_OF_SCOPE_ADMIN_FLAGS[module.key];
+  return !flag || isFeatureEnabled(flag);
+});

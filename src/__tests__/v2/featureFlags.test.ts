@@ -31,6 +31,22 @@ describe('feature flags (M00) — pure resolution', () => {
     expect(resolveFlag(FF.V2_STUDIO, env, localStorage)).toBe(false);
   });
 
+  it('S1 scope firewall: all out-of-scope surfaces are OFF by default', () => {
+    // Prod
+    expect(resolveFlag(FF.SHOP_ENABLED, envLike({ PROD: true }), localStorage)).toBe(false);
+    // Dev
+    expect(resolveFlag(FF.SHOP_ENABLED, envLike({}), localStorage)).toBe(false);
+    expect(resolveFlag(FF.AGENT_LAB_ENABLED, envLike({}), localStorage)).toBe(false);
+    expect(resolveFlag(FF.GENERIC_WORKFLOW_ENABLED, envLike({}), localStorage)).toBe(false);
+  });
+
+  it('S1 scope firewall: env override CAN enable SHOP (for operator opt-in)', () => {
+    // Unlike V2 flags, SHOP is hard-locked to OFF by default but env override still works
+    // (consistent with the resolveFlag architecture where env > localStorage > default)
+    const env: Env = envLike({ VITE_FF_SHOP_ENABLED: '1' });
+    expect(resolveFlag(FF.SHOP_ENABLED, env, localStorage)).toBe(true);
+  });
+
   it('dev build: V2_APP_SHELL default ON (preview), others OFF', () => {
     const env: Env = envLike({});
     expect(resolveFlag(FF.V2_APP_SHELL, env, localStorage)).toBe(true);
@@ -60,8 +76,10 @@ describe('feature flags (M00) — pure resolution', () => {
     // A malicious/buggy console injection:
     localStorage.setItem('ml2-ff-V2_APP_SHELL', '1');
     localStorage.setItem('ml2-ff-V2_STUDIO', '1');
+    localStorage.setItem('ml2-ff-SHOP_ENABLED', '1');
     expect(resolveFlag(FF.V2_APP_SHELL, env, localStorage)).toBe(false);
     expect(resolveFlag(FF.V2_STUDIO, env, localStorage)).toBe(false);
+    expect(resolveFlag(FF.SHOP_ENABLED, env, localStorage)).toBe(false);
   });
 
   it('setOverride is a no-op in production', () => {
@@ -82,14 +100,16 @@ describe('feature flags (M00) — pure resolution', () => {
 });
 
 describe('feature flags (M00) — real module bindings (dev runtime)', () => {
-  it('getFeatureFlags returns all four and matches dev defaults', () => {
+  it('getFeatureFlags returns the complete registry and matches dev defaults', () => {
     const all = getFeatureFlags();
     expect(Object.keys(all).sort()).toEqual(
-      ['V2_AI_CONTROL', 'V2_APP_SHELL', 'V2_ASSETS', 'V2_STUDIO'].sort(),
+      ['V2_AI_CONTROL', 'V2_APP_SHELL', 'V2_ASSETS', 'V2_STUDIO', 'SHOP_ENABLED', 'AGENT_LAB_ENABLED', 'GENERIC_WORKFLOW_ENABLED'].sort(),
     );
     // vitest runs with PROD=false by default
     expect(isFeatureEnabled(FF.V2_APP_SHELL)).toBe(true);
     expect(isFeatureEnabled(FF.V2_STUDIO)).toBe(false);
+    // S1 scope firewall: SHOP_ENABLED is always OFF
+    expect(isFeatureEnabled(FF.SHOP_ENABLED)).toBe(false);
   });
 
   it('setFeatureFlag round-trips through localStorage in dev', () => {

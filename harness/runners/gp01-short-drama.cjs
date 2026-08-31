@@ -38,8 +38,8 @@ const STEPS = [
   'export',
 ];
 
-function run() {
-  const evidenceDir = path.join(__dirname, '..', 'evidence');
+function run(options = {}) {
+  const evidenceDir = path.resolve(options.evidenceDir || process.env.GOLDEN_PATH_EVIDENCE_DIR || path.join(__dirname, '..', 'evidence'));
   fs.mkdirSync(evidenceDir, { recursive: true });
 
   const steps = [];
@@ -78,8 +78,8 @@ function run() {
 
 if (require.main === module) {
   const result = run();
-  console.log(JSON.stringify(result, null, 2));
-  process.exit(result.status === 'PASS' ? 0 : 1);
+  console.log(`GOLDEN_PATH_RESULT=${JSON.stringify(result)}`);
+  process.exit(result.status === 'PASS' ? 0 : result.status === 'NOT_READY' ? 2 : 1);
 }
 
 module.exports = { run, STEPS };

@@ -16,6 +16,10 @@ export const FF = {
   V2_AI_CONTROL: 'V2_AI_CONTROL',
   V2_ASSETS: 'V2_ASSETS',
   V2_STUDIO: 'V2_STUDIO',
+  /** S1 Scope Firewall: Shop/Marketplace (M6) is out of 1.0 scope. Default OFF. */
+  SHOP_ENABLED: 'SHOP_ENABLED',
+  AGENT_LAB_ENABLED: 'AGENT_LAB_ENABLED',
+  GENERIC_WORKFLOW_ENABLED: 'GENERIC_WORKFLOW_ENABLED',
 } as const;
 
 export type FeatureFlagName = (typeof FF)[keyof typeof FF];
@@ -71,6 +75,10 @@ export function resolveFlag(
   switch (name) {
     case FF.V2_APP_SHELL:
       return !env.PROD; // dev-only preview by default
+    case FF.SHOP_ENABLED:
+    case FF.AGENT_LAB_ENABLED:
+    case FF.GENERIC_WORKFLOW_ENABLED:
+      return false; // S1 scope firewall: always OFF — 1.0 is video production OS
     default:
       return false;
   }
@@ -119,5 +127,8 @@ export function getFeatureFlags(): Record<FeatureFlagName, boolean> {
     [FF.V2_AI_CONTROL]: resolveFlag(FF.V2_AI_CONTROL, env, storage),
     [FF.V2_ASSETS]: resolveFlag(FF.V2_ASSETS, env, storage),
     [FF.V2_STUDIO]: resolveFlag(FF.V2_STUDIO, env, storage),
+    [FF.SHOP_ENABLED]: resolveFlag(FF.SHOP_ENABLED, env, storage),
+    [FF.AGENT_LAB_ENABLED]: resolveFlag(FF.AGENT_LAB_ENABLED, env, storage),
+    [FF.GENERIC_WORKFLOW_ENABLED]: resolveFlag(FF.GENERIC_WORKFLOW_ENABLED, env, storage),
   };
 }

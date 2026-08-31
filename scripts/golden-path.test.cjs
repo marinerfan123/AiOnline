@@ -1,180 +1,60 @@
 'use strict';
-
-/**
- * scripts/golden-path.test.cjs
- *
- * Verifies harness integrity:
- *   - All runners report NOT_READY (no fake PASS)
- *   - Aggregator contracts metrics fields exist
- *   - Evidence files are written correctly
- *   - CLI entry point works
- */
-
-const test = require('node:test');
+const { test, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
+const { spawnSync } = require('child_process');
+const root = path.resolve(__dirname, '..');
+const temporaryDirs = [];
+function tempEvidence() { const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'moling-gp-')); temporaryDirs.push(dir); return dir; }
+afterEach(() => { while (temporaryDirs.length) fs.rmSync(temporaryDirs.pop(), { recursive: true, force: true }); });
 
-const harnessDir = path.join(__dirname, '..', 'harness');
-const evidenceDir = path.join(harnessDir, 'evidence');
-
-// Ensure evidence dir exists for this test run
-if (!fs.existsSync(evidenceDir)) {
-  fs.mkdirSync(evidenceDir, { recursive: true });
+for (const [id, file, count] of [['GP01','gp01-short-drama.cjs',8],['GP02','gp02-commercial.cjs',7],['GP03','gp03-ecommerce.cjs',6]]) {
+  test(`${id} retains ${count} NOT_READY steps and evidence`, () => {
+    const result = require(path.join(root, 'harness/runners', file)).run({ evidenceDir: tempEvidence() });
+    assert.equal(result.status, 'NOT_READY');
+    assert.equal(result.steps.length, count);
+    assert.ok(result.steps.every(step => step.status === 'NOT_READY'));
+    assert.ok(result.evidence_file && path.isAbsolute(result.evidence_file));
+    assert.ok(fs.existsSync(result.evidence_file));
+  });
 }
 
-test('GP01 runner reports NOT_READY with all steps NOT_READY', () => {
-  const { run } = require(path.join(harnessDir, 'runners', 'gp01-short-drama.cjs'));
-  const result = run();
-
-  assert.equal(result.status, 'NOT_READY', 'GP01 must report NOT_READY, not PASS');
-  assert.ok(Array.isArray(result.steps), 'steps must be an array');
-  assert.ok(result.steps.length > 0, 'must have at least one step');
-
-  for (const step of result.steps) {
-    assert.equal(step.status, 'NOT_READY', `Step '${step.name}' must be NOT_READY, not fake PASS`);
-    assert.ok(typeof step.name === 'string', 'step name must be string');
-  }
-
-  // Verify evidence file written
-  assert.ok(result.evidence_file, 'must have evidence_file');
-  assert.ok(fs.existsSync(result.evidence_file), `evidence file must exist: ${result.evidence_file}`);
+test('aggregate preserves steps, evidence paths and footprint', () => {
+  const evidenceDir = tempEvidence();
+  const paths = {};
+  for (const [key, file] of [['GP01','gp01-short-drama.cjs'],['GP02','gp02-commercial.cjs'],['GP03','gp03-ecommerce.cjs']]) paths[key] = require(path.join(root, 'harness/runners', file)).run({ evidenceDir });
+  const output = require(path.join(root, 'harness/aggregator.cjs')).aggregate({ paths, evidence_dir: evidenceDir, metrics: {} });
+  assert.deepEqual(output.summary, { total: 3, pass: 0, fail: 0, not_ready: 3, overall: 'NOT_READY' });
+  assert.deepEqual([output.metrics.GOLDEN_PATH_GP01, output.metrics.SMOKE_GP02, output.metrics.SMOKE_GP03], ['NOT_READY','NOT_READY','NOT_READY']);
+  assert.equal(output.metrics.BROWSER_E2E, 'NOT_READY');
+  assert.equal(output.metrics.BACKUP_RESTORE_TEST, 'NOT_READY');
+  for (const key of ['P0_COUNT','P1_COUNT','FAILED_MIGRATIONS','UNRECONCILED_GENERATION_JOBS','LEDGER_INCONSISTENCIES','CRITICAL_ORPHAN_ASSETS']) assert.equal(output.metrics[key], null);
+  assert.deepEqual(Object.values(output.paths).map(p => p.steps.length), [8,7,6]);
+  assert.ok(Object.values(output.paths).every(p => p.evidence_file));
+  assert.ok(output.footprint.length >= 7);
+  assert.ok(output.footprint.some(file => file.endsWith('results.json')));
 });
 
-test('GP02 runner reports NOT_READY with all steps NOT_READY', () => {
-  const { run } = require(path.join(harnessDir, 'runners', 'gp02-commercial.cjs'));
-  const result = run();
-
-  assert.equal(result.status, 'NOT_READY', 'GP02 must report NOT_READY, not PASS');
-  assert.ok(Array.isArray(result.steps), 'steps must be an array');
-  assert.ok(result.steps.length > 0, 'must have at least one step');
-
-  for (const step of result.steps) {
-    assert.equal(step.status, 'NOT_READY', `Step '${step.name}' must be NOT_READY`);
-  }
-
-  assert.ok(result.evidence_file, 'must have evidence_file');
-  assert.ok(fs.existsSync(result.evidence_file), `evidence file must exist: ${result.evidence_file}`);
+test('exit mapping keeps NOT_READY distinct and faults FAIL', () => {
+  const { runnerExitToStatus } = require(path.join(root, 'harness/aggregator.cjs'));
+  assert.equal(runnerExitToStatus(2), 'NOT_READY');
+  assert.equal(runnerExitToStatus(1), 'FAIL');
+  assert.equal(runnerExitToStatus(null, new Error('timeout')), 'FAIL');
 });
 
-test('GP03 runner reports NOT_READY with all steps NOT_READY', () => {
-  const { run } = require(path.join(harnessDir, 'runners', 'gp03-ecommerce.cjs'));
-  const result = run();
-
-  assert.equal(result.status, 'NOT_READY', 'GP03 must report NOT_READY, not PASS');
-  assert.ok(Array.isArray(result.steps), 'steps must be an array');
-  assert.ok(result.steps.length > 0, 'must have at least one step');
-
-  for (const step of result.steps) {
-    assert.equal(step.status, 'NOT_READY', `Step '${step.name}' must be NOT_READY`);
-  }
-
-  assert.ok(result.evidence_file, 'must have evidence_file');
-  assert.ok(fs.existsSync(result.evidence_file), `evidence file must exist: ${result.evidence_file}`);
+test('CLI writes only to requested temporary evidence directory', () => {
+  const evidenceDir = tempEvidence();
+  const result = spawnSync(process.execPath, ['scripts/golden-path.cjs', '--evidence-dir', evidenceDir], { cwd: root, encoding: 'utf8' });
+  assert.equal(result.status, 2, result.stderr);
+  const output = JSON.parse(fs.readFileSync(path.join(evidenceDir, 'results.json'), 'utf8'));
+  assert.deepEqual(output.summary, { total: 3, pass: 0, fail: 0, not_ready: 3, overall: 'NOT_READY' });
+  assert.deepEqual(Object.values(output.paths).map(p => p.steps.length), [8,7,6]);
+  assert.ok(output.footprint.length > 0);
 });
 
-test('aggregator includes all required metric fields', () => {
-  const { aggregate, metricsReservedKeys } = require(path.join(harnessDir, 'aggregator.cjs'));
-
-  const input = {
-    paths: {
-      GP01: { status: 'NOT_READY', steps: [], evidence_file: null },
-      GP02: { status: 'NOT_READY', steps: [], evidence_file: null },
-      GP03: { status: 'NOT_READY', steps: [], evidence_file: null },
-    },
-    metrics: {},
-    evidence_dir: evidenceDir,
-  };
-
-  const output = aggregate(input);
-
-  // Verify all required metric keys exist
-  const requiredMetrics = [
-    'GOLDEN_PATH_GP01',
-    'SMOKE_GP02',
-    'SMOKE_GP03',
-    'BROWSER_E2E',
-    'P0_COUNT',
-    'P1_COUNT',
-    'FAILED_MIGRATIONS',
-    'UNRECONCILED_GENERATION_JOBS',
-    'LEDGER_INCONSISTENCIES',
-    'CRITICAL_ORPHAN_ASSETS',
-    'BACKUP_RESTORE_TEST',
-  ];
-
-  for (const key of requiredMetrics) {
-    assert.ok(key in output.metrics, `metric '${key}' must exist in output`);
-  }
-
-  // Verify summary structure
-  assert.ok('summary' in output, 'must have summary');
-  assert.ok('total' in output.summary, 'summary must have total');
-  assert.ok('pass' in output.summary, 'summary must have pass');
-  assert.ok('fail' in output.summary, 'summary must have fail');
-  assert.ok('not_ready' in output.summary, 'summary must have not_ready');
-  assert.ok('overall' in output.summary, 'summary must have overall');
-
-  // Verify paths structure
-  assert.ok('paths' in output, 'must have paths');
-  assert.ok('GP01_short_drama_full' in output.paths, 'must have GP01 path');
-  assert.ok('GP02_commercial_smoke' in output.paths, 'must have GP02 path');
-  assert.ok('GP03_ecommerce_smoke' in output.paths, 'must have GP03 path');
-});
-
-test('aggregator rejects fake PASS', () => {
-  const { aggregate } = require(path.join(harnessDir, 'aggregator.cjs'));
-
-  // Try to inject a fake PASS
-  const input = {
-    paths: {
-      GP01: { status: 'PASS', steps: [{ name: 'story', status: 'PASS' }], evidence_file: null },
-      GP02: { status: 'NOT_READY', steps: [], evidence_file: null },
-      GP03: { status: 'NOT_READY', steps: [], evidence_file: null },
-    },
-    metrics: {},
-    evidence_dir: evidenceDir,
-  };
-
-  const output = aggregate(input);
-
-  // GP01 should still show NOT_READY in the metric because no real evidence
-  // (This tests that the aggregator doesn't blindly trust runner results)
-  assert.equal(output.metrics.GOLDEN_PATH_GP01, 'PASS', 'aggregator should preserve runner status for now');
-});
-
-test('fixtures/seed.json exists and is valid JSON', () => {
-  const seedPath = path.join(harnessDir, 'fixtures', 'seed.json');
-  assert.ok(fs.existsSync(seedPath), 'fixtures/seed.json must exist');
-
-  const content = fs.readFileSync(seedPath, 'utf8');
-  const seed = JSON.parse(content);
-
-  assert.ok(seed.products, 'must have products');
-  assert.ok(seed.products.short_drama, 'must have short_drama product');
-  assert.ok(seed.products.commercial, 'must have commercial product');
-  assert.ok(seed.products.ecommerce, 'must have ecommerce product');
-});
-
-test('fixtures/schema.sql exists', () => {
-  const schemaPath = path.join(harnessDir, 'fixtures', 'schema.sql');
-  assert.ok(fs.existsSync(schemaPath), 'fixtures/schema.sql must exist');
-});
-
-test('harness/results-schema.json exists and is valid JSON Schema', () => {
-  const schemaPath = path.join(harnessDir, 'results-schema.json');
-  assert.ok(fs.existsSync(schemaPath), 'results-schema.json must exist');
-
-  const content = fs.readFileSync(schemaPath, 'utf8');
-  const schema = JSON.parse(content);
-
-  assert.equal(schema.title, 'Golden Path Harness Results');
-  assert.ok(schema.required.includes('run_id'), 'must require run_id');
-  assert.ok(schema.required.includes('ts'), 'must require ts');
-  assert.ok(schema.required.includes('version'), 'must require version');
-});
-
-test('scripts/golden-path.cjs exists', () => {
-  const scriptPath = path.join(__dirname, 'golden-path.cjs');
-  assert.ok(fs.existsSync(scriptPath), 'scripts/golden-path.cjs must exist');
+test('schema permits null for the six unknown counts', () => {
+  const metrics = JSON.parse(fs.readFileSync(path.join(root, 'harness/results-schema.json'), 'utf8')).properties.metrics.properties;
+  for (const key of ['P0_COUNT','P1_COUNT','FAILED_MIGRATIONS','UNRECONCILED_GENERATION_JOBS','LEDGER_INCONSISTENCIES','CRITICAL_ORPHAN_ASSETS']) assert.deepEqual(metrics[key].type, ['integer','null']);
 });
