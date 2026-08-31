@@ -4,8 +4,8 @@
 // Features: base URL, credentials, request_id, timeout, AbortSignal,
 // standard error normalization, JSON + 204 handling, GET/idempotent retry.
 //
-// Session: mirrors production — httpOnly cookie (credentials:'include') for the
-// `sid` session, plus the optional bearer token discovered from /api/token.
+// Session: httpOnly `sid` cookie (credentials:'include'). System bearer tokens
+// are server-side credentials and are never discovered by browser clients.
 
 import { ApiError, codeFromStatus, parseErrorPayload, type ApiErrorPayload } from './errors';
 import { newRequestId } from '@/shared/telemetry/correlation';
@@ -26,7 +26,7 @@ export interface RequestOptions {
   headers?: Record<string, string>;
   /** When true, transient failures (network/5xx/429) are retried (GET-only by default). */
   retry?: boolean;
-  /** Bypass the bearer token (e.g. /api/token itself). */
+  /** Bypass an explicitly injected bearer token. */
   auth?: boolean;
 }
 
@@ -47,8 +47,6 @@ export class ApiClient {
   private timeoutMs: number;
   private getAuthToken?: () => string | null | Promise<string | null>;
   private onUnauthorized?: () => void;
-  private token: string | null = null;
-  private discoverPromise: Promise<boolean> | null = null;
 
   constructor(cfg: ApiClientConfig = {}) {
     this.baseUrl = (cfg.baseUrl ?? '').replace(/\/$/, '');
@@ -57,34 +55,15 @@ export class ApiClient {
     this.onUnauthorized = cfg.onUnauthorized;
   }
 
-  /** Auto-discover same-origin backend + bearer token (idempotent). */
+  /** Same-origin cookie sessions require no credential discovery. */
   ensureConnected(): Promise<boolean> {
-    if (this.token || this.discoverPromise) return this.discoverPromise ?? Promise.resolve(true);
-    this.discoverPromise = (async () => {
-      try {
-        const base = this.baseUrl || `${window.location.protocol}//${window.location.host}`;
-        const res = await fetch(`${base}/api/token`, {
-          headers: { 'Content-Type': 'application/json' },
-          credentials: 'include',
-        });
-        if (res.ok) {
-          const { token } = await res.json();
-          if (token) this.token = token;
-          return true;
-        }
-        return false;
-      } catch {
-        return false;
-      }
-    })();
-    return this.discoverPromise;
+    return Promise.resolve(true);
   }
 
   private async buildHeaders(auth: boolean, extra?: Record<string, string>) {
     const h: Record<string, string> = { 'Content-Type': 'application/json', ...extra };
     if (auth) {
-      let tok = this.token;
-      if (!tok && this.getAuthToken) tok = await this.getAuthToken();
+      const tok = this.getAuthToken ? await this.getAuthToken() : null;
       if (tok) h.Authorization = `Bearer ${tok}`;
     }
     return h;
@@ -182,7 +161,7 @@ export class ApiClient {
   }
 }
 
-/** Shared default instance (same-origin, auto token discovery). */
+/** Shared default instance (same-origin cookie session). */
 export const api = new ApiClient({
   onUnauthorized: () => {
     // Hook point: auth layer wires session refresh / redirect here.

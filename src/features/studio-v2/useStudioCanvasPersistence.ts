@@ -25,6 +25,8 @@ export function useStudioCanvasPersistence(projectId: string, enabled = true) {
   const revisionRef = useRef<number | null>(null);
   const suppressRef = useRef(false);
   const blockedRef = useRef(false);
+  const inFlightRef = useRef(false);
+  const generationRef = useRef(0);
   const prevNodesRef = useRef(new Map<string, string>());
   const prevEdgesRef = useRef(new Map<string, string>());
   const prevViewportRef = useRef('');
@@ -36,19 +38,31 @@ export function useStudioCanvasPersistence(projectId: string, enabled = true) {
   };
 
   const flush = async () => {
-    if (blockedRef.current || bufferRef.current.isEmpty() || !projectId || revisionRef.current == null) return;
+    if (inFlightRef.current || blockedRef.current || bufferRef.current.isEmpty() || !projectId || revisionRef.current == null) return;
+    const generation = generationRef.current;
+    const savingProjectId = projectId;
     const baseRevision = revisionRef.current;
     const patch = bufferRef.current.flush({ baseRevision, clientMutationId: mutationId() });
+    let saved = false;
+    inFlightRef.current = true;
     setStatus('Saving');
     try {
-      const res = await v2studio.patchCanvas(projectId, patch);
+      const res = await v2studio.patchCanvas(savingProjectId, patch);
+      if (generation !== generationRef.current) return;
       if (!res.canvas) throw new Error('missing canvas');
       revisionRef.current = res.canvas.revision;
+      saved = true;
       setRevision(res.canvas.revision);
       setLastSavedAt(new Date().toISOString());
-      setStatus('Saved');
-      markClean(useStudioStore.getState().nodes, useStudioStore.getState().edges, useStudioStore.getState().viewport);
+      if (bufferRef.current.isEmpty()) {
+        setStatus('Saved');
+        markClean(useStudioStore.getState().nodes, useStudioStore.getState().edges, useStudioStore.getState().viewport);
+      } else {
+        setStatus('Unsaved');
+      }
     } catch (e) {
+      if (generation !== generationRef.current) return;
+      bufferRef.current.restore(patch);
       if (e instanceof StudioCanvasApiError && e.status === 409 && e.serverRevision && e.canvasId) {
         blockedRef.current = true;
         setConflict({ serverRevision: e.serverRevision, canvasId: e.canvasId });
@@ -56,6 +70,11 @@ export function useStudioCanvasPersistence(projectId: string, enabled = true) {
         return;
       }
       setStatus(navigator.onLine === false ? 'Offline' : 'Save failed');
+    } finally {
+      if (generation === generationRef.current) {
+        inFlightRef.current = false;
+        if (saved && !blockedRef.current && !bufferRef.current.isEmpty()) schedule();
+      }
     }
   };
 
@@ -68,11 +87,15 @@ export function useStudioCanvasPersistence(projectId: string, enabled = true) {
 
   const reloadFromServer = async () => {
     if (!projectId) return;
+    const generation = generationRef.current;
+    const loadingProjectId = projectId;
     setStatus('Loading');
     blockedRef.current = false;
     setConflict(null);
-    const res = await v2studio.getCanvas(projectId);
-    const data = res.canvas ? res : await v2studio.createCanvas(projectId, { name: 'Primary Canvas' });
+    const res = await v2studio.getCanvas(loadingProjectId);
+    if (generation !== generationRef.current) return;
+    const data = res.canvas ? res : await v2studio.createCanvas(loadingProjectId, { name: 'Primary Canvas' });
+    if (generation !== generationRef.current) return;
     const nodes = data.nodes.map(deserializeStudioNode);
     const edges = data.edges.map(deserializeStudioEdge);
     suppressRef.current = true;
@@ -87,8 +110,24 @@ export function useStudioCanvasPersistence(projectId: string, enabled = true) {
   };
 
   useEffect(() => {
+    generationRef.current += 1;
+    bufferRef.current = new DirtyOperationBuffer();
+    revisionRef.current = null;
+    inFlightRef.current = false;
+    blockedRef.current = false;
+    suppressRef.current = false;
+    prevNodesRef.current = new Map();
+    prevEdgesRef.current = new Map();
+    prevViewportRef.current = '';
+    setRevision(null);
+    setLastSavedAt(null);
+    setConflict(null);
+    if (timerRef.current) clearTimeout(timerRef.current);
     if (!enabled || !projectId) return;
-    void reloadFromServer().catch(() => setStatus('Save failed'));
+    const generation = generationRef.current;
+    void reloadFromServer().catch(() => {
+      if (generation === generationRef.current) setStatus('Save failed');
+    });
     const unsub = useStudioStore.subscribe((state) => {
       if (suppressRef.current || revisionRef.current == null || blockedRef.current) return;
       const prevNodes = prevNodesRef.current;
@@ -100,9 +139,16 @@ export function useStudioCanvasPersistence(projectId: string, enabled = true) {
       for (const e of state.edges) if (prevEdges.get(e.id) !== nextEdges.get(e.id)) bufferRef.current.upsertEdge(e);
       for (const id of prevEdges.keys()) if (!nextEdges.has(id)) bufferRef.current.deleteEdge(id);
       if (prevViewportRef.current !== viewportSig(state.viewport)) bufferRef.current.viewport(state.viewport);
+      prevNodesRef.current = nextNodes;
+      prevEdgesRef.current = nextEdges;
+      prevViewportRef.current = viewportSig(state.viewport);
       if (!bufferRef.current.isEmpty()) schedule();
     });
-    return () => { unsub(); if (timerRef.current) clearTimeout(timerRef.current); };
+    return () => {
+      generationRef.current += 1;
+      unsub();
+      if (timerRef.current) clearTimeout(timerRef.current);
+    };
   }, [projectId, enabled]);
 
   const retry = () => { if (!blockedRef.current) void flush(); };

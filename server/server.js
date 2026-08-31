@@ -4532,9 +4532,6 @@ app.use((req, res, next) => {
   next();
 });
 
-// API token（网关探针）
-app.get('/api/token', (req, res) => sendJSON(res, 200, { token: API_TOKEN }));
-
 // API 路由 → handleAPI（含流量采样）
 app.use((req, res, next) => {
   if (!req.url.startsWith('/api/')) return next();

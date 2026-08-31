@@ -14,7 +14,7 @@
 //   const picker = useAssetPicker(projectId, { allowedTypes: ['IMAGE'] });
 //   picker.open(); picker.selected: AssetRef | null; picker.close();
 
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useInfiniteQuery } from '@tanstack/react-query';
 import { Image as ImageIcon, Film, AudioLines, Box, Check, Search, X } from 'lucide-react';
 import { v2asset } from '@/shared/api/contract/asset-client';
@@ -46,6 +46,9 @@ export interface AssetPickerProps {
 export function useAssetPicker(projectId: string, allowedTypes: AssetType[] = []) {
   const [open, setOpen] = useState(false);
   const [selected, setSelected] = useState<AssetRef | null>(null);
+  useEffect(() => {
+    setSelected(null);
+  }, [projectId]);
   return {
     open,
     openPicker: () => setOpen(true),
@@ -61,6 +64,10 @@ export function AssetPicker({ projectId, allowedTypes, onPick, initialAssetId, c
   const [open, setOpen] = useState(false);
   const [search, setSearch] = useState('');
   const [cursor, setCursor] = useState<AssetRef | null>(null);
+
+  useEffect(() => {
+    setCursor(null);
+  }, [projectId]);
 
   const typeFilter: AssetType | '' = allowedTypes?.length === 1 ? allowedTypes[0] : '';
 

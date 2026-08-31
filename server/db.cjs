@@ -1,4 +1,7 @@
 // server/db.js — PostgreSQL + Redis 连接层
+if (process.env.NODE_ENV === 'production' && !process.env.PG_PASSWORD) {
+  throw new Error('PG_PASSWORD is required in production');
+}
 const { Pool } = require('pg');
 const Redis = require('ioredis');
 const path = require('path');
@@ -10,7 +13,7 @@ const pool = new Pool({
   port: parseInt(process.env.PG_PORT || '5432', 10),
   database: process.env.PG_DATABASE || 'huabu',
   user: process.env.PG_USER || 'postgres',
-  password: process.env.PG_PASSWORD || 'postgres',
+  password: process.env.PG_PASSWORD || 'postgres', // explicit development/test-only fallback
   max: 10,
   idleTimeoutMillis: 30000,
 });

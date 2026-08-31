@@ -159,6 +159,22 @@ export class DirtyOperationBuffer {
   }
   viewport(viewport: Viewport) { this.viewportValue = viewport; }
   isEmpty() { return !this.nodes.size && !this.deletedNodes.size && !this.edges.size && !this.deletedEdges.size && !this.viewportValue; }
+  /** Restore a failed in-flight patch without replacing edits made afterward. */
+  restore(patch: CanvasPatchRequest) {
+    for (const n of patch.upsertNodes ?? []) {
+      if (!this.nodes.has(n.nodeId) && !this.deletedNodes.has(n.nodeId)) this.nodes.set(n.nodeId, n);
+    }
+    for (const id of patch.deleteNodeIds ?? []) {
+      if (!this.nodes.has(id) && !this.deletedNodes.has(id)) this.deletedNodes.add(id);
+    }
+    for (const e of patch.upsertEdges ?? []) {
+      if (!this.edges.has(e.edgeId) && !this.deletedEdges.has(e.edgeId)) this.edges.set(e.edgeId, e);
+    }
+    for (const id of patch.deleteEdgeIds ?? []) {
+      if (!this.edges.has(id) && !this.deletedEdges.has(id)) this.deletedEdges.add(id);
+    }
+    if (!this.viewportValue && patch.viewport) this.viewportValue = patch.viewport;
+  }
   flush(base: { baseRevision: number; clientMutationId: string }): CanvasPatchRequest {
     const out: CanvasPatchRequest = { baseRevision: base.baseRevision, clientMutationId: base.clientMutationId };
     if (this.nodes.size) out.upsertNodes = Array.from(this.nodes.values());

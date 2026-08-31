@@ -15,7 +15,7 @@ const { EventEmitter } = require('events');
 const { getRedis, isRedisUp } = require('./redis.cjs');
 
 const emitter = new EventEmitter();
-emitter.setMaxListeners(0); // 允许大量 SSE 连接同时订阅，避免 MaxListenersExceededWarning
+const MAX_CONNECTIONS_PER_USER = Math.max(1, parseInt(process.env.SSE_MAX_CONNECTIONS_PER_USER || '5', 10) || 5);
 
 // userId -> Set(res)：活跃 SSE 连接注册表（按用户隔离，防多用户串看，G1）
 const conns = new Map();
@@ -82,6 +82,15 @@ function subscribe(userId, res) {
   const key = `u:${userId}`;
   if (!conns.has(userId)) conns.set(userId, new Set());
   const set = conns.get(userId);
+  // Keep resource use bounded per authenticated principal. Replacing the
+  // oldest stream is deterministic and lets a newly opened tab remain usable.
+  if (set.size >= MAX_CONNECTIONS_PER_USER) {
+    const oldest = set.values().next().value;
+    if (oldest) {
+      oldest.__realtimeUnsubscribe?.();
+      try { oldest.end(); } catch (_) {}
+    }
+  }
   set.add(res);
   const onEvt = (payload) => {
     try {
@@ -91,11 +100,16 @@ function subscribe(userId, res) {
     }
   };
   emitter.on(key, onEvt);
-  return () => {
+  let active = true;
+  const unsubscribe = () => {
+    if (!active) return;
+    active = false;
     emitter.off(key, onEvt);
     set.delete(res);
     if (set.size === 0) conns.delete(userId);
   };
+  res.__realtimeUnsubscribe = unsubscribe;
+  return unsubscribe;
 }
 
 // 在途任务快照：连接建立时立即回灌，字段形状对齐 getTaskStatus / apiGetGenerationStatus，
@@ -133,4 +147,4 @@ async function snapshotActive(pgPool, userId) {
 
 startSubscriber();
 
-module.exports = { emitTaskUpdate, subscribe, snapshotActive, ensureSubscriber };
+module.exports = { emitTaskUpdate, subscribe, snapshotActive, ensureSubscriber, MAX_CONNECTIONS_PER_USER };

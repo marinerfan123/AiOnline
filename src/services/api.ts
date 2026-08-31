@@ -6,7 +6,6 @@ import type { IMediaItem } from '@/data/media';
 
 let API_BASE = '';
 let API_TOKEN = '';
-let discoverPromise: Promise<boolean> | null = null;
 
 /** 手动指定后端地址（一般不需要，ensureApi 会自动发现） */
 export function initApi(baseUrl: string, token: string) {
@@ -15,15 +14,14 @@ export function initApi(baseUrl: string, token: string) {
 }
 
 function headers(): Record<string, string> {
-  return {
-    'Content-Type': 'application/json',
-    Authorization: `Bearer ${API_TOKEN}`,
-  };
+  return API_TOKEN
+    ? { 'Content-Type': 'application/json', Authorization: `Bearer ${API_TOKEN}` }
+    : { 'Content-Type': 'application/json' };
 }
 
 async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
-  // 确保 API 已连接（首次调用时自动发现后端 + 获取 token）
-  if (!API_TOKEN) await ensureApi();
+  // 确保 API 已连接（同源 sid cookie 由浏览器自动携带）
+  await ensureApi();
   // credentials:'include' → 浏览器自动携带会话 cookie（后端 set-cookie 的 sid），用于 /api/generate 等需登录接口归属用户
   const res = await fetch(`${API_BASE}${path}`, { ...options, credentials: 'include', headers: { ...headers(), ...options?.headers } });
   if (!res.ok) {
@@ -34,35 +32,13 @@ async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
 }
 
 /**
- * 确保 API 已连接（模块级缓存，只发现一次）。
- * 根据当前访问地址自动推导后端：http://<hostname>:3001 并获取 token。
+ * 确保 API 已连接。
+ * 同源请求通过 httpOnly sid cookie 认证，不向浏览器分发系统 token。
  * 后端不可用时返回 false，调用方降级到内置默认数据（仅内存，不落盘）。
  */
 export function ensureApi(): Promise<boolean> {
-  if (API_BASE && API_TOKEN) return Promise.resolve(true);
-  if (!discoverPromise) {
-    discoverPromise = (async () => {
-      try {
-        // 同域：直接走相对路径
-        let apiBase = '';
-        if (typeof window !== 'undefined') {
-          const { protocol, host } = window.location;
-          apiBase = `${protocol}//${host}`;
-        }
-        const res = await fetch(`${apiBase}/api/token`, { headers: { 'Content-Type': 'application/json' }, credentials: 'include' });
-        if (res.ok) {
-          const { token } = await res.json();
-          initApi(apiBase, token);
-          console.log(`[API] 已连接 ${apiBase}`);
-          return true;
-        }
-      } catch {
-        console.log('[API] 后端未启动，使用内置默认数据（不持久化）');
-      }
-      return false;
-    })();
-  }
-  return discoverPromise;
+  if (!API_BASE && typeof window !== 'undefined') API_BASE = `${window.location.protocol}//${window.location.host}`;
+  return Promise.resolve(true);
 }
 
 // ─── Media ──────────────────────────────────────
