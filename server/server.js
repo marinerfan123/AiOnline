@@ -51,6 +51,9 @@ import aiControlRouterMod from './modules/ai-control/routes/aiControlRoutes.cjs'
 import projectFoundationMod from './modules/project-foundation/projectFoundation.cjs';
 import assetFoundationMod from './modules/project-foundation/assetFoundation.cjs';
 import studioCanvasPersistenceMod from './modules/project-foundation/studioCanvasPersistence.cjs';
+import studioRunEngineMod from './modules/project-foundation/studioRunEngine.cjs';
+import studioRunApiMod from './modules/project-foundation/studioRunApi.cjs';
+import { createWorkerDaemon as createStudioWorkerDaemon } from './modules/generation-v2/worker-daemon.cjs';
 import generationV2Shadow from './modules/generation-v2/shadow.cjs';
 // ModelHub V3 Phase 1 — 唯一模型身份 resolver（server.js 仅在此一处调用，不再散落处理 display_name）
 import modelHubResolver from './modules/modelhub/resolver.cjs';
@@ -1486,6 +1489,67 @@ const studioCanvasPersistence = studioCanvasPersistenceMod.createStudioCanvasPer
   parseBody,
 });
 
+// M05-D1 — Durable Studio Run engine + API (/api/v2/projects/:id/studio/runs).
+// PostgreSQL is the scheduling authority; this process is a stateless API +
+// optional worker. The engine never holds durable process state.
+const STUDIO_WORKER_ID = `studio-${NODE_ID}`;
+const studioRunEngine = studioRunEngineMod.createStudioRunEngine({
+  pg: {
+    query: (sql, params) => pgPool
+      ? pgPool.query(sql, params)
+      : Promise.reject(Object.assign(new Error('数据库未就绪'), { status: 503 })),
+    connect: () => pgPool
+      ? pgPool.connect()
+      : Promise.reject(Object.assign(new Error('数据库未就绪'), { status: 503 })),
+  },
+  workerId: STUDIO_WORKER_ID,
+  onLog: (tag, payload) => {
+    try { console.log(JSON.stringify({ tag: 'studio-run', event: tag, ...(payload || {}) })); } catch (_) {}
+  },
+});
+const studioRunApi = studioRunApiMod.createStudioRunApi({
+  pg: {
+    query: (sql, params) => pgPool
+      ? pgPool.query(sql, params)
+      : Promise.reject(Object.assign(new Error('数据库未就绪'), { status: 503 })),
+    connect: () => pgPool
+      ? pgPool.connect()
+      : Promise.reject(Object.assign(new Error('数据库未就绪'), { status: 503 })),
+  },
+  sessionUser: (req) => session.getUserFromCookie(req),
+  sendJSON,
+  parseBody,
+  engine: studioRunEngine,
+});
+
+// M05-D1 Studio worker daemon (LOCAL DEV CONVENIENCE ONLY, explicitly opted in):
+// Production runs dedicated Studio Worker replicas via `node server/studio-worker.cjs`
+// so API and Worker scale independently (MOLING-1000). The production API must
+// NOT start a worker by default. When opted in with STUDIO_WORKER_IN_API=true,
+// this daemon is still correct: no leader/singleton/PID/hostname dependency —
+// PostgreSQL SKIP LOCKED leasing + lease token fencing make any number of
+// concurrent daemons (API-embedded and/or dedicated) safe.
+let studioWorkerDaemon = null;
+async function startStudioWorkerDaemon() {
+  if (!pgPool || studioWorkerDaemon) return;
+  const STUDIO_WORKER_IN_API = process.env.STUDIO_WORKER_IN_API === 'true';
+  if (!STUDIO_WORKER_IN_API) { console.log('[studio-run] worker daemon NOT started (production: run dedicated `node server/studio-worker.cjs` replicas; local dev: set STUDIO_WORKER_IN_API=true)'); return; }
+  const tickIntervalMs = Number(process.env.STUDIO_WORKER_TICK_MS) || 1000;
+  const daemon = createStudioWorkerDaemon({
+    workerId: STUDIO_WORKER_ID,
+    pgPool,
+    tickIntervalMs,
+    tick: async () => {
+      try { await studioRunEngine.reapExpiredNodes({ limit: 100 }); } catch (e) { console.warn('[studio-run] reaper error:', e.message); }
+      try { await studioRunEngine.workerTick({ concurrency: Number(process.env.STUDIO_WORKER_CONCURRENCY) || 4, batch: 10 }); } catch (e) { console.warn('[studio-run] worker tick error:', e.message); }
+    },
+    onError: (e) => console.warn('[studio-run] daemon tick error:', e.message),
+  });
+  studioWorkerDaemon = daemon;
+  daemon.start();
+  console.log(`[studio-run] worker daemon started (id=${STUDIO_WORKER_ID}, tick=${tickIntervalMs}ms)`);
+}
+
 const referenceStyles = referenceStylesMod.createReferenceStyles({
   getPg: () => pgPool,
   session,
@@ -2405,6 +2469,11 @@ async function handleAPI(req, res) {
   // ── M05-C Studio Canvas Persistence（/api/v2/projects/:id/studio/canvas）──
   if (/\/api\/v2\/projects\/[^/]+\/studio\/canvas/.test(url)) {
     if (await studioCanvasPersistence.handle(req, res, url.split('?')[0], method)) return;
+  }
+
+  // ── M05-D1 Studio Runs（/api/v2/projects/:id/studio/runs）──
+  if (/\/api\/v2\/projects\/[^/]+\/studio\/runs/.test(url)) {
+    if (await studioRunApi.handle(req, res, url.split('?')[0], method)) return;
   }
 
   // ── M04-S Asset Foundation（/api/v2/assets, /api/v2/projects/:id/assets）──
@@ -4687,7 +4756,10 @@ if (pgPool && IS_LEADER) {
   // 搬运与 API 解耦：启动后台上传队列 worker（建表 + 崩溃恢复 + 起 worker），仅 leader worker 跑
   dispatcher.startUploadQueue(pgPool)
     .then(() => console.log('[startup] 上传队列 worker 已启动'))
-    .catch((e) => console.warn('[startup] 上传队列启动失败（不影响启动）:', e.message));
+    .catch((e) => console.warn('[startup] 上传队列 worker 启动失败（不影响启动）:', e.message));
+  // M05-D1：Studio Run 调度 worker（lease/reaper/execute），PostgreSQL 为唯一权威
+  startStudioWorkerDaemon()
+    .catch((e) => console.warn('[startup] Studio worker 启动失败（不影响启动）:', e.message));
 }
 
 // ─── 核心错误持久化 + 进程级异常兜底（#449/#450）───
