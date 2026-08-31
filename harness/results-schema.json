@@ -1,0 +1,129 @@
+{
+  "$id": "https://moling.ai/schemas/golden-path/results/v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Golden Path Harness Results",
+  "description": "Aggregated results from Golden Path test runs. Consumers: CI, human reviewers, downstream tasks.",
+  "type": "object",
+  "required": ["run_id", "ts", "version", "summary", "paths", "metrics", "evidence_dir"],
+  "properties": {
+    "run_id": { "type": "string", "description": "Unique run identifier (ISO timestamp or UUID)" },
+    "ts": { "type": "string", "format": "date-time" },
+    "version": { "type": "string", "description": "Schema version" },
+    "summary": {
+      "type": "object",
+      "required": ["total", "pass", "fail", "not_ready", "overall"],
+      "properties": {
+        "total": { "type": "integer" },
+        "pass": { "type": "integer" },
+        "fail": { "type": "integer" },
+        "not_ready": { "type": "integer" },
+        "overall": {
+          "type": "string",
+          "enum": ["PASS", "FAIL", "NOT_READY"]
+        }
+      }
+    },
+    "paths": {
+      "type": "object",
+      "description": "Per-path result statuses",
+      "properties": {
+        "GP01_short_drama_full": {
+          "type": "object",
+          "required": ["status", "runner", "evidence_file"],
+          "properties": {
+            "status": { "type": "string", "enum": ["PASS", "FAIL", "NOT_READY"] },
+            "runner": { "type": "string" },
+            "evidence_file": { "type": "string" },
+            "steps": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["name", "status"],
+                "properties": {
+                  "name": { "type": "string" },
+                  "status": { "type": "string", "enum": ["PASS", "FAIL", "NOT_READY"] },
+                  "duration_ms": { "type": "integer" },
+                  "evidence": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "GP02_commercial_smoke": {
+          "type": "object",
+          "required": ["status", "runner", "evidence_file"],
+          "properties": {
+            "status": { "type": "string", "enum": ["PASS", "FAIL", "NOT_READY"] },
+            "runner": { "type": "string" },
+            "evidence_file": { "type": "string" },
+            "steps": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["name", "status"],
+                "properties": {
+                  "name": { "type": "string" },
+                  "status": { "type": "string", "enum": ["PASS", "FAIL", "NOT_READY"] },
+                  "duration_ms": { "type": "integer" },
+                  "evidence": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "GP03_ecommerce_smoke": {
+          "type": "object",
+          "required": ["status", "runner", "evidence_file"],
+          "properties": {
+            "status": { "type": "string", "enum": ["PASS", "FAIL", "NOT_READY"] },
+            "runner": { "type": "string" },
+            "evidence_file": { "type": "string" },
+            "steps": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["name", "status"],
+                "properties": {
+                  "name": { "type": "string" },
+                  "status": { "type": "string", "enum": ["PASS", "FAIL", "NOT_READY"] },
+                  "duration_ms": { "type": "integer" },
+                  "evidence": { "type": "string" }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "description": "Final product-level aggregator fields (契约字段)",
+      "properties": {
+        "GOLDEN_PATH_GP01": { "type": "string", "enum": ["PASS", "FAIL", "NOT_READY"] },
+        "SMOKE_GP02": { "type": "string", "enum": ["PASS", "FAIL", "NOT_READY"] },
+        "SMOKE_GP03": { "type": "string", "enum": ["PASS", "FAIL", "NOT_READY"] },
+        "BROWSER_E2E": { "type": "string", "enum": ["PASS", "FAIL", "NOT_READY"] },
+        "P0_COUNT": { "type": "integer" },
+        "P1_COUNT": { "type": "integer" },
+        "FAILED_MIGRATIONS": { "type": "integer" },
+        "UNRECONCILED_GENERATION_JOBS": { "type": "integer" },
+        "LEDGER_INCONSISTENCIES": { "type": "integer" },
+        "CRITICAL_ORPHAN_ASSETS": { "type": "integer" },
+        "BACKUP_RESTORE_TEST": { "type": "string", "enum": ["PASS", "FAIL", "NOT_READY"] }
+      }
+    },
+    "evidence_dir": {
+      "type": "string",
+      "description": "Absolute path to evidence directory"
+    },
+    "footprint": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Relative paths of all evidence files written"
+    },
+    "errors": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  }
+}

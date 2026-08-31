@@ -1,0 +1,36 @@
+{
+  "version": "1.0.0",
+  "description": "Minimal seed data for Golden Path fixtures",
+  "notes": "This seed is used for harness skeleton testing. Later stages will add real fixtures.",
+  "products": {
+    "short_drama": {
+      "project_id": "gp01-test-project",
+      "title": "Test Short Drama",
+      "genre": "romance",
+      "target_duration_s": 180,
+      "shots_required": 12
+    },
+    "commercial": {
+      "project_id": "gp02-test-project",
+      "brand": "TestBrand",
+      "product": "TestProduct",
+      "target_duration_s": 30,
+      "shots_required": 6
+    },
+    "ecommerce": {
+      "project_id": "gp03-test-project",
+      "product_name": "TestEcomProduct",
+      "target_duration_s": 15,
+      "format": "vertical_9_16",
+      "shots_required": 5
+    }
+  },
+  "assets": {
+    "images": [
+      { "id": "seed-img-001", "url": null, "width": 1920, "height": 1080, "format": "png" }
+    ],
+    "videos": [
+      { "id": "seed-vid-001", "url": null, "duration_ms": 0, "format": "mp4" }
+    ]
+  }
+}

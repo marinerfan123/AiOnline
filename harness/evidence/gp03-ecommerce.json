@@ -1,0 +1,45 @@
+{
+  "status": "NOT_READY",
+  "runner": "harness/runners/gp03-ecommerce.cjs",
+  "label": "E-commerce Smoke",
+  "steps": [
+    {
+      "name": "product_images",
+      "status": "NOT_READY",
+      "duration_ms": 0,
+      "evidence": "Step 'product_images' not yet implemented"
+    },
+    {
+      "name": "selling_points",
+      "status": "NOT_READY",
+      "duration_ms": 0,
+      "evidence": "Step 'selling_points' not yet implemented"
+    },
+    {
+      "name": "shots_5",
+      "status": "NOT_READY",
+      "duration_ms": 0,
+      "evidence": "Step 'shots_5' not yet implemented"
+    },
+    {
+      "name": "video_15s_vertical",
+      "status": "NOT_READY",
+      "duration_ms": 0,
+      "evidence": "Step 'video_15s_vertical' not yet implemented"
+    },
+    {
+      "name": "cta",
+      "status": "NOT_READY",
+      "duration_ms": 0,
+      "evidence": "Step 'cta' not yet implemented"
+    },
+    {
+      "name": "export",
+      "status": "NOT_READY",
+      "duration_ms": 0,
+      "evidence": "Step 'export' not yet implemented"
+    }
+  ],
+  "ts": "2026-08-31T17:50:44.352Z",
+  "evidence_file": "C:\\Users\\Administrator\\github_ai_online\\.worktrees\\p1-g0-05-golden-path-harness\\harness\\evidence\\gp03-ecommerce.json"
+}

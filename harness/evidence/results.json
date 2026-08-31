@@ -1,0 +1,48 @@
+{
+  "run_id": "2026-08-31T17-50-44-360Z-12708",
+  "ts": "2026-08-31T17:50:44.360Z",
+  "version": "1.0.0",
+  "summary": {
+    "total": 3,
+    "pass": 0,
+    "fail": 3,
+    "not_ready": 0,
+    "overall": "FAIL"
+  },
+  "paths": {
+    "GP01_short_drama_full": {
+      "status": "FAIL",
+      "runner": "harness/runners/gp01-short-drama.cjs",
+      "label": "Short Drama FULL",
+      "steps": []
+    },
+    "GP02_commercial_smoke": {
+      "status": "FAIL",
+      "runner": "harness/runners/gp02-commercial.cjs",
+      "label": "Commercial Smoke",
+      "steps": []
+    },
+    "GP03_ecommerce_smoke": {
+      "status": "FAIL",
+      "runner": "harness/runners/gp03-ecommerce.cjs",
+      "label": "E-commerce Smoke",
+      "steps": []
+    }
+  },
+  "metrics": {
+    "GOLDEN_PATH_GP01": "FAIL",
+    "SMOKE_GP02": "FAIL",
+    "SMOKE_GP03": "FAIL",
+    "BROWSER_E2E": null,
+    "P0_COUNT": null,
+    "P1_COUNT": null,
+    "FAILED_MIGRATIONS": null,
+    "UNRECONCILED_GENERATION_JOBS": null,
+    "LEDGER_INCONSISTENCIES": null,
+    "CRITICAL_ORPHAN_ASSETS": null,
+    "BACKUP_RESTORE_TEST": null
+  },
+  "evidence_dir": "C:\\Users\\Administrator\\github_ai_online\\.worktrees\\p1-g0-05-golden-path-harness\\harness\\evidence",
+  "footprint": [],
+  "errors": []
+}

@@ -31,7 +31,9 @@
     "storybook": "storybook dev -p 6006",
     "storybook:build": "storybook build -o storybook-static",
     "e2e": "playwright test",
-    "e2e:install": "playwright install chromium"
+    "e2e:install": "playwright install chromium",
+    "golden-path": "node scripts/golden-path.cjs",
+    "golden-path:verify": "node --test scripts/golden-path.test.cjs"
   },
   "dependencies": {
     "@formkit/auto-animate": "^0.9.0",
