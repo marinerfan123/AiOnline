@@ -136,13 +136,13 @@ function aggregate(input) {
         footprint.push(path.relative(process.cwd(), evidenceFile));
       }
 
-      // Write aggregated step evidence
+      // Also track the aggregated step evidence file
       const stepEvidence = writeEvidence(evidenceDir, `${key}-steps.json`, {
         steps,
         status,
         runner: config.runner,
       });
-      stepFootprints.push(path.relative(process.cwd(), stepEvidence));
+      footprint.push(path.relative(process.cwd(), stepEvidence));
     }
 
     pathResults[config.id] = {
@@ -201,7 +201,13 @@ function aggregate(input) {
   ];
   for (const mk of requiredMetrics) {
     if (extraMetrics[mk] === undefined) {
-      extraMetrics[mk] = null;
+      // BROWSER_E2E and BACKUP_RESTORE_TEST default to NOT_READY when not
+      // explicitly provided; all count/integer metrics default to null.
+      if (mk === 'BROWSER_E2E' || mk === 'BACKUP_RESTORE_TEST') {
+        extraMetrics[mk] = 'NOT_READY';
+      } else {
+        extraMetrics[mk] = null;
+      }
     }
   }
 

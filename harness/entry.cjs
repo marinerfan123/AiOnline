@@ -66,18 +66,38 @@ function runRunner(config, dryRun) {
   }
 
   console.log(`  Running ${config.label}...`);
-  const result = spawnSync('node', [runnerPath], {
+  const result = spawnSync(process.execPath, [runnerPath], {
     cwd: path.join(__dirname, '..'),
     encoding: 'utf8',
     timeout: 300_000,
-    stdio: ['pipe', 'inherit', 'inherit'],
+    stdio: ['pipe', 'pipe', 'pipe'],
   });
 
-  // Parse runner's JSON output to get actual status (not just exit code)
-  const lines = (result.stdout || '').split('\n').filter(l => l.trim().startsWith('{'));
-  if (lines.length > 0) {
+  // Extract the JSON block from runner stdout by finding matching braces.
+  // A naive "lines starting with {" filter breaks on multi-line arrays
+  // whose inner elements also begin with "{".
+  const extractJsonBlock = (text) => {
+    let depth = 0;
+    let start = -1;
+    for (let i = 0; i < text.length; i++) {
+      const ch = text[i];
+      if (ch === '{') {
+        if (depth === 0) start = i;
+        depth++;
+      } else if (ch === '}') {
+        depth--;
+        if (depth === 0 && start !== -1) {
+          return text.slice(start, i + 1);
+        }
+      }
+    }
+    return null;
+  };
+
+  const jsonText = extractJsonBlock(result.stdout || '');
+  if (jsonText) {
     try {
-      const parsed = JSON.parse(lines[lines.length - 1]);
+      const parsed = JSON.parse(jsonText);
       return {
         status: parsed.status || 'NOT_READY',
         steps: parsed.steps || [],
