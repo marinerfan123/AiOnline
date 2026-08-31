@@ -1,0 +1,51 @@
+{
+  "status": "NOT_READY",
+  "runner": "harness/runners/gp02-commercial.cjs",
+  "label": "Commercial Smoke",
+  "steps": [
+    {
+      "name": "brief",
+      "status": "NOT_READY",
+      "duration_ms": 0,
+      "evidence": "Step 'brief' not yet implemented"
+    },
+    {
+      "name": "brand_references",
+      "status": "NOT_READY",
+      "duration_ms": 0,
+      "evidence": "Step 'brand_references' not yet implemented"
+    },
+    {
+      "name": "storyboard",
+      "status": "NOT_READY",
+      "duration_ms": 0,
+      "evidence": "Step 'storyboard' not yet implemented"
+    },
+    {
+      "name": "shots_6",
+      "status": "NOT_READY",
+      "duration_ms": 0,
+      "evidence": "Step 'shots_6' not yet implemented"
+    },
+    {
+      "name": "ad_30s",
+      "status": "NOT_READY",
+      "duration_ms": 0,
+      "evidence": "Step 'ad_30s' not yet implemented"
+    },
+    {
+      "name": "review",
+      "status": "NOT_READY",
+      "duration_ms": 0,
+      "evidence": "Step 'review' not yet implemented"
+    },
+    {
+      "name": "export",
+      "status": "NOT_READY",
+      "duration_ms": 0,
+      "evidence": "Step 'export' not yet implemented"
+    }
+  ],
+  "ts": "2026-08-31T17:50:44.308Z",
+  "evidence_file": "C:\\Users\\Administrator\\github_ai_online\\.worktrees\\p1-g0-05-golden-path-harness\\harness\\evidence\\gp02-commercial.json"
+}

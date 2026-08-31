@@ -1,0 +1,57 @@
+{
+  "status": "NOT_READY",
+  "runner": "harness/runners/gp01-short-drama.cjs",
+  "label": "Short Drama FULL",
+  "steps": [
+    {
+      "name": "story",
+      "status": "NOT_READY",
+      "duration_ms": 0,
+      "evidence": "Step 'story' not yet implemented"
+    },
+    {
+      "name": "characters",
+      "status": "NOT_READY",
+      "duration_ms": 0,
+      "evidence": "Step 'characters' not yet implemented"
+    },
+    {
+      "name": "scenes",
+      "status": "NOT_READY",
+      "duration_ms": 0,
+      "evidence": "Step 'scenes' not yet implemented"
+    },
+    {
+      "name": "shots_10plus",
+      "status": "NOT_READY",
+      "duration_ms": 0,
+      "evidence": "Step 'shots_10plus' not yet implemented"
+    },
+    {
+      "name": "image_generation",
+      "status": "NOT_READY",
+      "duration_ms": 0,
+      "evidence": "Step 'image_generation' not yet implemented"
+    },
+    {
+      "name": "video_generation",
+      "status": "NOT_READY",
+      "duration_ms": 0,
+      "evidence": "Step 'video_generation' not yet implemented"
+    },
+    {
+      "name": "timeline",
+      "status": "NOT_READY",
+      "duration_ms": 0,
+      "evidence": "Step 'timeline' not yet implemented"
+    },
+    {
+      "name": "export",
+      "status": "NOT_READY",
+      "duration_ms": 0,
+      "evidence": "Step 'export' not yet implemented"
+    }
+  ],
+  "ts": "2026-08-31T17:50:44.269Z",
+  "evidence_file": "C:\\Users\\Administrator\\github_ai_online\\.worktrees\\p1-g0-05-golden-path-harness\\harness\\evidence\\gp01-short-drama.json"
+}
