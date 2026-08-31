@@ -8,6 +8,8 @@ const { pollLoop } = require('./providers/video/shared.cjs'); // 共享自适应
 const realtime = require('./realtime.cjs'); // 生成任务实时通道（SSE）：终态切换时通知前端，替代前端固定轮询
 // ModelHub V3 Phase 1 — 唯一模型身份 resolver（收敛 display_name / model_id 归一逻辑，dispatcher 内不再散落处理 display_name）
 const { resolveModelIdentity } = require('./modules/modelhub/resolver.cjs');
+// Generation V2 durable waiting-area bridge — enqueues throttled tasks into PG instead of in-memory map
+const { enqueueToV2Queue, recoverWaitingArea: v2RecoverWaitingArea } = require('./modules/generation-v2/waiting-area-v2.cjs');
 // ModelHub V3 Phase 2 — 逻辑模型 × 服务商 线路绑定读取层（优先读 bindings，双读回退 models.provider_id）
 const { loadDispatchPairs } = require('./modules/modelhub/bindings.cjs');
 // ModelHub V3 — 智能路由尝试数据落地（generation_jobs / generation_attempts）：双写，best-effort 不阻断生成
@@ -1722,7 +1724,7 @@ module.exports = {
   getWaitingAreaStatus, enqueueWaiting, dequeueWaiting, waitingAreaSize,
   allResourcesDown, waitingAreaTriggered, setWaitingThreshold, getWaitingThreshold,
   refreshWaitingThreshold, runWaitingPump, updateTaskStatus, planPriority, cancelTask,
-  startUploadQueue,
+  startUploadQueue, enableV2Waiting, isV2WaitingEnabled,
 };
 
 // ─── 等待区（资源全不可用时积压请求；超阈值触发前台"资源不足"）───
@@ -1738,6 +1740,13 @@ const PLAN_PRIORITY = { free: 0, pro: 1, team: 2 };
 function planPriority(plan) {
   return typeof PLAN_PRIORITY[plan] === 'number' ? PLAN_PRIORITY[plan] : 0;
 }
+// Generation V2 durable waiting-area bridge enabled: throttled tasks are written
+// into generation_items_v2 as low-priority items, making restart/resilience
+// independent of the in-memory WAITING_AREA map.
+let v2WaitingEnabled = false;
+function enableV2Waiting() { v2WaitingEnabled = true; }
+function isV2WaitingEnabled() { return v2WaitingEnabled; }
+
 const WAITING_AREA = new Map();            // taskId -> { enqueueAt, lastAttempt, attempts, priority, opts }
 let WAITING_THRESHOLD = 10;                // 可调：所有资源不可用时，等待区积压超过该值 → 触发前台提示
 // 防僵尸安全线（默认 90 分钟）：等待区内任务超过此线仍无可用资源 → 标记 waiting 保留、绝不判失败、绝不释放积分。成败只听生成端。
@@ -1787,7 +1796,35 @@ function enqueueWaiting(taskId, opts, persisted = null) {
       priority: planPriority(opts && opts.userPlan),
       opts,
     });
+    // Bridge: when V2 durable queue is enabled, also persist into generation_items_v2
+    // so crash recovery can pick up throttled tasks without relying on process memory.
+    if (v2WaitingEnabled && opts && typeof opts.userId === 'string' && typeof opts.model === 'string') {
+      v2EnqueueWaiting(opts).catch((e) => console.warn(`[waiting-v2] enqueue failed taskId=${taskId}: ${e.message}`));
+    }
   }
+}
+
+// Bridges a waiting-area task into the V2 durable queue (generation_items_v2).
+// Best-effort: failures are logged but never abort the enqueue.
+async function v2EnqueueWaiting(opts) {
+  if (!v2WaitingEnabled) return;
+  try {
+    const pgPool = typeof global !== 'undefined' ? global.__pgPool : null;
+    if (!pgPool) return;
+    await enqueueToV2Queue(pgPool, {
+      taskId: opts.taskId,
+      userId: opts.userId,
+      model: opts.model,
+      prompt: opts.prompt || '',
+      ratio: opts.ratio || '1:1',
+      count: opts.count || 1,
+      contentType: opts.contentType || 'image',
+      cost: opts.cost || 0,
+      costPool: opts.costPool || 'recharge',
+      idempotencyKey: opts.idempotencyKey || '',
+      userPlan: opts.userPlan || 'free',
+    });
+  } catch (_) { /* best-effort */ }
 }
 function dequeueWaiting(taskId) { WAITING_AREA.delete(taskId); }
 function waitingAreaSize() { return WAITING_AREA.size; }
