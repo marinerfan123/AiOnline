@@ -20,7 +20,7 @@ const MIGRATION_0014 = fs.readFileSync(path.resolve(__dirname, '..', '..', 'db',
 const ADMIN_HOST = process.env.TEST_PG_HOST || process.env.PG_HOST || 'localhost';
 const ADMIN_PORT = Number(process.env.TEST_PG_PORT || process.env.PG_PORT || '5432');
 const ADMIN_USER = process.env.TEST_PG_USER || process.env.PG_USER || 'postgres';
-const ADMIN_PW = process.env.TEST_PG_PASSWORD || process.env.PG_PASSWORD || process.env.PGPASSWORD;
+const ADMIN_PW = process.env.TEST_PG_PASSWORD || process.env.PG_PASSWORD || process.env.PGPASSWORD || '0.0.1abcd';
 
 function poolConfig(database, max = 1) {
   return { host: ADMIN_HOST, port: ADMIN_PORT, user: ADMIN_USER, ...(ADMIN_PW ? { password: ADMIN_PW } : {}), database, max };
