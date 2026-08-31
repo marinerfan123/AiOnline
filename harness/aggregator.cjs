@@ -19,6 +19,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { DEFAULT_EVIDENCE_DIR } = require('./evidence-paths.cjs');
 
 // ---------------------------------------------------------------------------
 // Types (documented; Node has no runtime types)
@@ -51,7 +52,6 @@ const path = require('path');
 // Constants
 // ---------------------------------------------------------------------------
 const SCHEMA_VERSION = '1.0.0';
-const DEFAULT_EVIDENCE_DIR = path.join(process.cwd(), 'harness', 'evidence');
 
 const PATH_CONFIGS = {
   GP01: { id: 'GP01_short_drama_full', runner: 'harness/runners/gp01-short-drama.cjs', label: 'Short Drama FULL' },

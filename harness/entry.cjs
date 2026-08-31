@@ -9,19 +9,20 @@
  * Options:
  *   --gp GP01|GP02|GP03  Run only specified path(s)
  *   --list               List configured paths and metrics contract
- *   --evidence-dir DIR   Output directory (default: harness/evidence)
+ *   --evidence-dir DIR   Output directory (default: runtime temp directory)
  *   --dry-run            Show what would run without executing
  */
 
 const fs = require('fs');
 const path = require('path');
 const { aggregate, PATH_CONFIGS } = require('./aggregator.cjs');
+const { DEFAULT_EVIDENCE_DIR } = require('./evidence-paths.cjs');
 
 function parseArgs(argv) {
   const args = {
     gps: [],
     list: false,
-    evidenceDir: path.join(__dirname, 'evidence'),
+    evidenceDir: DEFAULT_EVIDENCE_DIR,
     dryRun: false,
   };
   for (let i = 0; i < argv.length; i++) {

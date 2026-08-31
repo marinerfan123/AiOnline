@@ -13,6 +13,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { DEFAULT_EVIDENCE_DIR } = require('../evidence-paths.cjs');
 
 const STEPS = [
   'brief',
@@ -25,7 +26,7 @@ const STEPS = [
 ];
 
 function run(options = {}) {
-  const evidenceDir = path.resolve(options.evidenceDir || process.env.GOLDEN_PATH_EVIDENCE_DIR || path.join(__dirname, '..', 'evidence'));
+  const evidenceDir = path.resolve(options.evidenceDir || process.env.GOLDEN_PATH_EVIDENCE_DIR || DEFAULT_EVIDENCE_DIR);
   fs.mkdirSync(evidenceDir, { recursive: true });
 
   const steps = [];

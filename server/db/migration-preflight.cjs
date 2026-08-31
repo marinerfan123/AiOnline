@@ -139,7 +139,7 @@ function classifyMigration(sql, issues) {
 }
 
 function runPreflight(filePath, options = {}) {
-  const { requireReservation = true, worktreeId = process.env.GIT_WORKTREE || 'unknown', rollbackDocsDir = path.join(__dirname, '..', '..', 'docs', 'migrations', 'rollbacks') } = options;
+  const { requireReservation = true, worktreeId = process.env.GIT_WORKTREE || 'unknown', rollbackDocsDir = path.join(__dirname, '..', '..', 'docs', 'migrations', 'rollbacks'), migrationsDir } = options;
   const result = new PreflightResult();
 
   // Read file
@@ -160,7 +160,13 @@ function runPreflight(filePath, options = {}) {
   const version = versionCheck.version;
 
   // 2. Get existing migrations
-  const allMigrations = discoverMigrations();
+  let allMigrations;
+  try {
+    allMigrations = discoverMigrations({ migrationsDir });
+  } catch (error) {
+    result.addError(error instanceof Error ? error.message : String(error));
+    return result;
+  }
   const head = getHeadVersion(allMigrations);
 
   // 3. No duplicate

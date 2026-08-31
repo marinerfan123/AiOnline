@@ -22,6 +22,18 @@ test('inventory recognizes immutable history, historical 0015 gap, and next P1 a
   assert.match(result.history.gapPolicy, /Historical gaps/);
 });
 
+test('inventory and preflight reject a mutated 0016 from an isolated migration fixture', () => {
+  const migrationsDir = path.join(tempDir(), 'migrations');
+  fs.cpSync(path.join(__dirname, 'migrations'), migrationsDir, { recursive: true });
+  const migration0016 = path.join(migrationsDir, '0016_studio_run_engine.sql');
+  fs.appendFileSync(migration0016, '\n-- unauthorized historical edit\n');
+
+  assert.throws(() => inventory.buildInventory({ migrationsDir }), /differs from its committed historical identity/);
+  const result = preflight.runPreflight(candidate('additive', 'CREATE TABLE IF NOT EXISTS x (id int);'), { requireReservation: false, migrationsDir });
+  assert.equal(result.passed, false);
+  assert.ok(result.errors.some(error => error.includes('committed historical identity')));
+});
+
 test('allocator requires valid identity/reason and enforces holder ownership', () => {
   useRegistry();
   assert.equal(allocator.acquire('0017', 'unknown', 'reason').acquired, false);

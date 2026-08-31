@@ -54,6 +54,18 @@ test('CLI writes only to requested temporary evidence directory', () => {
   assert.ok(output.footprint.length > 0);
 });
 
+test('default CLI invocation leaves tracked Git source unchanged', () => {
+  const before = spawnSync('git', ['status', '--short', '--untracked-files=all'], { cwd: root, encoding: 'utf8' });
+  assert.equal(before.status, 0, before.stderr);
+
+  const result = spawnSync(process.execPath, ['scripts/golden-path.cjs'], { cwd: root, encoding: 'utf8' });
+  assert.equal(result.status, 2, result.stderr);
+
+  const after = spawnSync('git', ['status', '--short', '--untracked-files=all'], { cwd: root, encoding: 'utf8' });
+  assert.equal(after.status, 0, after.stderr);
+  assert.equal(after.stdout, before.stdout);
+});
+
 test('schema permits null for the six unknown counts', () => {
   const metrics = JSON.parse(fs.readFileSync(path.join(root, 'harness/results-schema.json'), 'utf8')).properties.metrics.properties;
   for (const key of ['P0_COUNT','P1_COUNT','FAILED_MIGRATIONS','UNRECONCILED_GENERATION_JOBS','LEDGER_INCONSISTENCIES','CRITICAL_ORPHAN_ASSETS']) assert.deepEqual(metrics[key].type, ['integer','null']);

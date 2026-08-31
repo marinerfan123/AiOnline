@@ -13,29 +13,50 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const IMMUTABLE_HISTORY = require('./migration-history.json');
 
 const MIGRATIONS_DIR = path.join(__dirname, 'migrations');
 
-function discoverMigrations() {
-  if (!fs.existsSync(MIGRATIONS_DIR)) return [];
-  return fs.readdirSync(MIGRATIONS_DIR)
+function gitBlobSha1(contents) {
+  const header = Buffer.from(`blob ${contents.length}\0`);
+  return crypto.createHash('sha1').update(header).update(contents).digest('hex');
+}
+
+function discoverMigrations(options = {}) {
+  const migrationsDir = options.migrationsDir || MIGRATIONS_DIR;
+  if (!fs.existsSync(migrationsDir)) return [];
+  const migrations = fs.readdirSync(migrationsDir)
     .filter(f => /\.sql$/.test(f))
     .sort()
     .map(f => {
       const m = f.match(/^(\d+)_(.+)\.sql$/);
       if (!m) return null;
-      const filePath = path.join(MIGRATIONS_DIR, f);
-      const sql = fs.readFileSync(filePath, 'utf8');
+      const filePath = path.join(migrationsDir, f);
+      const contents = fs.readFileSync(filePath);
       return {
         version: m[1],
         name: m[2],
         filename: f,
         filePath,
         size: fs.statSync(filePath).size,
-        checksum: crypto.createHash('sha256').update(sql).digest('hex'),
+        checksum: crypto.createHash('sha256').update(contents).digest('hex'),
+        gitBlobSha1: gitBlobSha1(contents),
       };
     })
     .filter(Boolean);
+
+  assertImmutableHistory(migrations);
+  return migrations;
+}
+
+function assertImmutableHistory(migrations) {
+  for (const [version, expected] of Object.entries(IMMUTABLE_HISTORY)) {
+    const actual = migrations.find(migration => migration.version === version);
+    if (!actual) throw new Error(`Immutable migration ${expected.filename} is missing.`);
+    if (actual.filename !== expected.filename || actual.checksum !== expected.sha256 || actual.gitBlobSha1 !== expected.gitBlobSha1) {
+      throw new Error(`Immutable migration ${expected.filename} differs from its committed historical identity.`);
+    }
+  }
 }
 
 function getHeadVersion(migrations) {
@@ -58,8 +79,8 @@ function analyzeHistory(migrations) {
   return { duplicateVersions, gaps, gapPolicy: 'Historical gaps are recorded and immutable; new P1 allocations append after numeric head and must be contiguous.' };
 }
 
-function buildInventory() {
-  const migrations = discoverMigrations();
+function buildInventory(options = {}) {
+  const migrations = discoverMigrations(options);
   return {
     generatedAt: new Date().toISOString(),
     headVersion: getHeadVersion(migrations),
@@ -95,4 +116,4 @@ if (require.main === module) {
   main();
 }
 
-module.exports = { discoverMigrations, getHeadVersion, getNextVersion, analyzeHistory, buildInventory };
+module.exports = { discoverMigrations, getHeadVersion, getNextVersion, analyzeHistory, buildInventory, assertImmutableHistory, IMMUTABLE_HISTORY };
