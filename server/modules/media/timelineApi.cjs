@@ -99,11 +99,12 @@ function createTimelineApi({ pg, sessionUser, sendJSON, parseBody }) {
 
     if (method === 'GET' && timelineId && !sub) {
       const trackId = await ensureVideoTrack(timelineId);
+      // Plain clip read: asset_versions has no mime_type column (0032), so no
+      // JOIN — a join here was a double bug (wrong key AND missing column),
+      // caught by real-schema probe (audit H1 + follow-up).
       const clips = await pg.query(
-        `SELECT c.id, c.shot_id, c.asset_version_id, c.order_index, c.start_ms, c.duration_ms,
-                COALESCE(av.mime_type, '') AS mime_type
+        `SELECT c.id, c.shot_id, c.asset_version_id, c.order_index, c.start_ms, c.duration_ms
            FROM timeline_clips c
-           LEFT JOIN asset_versions av ON av.version_id = c.asset_version_id
           WHERE c.track_id = $1 ORDER BY c.order_index, c.start_ms`,
         [trackId],
       );

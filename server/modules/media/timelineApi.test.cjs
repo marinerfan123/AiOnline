@@ -36,7 +36,7 @@ function makeHarness({ timelineExists = true, memberFor = ['p-1'] } = {}) {
         return { rows: state.tracks.filter((x) => x.timeline_id === params[0]) };
       }
       if (/COALESCE\(MAX\(order_index\)/.test(sql)) { return { rows: [{ m: state.clips.length - 1 }] }; }
-      if (/LEFT JOIN asset_versions/.test(sql)) { return { rows: [...state.clips].sort((a, b) => a.order_index - b.order_index) }; }
+      if (/FROM timeline_clips c/.test(sql) && /WHERE c\.track_id/.test(sql)) { return { rows: [...state.clips].sort((a, b) => a.order_index - b.order_index) }; }
       if (/FROM project_timeline WHERE project_id/.test(sql)) { return { rows: state.timelines }; }
       if (/UPDATE timeline_clips SET order_index/.test(sql)) { const c = state.clips.find((x) => x.id === params[1]); if (c) c.order_index = params[0]; return { rows: [], rowCount: 1 }; }
       return { rows: [] };
