@@ -274,3 +274,163 @@ test('mediaWorker ⑤ started loop polls; stop() halts claiming (runOnce stays u
     w.stop();
   }
 });
+
+// ─── G11 stitch ctx alignment ────────────────────────────────────────────────
+
+const STITCH_SEGMENTS = [
+  { source: '/media/a.mp4', inMs: 2000, outMs: 5000 },
+  { source: '/media/b.mp4', inMs: 1500, outMs: 3000 },
+];
+
+/** Fake ffmpeg spawn (EventEmitter child, exit 0) — same shape executor tests use. */
+function makeFakeFfmpegSpawn() {
+  const fn = (bin, args) => {
+    const child = new (require('node:events').EventEmitter)();
+    child.stdout = new (require('node:events').EventEmitter)();
+    child.stderr = new (require('node:events').EventEmitter)();
+    child.kill = () => {};
+    fn.calls.push({ bin, args });
+    setImmediate(() => child.emit('close', 0));
+    return child;
+  };
+  fn.calls = [];
+  return fn;
+}
+
+test('mediaWorker ⑥ G11 stitch: params.segments/outKey reach ctx — no ctx.source forced', async () => {
+  const pg = makePg();
+  const params = { segments: STITCH_SEGMENTS, outKey: '/tmp/stitch.mp4' };
+  const job = seedJob(pg, { kind: 'stitch', params });
+  let ctxSeen = null;
+  const executors = {
+    stitch: async (ctx) => {
+      ctxSeen = ctx;
+      return { ok: true, result: { output: ctx.outKey, segments: ctx.segments.length } };
+    },
+  };
+  const w = makeWorker({ pg, executors, kind: 'stitch', workerId: 'w1', maxRetries: 3 });
+
+  const res = await w.runOnce();
+  assert.equal(res.claimed, true);
+  assert.equal(res.status, 'done');
+  assert.equal(res.requeued, false);
+
+  assert.equal(ctxSeen.kind, 'stitch');
+  assert.deepEqual(ctxSeen.segments, STITCH_SEGMENTS); // params.segments mirrored onto ctx
+  assert.equal(ctxSeen.outKey, '/tmp/stitch.mp4'); // params.outKey mirrored onto ctx
+  assert.equal(ctxSeen.source, null); // no params.source/objectKey → stitch runs without one
+  assert.deepEqual(ctxSeen.params, params);
+  assert.equal(ctxSeen.pg, pg);
+  assert.equal(ctxSeen.job, jobById(pg, job.id));
+
+  const cur = jobById(pg, job.id);
+  assert.equal(cur.status, 'done');
+  assert.deepEqual(JSON.parse(cur.result_json), { output: '/tmp/stitch.mp4', segments: 2 });
+  assert.equal(pg._state.calls.complete, 1);
+  assert.equal(pg._state.calls.fail, 0);
+});
+
+test('mediaWorker ⑦ G11 stitch: no params.outKey → job-scoped /tmp/media-jobs/<jobId>/stitch.mp4 default', async () => {
+  const pg = makePg();
+  const job = seedJob(pg, { kind: 'stitch', params: { segments: STITCH_SEGMENTS } });
+  let ctxSeen = null;
+  const executors = {
+    stitch: async (ctx) => {
+      ctxSeen = ctx;
+      return { ok: true, result: { output: ctx.outKey } };
+    },
+  };
+  const w = makeWorker({ pg, executors, kind: 'stitch', workerId: 'w1', maxRetries: 3 });
+
+  const res = await w.runOnce();
+  assert.equal(res.claimed, true);
+  assert.equal(res.status, 'done');
+  assert.equal(ctxSeen.outKey, `/tmp/media-jobs/${job.id}/stitch.mp4`);
+  assert.deepEqual(ctxSeen.segments, STITCH_SEGMENTS);
+});
+
+test('mediaWorker ⑧ G11 stitch: queued job runs the real runStitch through the worker (injected spawn) and completes', async () => {
+  const pg = makePg();
+  const spawn = makeFakeFfmpegSpawn();
+  const job = seedJob(pg, {
+    kind: 'stitch',
+    params: { segments: STITCH_SEGMENTS, outKey: '/tmp/stitch-out.mp4', spawn, timeoutMs: 2000 },
+  });
+  // Same wiring shape as server.js: EXECUTORS.stitch delegates to runStitch.
+  const executors = { stitch: (ctx) => require('./executorsStitch.cjs').runStitch(ctx) };
+  const w = makeWorker({ pg, executors, kind: 'stitch', workerId: 'w1', maxRetries: 3 });
+
+  const res = await w.runOnce();
+  assert.equal(res.claimed, true);
+  assert.equal(res.status, 'done');
+  assert.equal(spawn.calls.length, 1);
+  assert.equal(spawn.calls[0].bin, 'ffmpeg');
+  const args = spawn.calls[0].args;
+  const fi = args.indexOf('-filter_complex');
+  assert.ok(fi !== -1, 'args must contain -filter_complex');
+  assert.ok(args[fi + 1].includes('[0:v]trim=start=2.000:end=5.000,setpts=PTS-STARTPTS[v0]'));
+  assert.ok(args[fi + 1].includes('[1:v]trim=start=1.500:end=3.000,setpts=PTS-STARTPTS[v1]'));
+  assert.ok(args[fi + 1].endsWith('[v0][v1]concat=n=2:v=1:a=0[v]'));
+  assert.equal(args[args.length - 1], '/tmp/stitch-out.mp4');
+  const cur = jobById(pg, job.id);
+  assert.equal(cur.status, 'done');
+  assert.deepEqual(JSON.parse(cur.result_json), { output: '/tmp/stitch-out.mp4', segments: 2 });
+  assert.equal(pg._state.calls.complete, 1);
+  assert.equal(pg._state.calls.fail, 0);
+});
+
+test('mediaWorker ⑨ AV kinds unchanged: extra params never leak onto ctx; ctx.source mapping intact', async () => {
+  const pg = makePg();
+  // A probe job carrying stitch-shaped extras must still get the exact AV ctx
+  // shape — the G11 mirror is stitch-only (still walks the ctx.source gate).
+  seedJob(pg, {
+    kind: 'probe',
+    params: { source: '/tmp/a.mp4', cols: 2, rows: 2, outKey: '/tmp/nope.mp4', segments: [STITCH_SEGMENTS[0]] },
+  });
+  let ctxSeen = null;
+  const executors = {
+    probe: async (ctx) => {
+      ctxSeen = ctx;
+      return { ok: true, result: {} };
+    },
+  };
+  const w = makeWorker({ pg, executors, kind: 'probe', workerId: 'w1', maxRetries: 3 });
+
+  const res = await w.runOnce();
+  assert.equal(res.claimed, true);
+  assert.equal(res.status, 'done');
+  assert.deepEqual(
+    Object.keys(ctxSeen).sort(),
+    ['assetId', 'job', 'jobId', 'kind', 'params', 'pg', 'source'].sort()
+  );
+  assert.equal(ctxSeen.source, '/tmp/a.mp4');
+  assert.equal(ctxSeen.outKey, undefined);
+  assert.equal(ctxSeen.segments, undefined);
+  assert.equal(ctxSeen.cols, undefined);
+});
+
+test('mediaWorker ⑩ AV kinds unchanged: probe objectKey still resolved to signed source via resolveSource', async () => {
+  const pg = makePg();
+  seedJob(pg, { kind: 'probe', params: { objectKey: 'assets/o/a.mp4' } });
+  let ctxSeen = null;
+  const executors = {
+    probe: async (ctx) => {
+      ctxSeen = ctx;
+      return { ok: true, result: {} };
+    },
+  };
+  const w = makeWorker({
+    pg,
+    executors,
+    kind: 'probe',
+    workerId: 'w1',
+    maxRetries: 3,
+    resolveSource: async (params) => `https://signed.example/${params.objectKey}`,
+  });
+
+  const res = await w.runOnce();
+  assert.equal(res.claimed, true);
+  assert.equal(res.status, 'done');
+  assert.equal(ctxSeen.source, 'https://signed.example/assets/o/a.mp4');
+  assert.equal(ctxSeen.segments, undefined);
+});

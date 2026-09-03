@@ -13,6 +13,8 @@
  *
  * executors: { probe: async (ctx) => ({ ok: true, result }) | ({ ok: false, code, message }) }
  * ctx = { jobId, assetId, kind, params, job, pg, source }  (params parsed from params_json)
+ *   stitch jobs additionally mirror their executor-facing params (segments,
+ *   outKey, …) onto ctx — see the G11 mapping in runOnce.
  *
  * Optional injected hooks (server wiring):
  *   resolveSource(params)  async — turn an OSS objectKey into a signed GET url
@@ -78,6 +80,26 @@ function createMediaWorker({ pg, executors = {}, kind, workerId, pollMs = 500, m
       ctx.source = (await resolveSource(p)) || null;
     } else {
       ctx.source = p.objectKey || null;
+    }
+    // G11 — Segment-based kinds (stitch; executors.cjs SEGMENT_BASED_KINDS)
+    // carry per-segment sources and bypass the single ctx.source contract:
+    // runStitch(ctx) reads ctx.segments / ctx.outKey and validates each
+    // segment's own source (returns MEDIA_SOURCE_MISSING itself), so a stitch
+    // job must never be forced through the AV source gate. Mirror the job's
+    // remaining params onto ctx in the same style as ctx.source above —
+    // reserved ctx fields (jobId/assetId/kind/params/job/pg/source) are never
+    // overwritten. The block is stitch-only, so AV kinds keep their unchanged
+    // source-mapping path above.
+    if (ctx.kind === 'stitch') {
+      for (const key of Object.keys(p)) {
+        if (!(key in ctx)) ctx[key] = p[key];
+      }
+      // Deterministic job-scoped output default (same /tmp/media-jobs/<jobId>/
+      // convention as executorsAv.defaultOut; runStitch's runner mkdirs the
+      // dir). A params.outKey always wins when present.
+      if (!ctx.outKey) {
+        ctx.outKey = `/tmp/media-jobs/${String(job.id).replace(/[^\w.\-]/g, '_')}/stitch.mp4`;
+      }
     }
 
     const fn = executors[kindOverride || kind] || executors[job.kind];

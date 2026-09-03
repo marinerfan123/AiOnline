@@ -16,35 +16,58 @@
  *          deterministic beats/shots plan from the project's rows (scene order)
  *          via buildStoryboardPlan. Permissions follow GET /rows (viewer can
  *          read; owner/editor not required).
+ *   POST   /api/v2/script/:scriptId/storyboard/apply  (or
+ *          /api/v2/script/storyboard/apply?scriptId=) PERSIST the plan: same
+ *          dual spelling, same project-bound ownership, but the write gate
+ *          (owner/editor) applies. The plan is ALWAYS recomputed server-side
+ *          from the project's own script_rows → buildStoryboardPlan →
+ *          persistStoryboardShots; the request body is ignored (empty OK), so
+ *          a client can never forge persisted beats/shots. rows 空 → 400.
+ *          Success 200 { ok:true, applied:{ version, shotCount, replaced } }.
  * Rows carry integer-ms timing only (Blueprint hard rule). Speaker enforced for
  * dialogue by validateScriptRow.
  */
 const crypto = require('crypto');
 const { validateScriptRow, buildSceneRows, normalizeContinuityNotes } = require('./scriptModel.cjs');
 const { buildStoryboardPlan } = require('./storyboardPlan.cjs');
+const { persistStoryboardShots } = require('./storyboardShots.cjs');
 
 /**
- * Match the storyboard plan-view route on a scriptApi URL. Two spellings are
- * accepted (same handler, same semantics):
- *   A) /api/v2/script/:scriptId/storyboard      — scriptId in the path
- *   B) /api/v2/script/storyboard?scriptId=…     — scriptId in params/query
+ * Match the storyboard routes on a scriptApi URL. Two spellings are accepted
+ * for each (same handler, same semantics):
+ *   A) /api/v2/script/:scriptId/storyboard[/apply]  — scriptId in the path
+ *   B) /api/v2/script/storyboard[/apply]?scriptId=… — scriptId in params/query
  * (projectId is always supplied the way sibling rows routes receive it — from
  * the query string via req.params, project-bound SQL does the ownership.)
- * Returns { scriptId } when the URL is a storyboard route (scriptId may be
- * null when spelling B omits it — the handler then 400s), else null.
+ * Returns { scriptId, apply } when the URL is a storyboard route — apply:true
+ * for the POST persist endpoint (…/storyboard/apply), apply:false for the GET
+ * plan view (…/storyboard). scriptId may be null when spelling B omits it (the
+ * handler then 400s), else null for any other URL.
  * The 'rows' / 'order' prefixes are reserved by the CRUD routes, so
  * /api/v2/script/rows/storyboard stays a rows/:id GET, never a plan view.
  */
 function matchStoryboardRoute(urlPath, params) {
+  // POST persist form: /api/v2/script/storyboard/apply[?scriptId=…]
+  if (urlPath === '/api/v2/script/storyboard/apply') {
+    const sid = params && typeof params.scriptId === 'string' ? params.scriptId.trim() : '';
+    return { scriptId: sid !== '' ? sid : null, apply: true };
+  }
+  const am = /^\/api\/v2\/script\/([^/]+)\/storyboard\/apply$/.exec(urlPath);
+  if (am && am[1] !== 'rows' && am[1] !== 'order') {
+    let sid = null;
+    try { sid = decodeURIComponent(am[1]); } catch (e) { sid = null; }
+    return { scriptId: sid, apply: true };
+  }
+  // GET plan-view form: /api/v2/script/storyboard[?scriptId=…]
   if (urlPath === '/api/v2/script/storyboard') {
     const sid = params && typeof params.scriptId === 'string' ? params.scriptId.trim() : '';
-    return { scriptId: sid !== '' ? sid : null };
+    return { scriptId: sid !== '' ? sid : null, apply: false };
   }
   const sm = /^\/api\/v2\/script\/([^/]+)\/storyboard$/.exec(urlPath);
   if (sm && sm[1] !== 'rows' && sm[1] !== 'order') {
     let sid = null;
     try { sid = decodeURIComponent(sm[1]); } catch (e) { sid = null; }
-    return { scriptId: sid };
+    return { scriptId: sid, apply: false };
   }
   return null;
 }
@@ -73,10 +96,11 @@ function createScriptApi({ pg, sessionUser, sendJSON, parseBody }) {
   }
 
   async function handle(req, res, urlPath, method) {
-    // Storyboard plan view — GET only in this leaf (a future POST mount that
-    // persists the plan via storyboardShots is the 主线's call, not ours).
+    // Storyboard routes — GET …/storyboard (plan view) and POST …/storyboard/apply
+    // (persist). Each route answers exactly one method; anything else falls
+    // through unhandled (false) to the outer router.
     const storyboard = matchStoryboardRoute(urlPath, req.params || {});
-    if (storyboard && method !== 'GET') return false;
+    if (storyboard && method !== (storyboard.apply ? 'POST' : 'GET')) return false;
     const m = urlPath.match(/^\/api\/v2\/script\/rows(?:\/([^/]+))?$/) || urlPath.match(/^\/api\/v2\/script\/order$/);
     if (!m && !storyboard) return false;
     const isOrder = urlPath === '/api/v2/script/order';
@@ -87,40 +111,38 @@ function createScriptApi({ pg, sessionUser, sendJSON, parseBody }) {
     const project = await requireProject(res, user, projectId);
     if (!project) return true;
     // Audit fix (G14 v4pro M1): viewer is read-only — mutating routes need an
-    // owner/editor role (PATCH included for script rows).
+    // owner/editor role (PATCH included for script rows). POST …/storyboard/apply
+    // is a write → this gate applies; the GET plan view never reaches it.
     const WRITE = ['POST', 'PUT', 'DELETE', 'PATCH'];
     if (WRITE.includes(method) && !['owner', 'editor'].includes(project.role)) {
       return sendJSON(res, 403, { ok: false, error: '只读成员不可修改（需 owner/editor）' });
     }
 
-    // GET /api/v2/script/:scriptId/storyboard — storyboard PLAN view (read-only).
-    // Permissions mirror GET /rows: any member may read (viewer included); the
-    // WRITE gate above never applies to GET. scriptId ownership = project-scope:
-    // a script's content carrier is that project's script_rows (no standalone
-    // scripts table before 0045's note), so the rows SELECT binds project_id in
-    // SQL exactly like the row-level ownership checks — no other project's rows
-    // can ever leak into this plan.
-    if (storyboard) {
-      const scriptId = storyboard.scriptId;
-      if (!scriptId) return sendJSON(res, 400, { ok: false, error: 'scriptId 必填' });
+    // Shared storyboard source read: this project's ordered script_rows + the
+    // best-effort entity tables used for shot subjectRefs. scriptId ownership =
+    // project-scope: a script's content carrier is that project's script_rows
+    // (no standalone scripts table before 0045's note), so the SELECT binds
+    // project_id in SQL exactly like the row-level ownership checks — no other
+    // project's rows can ever leak into a plan (GET or apply). rows 空 → 400.
+    async function loadStoryboardContext(res2, pid) {
       const r = await pg.query(
         `SELECT * FROM script_rows WHERE project_id = $1 ORDER BY scene_index ASC, row_index ASC`,
-        [projectId],
+        [pid],
       );
       if (!r.rows.length) {
-        return sendJSON(res, 400, { ok: false, error: '计划需至少 1 行脚本行（该项目暂无 script_rows）' });
+        return sendJSON(res2, 400, { ok: false, error: '计划需至少 1 行脚本行（该项目暂无 script_rows）' });
       }
       // Best-effort entity sources for shot subjectRefs. Both live in this
       // project's bible tables (0027/0028); a read failure must never break the
-      // plan view, so swallow to [] — subjectRefs then stay row-internal
-      // (dialogue speaker only), which is exactly buildStoryboardPlan S4's
-      // never-invent rule.
+      // plan (view or apply), so swallow to [] — subjectRefs then stay
+      // row-internal (dialogue speaker only), which is exactly
+      // buildStoryboardPlan S4's never-invent rule.
       let characters = [];
       let locations = [];
       try {
         const [ch, loc] = await Promise.all([
-          pg.query('SELECT id, name FROM project_characters WHERE project_id = $1', [projectId]),
-          pg.query('SELECT id, name FROM project_environments WHERE project_id = $1', [projectId]),
+          pg.query('SELECT id, name FROM project_characters WHERE project_id = $1', [pid]),
+          pg.query('SELECT id, name FROM project_environments WHERE project_id = $1', [pid]),
         ]);
         characters = (ch.rows || []).map((x) => ({ id: x.id, name: x.name }));
         locations = (loc.rows || []).map((x) => ({ id: x.id, name: x.name }));
@@ -128,7 +150,8 @@ function createScriptApi({ pg, sessionUser, sendJSON, parseBody }) {
         characters = [];
         locations = [];
       }
-      const plan = buildStoryboardPlan({
+      return {
+        // PG returns BIGINT timing_ms as a string — normalize to an int ms.
         rows: r.rows.map((row) => ({
           id: row.id,
           episode_id: row.episode_id,
@@ -138,16 +161,51 @@ function createScriptApi({ pg, sessionUser, sendJSON, parseBody }) {
           speaker: row.speaker,
           text: row.text,
           beat: row.beat,
-          // PG returns BIGINT timing_ms as a string — normalize to an int ms.
           timing_ms: row.timing_ms == null ? null : Number(row.timing_ms),
         })),
         characters,
         locations,
+      };
+    }
+
+    // GET …/storyboard — read-only plan view (any member may read, viewer
+    // included). POST …/storyboard/apply — persist: recomputes the SAME
+    // server-side plan (rows → buildStoryboardPlan → persistStoryboardShots)
+    // and never trusts a client-supplied body, so persisted shots can't be
+    // forged or point at rows outside this project.
+    if (storyboard) {
+      const scriptId = storyboard.scriptId;
+      if (!scriptId) return sendJSON(res, 400, { ok: false, error: 'scriptId 必填' });
+      const ctx = await loadStoryboardContext(res, projectId);
+      if (!ctx || !ctx.rows) return true; // 400 already sent (empty rows / read error)
+      const plan = buildStoryboardPlan({
+        rows: ctx.rows,
+        characters: ctx.characters,
+        locations: ctx.locations,
       });
       if (!plan || !Array.isArray(plan.beats)) {
         return sendJSON(res, 400, {
           ok: false,
           errors: plan && Array.isArray(plan.errors) ? plan.errors : ['计划构建失败：脚本行不满足模型校验'],
+        });
+      }
+      if (storyboard.apply) {
+        const persisted = await persistStoryboardShots({ pg, projectId, scriptId, plan });
+        if (!persisted || persisted.ok !== true) {
+          const status = persisted && Number.isInteger(persisted.status) ? persisted.status : 400;
+          return sendJSON(res, status, {
+            ok: false,
+            error: persisted && typeof persisted.error === 'string' ? persisted.error : '计划持久化失败',
+            errors: persisted && Array.isArray(persisted.errors) ? persisted.errors : undefined,
+          });
+        }
+        return sendJSON(res, 200, {
+          ok: true,
+          applied: {
+            version: persisted.version,
+            shotCount: persisted.inserted,
+            replaced: persisted.replaced,
+          },
         });
       }
       return sendJSON(res, 200, { ok: true, plan: { beats: plan.beats, totalShots: plan.totalShots } });
