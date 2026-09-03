@@ -356,6 +356,55 @@ test('G21: bogus Last-Event-ID (non-integer) falls back to a full replay', async
   await ctrl.done;
 });
 
+test('G21: huge Last-Event-ID (beyond 2^53-1) degrades to full replay, never overflows BIGINT into a 500', async () => {
+  const m = createPgMock();
+  seedRun(m);
+  m.insertEvent('run-1', 1, 'run.started', {});
+  m.insertEvent('run-1', 2, 'run.node.started', { nodeId: 'n1' });
+  const res = makeRes();
+  const sse = createRunEventsSse({ pg: m.pg });
+  const ctrl = await sse.streamRunEvents({
+    req: makeReq({ 'last-event-id': '999999999999999999999999999999' }),
+    res, runId: 'run-1', user: USERS.editor,
+  });
+  assert.equal(ctrl.status, 200, 'must not 500 on an over-BIGINT resume cursor');
+  assert.deepEqual(dataEvents(res).map((e) => e.seq), [1, 2]);
+  assert.deepEqual(ctrl.afterSeq(), 2);
+  res.emit('close');
+  await ctrl.done;
+});
+
+test('G21: backpressure — write()→false pauses the replay until drain, then every event still lands', async () => {
+  const m = createPgMock();
+  seedRun(m);
+  for (let seq = 1; seq <= 5; seq += 1) m.insertEvent('run-1', seq, `run.tick.${seq}`, { seq });
+
+  const res = makeRes();
+  let backpressured = false;
+  res.write = (chunk) => {
+    // Data is buffered even when the transport is full — only the return value
+    // signals "pause"; nothing is dropped.
+    res.chunks.push(String(chunk));
+    if (!backpressured) {
+      backpressured = true;
+      setImmediate(() => res.emit('drain')); // drain shortly after the pause
+      return false;
+    }
+    return true;
+  };
+
+  const sse = createRunEventsSse({ pg: m.pg });
+  const ctrl = await sse.streamRunEvents({ req: makeReq(), res, runId: 'run-1', user: USERS.editor });
+
+  // The drain-aware write paused on backpressure, resumed on drain, and never
+  // lost an event (pre-fix the replay ignored write()'s false and kept
+  // buffering unboundedly without awaiting drain).
+  assert.deepEqual(dataEvents(res).map((e) => e.seq), [1, 2, 3, 4, 5]);
+  assert.equal(backpressured, true, 'the transport must actually have signalled backpressure');
+  res.emit('close');
+  await ctrl.done;
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 5. incremental poll deltas
 // ─────────────────────────────────────────────────────────────────────────────

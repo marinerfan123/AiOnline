@@ -40,6 +40,16 @@ function createRunEventsMockPg() {
     calls.push({ text, params });
     const sql = String(text).trim();
     if (sql.startsWith('CREATE TABLE IF NOT EXISTS run_events')) return { rows: [], rowCount: 0 };
+    if (sql.startsWith('CREATE TABLE IF NOT EXISTS run_event_counters')) return { rows: [], rowCount: 0 };
+    // Atomic auto-seq allocate (appendNextRunEvent): counter bump + insert in
+    // one synchronous step (mirrors the atomic single statement).
+    if (sql.includes('INSERT INTO run_events') && sql.includes('RETURNING seq')) {
+      const [runId, type, payloadJson] = params;
+      const run = getRun(runId);
+      const seq = run.size ? Math.max(...run.keys()) + 1 : 1;
+      run.set(seq, { seq, type, payloadJson });
+      return { rows: [{ seq }], rowCount: 1 };
+    }
     if (sql.includes('INSERT INTO run_events')) {
       const [runId, seq, type, payloadJson] = params;
       const run = getRun(runId);

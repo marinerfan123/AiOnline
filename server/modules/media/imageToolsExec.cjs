@@ -8,13 +8,14 @@
  *   native      = locally doable, NO provider model   → annotate / focus / grid
  *   provider    = needs a provider image-edit model   → enhance / outpaint / relight
  *                                                       inpaint / remove-bg / upscale
- * BUT native classification ≠ implemented executor: annotate / focus are still
- * NOT_IMPLEMENTED, and every provider-gated tool is NOT_IMPLEMENTED too (no
- * provider executor exists yet). Only `grid` has a real native executor today.
+ * BUT native classification ≠ implemented executor: annotate / grid have real
+ * native executors today; `focus` is still NOT_IMPLEMENTED, and every
+ * provider-gated tool is NOT_IMPLEMENTED too (no provider executor exists yet).
  *
  * ── NATIVE_KINDS (this module — an OBJECT map, unlike the registry's array) ──
- *   { grid:  { run: ctx => executorsGrid.runGrid(ctx) },      // contact-sheet split
- *     frame: { run: ctx => executorsFrame.runFrame(ctx) } }   // internal primitive
+ *   { grid:    { run: ctx => executorsGrid.runGrid(ctx) },        // contact sheet
+ *     annotate:{ run: ctx => executorsAnnotate.runAnnotate(ctx) },// drawtext text-overlay
+ *     frame:   { run: ctx => executorsFrame.runFrame(ctx) } }     // internal primitive
  * `frame` is NOT a registry tool kind — it exists so FOCUS-class single-frame
  * edits can pull a still (or one frame of a video/sequence) BEFORE their local
  * region pass. It is reachable through dispatchToolRequest for parity, but the
@@ -25,7 +26,7 @@
  *                               executor; executor result is passed through
  *                               verbatim ({ ok:true, result } | { ok:false,
  *                               code, message }).
- *   registry kind w/o executor (annotate / focus / any provider-gated)
+ *   registry kind w/o executor (focus / any provider-gated)
  *                             → { ok:false, code:'EXECUTOR_NOT_IMPLEMENTED' }
  *   kind in neither           → { ok:false, code:'INVALID_TOOL' }
  *
@@ -49,6 +50,12 @@
  *              executor defaults 2), spawn?, timeoutMs? }. `rows` is validated
  *              but NOT forwarded: executorsGrid DERIVES rows = ceil(n/cols) so
  *              the sheet never leaves layout holes (executorsGrid header).
+ *     annotate → { source, text, x?, y?, fontSizePx?, opacity? (schema surface),
+ *              outKey, fontFile?, jobDir?, spawn?, timeoutMs? }. fontFile is an
+ *              ENVELOPE key (not registry-governed): the font the drawtext pass
+ *              renders with. When absent, runAnnotate falls back to the
+ *              ANNOTATE_FONT_PATH environment variable; with neither it refuses
+ *              MEDIA_ANNOTATE_FONT_UNAVAILABLE before any spawn.
  *     frame → { source, timeMs, outKey, jobDir, spawn?, timeoutMs? }.
  *
  *   sessionUser is accepted for API-layer uniformity but UNUSED by native
@@ -61,11 +68,14 @@
 
 const executorsGrid = require('./executorsGrid.cjs');
 const executorsFrame = require('./executorsFrame.cjs');
+const executorsAnnotate = require('./executorsAnnotate.cjs');
 const registry = require('./imageToolsRegistry.cjs');
 
 /** Executor kinds with a REAL native implementation, kind → { run(ctx) }. */
 const NATIVE_KINDS = Object.freeze({
   grid: { run: (ctx) => executorsGrid.runGrid(ctx) },
+  // drawtext text-overlay — pure local annotation, no provider model.
+  annotate: { run: (ctx) => executorsAnnotate.runAnnotate(ctx) },
   // Internal single-frame extraction primitive for focus-class edits (NOT a
   // registry tool kind — upstream tool gate must not expose it as a tool).
   frame: { run: (ctx) => executorsFrame.runFrame(ctx) },
@@ -139,6 +149,29 @@ function buildFrameCtx(p) {
 }
 
 /**
+ * annotate: envelope { source, outKey, fontFile?, jobDir? } + the schema
+ * surface (text is required by contract; x/y/fontSizePx/opacity optional) →
+ * executorsAnnotate ctx. fontFile is envelope, NOT registry schema — the font
+ * the drawtext pass renders with (runAnnotate falls back to the
+ * ANNOTATE_FONT_PATH env and refuses MEDIA_ANNOTATE_FONT_UNAVAILABLE with
+ * neither, before any spawn).
+ */
+function buildAnnotateCtx(p) {
+  const ctx = {};
+  if (typeof p.source === 'string' && p.source.length > 0) ctx.source = p.source;
+  if (typeof p.text === 'string') ctx.text = p.text;
+  if (typeof p.x === 'number') ctx.x = p.x;
+  if (typeof p.y === 'number') ctx.y = p.y;
+  if (typeof p.fontSizePx === 'number') ctx.fontSizePx = p.fontSizePx;
+  if (typeof p.opacity === 'number') ctx.opacity = p.opacity;
+  if (typeof p.fontFile === 'string' && p.fontFile.length > 0) ctx.fontFile = p.fontFile;
+  if (typeof p.outKey === 'string' && p.outKey.length > 0) ctx.outKey = p.outKey;
+  if (typeof p.jobDir === 'string' && p.jobDir.length > 0) ctx.jobDir = p.jobDir;
+  forwardKnobs(p, ctx);
+  return ctx;
+}
+
+/**
  * Double-guard surface: ONLY the keys the registry schema declares for `kind`.
  * Envelope keys (sources/outKey/jobDir/spawn/timeoutMs) never enter the
  * contract check — they are executor concerns, guarded by the executors.
@@ -185,7 +218,10 @@ async function dispatchToolRequest({ kind, params = {}, sessionUser = null } = {
       };
     }
   }
-  const ctx = kind === 'grid' ? buildGridCtx(p) : buildFrameCtx(p);
+  // frame has no registry schema → only the envelope keys below exist.
+  const ctx = kind === 'grid' ? buildGridCtx(p)
+    : kind === 'annotate' ? buildAnnotateCtx(p)
+    : buildFrameCtx(p);
   return runner.run(ctx);
 }
 

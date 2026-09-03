@@ -393,3 +393,150 @@ test('G13: validatePersistArgs returns { ok } and dedupes scriptRowIds refs', ()
   assert.equal(dupShot.status, 400);
   assert.ok(dupShot.errors.some((e) => /duplicate shotId/.test(e)));
 });
+
+// ---------------------------------------------- 并发 apply 竞态（CRITICAL fix）
+/**
+ * 忠实模拟 Postgres 下同 (project, script) 并发 apply 的关键语义，验证 LOCK_SQL：
+ *   - 每个 `await q.query(...)` 让出事件循环 → 两个请求自然逐语句交错；
+ *   - MAX(version) 读共享 committed 行集（本事务未提交写入对他人不可见由锁保证）；
+ *   - INSERT 强制 UNIQUE(script_id, shot_id)，撞已提交同 key → 抛 23505 唯一冲突；
+ *   - pg_advisory_xact_lock 以 (project, script) 为键互斥，COMMIT/ROLLBACK 自动释放。
+ */
+function makeConcurrentPg() {
+  const committed = [];                 // committed shot rows
+  const shotIds = new Set();            // committed (script|shot) unique index
+  const locks = new Map();              // key -> { held, waiters[] }
+
+  const keyOf = (p, s) => `${p}|${s}`;
+  const ukey = (s, k) => `${s}|${k}`;
+
+  async function acquire(key) {
+    let l = locks.get(key);
+    if (!l) { l = { held: false, waiters: [] }; locks.set(key, l); }
+    if (!l.held) { l.held = true; return; }
+    await new Promise((resolve) => l.waiters.push(resolve));
+  }
+  function release(key) {
+    const l = locks.get(key);
+    if (!l) return;
+    if (l.waiters.length) l.waiters.shift()();
+    else l.held = false;
+  }
+
+  const state = { committed, insertCount: 0, lockLog: [] };
+
+  function execData(sql, params) {
+    if (/SELECT 1 AS ok FROM projects/.test(sql)) return { rows: [{ ok: 1 }] };
+    if (/SELECT id FROM script_rows WHERE project_id = \$1 AND id = ANY/.test(sql)) {
+      return { rows: (params[1] || []).map((id) => ({ id })) };
+    }
+    if (/COALESCE\(MAX\(version\), 0\)/.test(sql)) {
+      const [scriptId, projectId] = params;
+      const v = committed
+        .filter((s) => s.script_id === scriptId && s.project_id === projectId)
+        .reduce((m, s) => Math.max(m, s.version), 0);
+      return { rows: [{ v }] };
+    }
+    if (/DELETE FROM project_shots_rows WHERE script_id = \$1/.test(sql)) {
+      const [scriptId, projectId] = params;
+      const before = committed.length;
+      const kept = [];
+      for (const s of committed) {
+        if (s.script_id === scriptId && s.project_id === projectId) shotIds.delete(ukey(s.script_id, s.shot_id));
+        else kept.push(s);
+      }
+      committed.length = 0; committed.push(...kept);
+      return { rowCount: before - committed.length };
+    }
+    if (/INSERT INTO project_shots_rows/.test(sql)) {
+      const [projectId, scriptId, shotId] = [params[0], params[1], params[2]];
+      const k = ukey(scriptId, shotId);
+      if (shotIds.has(k)) {
+        const e = new Error(`duplicate key value violates unique constraint (script_id, shot_id)=(${scriptId}, ${shotId})`);
+        e.code = '23505';
+        throw e;
+      }
+      shotIds.add(k);
+      committed.push({
+        project_id: projectId, script_id: scriptId, shot_id: shotId,
+        beat_id: params[3], scene_index: params[4], beat_index: params[5],
+        shot_index: params[6], kind: params[7], intent: params[8],
+        subject_refs: JSON.parse(params[9]), duration_ms: params[10],
+        ordering: params[11], version: params[12],
+      });
+      state.insertCount += 1;
+      return { rowCount: 1 };
+    }
+    return { rows: [] };
+  }
+
+  const pg = {
+    state,
+    async query(sql, params = []) { return execData(sql, params); }, // validatePersistArgs 要求 pg.query 存在
+    async connect() {
+      const txn = { lockedKey: null };
+      return {
+        async query(sql, params = []) {
+          if (sql === 'BEGIN') return { rows: [] };
+          if (sql === 'COMMIT') { if (txn.lockedKey) release(txn.lockedKey); return { rows: [] }; }
+          if (sql === 'ROLLBACK') { if (txn.lockedKey) release(txn.lockedKey); return { rows: [] }; }
+          if (/pg_advisory_xact_lock/.test(sql)) {
+            const key = keyOf(params[0], params[1]);
+            state.lockLog.push(`lock:${key}`);
+            await acquire(key);
+            txn.lockedKey = key;
+            return { rows: [] };
+          }
+          return execData(sql, params);
+        },
+        async release() {},
+      };
+    },
+  };
+  return pg;
+}
+
+test('G13 CRITICAL: concurrent apply on the same script serializes — distinct versions, no unique conflict', async () => {
+  const { plan } = samplePlan();
+  const pg = makeConcurrentPg();
+
+  const [a, b] = await Promise.allSettled([
+    callPersist(pg, { plan }),
+    callPersist(pg, { plan }),
+  ]);
+
+  // 两个请求都必须成功（修复后：advisory lock 串行化，第二个读到 MAX=1 → v2）
+  assert.equal(a.status, 'fulfilled', a.reason ? a.reason.message : 'a rejected');
+  assert.equal(b.status, 'fulfilled', b.reason ? b.reason.message : 'b rejected');
+  const versions = [a.value.version, b.value.version].sort((x, y) => x - y);
+  assert.deepEqual(versions, [1, 2], 'versions must be distinct 1..2, not both 1');
+  // 两次 apply 各插 4 行 → 8 次 INSERT；终态 = 最新 plan 行集（version 2，无残留/重复）
+  assert.equal(pg.state.insertCount, 8);
+  assert.equal(pg.state.committed.length, 4);
+  assert.ok(pg.state.committed.every((s) => s.version === 2));
+  assert.deepEqual(new Set(pg.state.committed.map((s) => s.shot_id)), new Set([
+    's0:b0:k0', 's0:b0:k1', 's1:b0:k0', 's1:b0:k1',
+  ]));
+  // 锁确实以 (project, script) 为键取过两次（两次 apply 各一次，第二次等待第一次提交）
+  assert.equal(pg.state.lockLog.length, 2);
+});
+
+test('G13 CRITICAL: advisory lock is acquired before the MAX(version) read (mechanism)', async () => {
+  const { plan } = samplePlan();
+  const calls = [];
+  const pg = {
+    async query(sql, params = []) {
+      if (/SELECT 1 AS ok FROM projects/.test(sql)) return { rows: [{ ok: 1 }] };
+      if (/SELECT id FROM script_rows/.test(sql)) return { rows: (params[1] || []).map((id) => ({ id })) };
+      if (/COALESCE\(MAX\(version\)/.test(sql)) { calls.push('max'); return { rows: [{ v: 0 }] }; }
+      if (/DELETE FROM project_shots_rows/.test(sql)) { calls.push('delete'); return { rowCount: 0 }; }
+      if (/INSERT INTO project_shots_rows/.test(sql)) { calls.push('insert'); return { rowCount: 1 }; }
+      if (/pg_advisory_xact_lock/.test(sql)) { calls.push('lock'); return { rows: [] }; }
+      return { rows: [] };
+    },
+  };
+  await persistStoryboardShots({ pg, projectId: P_ID, scriptId: S_ID, plan });
+  assert.equal(calls[0], 'lock', 'advisory lock must precede the version read');
+  assert.ok(calls.indexOf('lock') < calls.indexOf('max'), 'lock before MAX(version)');
+});
+

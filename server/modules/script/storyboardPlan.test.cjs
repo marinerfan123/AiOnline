@@ -5,6 +5,7 @@ const {
   buildStoryboardPlan,
   sceneRowsToPlan,
 } = require('./storyboardPlan.cjs');
+const { buildSceneRows } = require('./scriptModel.cjs');
 
 // ---------------------------------------------------------------- helpers
 let SEQ = 0;
@@ -264,4 +265,71 @@ test('sceneRowsToPlan is an alias of buildStoryboardPlan with identical output',
   assert.equal(sceneRowsToPlan, buildStoryboardPlan);
   const rows = [D('MAYA', 'Hi.'), A('Door opens.')];
   assert.deepEqual(sceneRowsToPlan({ rows, characters: [MAYA_CHAR] }), buildStoryboardPlan({ rows, characters: [MAYA_CHAR] }));
+});
+
+// ------------------------------------------- 不变量边界（真实脚本混合 kind）
+test('consecutive shot_direction rows each form their own single-row beat (no merge, no loss)', () => {
+  const rows = [
+    A('she turns'),
+    SD('CLOSE ON: the letter'),
+    SD('PUSH IN: the stamp'),
+    SD('TILT DOWN: the floor'),
+    A('she reads'),
+  ];
+  const plan = buildStoryboardPlan({ rows });
+  // [A] | [SD1] | [SD2] | [SD3] | [A] → 5 beats
+  assert.equal(plan.beats.length, 5);
+  assert.deepEqual(plan.beats.map((b) => b.scriptRowIds), [
+    [rows[0].id], [rows[1].id], [rows[2].id], [rows[3].id], [rows[4].id],
+  ]);
+  // every shot_direction row is alone in its beat
+  for (const b of plan.beats) {
+    const id = b.scriptRowIds[0];
+    if (rows.some((r) => r.kind === 'shot_direction' && r.id === id)) {
+      assert.equal(b.scriptRowIds.length, 1);
+    }
+  }
+});
+
+test('long dialogue runs chunk stably at 4 rows (9 dialogue rows → 4/4/1 beats, order preserved)', () => {
+  const speakers = ['MAYA', 'LEO', 'MAYA', 'LEO', 'MAYA', 'LEO', 'MAYA', 'LEO', 'MAYA'];
+  const rows = speakers.map((sp, i) => D(sp, `line ${i}`));
+  const plan = buildStoryboardPlan({ rows });
+  assert.equal(plan.beats.length, 3);
+  assert.deepEqual(plan.beats.map((b) => b.scriptRowIds.length), [4, 4, 1]);
+  // 保序：拍平 = 源顺序
+  assert.deepEqual(plan.beats.flatMap((b) => b.scriptRowIds), rows.map((r) => r.id));
+});
+
+test('R4 invariant on a real mixed-kind script: no row lost, duplicated, or reordered (per-scene contiguous partition)', () => {
+  const rows = [
+    R('header', 'INT. OFFICE - DAY', { scene_index: 0 }),
+    D('MAYA', 'You never called.', { scene_index: 0 }),
+    D('LEO', 'I was busy.', { scene_index: 0 }),
+    A('Maya turns away.', { scene_index: 0 }),
+    SD('CLOSE ON: the phone', { scene_index: 0 }),
+    A('It buzzes.', { scene_index: 0 }),
+    R('parenthetical', '(beat)', { scene_index: 0 }),
+    D('MAYA', 'Now what?', { scene_index: 0 }),
+    R('transition', 'CUT TO:', { scene_index: 1 }),
+    D('LEO', 'We go.', { scene_index: 1 }),
+    A('They leave.', { scene_index: 2 }),
+  ];
+  const plan = buildStoryboardPlan({ rows });
+
+  // 拍平所有 beat 的 scriptRowIds，必须与按场景分组后的源顺序完全一致
+  const expected = buildSceneRows(rows).flatMap((g) => g.rows.map((r) => r.id));
+  const covered = plan.beats.flatMap((b) => b.scriptRowIds);
+  assert.deepEqual(covered, expected);
+  assert.equal(new Set(covered).size, rows.length);   // 不重复
+  assert.equal(covered.length, rows.length);          // 不丢失
+
+  // 每个 beat 内行数 ≤ 4，且 shot_direction 行独占 beat
+  for (const b of plan.beats) {
+    assert.ok(b.scriptRowIds.length >= 1 && b.scriptRowIds.length <= 4);
+  }
+  // durationMs 恒为整数（S5 默认 3000）
+  for (const b of plan.beats) {
+    for (const s of b.shots) assert.ok(Number.isInteger(s.durationMs));
+  }
 });

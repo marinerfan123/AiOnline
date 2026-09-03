@@ -271,3 +271,68 @@ test('frame real-ffmpeg smoke: extract 500ms frame from generated testsrc video 
     fs.rmSync(jobDir, { recursive: true, force: true });
   }
 });
+
+// ─── security: output path traversal + ffmpeg option injection ───────────────
+
+test('buildFrameCommand: rejects outKey with .. traversal and - prefix (no ffmpeg option injection)', () => {
+  assert.throws(() => buildFrameCommand({ source: 'a.mp4', timeMs: 500, outKey: '../escape.png' }), /'\.\.'/);
+  assert.throws(() => buildFrameCommand({ source: 'a.mp4', timeMs: 500, outKey: '/tmp/../../etc/evil.png' }), /'\.\.'/);
+  assert.throws(() => buildFrameCommand({ source: 'a.mp4', timeMs: 500, outKey: '-vf' }), /'-'/);
+  assert.throws(() => buildFrameCommand({ source: 'a.mp4', timeMs: 500, outKey: '-metadata' }), /'-'/);
+  assert.throws(() => buildFrameCommand({ source: 'a.mp4', timeMs: 500, outKey: 'ok\0.png' }), /NUL/);
+});
+
+test('buildFrameCommand: neutralizes jobDir traversal so output cannot escape its scope', () => {
+  const cmd = buildFrameCommand({ source: 'a.mp4', timeMs: 500, jobDir: '/tmp/../../etc' });
+  assert.ok(!cmd.output.includes('..'), 'jobDir traversal must be neutralized, not passed through');
+  assert.equal(cmd.output, '/tmp/_/_/etc/a.frame.500ms.png');
+});
+
+test('defaultOutKey: neutralizes .. in jobId/jobDir so the scoped dir cannot escape', () => {
+  assert.equal(defaultOutKey('a.mp4', 500, null, '..'), '/tmp/media-jobs/_/a.frame.500ms.png');
+  assert.equal(defaultOutKey('a.mp4', 500, '/tmp/../x', null), '/tmp/_/x/a.frame.500ms.png');
+});
+
+test('runFrame: traversal outKey → MEDIA_FRAME_FAILED with no ffmpeg spawn', async () => {
+  const spawn = makeFakeSpawn();
+  const r = await runFrame({ source: 'a.mp4', timeMs: 500, outKey: '../escape.png', spawn, timeoutMs: 2000 });
+  assert.equal(r.ok, false);
+  assert.equal(r.code, 'MEDIA_FRAME_FAILED');
+  assert.ok(/\.\./.test(r.message));
+  assert.equal(spawn.calls.length, 0, 'no spawn for a traversal output path');
+});
+
+test('frame real-ffmpeg: traversal outKey is rejected before spawn — nothing written outside jobDir', { timeout: 60000 }, async (t) => {
+  const hasFfmpeg = await new Promise((resolve) => {
+    try {
+      const p = require('node:child_process').spawn('ffmpeg', ['-version'], { stdio: 'ignore' });
+      p.on('error', () => resolve(false));
+      p.on('close', (c) => resolve(c === 0));
+    } catch { resolve(false); }
+  });
+  if (!hasFfmpeg) {
+    t.skip('ffmpeg not installed on this host — real smoke test not run');
+    return;
+  }
+  const jobDir = fs.mkdtempSync(path.join(os.tmpdir(), 'frame-escape-'));
+  const src = path.join(jobDir, 'input.mp4');
+  const escapeTarget = path.resolve(jobDir, '..', '..', 'frame-escape.png');
+  try {
+    const gen = await new Promise((resolve) => {
+      const p = require('node:child_process').spawn(
+        'ffmpeg',
+        ['-y', '-f', 'lavfi', '-i', 'testsrc=duration=1:size=160x120:rate=10', '-pix_fmt', 'yuv420p', src],
+        { stdio: ['ignore', 'ignore', 'pipe'] }
+      );
+      p.stderr.resume();
+      p.on('close', resolve);
+    });
+    assert.equal(gen, 0, 'ffmpeg must generate the input clip');
+    const r = await runFrame({ source: src, timeMs: 0, outKey: path.join(jobDir, '..', '..', 'frame-escape.png'), timeoutMs: 30000 });
+    assert.equal(r.ok, false, 'traversal outKey must fail before ffmpeg runs');
+    assert.equal(r.code, 'MEDIA_FRAME_FAILED');
+    assert.ok(!fs.existsSync(escapeTarget), 'no file may be written outside jobDir via traversal');
+  } finally {
+    fs.rmSync(jobDir, { recursive: true, force: true });
+  }
+});

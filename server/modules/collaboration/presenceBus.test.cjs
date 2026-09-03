@@ -122,8 +122,17 @@ test('G22 presenceBus: state 不在枚举内拒 (400)，不降级 online', async
 test('G22 presenceBus: 枚举常量完整性（online/away/editing/offline 冻结）', () => {
   assert.deepEqual([...PRESENCE_STATE_LIST].sort(), ['away', 'editing', 'offline', 'online']);
   assert.ok(Object.isFrozen(PRESENCE_STATES));
-  assert.equal(HEARTBEAT_TTL_MS, 15_000);
+  assert.equal(HEARTBEAT_TTL_MS, 30_000);
   assert.deepEqual(Object.values(PRESENCE_STATES), PRESENCE_STATE_LIST);
+});
+
+/* ── 跨模块 TTL 一致性：bus 过期阈值 = 契约 presenceTtlMs（= 2× 心跳间隔） ── */
+test('G22 presenceBus: HEARTBEAT_TTL_MS = collabContract.presenceTtlMs = 2× 心跳间隔（容忍漏报一次）', () => {
+  const CC = require('../studio-contracts/collabContract.cjs');
+  assert.equal(HEARTBEAT_TTL_MS, 30_000);
+  assert.equal(HEARTBEAT_TTL_MS, CC.presenceTtlMs, 'bus 过期阈值须与契约 presenceTtlMs 一致');
+  assert.equal(HEARTBEAT_TTL_MS, CC.HEARTBEAT_INTERVAL_MS * 2, 'TTL = 2× 心跳间隔');
+  assert.ok(HEARTBEAT_TTL_MS > CC.HEARTBEAT_INTERVAL_MS, 'TTL 必须严格大于间隔，避免边界闪烁掉线');
 });
 
 /* ── legacy alias 归一：busy → editing ─────────────────────────── */

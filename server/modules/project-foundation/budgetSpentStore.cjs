@@ -14,6 +14,16 @@
  * 幂等（防双扣）：idempotency_key 先 INSERT ... ON CONFLICT DO NOTHING 落 UNIQUE 列，
  * 只有抢到键的请求才能推进累计；同键重试是 no-op，并回放已记录/已拒绝的结果。
  * 超剩余（budget - spent < amount）由带守卫的 UPDATE 拒绝，绝不触碰计数器。
+ *
+ * 原子性（G20 修复）：占键 INSERT 与累计 UPDATE 必须同一事务。二者若分属两次自动提交，
+ * 一旦 UPDATE 因瞬时故障失败，占键行仍已提交且 status 默认 'recorded'，重试会误判
+ * 「已记录」而永久漏扣。故本模块在 pg 提供 connect()（node-postgres Pool/Client）时
+ * 用 BEGIN…COMMIT/ROLLBACK 包裹整段；pg 无 connect()（纯直连/假实现）时退化为直连。
+ *
+ * 幂等键全局唯一契约（G20 修复）：0044 的 idempotency_key 是全局 UNIQUE（非按 project
+ * 复合）。因此重放分支必须校验「同键 → 同 project_id 且同 amount」，否则跨预算撞键或
+ * 同键不同金额会被静默回放成另一笔预算的结果。校验不通过 → SPEND_IDEMPOTENCY_KEY_CONFLICT
+ * （fail-closed），调用方必须保证幂等键全局唯一。
  */
 
 function toNum(v) {
@@ -46,9 +56,10 @@ async function getBudgetSpent(pg, projectId) {
 }
 
 /**
- * 记录一笔预算扣减（幂等 + 超限拒绝）。
+ * 记录一笔预算扣减（幂等 + 超限拒绝 + 原子事务）。
  * 返回 { ok, recorded, alreadyRecorded?, spent?, remaining?, error? }。
  * 幂等键已存在时回放其结果（recorded → no-op；rejected → 再次拒绝），不二次扣减。
+ * 同键但 project_id/amount 不一致 → SPEND_IDEMPOTENCY_KEY_CONFLICT（fail-closed）。
  */
 async function recordSpend(pg, { projectId, amount, idempotencyKey } = {}) {
   if (!projectId) return { ok: false, error: { code: 'SPEND_MISSING_PROJECT' } };
@@ -56,57 +67,89 @@ async function recordSpend(pg, { projectId, amount, idempotencyKey } = {}) {
   if (!(amt > 0)) return { ok: false, error: { code: 'SPEND_INVALID_AMOUNT' } };
   if (!idempotencyKey) return { ok: false, error: { code: 'SPEND_MISSING_IDEMPOTENCY_KEY' } };
 
-  // 1. 先占幂等键（ledger 风格去重）。UNIQUE 约束是唯一仲裁者：
-  //    同键并发只有一个能成功，其余走回放分支，杜绝双扣。
-  const ins = await pg.query(
-    `INSERT INTO project_budget_spends (project_id, idempotency_key, amount)
-     VALUES ($1, $2, $3)
-     ON CONFLICT (idempotency_key) DO NOTHING`,
-    [projectId, idempotencyKey, amt],
-  );
-  if (!ins || !ins.rowCount) {
-    const prior = await pg.query(
-      `SELECT status FROM project_budget_spends WHERE idempotency_key = $1`,
-      [idempotencyKey],
-    );
-    const st = prior && prior.rows && prior.rows[0] && prior.rows[0].status;
-    if (st === 'rejected') {
-      return { ok: false, error: { code: 'SPEND_OVER_REMAINING' }, alreadyRejected: true };
+  // 有 connect()（Pool/Client）就取专属 client 走事务；否则退化为直连（假实现/单语句）。
+  const client = typeof pg.connect === 'function' ? await pg.connect() : null;
+  const q = client || pg;
+  let begun = false;
+  try {
+    if (client) {
+      await q.query('BEGIN');
+      begun = true;
     }
-    return { ok: true, recorded: false, alreadyRecorded: true };
-  }
 
-  // 2. 带守卫的原子累计：仅当 amount <= remaining (budget - spent) 时才加。
-  const upd = await pg.query(
-    `UPDATE project_budgets
-        SET spent = spent + $2, updated_at = NOW()
-      WHERE project_id = $1 AND budget - spent >= $2
-      RETURNING project_id, budget, spent`,
-    [projectId, amt],
-  );
-  const row = upd && upd.rows && upd.rows[0];
-  if (!row) {
-    await pg
-      .query(
+    // 1. 先占幂等键（ledger 风格去重）。UNIQUE 约束是唯一仲裁者：
+    //    同键并发只有一个能成功，其余走回放分支，杜绝双扣。
+    const ins = await q.query(
+      `INSERT INTO project_budget_spends (project_id, idempotency_key, amount)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (idempotency_key) DO NOTHING`,
+      [projectId, idempotencyKey, amt],
+    );
+    if (!ins || !ins.rowCount) {
+      const prior = await q.query(
+        `SELECT project_id, amount, status FROM project_budget_spends WHERE idempotency_key = $1`,
+        [idempotencyKey],
+      );
+      const p = prior && prior.rows && prior.rows[0];
+      if (client) {
+        await q.query('ROLLBACK').catch(() => {});
+        begun = false;
+      }
+      // 同键重放必须同 project 且同金额；否则是幂等键冲突（跨预算撞键 / 金额不一致）。
+      if (p && (p.project_id !== projectId || toNum(p.amount) !== amt)) {
+        return { ok: false, error: { code: 'SPEND_IDEMPOTENCY_KEY_CONFLICT' } };
+      }
+      if (p && p.status === 'rejected') {
+        return { ok: false, error: { code: 'SPEND_OVER_REMAINING' }, alreadyRejected: true };
+      }
+      return { ok: true, recorded: false, alreadyRecorded: true };
+    }
+
+    // 2. 带守卫的原子累计：仅当 amount <= remaining (budget - spent) 时才加。
+    //    WHERE 在 UPDATE 内 → PG 行锁下重估条件，并发扣减被串行化，绝不超卖。
+    const upd = await q.query(
+      `UPDATE project_budgets
+          SET spent = spent + $2, updated_at = NOW()
+        WHERE project_id = $1 AND budget - spent >= $2
+        RETURNING project_id, budget, spent`,
+      [projectId, amt],
+    );
+    const row = upd && upd.rows && upd.rows[0];
+    if (!row) {
+      // 超限或无预算行：记账行标记 rejected（同一事务内提交），计数器不动。
+      await q.query(
         `UPDATE project_budget_spends SET status = $2 WHERE idempotency_key = $1`,
         [idempotencyKey, 'rejected'],
-      )
-      .catch(() => {});
-    const ex = await pg.query(
-      `SELECT budget, spent FROM project_budgets WHERE project_id = $1`,
-      [projectId],
-    );
-    if (!(ex && ex.rows && ex.rows[0])) return { ok: false, error: { code: 'SPEND_NO_BUDGET' } };
-    return { ok: false, error: { code: 'SPEND_OVER_REMAINING' } };
-  }
+      );
+      const ex = await q.query(
+        `SELECT budget, spent FROM project_budgets WHERE project_id = $1`,
+        [projectId],
+      );
+      if (client) {
+        await q.query('COMMIT');
+        begun = false;
+      }
+      if (!(ex && ex.rows && ex.rows[0])) return { ok: false, error: { code: 'SPEND_NO_BUDGET' } };
+      return { ok: false, error: { code: 'SPEND_OVER_REMAINING' } };
+    }
 
-  return {
-    ok: true,
-    recorded: true,
-    projectId: row.project_id,
-    spent: toNum(row.spent),
-    remaining: toNum(row.budget) - toNum(row.spent),
-  };
+    if (client) {
+      await q.query('COMMIT');
+      begun = false;
+    }
+    return {
+      ok: true,
+      recorded: true,
+      projectId: row.project_id,
+      spent: toNum(row.spent),
+      remaining: toNum(row.budget) - toNum(row.spent),
+    };
+  } catch (e) {
+    if (begun) await q.query('ROLLBACK').catch(() => {});
+    throw e;
+  } finally {
+    if (client && typeof client.release === 'function') await client.release();
+  }
 }
 
 module.exports = { getBudgetSpent, recordSpend };

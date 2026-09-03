@@ -453,12 +453,13 @@ function createStudioRunEngine(deps) {
   async function reapExpiredNodes(opts = {}) {
     const limit = Math.max(1, Math.min(500, Number(opts.limit) || LIMITS.reaperBatch));
     const client = await pg.connect();
-    let reaped = 0; let failed = 0;
+    let reaped = 0; let failed = 0; let cancelled = 0;
     try {
       await client.query('BEGIN');
       const r = await client.query(
         `WITH expired AS (
-           SELECT n.id, n.run_id, n.studio_node_id, n.attempt, n.max_attempts
+           SELECT n.id, n.run_id, n.studio_node_id, n.attempt, n.max_attempts,
+                  (run.cancel_requested_at IS NOT NULL) AS cancel_requested
              FROM studio_run_nodes n
              JOIN studio_runs run ON run.id = n.run_id
             WHERE n.status IN ('RUNNING','LEASED','WAITING')
@@ -470,23 +471,43 @@ function createStudioRunEngine(deps) {
             LIMIT $1
          )
          UPDATE studio_run_nodes n
-            SET status = CASE WHEN e.attempt >= e.max_attempts THEN 'FAILED' ELSE 'READY' END,
-                attempt = CASE WHEN e.attempt >= e.max_attempts THEN e.attempt ELSE e.attempt END,
-                next_retry_at = CASE WHEN e.attempt >= e.max_attempts THEN NULL ELSE NOW() + ($2 * INTERVAL '1 millisecond') END,
-                error_code = CASE WHEN e.attempt >= e.max_attempts THEN 'LEASE_EXPIRED' ELSE n.error_code END,
-                error_message = CASE WHEN e.attempt >= e.max_attempts THEN 'worker lease expired and retries exhausted' ELSE n.error_message END,
+            SET status = CASE
+                  WHEN e.cancel_requested THEN 'CANCELLED'
+                  WHEN e.attempt >= e.max_attempts THEN 'FAILED'
+                  ELSE 'READY' END,
+                next_retry_at = CASE
+                  WHEN e.cancel_requested OR e.attempt >= e.max_attempts THEN NULL
+                  ELSE NOW() + ($2 * INTERVAL '1 millisecond') END,
+                error_code = CASE
+                  WHEN e.cancel_requested THEN 'RUN_CANCELLED'
+                  WHEN e.attempt >= e.max_attempts THEN 'LEASE_EXPIRED'
+                  ELSE n.error_code END,
+                error_message = CASE
+                  WHEN e.cancel_requested THEN 'run cancellation requested'
+                  WHEN e.attempt >= e.max_attempts THEN 'worker lease expired and retries exhausted'
+                  ELSE n.error_message END,
                 lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL,
-                completed_at = CASE WHEN e.attempt >= e.max_attempts THEN NOW() ELSE n.completed_at END,
+                completed_at = CASE
+                  WHEN e.cancel_requested OR e.attempt >= e.max_attempts THEN NOW()
+                  ELSE n.completed_at END,
                 updated_at = NOW()
           FROM expired e
           WHERE n.id = e.id
-          RETURNING n.*, e.max_attempts AS reap_max_attempts`,
+          RETURNING n.*, e.max_attempts AS reap_max_attempts, e.cancel_requested AS reap_cancel_requested`,
         [limit, Math.max(0, retryDelayMs(1, opts.retryBackoffMs || defaultRetryBackoffMs))]
       );
       const reapedIds = [];
       for (const row of r.rows) {
         reapedIds.push(row.id);
-        if (row.status === 'FAILED') {
+        if (row.status === 'CANCELLED') {
+          // A cancelled run's expired in-flight node must NOT go back to READY:
+          // the lease path refuses cancel_requested_at runs and this reaper only
+          // touches RUNNING/LEASED/WAITING, so a READY node here would strand the
+          // run nonterminal forever. Cancel it so the run can reach CANCELLED.
+          cancelled += 1;
+          await emitEvent(client, row.run_id, row.id, 'studio.run_node.cancelled', { run_node_id: row.id, code: 'RUN_CANCELLED' });
+          await aggregateRun(client, row.run_id, { runNodeId: row.id, workerId });
+        } else if (row.status === 'FAILED') {
           failed += 1;
           await blockDependents(client, row.run_id, row.studio_node_id, 'UPSTREAM_FAILED');
           await emitEvent(client, row.run_id, row.id, 'studio.run_node.failed', { run_node_id: row.id, code: 'LEASE_EXPIRED', final: true });
@@ -508,8 +529,8 @@ function createStudioRunEngine(deps) {
       try { await client.query('ROLLBACK'); } catch (_) {}
       throw e;
     } finally { client.release(); }
-    log('reaper.tick', { reaped, failed, workerId });
-    return { reaped, failed };
+    log('reaper.tick', { reaped, failed, cancelled, workerId });
+    return { reaped, failed, cancelled };
   }
   // ── END SECTION:scheduling ─────────────────────────────────────────────
 
@@ -563,7 +584,7 @@ function createStudioRunEngine(deps) {
     const failed = counts.FAILED || 0;
     const cancelled = counts.CANCELLED || 0;
     const active = (counts.READY || 0) + (counts.BLOCKED || 0) + (counts.LEASED || 0) + (counts.RUNNING || 0) + (counts.WAITING || 0);
-    const cancelR = await client.query('SELECT status, cancel_requested_at, failure_code FROM studio_runs WHERE id=$1', [runId]);
+    const cancelR = await client.query('SELECT status, cancel_requested_at, failure_code, executor_unavailable FROM studio_runs WHERE id=$1', [runId]);
     const runRow = cancelR.rows[0];
     let next = runRow.status;
     let terminal = false;
@@ -710,7 +731,14 @@ function createStudioRunEngine(deps) {
     const client = await pg.connect();
     try {
       await client.query('BEGIN');
-      const fr = await client.query('SELECT * FROM studio_run_nodes WHERE id=$1 FOR UPDATE', [runNodeId]);
+      const fr = await client.query(
+        `SELECT n.*, r.cancel_requested_at AS run_cancel_requested_at
+           FROM studio_run_nodes n
+           JOIN studio_runs r ON r.id = n.run_id
+          WHERE n.id = $1
+          FOR UPDATE OF n`,
+        [runNodeId]
+      );
       const node = fr.rows[0];
       if (!node) { await client.query('ROLLBACK'); return { ok: false, notFound: true }; }
       if (TERMINAL_NODE.has(node.status)) {
@@ -726,6 +754,27 @@ function createStudioRunEngine(deps) {
       if (exp && exp.getTime() <= Date.now()) {
         await client.query('COMMIT');
         return { ok: false, staleToken: true, nodeStatus: 'lease_expired' };
+      }
+      // Cancellation requested while this node was in flight: do NOT retry to
+      // READY — a READY node under a cancel_requested_at run can never be
+      // re-leased (lease path checks the flag) and this node is no longer
+      // RUNNING, so the reaper won't recover it either. It would strand the
+      // run nonterminal forever. Cancel it instead and let aggregateRun drive
+      // the run to terminal CANCELLED.
+      if (node.run_cancel_requested_at != null) {
+        await client.query(
+          `UPDATE studio_run_nodes
+              SET status = 'CANCELLED', error_code = 'RUN_CANCELLED', error_message = 'run cancellation requested',
+                  lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL,
+                  completed_at = NOW(), updated_at = NOW()
+            WHERE id = $1`,
+          [runNodeId]
+        );
+        await emitEvent(client, node.run_id, runNodeId, 'studio.run_node.cancelled', { run_node_id: runNodeId, code: 'RUN_CANCELLED' });
+        const agg = await aggregateRun(client, node.run_id, { runNodeId: runNodeId, workerId: owner });
+        await client.query('COMMIT');
+        log('run.node.cancelled', { runId: node.run_id, studioNodeId: node.studio_node_id, runStatus: agg && agg.status, workerId: owner });
+        return { ok: true, cancelled: true, nodeStatus: 'CANCELLED', runStatus: agg && agg.status, runId: node.run_id };
       }
       const retryable = error && error.retryable !== false && code !== 'PERMANENT';
       const attemptsLeft = node.attempt < node.max_attempts;
@@ -895,7 +944,11 @@ function createStudioRunEngine(deps) {
   /** Build the deterministic execution context from durable rows only. */
   async function buildExecContext(node) {
     const input = node.input_json || {};
-    const depIds = (node.dependencies || []) && node.dependencies.length
+    // NOTE: studio_run_nodes has NO `dependencies` column — the dependency
+    // relation lives in studio_run_node_edges. Guard with Array.isArray (an
+    // empty array is truthy, so the old `(node.dependencies || []) && …`
+    // evaluated `undefined.length` and threw for EVERY node, bricking workerTick).
+    const depIds = Array.isArray(node.dependencies) && node.dependencies.length
       ? node.dependencies
       : await (async () => {
         const r = await pg.query(

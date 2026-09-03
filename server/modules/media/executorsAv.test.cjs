@@ -232,3 +232,32 @@ test('AV runners: no close within timeoutMs → kill() + MEDIA_<KIND>_TIMEOUT', 
     assert.ok(child.killed, `${expected}: child.kill() must have been called`);
   }
 });
+
+// ─── security: output path traversal + ffmpeg option injection ───────────────
+
+test('AV buildThumbnailCommand: rejects .. traversal and - prefixed outKey (no option injection)', () => {
+  assert.throws(() => buildThumbnailCommand({ source: 'a.mp4', outKey: '../x.png' }), /'\.\.'/);
+  assert.throws(() => buildThumbnailCommand({ source: 'a.mp4', outKey: '/tmp/../../x.png' }), /'\.\.'/);
+  assert.throws(() => buildThumbnailCommand({ source: 'a.mp4', outKey: '-vf' }), /'-'/);
+});
+
+test('AV buildProxyCommand: rejects .. traversal and - prefixed outKey', () => {
+  assert.throws(() => buildProxyCommand({ source: 'a.mp4', outKey: '../x.mp4' }), /'\.\.'/);
+  assert.throws(() => buildProxyCommand({ source: 'a.mp4', outKey: '-metadata' }), /'-'/);
+});
+
+test('AV default output derived from a - prefixed source basename is rejected (no option injection)', () => {
+  assert.throws(() => buildThumbnailCommand({ source: '-vf.mp4' }), /'-'/);
+  assert.throws(() => buildProxyCommand({ source: '-vf.mp4' }), /'-'/);
+});
+
+test('AV runThumbnail/runProxy: unsafe outKey → *_FAILED with no ffmpeg spawn', async () => {
+  const spawn = makeFakeSpawn();
+  const rt = await runThumbnail({ source: 'a.mp4', outKey: '../x.png', spawn, timeoutMs: 2000 });
+  assert.equal(rt.ok, false);
+  assert.equal(rt.code, 'MEDIA_THUMBNAIL_FAILED');
+  const rp = await runProxy({ source: 'a.mp4', outKey: '-vf', spawn, timeoutMs: 2000 });
+  assert.equal(rp.ok, false);
+  assert.equal(rp.code, 'MEDIA_PROXY_FAILED');
+  assert.equal(spawn.calls.length, 0, 'no ffmpeg spawn for an unsafe output path');
+});

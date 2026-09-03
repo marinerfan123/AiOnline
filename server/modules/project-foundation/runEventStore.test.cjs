@@ -30,6 +30,20 @@ function createMockPg() {
       createTableCalls += 1;
       return { rows: [], rowCount: 0 };
     }
+    if (sql.startsWith('CREATE TABLE IF NOT EXISTS run_event_counters')) {
+      return { rows: [], rowCount: 0 };
+    }
+    // Atomic auto-seq allocate (appendNextRunEvent): MAX+1 computed and
+    // inserted in one synchronous step — mirrors the advisory-locked
+    // INSERT…SELECT…RETURNING against real Postgres (no interleaving possible
+    // because the whole branch runs without awaiting).
+    if (sql.includes('INSERT INTO run_events') && sql.includes('RETURNING seq')) {
+      const [runId, type, payloadJson] = params;
+      const run = getRun(runId);
+      const seq = run.size ? Math.max(...run.keys()) + 1 : 1;
+      run.set(seq, { seq, type, payloadJson });
+      return { rows: [{ seq }], rowCount: 1 };
+    }
     if (sql.includes('INSERT INTO run_events')) {
       const [runId, seq, type, payloadJson] = params;
       const run = getRun(runId);
@@ -189,4 +203,52 @@ test('reads never issue CREATE TABLE; only append owns schema ensure', async () 
   const store2 = createRunEventStore({ pg: m.pg });
   await store2.appendRunEvent({ runId: 'run-1', type: 'run.tick', payload: {}, seq: 2 });
   assert.equal(m.createTableCalls, 2);
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// appendNextRunEvent — atomic advisory-locked seq allocation
+// ─────────────────────────────────────────────────────────────────────────────
+test('appendNextRunEvent allocates contiguous per-run seq atomically (no caller seq)', async () => {
+  const m = createMockPg();
+  const store = createRunEventStore({ pg: m.pg });
+
+  const r1 = await store.appendNextRunEvent({ runId: 'run-1', type: 'run.started', payload: { status: 'RUNNING' } });
+  assert.deepEqual(r1, { ok: true, idempotent: false, seq: 1 });
+  const r2 = await store.appendNextRunEvent({ runId: 'run-1', type: 'run.node.started', payload: { nodeId: 'n1' } });
+  assert.deepEqual(r2, { ok: true, idempotent: false, seq: 2 });
+  // per-run scope: a second run starts at 1
+  const rOther = await store.appendNextRunEvent({ runId: 'run-2', type: 'run.started', payload: {} });
+  assert.deepEqual(rOther, { ok: true, idempotent: false, seq: 1 });
+
+  // single-statement SQL shape (atomic counter + RETURNING) is what makes it atomic
+  const appends = m.calls.filter((c) => c.text.includes('INSERT INTO run_events') && c.text.includes('RETURNING seq'));
+  assert.equal(appends.length, 3);
+  assert.match(appends[0].text, /run_event_counters/);
+  assert.match(appends[0].text, /ON CONFLICT \(run_id\) DO UPDATE SET seq = run_event_counters\.seq \+ 1/);
+  assert.match(appends[0].text, /RETURNING seq/);
+  assert.deepEqual(appends[0].params, ['run-1', 'run.started', JSON.stringify({ status: 'RUNNING' })]);
+});
+
+test('appendNextRunEvent: N-way concurrent appends never collide — 10 distinct events land on 1..10', async () => {
+  const m = createMockPg();
+  const store = createRunEventStore({ pg: m.pg });
+
+  const results = await Promise.all(
+    Array.from({ length: 10 }, (_, i) =>
+      store.appendNextRunEvent({ runId: 'run-1', type: `run.tick.${i}`, payload: { i } }))
+  );
+
+  const seqs = results.map((r) => r.seq).sort((a, b) => a - b);
+  assert.deepEqual(seqs, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 'no dropped event, contiguous seqs');
+  assert.ok(results.every((r) => r.ok === true && r.idempotent === false));
+  assert.equal(m.stored('run-1').length, 10);
+});
+
+test('appendNextRunEvent validates inputs like appendRunEvent (no SQL on rejection)', async () => {
+  const m = createMockPg();
+  const store = createRunEventStore({ pg: m.pg });
+  assert.equal((await store.appendNextRunEvent({ type: 'x', payload: {} })).error.code, 'INVALID_RUN_ID');
+  assert.equal((await store.appendNextRunEvent({ runId: 'r', type: '' })).error.code, 'INVALID_TYPE');
+  assert.equal((await store.appendNextRunEvent({ runId: 'r', type: 'x', payload: 'nope' })).error.code, 'INVALID_PAYLOAD');
+  assert.equal(m.calls.length, 0);
 });

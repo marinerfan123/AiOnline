@@ -2,7 +2,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { normalizeMediaMeta, mimeToKind, safeFileName, assertIntegerMs } = require('./mediaMeta.cjs');
-const { enqueueJob, claimJob, completeJob, failJob, requeueJob, JOB_KINDS } = require('./jobQueue.cjs');
+const { enqueueJob, claimJob, completeJob, failJob, requeueJob, reclaimExpiredLeases, JOB_KINDS } = require('./jobQueue.cjs');
 
 /** Stateful mock PG that honors the media_jobs state machine (unit-level). */
 function makeJobPg() {
@@ -28,6 +28,19 @@ function makeJobPg() {
         if (!job) return { rows: [] };
         job.status = 'running'; job.lease_owner = params[2]; job.attempt_count += 1;
         return { rows: [job] };
+      }
+      if (sql.includes('LEASE_EXPIRED_MAX_ATTEMPTS')) {
+        // reclaimExpiredLeases: terminal-fail running jobs past the attempt cap
+        const cap = Number(params[0]);
+        const hit = state.jobs.filter((j) => j.status === 'running' && j.attempt_count >= cap);
+        for (const j of hit) { j.status = 'failed'; j.error_code = 'LEASE_EXPIRED_MAX_ATTEMPTS'; j.lease_owner = null; }
+        return { rows: hit };
+      }
+      if (sql.includes('WHERE status=\'running\' AND lease_expires_at')) {
+        // reclaimExpiredLeases: requeue remaining expired running jobs
+        const hit = state.jobs.filter((j) => j.status === 'running');
+        for (const j of hit) { j.status = 'queued'; j.lease_owner = null; }
+        return { rows: hit };
       }
       if (sql.includes('status=\'done\'')) {
         const job = find(params[0]);
@@ -137,4 +150,41 @@ test('G06 jobQueue: rejects unknown kind', async () => {
   await assert.rejects(() => enqueueJob({}, { assetId: 'm1', kind: 'magic' }), TypeError);
   await assert.rejects(() => claimJob({}, { kind: 'magic' }), TypeError);
   assert.equal(JOB_KINDS.has('render'), true);
+});
+
+test('G06 jobQueue: reclaimExpiredLeases requeues under cap, terminal-fails past it (poison job)', async () => {
+  const pg = makeJobPg({});
+  const { job } = await enqueueJob(pg, { assetId: 'm1', kind: 'probe' });
+  for (let i = 1; i <= 3; i++) {
+    await claimJob(pg, { kind: 'probe', workerId: `w${i}` });
+    assert.equal(job.attempt_count, i, `attempt_count after claim ${i}`);
+    const r = await reclaimExpiredLeases(pg); // default maxAttempts=3
+    if (i < 3) {
+      assert.equal(r.reclaimed, 1);
+      assert.equal(r.failed, 0);
+      assert.equal(job.status, 'queued');
+    } else {
+      assert.equal(r.reclaimed, 0);
+      assert.equal(r.failed, 1);
+      assert.equal(job.status, 'failed');
+      assert.equal(job.error_code, 'LEASE_EXPIRED_MAX_ATTEMPTS');
+    }
+  }
+  // Terminal: a further reclaim leaves it failed (never requeued again).
+  const again = await reclaimExpiredLeases(pg);
+  assert.equal(again.reclaimed, 0);
+  assert.equal(again.failed, 0);
+  assert.equal(job.status, 'failed');
+});
+
+test('G06 jobQueue: reclaimExpiredLeases honors custom maxAttempts', async () => {
+  const pg = makeJobPg({});
+  const { job } = await enqueueJob(pg, { assetId: 'm2', kind: 'thumbnail' });
+  await claimJob(pg, { kind: 'thumbnail', workerId: 'w1' });
+  assert.equal(job.attempt_count, 1);
+  const r = await reclaimExpiredLeases(pg, { maxAttempts: 1 });
+  assert.equal(r.reclaimed, 0);
+  assert.equal(r.failed, 1);
+  assert.equal(job.status, 'failed');
+  assert.equal(job.error_code, 'LEASE_EXPIRED_MAX_ATTEMPTS');
 });

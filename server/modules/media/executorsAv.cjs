@@ -12,6 +12,7 @@
  */
 
 const IMAGE_EXT_RE = /\.(png|jpe?g|gif|webp|bmp|avif|tiff?)$/i;
+const { assertSafeOutputPath, sanitizeJobScope } = require('./executorsPathGuard.cjs');
 const DEFAULT_TIMEOUT_MS = 15000;
 const DEFAULT_PROXY_WIDTH = 1280;
 const DEFAULT_PROXY_FPS = 24;
@@ -53,7 +54,7 @@ function defaultOut(source, suffix, ext, jobId) {
   const stem = stemOf(source) || 'media';
   const name = `${stem}.${suffix}.${ext || 'jpg'}`;
   if (!jobId) return name;
-  const dir = `/tmp/media-jobs/${String(jobId).replace(/[^\w.\-]/g, '_')}`;
+  const dir = `/tmp/media-jobs/${sanitizeJobScope(jobId)}`;
   return `${dir}/${name}`;
 }
 
@@ -73,6 +74,7 @@ function buildThumbnailCommand({ source, outKey, jobId }) {
   const inputKind = detectInputKind(source);
   const imageExt = extOf(source);
   const output = outKey || defaultOut(source, 'thumb', inputKind === 'image' ? (imageExt || 'jpg') : 'jpg', jobId);
+  assertSafeOutputPath(output, 'thumbnail output path');
   const args = ['-y', '-i', String(source), '-vf', 'scale=-2:512'];
   if (inputKind === 'video') args.push('-frames:v', '1');
   args.push(output);
@@ -89,6 +91,7 @@ function buildProxyCommand({ source, outKey, width, fps, jobId }) {
   const w = clampInt(width, DEFAULT_PROXY_WIDTH, 2, 7680);
   const f = clampInt(fps, DEFAULT_PROXY_FPS, 1, 120);
   const output = outKey || defaultOut(source, 'proxy', 'mp4', jobId);
+  assertSafeOutputPath(output, 'proxy output path');
   const args = [
     '-y', '-i', String(source),
     '-vf', `scale=${w % 2 === 0 ? w : w - 1}:-2`,
@@ -201,13 +204,23 @@ function runFfmpeg({ spawn = require('child_process').spawn, timeoutMs = DEFAULT
 
 /** Thumbnail executor: { source, outKey?, spawn?, timeoutMs? } */
 function runThumbnail(ctx = {}) {
-  const cmd = buildThumbnailCommand(ctx);
+  let cmd;
+  try {
+    cmd = buildThumbnailCommand(ctx);
+  } catch (e) {
+    return Promise.resolve({ ok: false, code: 'MEDIA_THUMBNAIL_FAILED', message: String((e && e.message) || e) });
+  }
   return runFfmpeg(ctx, 'thumbnail', cmd, () => ({ output: cmd.output, inputKind: cmd.inputKind }));
 }
 
 /** Proxy executor: { source, outKey?, width?, fps?, spawn?, timeoutMs? } */
 function runProxy(ctx = {}) {
-  const cmd = buildProxyCommand(ctx);
+  let cmd;
+  try {
+    cmd = buildProxyCommand(ctx);
+  } catch (e) {
+    return Promise.resolve({ ok: false, code: 'MEDIA_PROXY_FAILED', message: String((e && e.message) || e) });
+  }
   return runFfmpeg(ctx, 'proxy', cmd, () => ({ output: cmd.output, width: cmd.width, fps: cmd.fps }));
 }
 

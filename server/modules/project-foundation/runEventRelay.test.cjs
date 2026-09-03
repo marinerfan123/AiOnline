@@ -3,12 +3,13 @@
  * G21 — runEventRelay.cjs unit tests.
  *
  * The relay is exercised against the REAL runEventStore over a mock pg that
- * routes by SQL shape and implements genuine (run_id, seq) PK semantics
- * (duplicate INSERT → rowCount 0, like `ON CONFLICT DO NOTHING`). Because the
- * mock computes MAX(seq) at query time, two concurrent relayRunEvent calls
- * naturally read the same lastSequence before either INSERT lands — the exact
- * read-then-write race the relay was built to handle, deterministically under
- * the microtask FIFO.
+ * implements the atomic auto-seq allocation (appendNextRunEvent → the mock's
+ * synchronous MAX+1 branch mirrors the advisory-locked INSERT…SELECT…
+ * RETURNING against real Postgres). The pre-fix relay allocated seq via
+ * read-last → write-last+1 with a single retry, which dropped events under a
+ * 3+-way race (the loser re-read the same MAX and collided again on its one
+ * allowed retry). These tests prove the fixed contract: concurrent emits for
+ * the same run never collide and never drop.
  */
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
@@ -30,6 +31,18 @@ function createMockPg() {
 
     if (sql.startsWith('CREATE TABLE IF NOT EXISTS run_events')) {
       return { rows: [], rowCount: 0 };
+    }
+    if (sql.startsWith('CREATE TABLE IF NOT EXISTS run_event_counters')) {
+      return { rows: [], rowCount: 0 };
+    }
+    // Atomic auto-seq allocate: counter bump + insert in one synchronous step
+    // (mirrors the atomic single statement — no interleaving possible).
+    if (sql.includes('INSERT INTO run_events') && sql.includes('RETURNING seq')) {
+      const [runId, type, payloadJson] = params;
+      const run = getRun(runId);
+      const seq = run.size ? Math.max(...run.keys()) + 1 : 1;
+      run.set(seq, { seq, type, payloadJson });
+      return { rows: [{ seq }], rowCount: 1 };
     }
     if (sql.includes('INSERT INTO run_events')) {
       const [runId, seq, type, payloadJson] = params;
@@ -62,8 +75,6 @@ function createMockPg() {
     pg: { query },
     calls,
     insertCount: () => calls.filter((c) => c.text.includes('INSERT INTO run_events')).length,
-    lastSeqCount: () => calls.filter((c) => c.text.includes('COALESCE')).length,
-    listCount: () => calls.filter((c) => c.text.includes('ORDER BY seq')).length,
     stored: (runId) => {
       const run = rowsByRun.get(runId);
       return run ? [...run.values()].map((r) => ({ ...r, payload_json: JSON.parse(r.payloadJson) })) : [];
@@ -71,7 +82,7 @@ function createMockPg() {
   };
 }
 
-test('relayRunEvent allocates monotonic seq 1,2,3 via lastSequence+1 (fresh run starts at 1)', async () => {
+test('relayRunEvent allocates monotonic seq 1,2,3 (fresh run starts at 1)', async () => {
   const m = createMockPg();
   const relay = createRunEventRelay({ pg: m.pg });
 
@@ -82,7 +93,6 @@ test('relayRunEvent allocates monotonic seq 1,2,3 via lastSequence+1 (fresh run 
   const e3 = await relay.relayRunEvent({ runId: 'run-1', type: 'studio.run_node.completed', payload: { run_node_id: 'n1', attempt: 1 } });
   assert.deepEqual(e3, { ok: true, seq: 3, idempotent: false, retried: false });
 
-  // Stored rows are contiguous 1..3 with the exact engine-style types/payloads.
   const stored = m.stored('run-1');
   assert.deepEqual(stored.map((r) => r.seq), [1, 2, 3]);
   assert.deepEqual(stored.map((r) => r.type), ['studio.run.started', 'studio.run_node.started', 'studio.run_node.completed']);
@@ -94,19 +104,19 @@ test('relayRunEvent allocates monotonic seq 1,2,3 via lastSequence+1 (fresh run 
   assert.equal(m.stored('run-1').length, 3);
 });
 
-test('relayRunEvent read-before-write: COALESCE lastSequence precedes every INSERT (SQL routing)', async () => {
+test('relayRunEvent uses ONE atomic statement (counter bump + RETURNING seq, params [runId, type, payload])', async () => {
   const m = createMockPg();
   const relay = createRunEventRelay({ pg: m.pg });
   await relay.relayRunEvent({ runId: 'run-1', type: 'run.started', payload: { a: 1 } });
 
-  const lastCalls = m.calls.filter((c) => c.text.includes('COALESCE'));
-  const insertCalls = m.calls.filter((c) => c.text.includes('INSERT INTO run_events'));
-  assert.equal(lastCalls.length, 1);
-  assert.equal(insertCalls.length, 1);
-  assert.deepEqual(lastCalls[0].params, ['run-1']); // lastSequence scoped to this run
-  assert.ok(m.calls.indexOf(lastCalls[0]) < m.calls.indexOf(insertCalls[0]), 'lastSequence read must precede the INSERT');
-  assert.match(insertCalls[0].text, /ON CONFLICT \(run_id, seq\) DO NOTHING/);
-  assert.deepEqual(insertCalls[0].params.slice(0, 4), ['run-1', 1, 'run.started', JSON.stringify({ a: 1 })]);
+  const appends = m.calls.filter((c) => c.text.includes('INSERT INTO run_events') && c.text.includes('RETURNING seq'));
+  assert.equal(appends.length, 1);
+  assert.match(appends[0].text, /run_event_counters/);
+  assert.match(appends[0].text, /ON CONFLICT \(run_id\) DO UPDATE SET seq = run_event_counters\.seq \+ 1/);
+  assert.match(appends[0].text, /ON CONFLICT \(run_id, seq\) DO NOTHING/);
+  assert.deepEqual(appends[0].params, ['run-1', 'run.started', JSON.stringify({ a: 1 })]);
+  // No separate lastSequence read: allocation is inside the single statement.
+  assert.equal(m.calls.filter((c) => c.text.includes('INSERT INTO run_events')).length, 1);
 });
 
 test('relayRunEvent rejects missing runId / type / non-object payload before touching pg', async () => {
@@ -132,63 +142,41 @@ test('relayRunEvent rejects missing runId / type / non-object payload before tou
   const blankType = await relay.relayRunEvent({ runId: 'run-1', type: '   ' });
   assert.equal(blankType.ok, false);
 
-  // Rejection is pure validation — zero SQL issued, nothing stored.
   assert.equal(m.calls.length, 0);
   assert.equal(m.stored('run-1').length, 0);
 });
 
-test('concurrent duplicate delivery of the SAME event → store idempotency absorbs it (returns idempotent, single row)', async () => {
+test('concurrent DIFFERENT events (4-way race) → all land on distinct contiguous seqs, nothing dropped', async () => {
+  const m = createMockPg();
+  const relay = createRunEventRelay({ pg: m.pg });
+
+  const results = await Promise.all([
+    relay.relayRunEvent({ runId: 'run-1', type: 'studio.run_node.started', payload: { run_node_id: 'n1', attempt: 1 } }),
+    relay.relayRunEvent({ runId: 'run-1', type: 'studio.run_node.started', payload: { run_node_id: 'n2', attempt: 1 } }),
+    relay.relayRunEvent({ runId: 'run-1', type: 'studio.run_node.ready', payload: { run_node_id: 'n3' } }),
+    relay.relayRunEvent({ runId: 'run-1', type: 'studio.run_node.completed', payload: { run_node_id: 'n4', attempt: 1 } }),
+  ]);
+
+  // The pre-fix relay (read-last → write-last+1, one retry) dropped events in a
+  // 3+-way race. The fixed relay must persist every event.
+  assert.ok(results.every((r) => r.ok === true), 'no SEQ_COLLISION_RETRY_EXHAUSTED / drop');
+  const seqs = results.map((r) => r.seq).sort((a, b) => a - b);
+  assert.deepEqual(seqs, [1, 2, 3, 4]);
+  assert.ok(results.every((r) => r.idempotent === false && r.retried === false));
+  assert.deepEqual(m.stored('run-1').map((r) => r.seq), [1, 2, 3, 4]);
+});
+
+test('concurrent duplicate delivery of the SAME event → recorded once per delivery, never silently dropped', async () => {
   const m = createMockPg();
   const relay = createRunEventRelay({ pg: m.pg });
   const evt = { runId: 'run-1', type: 'studio.run_node.completed', payload: { run_node_id: 'n1', attempt: 1 } };
 
   const [a, b] = await Promise.all([relay.relayRunEvent(evt), relay.relayRunEvent(evt)]);
 
-  // Both calls read the same lastSequence (0) and raced for seq 1; the PK
-  // conflict made the loser an idempotent no-op — NO second row, NO seq 2.
-  for (const r of [a, b]) {
-    assert.equal(r.ok, true);
-    assert.equal(r.seq, 1);
-  }
-  assert.equal([a, b].filter((r) => r.idempotent === false).length, 1);
-  assert.equal([a, b].filter((r) => r.idempotent === true).length, 1);
-  assert.equal([a, b].filter((r) => r.retried === false).length, 2);
-  assert.equal(m.stored('run-1').length, 1); // duplicate delivery left exactly one row
-  assert.equal(m.insertCount(), 2); // both INSERTs attempted…
-  assert.equal(m.listCount(), 1); // …and the loser disambiguated via listRunEvents
-});
-
-test('concurrent DIFFERENT events racing for the same seq → loser retries once and lands on seq 2 (nothing dropped)', async () => {
-  const m = createMockPg();
-  const relay = createRunEventRelay({ pg: m.pg });
-
-  const [a, b] = await Promise.all([
-    relay.relayRunEvent({ runId: 'run-1', type: 'studio.run_node.started', payload: { run_node_id: 'n1', attempt: 1 } }),
-    relay.relayRunEvent({ runId: 'run-1', type: 'studio.run_node.ready', payload: { run_node_id: 'n2', attempt: 1 } }),
-  ]);
-
-  for (const r of [a, b]) assert.equal(r.ok, true);
-  // Both events survive: winner at seq 1 (no retry), loser re-allocated to seq 2.
-  const seqs = [a, b].map((r) => r.seq).sort((x, y) => x - y);
-  assert.deepEqual(seqs, [1, 2]);
-  const retried = [a, b].find((r) => r.retried === true);
-  assert.ok(retried, 'loser must have retried once');
-  assert.equal(retried.seq, 2);
-  assert.equal(retried.idempotent, false);
-  assert.equal([a, b].find((r) => r.retried === false).seq, 1);
-
-  const stored = m.stored('run-1');
-  assert.deepEqual(stored.map((r) => r.seq), [1, 2]);
-  assert.deepEqual(stored.map((r) => r.type).sort(), ['studio.run_node.ready', 'studio.run_node.started']);
-  assert.equal(m.insertCount(), 3); // winner 1 + loser's conflict attempt + loser's retry
-});
-
-test('first event on an empty run starts at seq 1 (lastSequence 0 baseline)', async () => {
-  const m = createMockPg();
-  const relay = createRunEventRelay({ pg: m.pg });
-  // Store-level baseline check: no rows yet → lastSequence is 0.
-  assert.deepEqual(m.stored('run-empty').length, 0);
-  const r = await relay.relayRunEvent({ runId: 'run-empty', type: 'studio.run.started', payload: {} });
-  assert.deepEqual(r, { ok: true, seq: 1, idempotent: false, retried: false });
-  assert.deepEqual(m.stored('run-empty').map((e) => e.seq), [1]);
+  // Atomic allocation gives each delivery its own seq (the pre-fix racy design
+  // collapsed identical concurrent deliveries onto one seq via a PK collision).
+  assert.equal(a.ok, true);
+  assert.equal(b.ok, true);
+  assert.deepEqual([a.seq, b.seq].sort((x, y) => x - y), [1, 2]);
+  assert.equal(m.stored('run-1').length, 2);
 });

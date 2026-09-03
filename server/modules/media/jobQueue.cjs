@@ -117,14 +117,37 @@ async function requeueJob(pg, { jobId, maxRetries = 3 }) {
  * completing) are returned to queued so any worker can pick them up again.
  * Idempotent + safe under concurrency (plain UPDATE, re-claim goes through
  * FOR UPDATE SKIP LOCKED).
+ *
+ * Audit fix (G06 HIGH): jobs that already exhausted `maxAttempts` are
+ * terminal-failed instead of requeued. Without this, a poison job (whose
+ * worker keeps dying before complete/fail) would loop claim→expire→reclaim
+ * forever, and since claimJob is FIFO (ORDER BY created_at) it would sit at
+ * the head of the queue and starve every newer job of that kind. This mirrors
+ * the bounded-retry semantics of failJob→requeueJob (attempt_count < maxRetries).
  */
-async function reclaimExpiredLeases(pg) {
-  const r = await pg.query(
+async function reclaimExpiredLeases(pg, { maxAttempts = 3 } = {}) {
+  const cap = Math.max(1, Number(maxAttempts) || 3);
+  const failed = await pg.query(
+    `UPDATE media_jobs SET status='failed',
+       error_code='LEASE_EXPIRED_MAX_ATTEMPTS',
+       error_message='worker repeatedly died before completing (lease expired past attempt cap)',
+       lease_owner=NULL, lease_expires_at=NULL, updated_at=NOW()
+     WHERE status='running' AND lease_expires_at IS NOT NULL AND lease_expires_at < NOW()
+       AND attempt_count >= $1
+     RETURNING id`,
+    [cap],
+  );
+  const reclaimed = await pg.query(
     `UPDATE media_jobs SET status='queued', lease_owner=NULL, lease_expires_at=NULL, updated_at=NOW()
      WHERE status='running' AND lease_expires_at IS NOT NULL AND lease_expires_at < NOW()
      RETURNING id`,
   );
-  return { reclaimed: r.rows.length, ids: r.rows.map((x) => x.id) };
+  return {
+    reclaimed: reclaimed.rows.length,
+    ids: reclaimed.rows.map((x) => x.id),
+    failed: failed.rows.length,
+    failedIds: failed.rows.map((x) => x.id),
+  };
 }
 
 module.exports = { JOB_KINDS, TERMINAL, enqueueJob, claimJob, completeJob, failJob, requeueJob, reclaimExpiredLeases };

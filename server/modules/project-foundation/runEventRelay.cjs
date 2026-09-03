@@ -8,9 +8,11 @@
  *     repeated append at an existing seq a no-op reported as
  *     { ok:true, idempotent:true } — i.e. the store is idempotent but does
  *     NOT hand out sequence numbers.
- *   - this relay is the single seq allocator: seq = lastSequence(runId) + 1,
- *     then appendRunEvent. Callers (studioRunEngine's emitEvent funnel, etc.)
- *     never see or choose seqs.
+ *   - runEventStore.appendNextRunEvent  allocates the next per-run seq and
+ *     inserts in ONE advisory-locked statement (INSERT…SELECT MAX+1…
+ *     RETURNING), so allocation is atomic and serialized per run across
+ *     processes. This relay is a thin wrapper over it: callers (the
+ *     studioRunEngine emitEvent funnel) never see or choose seqs.
  *
  * Event shape (bridged from studioRunEngine.emitEvent):
  *   engine : emitEvent(client, runId, runNodeId, eventType, payload)
@@ -23,57 +25,41 @@
  *            { ...(runNodeId ? { run_node_id: runNodeId } : {}), ...payload }
  *            so replayed events carry node identity like studio_run_events does.
  *
- * SEQ ALLOCATION RACE (read-last → write-last+1 is not atomic):
- *   Two concurrent relays can read the same lastSequence and both attempt the
- *   same next seq. The loser's INSERT hits the (run_id, seq) PK conflict and
- *   appendRunEvent returns idempotent:true. The relay then distinguishes:
- *     - the row already at that seq IS our event (same type + deep-equal
- *       payload) → duplicate delivery of one logical event; store idempotency
- *       absorbs it. We return { ok:true, seq, idempotent:true } WITHOUT
- *       allocating a new seq (spec: repeated same (runId, seq) handled by the
- *       store).
- *     - a DIFFERENT event won the slot (true race) → re-read lastSequence and
- *       retry the allocate+append cycle (bounded: RACE_RETRY_LIMIT extra
- *       attempts — spec: PK conflict → retry once). No event is dropped.
- *   A still-contended slot after the bounded retries is reported as an error
- *   rather than silently dropped from the log.
+ * CONCURRENCY (audit 2026-09-04 — previously a CRITICAL silent-drop bug):
+ *   The engine is NOT single-writer per run. Multiple Studio Worker replicas
+ *   (stateless, "any number may run concurrently") lease different nodes of the
+ *   SAME run, and within one worker process workerTick runs up to
+ *   STUDIO_WORKER_CONCURRENCY node runners in parallel — all emitting for the
+ *   same run at overlapping instants. The old relay did read-last → write-last+1
+ *   with a single retry (RACE_RETRY_LIMIT=1): a 3+-way race made all losers
+ *   re-read the same MAX and collide again on the one allowed retry, so the
+ *   relay returned SEQ_COLLISION_RETRY_EXHAUSTED and the event was silently
+ *   dropped from run_events (a permanent gap in the SSE log). Seq allocation is
+ *   now atomic via appendNextRunEvent (a per-run counter bumped and the event
+ *   inserted in one statement — see runEventStore.cjs); the retry loop below is
+ *   defence-in-depth that only fires if allocation is somehow contended — it
+ *   re-allocates rather than dropping.
  *
- * NOTE for the eventual SSE wiring: this relay writes on the injected pool
- * (autocommit), NOT on the engine's transaction client — a run_events row can
- * become visible before the surrounding studio_run_events tx commits, and it
- * survives a later ROLLBACK of that tx. Acceptable for an append-only event
- * log consumed by SSE; if atomicity with the engine tx is ever required, the
- * store needs a client-transactional append variant (out of scope here).
+ * NOTE on durability vs the engine transaction: the relay writes on the injected
+ * pool (autocommit), NOT on the engine's transaction client — a run_events row
+ * can become visible before the surrounding studio_run_events tx commits and it
+ * survives a later ROLLBACK of that tx. Acceptable for an append-only event log
+ * consumed by SSE. (The FK run_events.run_id → studio_runs.id from migration
+ * 0043 is satisfied because every emitEvent call site runs on an already-created
+ * run; ON DELETE CASCADE clears the log when a run is deleted.)
  */
 
 const { createRunEventStore } = require('./runEventStore.cjs');
 
-/** Spec: on a (run_id, seq) PK conflict caused by a different event, retry once. */
-const RACE_RETRY_LIMIT = 1;
+/**
+ * Defence-in-depth re-allocate attempts when appendNextRunEvent reports an
+ * occupied seq (idempotent:true with seq:null). Under the advisory lock this
+ * never happens; a small bound guards against pathological setups.
+ */
+const RELAY_APPEND_RETRY_LIMIT = 3;
 
 function isNonEmptyString(v) { return typeof v === 'string' && v.trim().length > 0; }
 function isRecord(v) { return v !== null && typeof v === 'object' && !Array.isArray(v); }
-
-/** Order-insensitive object / ordered-array deep equality (for payload dedup). */
-function deepEqual(a, b) {
-  if (Object.is(a, b)) return true;
-  if (typeof a !== typeof b || a === null || b === null) return false;
-  if (Array.isArray(a) || Array.isArray(b)) {
-    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
-    return a.every((v, i) => deepEqual(v, b[i]));
-  }
-  if (typeof a === 'object') {
-    const ka = Object.keys(a);
-    const kb = Object.keys(b);
-    if (ka.length !== kb.length) return false;
-    for (const k of ka) {
-      if (!Object.prototype.hasOwnProperty.call(b, k)) return false;
-      if (!deepEqual(a[k], b[k])) return false;
-    }
-    return true;
-  }
-  return false;
-}
 
 /**
  * @param {{pg?: {query:Function}, store?: object}} deps
@@ -88,20 +74,7 @@ function createRunEventRelay({ pg, store } = {}) {
     }
     store = createRunEventStore({ pg });
   }
-  const { appendRunEvent, lastSequence, listRunEvents } = store;
-
-  /** Read the row occupying `seq` and decide whether it is OUR event. */
-  async function occupantIsOurs({ runId, seq, type, payload }) {
-    try {
-      const res = await listRunEvents({ runId, afterSeq: seq - 1, limit: 1 });
-      if (!res || res.ok === false || res.error || !Array.isArray(res.events)) return null;
-      const row = res.events[0];
-      if (!row || row.seq !== seq) return null; // row vanished → unresolved
-      return row.type === type && deepEqual(row.payload, payload);
-    } catch (_) {
-      return null; // unresolved — caller must not silently drop the event
-    }
-  }
+  const { appendNextRunEvent } = store;
 
   /**
    * Persist one run event with the next monotonic per-run seq.
@@ -120,38 +93,26 @@ function createRunEventRelay({ pg, store } = {}) {
     if (errors.length) return { ok: false, errors };
     body = body === undefined ? {} : body;
 
-    for (let attempt = 0; attempt <= RACE_RETRY_LIMIT; attempt += 1) {
-      const last = await lastSequence({ runId });
-      if (!last || last.ok === false || last.error) {
-        return {
-          ok: false,
-          errors: [last && last.error ? last.error : { code: 'LAST_SEQ_FAILED', message: 'lastSequence read failed' }],
-        };
-      }
-      const seq = Number(last.seq) + 1;
-      const res = await appendRunEvent({ runId, type, payload: body, seq });
+    for (let attempt = 0; attempt <= RELAY_APPEND_RETRY_LIMIT; attempt += 1) {
+      const res = await appendNextRunEvent({ runId, type, payload: body });
       if (!res || res.ok === false) {
-        return { ok: false, errors: [res && res.error ? res.error : { code: 'APPEND_FAILED', message: 'appendRunEvent failed' }] };
-      }
-      if (res.idempotent === false) return { ok: true, seq, idempotent: false, retried: attempt > 0 };
-
-      // PK conflict at `seq`: same logical event re-delivered, or a lost race.
-      const ours = await occupantIsOurs({ runId, seq, type, payload: body });
-      if (ours === true) return { ok: true, seq, idempotent: true, retried: attempt > 0 }; // store dedup won
-      if (ours === null) {
         return {
           ok: false,
-          errors: [{ code: 'SEQ_CONFLICT_UNRESOLVED', message: `run ${runId}: seq ${seq} is occupied by an unverifiable row` }],
+          errors: [res && res.error ? res.error : { code: 'APPEND_FAILED', message: 'appendNextRunEvent failed' }],
         };
       }
-      // A different event won the slot → loop retries with a fresh seq.
+      if (res.idempotent === false) {
+        return { ok: true, seq: res.seq, idempotent: false, retried: attempt > 0 };
+      }
+      // idempotent:true + seq:null — an occupied slot (advisory lock was a
+      // no-op, or a manual insert created a gap). Re-allocate fresh.
     }
 
     return {
       ok: false,
       errors: [{
-        code: 'SEQ_COLLISION_RETRY_EXHAUSTED',
-        message: `run ${runId}: seq slot still contended after ${RACE_RETRY_LIMIT + 1} allocate attempts`,
+        code: 'SEQ_ALLOC_RETRY_EXHAUSTED',
+        message: `run ${runId}: seq allocation still contended after ${RELAY_APPEND_RETRY_LIMIT + 1} attempts`,
       }],
     };
   }
@@ -159,4 +120,4 @@ function createRunEventRelay({ pg, store } = {}) {
   return { relayRunEvent };
 }
 
-module.exports = { createRunEventRelay, RACE_RETRY_LIMIT };
+module.exports = { createRunEventRelay, RELAY_APPEND_RETRY_LIMIT };

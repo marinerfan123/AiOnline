@@ -15,12 +15,19 @@
  *     与 editing 同语义「编辑中/执行中」），heartbeat 入列前归一 busy→editing。
  *   - heartbeat 校验 userId/canvasId 必填、state ∈ 枚举；不合法一律拒（status 400 + errors），
  *     不降级 online（显式优于隐式）。state=offline 视为「离开画布」：删除该 (canvas,user) 记录。
- *   - TTL：HEARTBEAT_TTL_MS=15000；peers() 只返回 ≤TTL 内且非 offline 的成员（惰性过滤，
- *     不写存储）；sweep(nowMs) 主动清过期记录，生产可按间隔调度（如每 5s 一次）。
+ *   - TTL：HEARTBEAT_TTL_MS=30000（= 2× 客户端心跳间隔，与
+ *     collabContract.presenceTtlMs 同源一致）；peers() 只返回 ≤TTL 内且非 offline 的
+ *     成员（惰性过滤，不写存储）；sweep(nowMs) 主动清过期记录，生产可按间隔调度
+ *     （如每 5s 一次）。
  *   - 时间戳一律 epoch ms（与 Date.now() 同源）；isExpired(rec, nowMs) = nowMs-lastSeenMs >= TTL。
+ *
+ * ⚠️ TTL 必须严格大于心跳间隔（= 2× interval），否则客户端按间隔上报会被边界误判过期：
+ *   客户端每 HEARTBEAT_INTERVAL_MS(=15s) 报一次心跳，若 TTL == interval(=15s)，则在
+ *   下一拍到达前的任何 jitter 窗口内 age 都 >= TTL，在线成员反复闪烁掉线。TTL=30s
+ *   容忍漏报一次心跳（连续两拍间隔 = 2×interval = TTL）而不误判过期。
  */
 
-const HEARTBEAT_TTL_MS = 15_000;
+const HEARTBEAT_TTL_MS = 30_000;
 
 /* ── presence 状态枚举（单一真源） ────────────────────────────────
  * online  连接中且活跃（可收到协作广播）

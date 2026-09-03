@@ -107,14 +107,96 @@ test('dispatch frame: routes to executorsFrame with a fast-seek single-frame ffm
   assert.ok(args.includes('-frames:v') && args.includes('1'));
 });
 
-// ─── NOT_IMPLEMENTED kinds (one each category) ───────────────────────────────
+// ─── dispatch annotate → executorsAnnotate (drawtext + font preflight) ───────
 
-test('dispatch annotate (native, executor missing) → EXECUTOR_NOT_IMPLEMENTED even with valid params', async () => {
-  const r = await dispatchToolRequest({ kind: 'annotate', params: { text: 'hello', x: 10, y: 20 } });
-  assert.equal(r.ok, false);
-  assert.equal(r.code, 'EXECUTOR_NOT_IMPLEMENTED');
-  assert.ok(r.message.includes('annotate'));
+test('dispatch annotate: routes to executorsAnnotate with an escaped drawtext ffmpeg run (fontFile envelope)', async () => {
+  const spawn = makeFakeSpawn();
+  const r = await dispatchToolRequest({
+    kind: 'annotate',
+    params: {
+      text: "O'Brien: Take 2", // schema surface (double-guarded)
+      x: 40,
+      y: 120,
+      fontSizePx: 48,
+      opacity: 0.9,
+      source: '/img/scene.png', // envelope
+      fontFile: '/fonts/DejaVuSans.ttf', // envelope — font for the drawtext pass
+      outKey: '/tmp/scene.annotated.png',
+      spawn,
+      timeoutMs: 2000,
+    },
+  });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.equal(r.result.output, '/tmp/scene.annotated.png');
+  assert.equal(r.result.text, "O'Brien: Take 2");
+  assert.equal(r.result.fontFile, '/fonts/DejaVuSans.ttf');
+  assert.equal(r.result.fontSize, 48, 'schema fontSizePx must reach the drawtext fontsize');
+  assert.equal(spawn.calls.length, 1, 'annotate dispatch must spawn exactly once');
+  assert.equal(spawn.calls[0].bin, 'ffmpeg');
+  const args = spawn.calls[0].args;
+  assert.equal(args[0], '-y');
+  assert.equal(args[1], '-i');
+  assert.equal(args[2], '/img/scene.png');
+  const vfI = args.indexOf('-vf');
+  assert.ok(vfI !== -1, 'annotate must carry -vf drawtext');
+  assert.equal(
+    args[vfI + 1],
+    "drawtext=text='O\\'Brien\\: Take 2':x=40:y=120:fontfile=/fonts/DejaVuSans.ttf:fontsize=48:fontcolor=white@0.9"
+  );
+  assert.equal(args[args.length - 1], '/tmp/scene.annotated.png');
 });
+
+test('dispatch annotate: schema-valid but no fontFile and no ANNOTATE_FONT_PATH → MEDIA_ANNOTATE_FONT_UNAVAILABLE, no spawn', async () => {
+  const prev = process.env.ANNOTATE_FONT_PATH;
+  delete process.env.ANNOTATE_FONT_PATH;
+  try {
+    const spawn = makeFakeSpawn();
+    const r = await dispatchToolRequest({
+      kind: 'annotate',
+      params: { text: 'Scene 1', source: 'a.png', outKey: '/tmp/o.png', spawn, timeoutMs: 2000 },
+    });
+    assert.equal(r.ok, false);
+    assert.equal(r.code, 'MEDIA_ANNOTATE_FONT_UNAVAILABLE');
+    assert.ok(r.message.includes('ANNOTATE_FONT_PATH'));
+    assert.equal(spawn.calls.length, 0, 'no ffmpeg may spawn without a resolvable font');
+  } finally {
+    if (prev === undefined) delete process.env.ANNOTATE_FONT_PATH;
+    else process.env.ANNOTATE_FONT_PATH = prev;
+  }
+});
+
+test('dispatch annotate: env ANNOTATE_FONT_PATH supplies the font when no fontFile is passed', async () => {
+  const prev = process.env.ANNOTATE_FONT_PATH;
+  process.env.ANNOTATE_FONT_PATH = '/env/fonts/DejaVuSans.ttf';
+  try {
+    const spawn = makeFakeSpawn();
+    const r = await dispatchToolRequest({
+      kind: 'annotate',
+      params: { text: 'env font', source: 'a.png', outKey: '/tmp/o.png', spawn, timeoutMs: 2000 },
+    });
+    assert.equal(r.ok, true, JSON.stringify(r));
+    const vfI = spawn.calls[0].args.indexOf('-vf');
+    assert.ok(spawn.calls[0].args[vfI + 1].includes('fontfile=/env/fonts/DejaVuSans.ttf'),
+      'ANNOTATE_FONT_PATH must reach the drawtext fontfile');
+  } finally {
+    if (prev === undefined) delete process.env.ANNOTATE_FONT_PATH;
+    else process.env.ANNOTATE_FONT_PATH = prev;
+  }
+});
+
+test('dispatch annotate: text over the 500-char registry cap → INVALID_PARAMS, executor never spawns', async () => {
+  const spawn = makeFakeSpawn();
+  const r = await dispatchToolRequest({
+    kind: 'annotate',
+    params: { text: 'a'.repeat(501), source: 'a.png', fontFile: '/fonts/a.ttf', outKey: '/tmp/o.png', spawn, timeoutMs: 2000 },
+  });
+  assert.equal(r.ok, false);
+  assert.equal(r.code, 'INVALID_PARAMS');
+  assert.ok(Array.isArray(r.errors) && r.errors.some((e) => e.includes('"text"') && e.includes('500')));
+  assert.equal(spawn.calls.length, 0, 'overlong text must be blocked by the double-guard before any executor runs');
+});
+
+// ─── NOT_IMPLEMENTED kinds (focus + provider-gated) ─────────────────────────
 
 test('dispatch focus (native, executor missing) → EXECUTOR_NOT_IMPLEMENTED even with valid params', async () => {
   const r = await dispatchToolRequest({ kind: 'focus', params: { region: { x: 1, y: 1, w: 10, h: 10 }, strength: 50 } });
@@ -211,8 +293,9 @@ test('dispatch grid: schema-valid but outKey missing → executor MEDIA_GRID_FAI
 
 // ─── module surface sanity ───────────────────────────────────────────────────
 
-test('NATIVE_KINDS exposes exactly the implemented native runners grid + frame', () => {
-  assert.deepEqual(Object.keys(NATIVE_KINDS).sort(), ['frame', 'grid']);
+test('NATIVE_KINDS exposes exactly the implemented native runners grid + annotate + frame', () => {
+  assert.deepEqual(Object.keys(NATIVE_KINDS).sort(), ['annotate', 'frame', 'grid']);
   assert.equal(typeof NATIVE_KINDS.grid.run, 'function');
+  assert.equal(typeof NATIVE_KINDS.annotate.run, 'function');
   assert.equal(typeof NATIVE_KINDS.frame.run, 'function');
 });

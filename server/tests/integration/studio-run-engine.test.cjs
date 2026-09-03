@@ -707,3 +707,81 @@ test('engine: multi-worker — two replicas lease concurrently, restart-safe rec
     assert.deepEqual(fin.node_status_counts, { SUCCEEDED: 5 });
   });
 });
+
+test('engine: cancel + worker crash — reaper CANCELS the expired in-flight node, never re-readies', { concurrency: 1 }, async (t) => {
+  // G15 audit HIGH-1 regression: a cancelled run whose in-flight node's lease
+  // expires must cancel that node (not READY). Re-reading it would strand the
+  // run forever (lease path blocks cancel_requested_at; reaper only touches
+  // RUNNING/LEASED/WAITING), so the run could never reach CANCELLED.
+  const s = await seedPromptOutput(); // p1 -> o1
+  const eng = makeEngine(pg, { workerId: 'w-cancel-reap', leaseSeconds: 120, retryBackoffMs: [1] });
+  const created = await engineCreateRun(pg, eng, s, { idempotencyKey: 'cancel-reap-1' });
+  await isolateRun(pg, created.runId);
+
+  const leased = await eng.leaseReadyNode({});
+  assert.equal(leased.studio_node_id, 'p1');
+  assert.equal(leased.status, 'RUNNING');
+  // cancel while p1 in flight: only BLOCKED o1 is cancelled now
+  const cr = await eng.requestRunCancellation(created.runId);
+  assert.equal(cr.cancelledNodes, 1, 'BLOCKED downstream cancelled; in-flight p1 keeps its lease');
+  // worker dies: p1 lease expires
+  await forceLeaseExpired(pg, leased.id);
+  const reap = await eng.reapExpiredNodes({ limit: 100, retryBackoffMs: [1] });
+  assert.equal(reap.cancelled, 1, 'reaper cancelled the expired in-flight node under cancel');
+  assert.equal(reap.reaped, 0, 'no node may be re-readied under cancellation');
+  const p1 = (await runNodes(pg, created.runId)).find((x) => x.studio_node_id === 'p1');
+  assert.equal(p1.status, 'CANCELLED');
+  assert.equal(p1.error_code, 'RUN_CANCELLED');
+  const run = (await pg.query('SELECT status FROM studio_runs WHERE id=$1', [created.runId])).rows[0];
+  assert.equal(run.status, 'CANCELLED', 'run must reach terminal CANCELLED (no stranded READY node)');
+});
+
+test('engine: cancel + in-flight retryable failure — node CANCELLED, never re-readied', { concurrency: 1 }, async (t) => {
+  // G15 audit HIGH-1 regression (failRunNode path): a retryable failure on a
+  // node that was leased BEFORE cancellation must NOT retry to READY — same
+  // stranding hazard as the reaper path.
+  const s = await seedPromptOutput();
+  const eng = makeEngine(pg, { workerId: 'w-cancel-fail', retryBackoffMs: [1] });
+  const created = await engineCreateRun(pg, eng, s, { idempotencyKey: 'cancel-fail-1' });
+  await isolateRun(pg, created.runId);
+  const leased = await eng.leaseReadyNode({});
+  assert.equal(leased.studio_node_id, 'p1');
+  await eng.requestRunCancellation(created.runId);
+  const r = await eng.failRunNode(leased.id, { owner: 'w-cancel-fail', token: leased.lease_token, error: Object.assign(new Error('flaky'), { code: 'FLAKY' }) });
+  assert.equal(r.ok, true);
+  assert.equal(r.cancelled, true, 'a cancelled run must not retry an in-flight failure');
+  assert.equal(r.nodeStatus, 'CANCELLED');
+  const p1 = (await runNodes(pg, created.runId)).find((x) => x.studio_node_id === 'p1');
+  assert.equal(p1.status, 'CANCELLED');
+  assert.equal(p1.next_retry_at, null, 'no backoff scheduled for a cancelled node');
+  const run = (await pg.query('SELECT status FROM studio_runs WHERE id=$1', [created.runId])).rows[0];
+  assert.equal(run.status, 'CANCELLED');
+});
+
+test('engine: executor_unavailable BLOCKED safety net (aggregateRun parks deterministically)', { concurrency: 1 }, async (t) => {
+  // G15 audit MEDIUM-1 regression: aggregateRun's BLOCKED safety net read
+  // executor_unavailable off the run row but the SELECT never fetched the
+  // column, so the branch was dead. This forces the exact guarded state and
+  // asserts the run parks to BLOCKED.
+  const s = await seedProject(pg, {
+    nodeRows: [nodes.prompt('p1'), nodes.imageGen('g1'), nodes.output('o1')],
+    edgeRows: [edge('e1', 'p1', 'g1', 'text', 'text'), edge('e2', 'g1', 'o1', 'image', 'image')],
+  });
+  const eng = makeEngine(pg, { workerId: 'w-eu' }); // no injected executor
+  const created = await engineCreateRun(pg, eng, s, { idempotencyKey: 'eu-1' });
+  await isolateRun(pg, created.runId);
+  const flag = (await pg.query('SELECT executor_unavailable FROM studio_runs WHERE id=$1', [created.runId])).rows[0];
+  assert.equal(flag.executor_unavailable, true);
+  // Force the exact state the safety net guards: every active node BLOCKED,
+  // nothing succeeded, executor unavailable. (Fabricated for the unit test —
+  // the normal flow parks GENERATION nodes to WAITING instead.)
+  await pg.query(`UPDATE studio_run_nodes SET status='BLOCKED', remaining_dependency_count=0 WHERE run_id=$1`, [created.runId]);
+  const client = await pg.connect();
+  await client.query('BEGIN');
+  const agg = await eng.aggregateRun(client, created.runId, { workerId: 'w-eu' });
+  await client.query('COMMIT');
+  client.release();
+  assert.equal(agg.status, 'BLOCKED', 'aggregateRun must park a bridge-pending-only run to BLOCKED');
+  const after = (await pg.query('SELECT status FROM studio_runs WHERE id=$1', [created.runId])).rows[0];
+  assert.equal(after.status, 'BLOCKED');
+});

@@ -387,7 +387,11 @@ async function recordAssetVersion(pgPool, { mediaId, taskId, model, storageKey, 
     const projectId = meta.rows && meta.rows.length ? meta.rows[0].project_id : null;
     if (!projectId) return false;
     await insertAssetVersion(pgPool, {
-      versionId: `av-${crypto.randomUUID()}`,
+      // G08 幂等键修复：version_id 由 (mediaId, taskId) 确定性派生，而非每次随机 UUID。
+      // 随机 UUID 会让「重入 finalizeUrl（崩溃恢复 recoverUploadJobs 把 processing 退回 queued 后重放、
+      // 或 reaper 对同一 media 续传）再次生成新 version_id → ON CONFLICT(version_id) 失效 → 同 media 重复 asset_versions 行。
+      // 确定性键保证：同一 media+task 重放 → 同 version_id → DO NOTHING；不同 task（重新生成）→ 新版本行。
+      versionId: `av-${mediaId}-${taskId || 'gen'}`,
       mediaId,
       projectId,
       kind: 'generated',

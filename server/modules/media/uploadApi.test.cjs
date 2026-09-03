@@ -122,6 +122,10 @@ test('G06 upload: double finalize is idempotent (alreadyFinalized)', async () =>
   await h.api.handle({ body: { checksumSha256: 'a'.repeat(64), sizeBytes: 10 } }, {}, '/api/v2/uploads/m-1/finalize', 'POST');
   assert.equal(h.responses[1].code, 200);
   assert.equal(h.responses[1].body.alreadyFinalized, true);
+  // Idempotency guard: the second finalize must NOT re-derive jobs
+  // (image/png → probe + thumbnail planned exactly once, not twice).
+  const enqueues = h.queries.filter((q) => q.sql.startsWith('INSERT INTO media_jobs'));
+  assert.equal(enqueues.length, 2);
 });
 
 test('G06 upload: non-owner finalize rejected (403) — audit HIGH-1 fix', async () => {

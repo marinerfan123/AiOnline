@@ -241,9 +241,26 @@ function createRunEventsSse({ pg, store } = {}) {
       try { res.write(chunk); return true; } catch (_) { state.closed = true; return false; }
     };
 
-    const writeEventLine = (ev) => {
+    // Drain-aware write: when the transport signals backpressure (write()
+    // returns false), wait for 'drain' (or close/error) before the next chunk,
+    // so a full replay of a large run cannot buffer unboundedly in memory.
+    const write = (chunk) => new Promise((resolve) => {
+      if (state.closed || !res || res.writableEnded) { resolve(false); return; }
+      let ok;
+      try { ok = res.write(chunk); } catch (_) { state.closed = true; resolve(false); return; }
+      if (ok === false && typeof res.once === 'function') {
+        const stop = () => resolve(false);
+        res.once('drain', () => resolve(true));
+        res.once('close', stop);
+        res.once('error', stop);
+      } else {
+        resolve(true);
+      }
+    });
+
+    const writeEventLine = async (ev) => {
       const data = JSON.stringify({ seq: ev.seq, type: ev.type, payload: ev.payload, ts: ev.ts });
-      return send(`id: ${ev.seq}\ndata: ${data}\n\n`);
+      return write(`id: ${ev.seq}\ndata: ${data}\n\n`);
     };
     const writeHeartbeat = () => send(': hb\n\n');
 
@@ -253,7 +270,11 @@ function createRunEventsSse({ pg, store } = {}) {
     let cursor = 0;
     if (lei !== undefined && lei !== null && String(lei).trim() !== '') {
       const n = Number(String(lei).trim());
-      if (Number.isInteger(n) && n >= 0) cursor = n;
+      // isSafeInteger (not isInteger) rejects values beyond 2^53-1 and any
+      // non-integral / NaN / infinite token — a huge Last-Event-ID would
+      // otherwise overflow BIGINT in `seq > $2` and 500 the stream, instead of
+      // degrading to a full replay.
+      if (Number.isSafeInteger(n) && n >= 0) cursor = n;
     }
 
     const sendUpTo = async (after) => {
@@ -262,7 +283,7 @@ function createRunEventsSse({ pg, store } = {}) {
         const rows = await fetchEvents({ runId, afterSeq: after, limit: batchLimit });
         if (!rows.length) break;
         for (const ev of rows) {
-          if (!writeEventLine(ev)) return after; // socket gone mid-replay
+          if (!(await writeEventLine(ev))) return after; // socket gone mid-replay
           after = ev.seq;
         }
         if (rows.length < batchLimit) break;

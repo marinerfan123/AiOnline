@@ -33,6 +33,11 @@
  */
 
 const INTENTS = new Set(['dialogue', 'reaction', 'action']); // G13 S2/S3 intent 枚举
+// 事务级咨询锁：串行化同一 (project_id, script_id) 的并发 apply。MAX(version)+1 是
+// 读-改-写，两请求同 script 并发会同时读到 MAX=N、都算 N+1，随后 DELETE+INSERT 撞上
+// UNIQUE(script_id, shot_id)（或 version 丢失更新）。此锁让第二个 apply 阻塞到第一个
+// COMMIT 后再读 MAX=N+1 → N+2，竞态消除。hashtext 碰撞仅导致无谓串行，绝不破坏正确性。
+const LOCK_SQL = 'SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))';
 const OWNER_PROJECT_SQL = 'SELECT 1 AS ok FROM projects WHERE id = $1';
 const OWNER_ROWS_SQL = 'SELECT id FROM script_rows WHERE project_id = $1 AND id = ANY($2::text[])';
 const MAX_VERSION_SQL =
@@ -189,6 +194,8 @@ async function persistStoryboardShots({ pg, projectId, scriptId, plan }) {
   let result;
   try {
     result = await withTx(pg, async (q) => {
+      // 0) 串行化同 script 并发 apply（见 LOCK_SQL 注释）——必须在 MAX(version) 读前取锁。
+      await q.query(LOCK_SQL, [projectId, scriptId]);
       // 1) project 存在（否则 404）
       const project = await q.query(OWNER_PROJECT_SQL, [projectId]);
       if (!project.rows || project.rows.length === 0) {
@@ -229,5 +236,5 @@ module.exports = {
   persistStoryboardShots,
   validatePersistArgs,
   buildShotRows,
-  SQL: { OWNER_PROJECT_SQL, OWNER_ROWS_SQL, MAX_VERSION_SQL, DELETE_SCRIPT_SQL, INSERT_SHOT_SQL },
+  SQL: { LOCK_SQL, OWNER_PROJECT_SQL, OWNER_ROWS_SQL, MAX_VERSION_SQL, DELETE_SCRIPT_SQL, INSERT_SHOT_SQL },
 };

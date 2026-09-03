@@ -41,10 +41,51 @@ CREATE TABLE IF NOT EXISTS run_events (
   PRIMARY KEY (run_id, seq)
 )`;
 
+// Per-run allocation counter. seq allocation MUST NOT read MAX(seq) over
+// run_events: under READ COMMITTED a blocked statement keeps the snapshot it
+// took before blocking, so a MAX(seq)+1 read sees a STALE value and two
+// concurrent writers still collide (this is why an advisory-lock-alone fix
+// failed a real-PG concurrency test — the lock serialized execution but not
+// the snapshot). An atomic counter (INSERT … ON CONFLICT DO UPDATE … RETURNING)
+// re-reads the latest committed row after acquiring the row lock, which is
+// exactly the read-modify-write semantics allocation needs.
+const CREATE_COUNTER_SQL = `
+CREATE TABLE IF NOT EXISTS run_event_counters (
+  run_id TEXT PRIMARY KEY,
+  seq BIGINT NOT NULL
+)`;
+
 const INSERT_SQL = `
 INSERT INTO run_events (run_id, seq, type, payload_json, created_at)
 VALUES ($1, $2, $3, $4, NOW())
 ON CONFLICT (run_id, seq) DO NOTHING`;
+
+// Atomic seq allocation (audit 2026-09-04): read-last → write-last+1 is NOT
+// atomic across concurrent writers (multiple Studio Worker replicas, and up to
+// STUDIO_WORKER_CONCURRENCY parallel node runners within one process, emit for
+// the SAME run simultaneously). A read-then-write allocator loses N-way races
+// and drops events. This single statement atomically bumps a per-run counter
+// and inserts the event in the same transaction:
+//   - the counter's INSERT … ON CONFLICT (run_id) DO UPDATE SET seq = seq + 1
+//     … RETURNING is a read-modify-write serialized by the counter row lock,
+//     so concurrent writers each get a DISTINCT, contiguous seq (no snapshot
+//     staleness — unlike a MAX(seq)+1 read under READ COMMITTED).
+//   - the event INSERT and the counter bump commit together (one statement),
+//     so a failed event insert never leaves a counter gap.
+//   - ON CONFLICT (run_id, seq) DO NOTHING is belt-and-suspenders; with the
+//     counter it is unreachable (seqs are unique per increment).
+const APPEND_NEXT_SQL = `
+WITH next AS (
+  INSERT INTO run_event_counters (run_id, seq)
+  VALUES ($1, 1)
+  ON CONFLICT (run_id) DO UPDATE SET seq = run_event_counters.seq + 1
+  RETURNING seq
+)
+INSERT INTO run_events (run_id, seq, type, payload_json, created_at)
+SELECT $1, next.seq, $2, $3::jsonb, NOW()
+FROM next
+ON CONFLICT (run_id, seq) DO NOTHING
+RETURNING seq`;
 
 const LIST_SQL = `
 SELECT run_id, seq, type, payload_json
@@ -80,6 +121,14 @@ function createRunEventStore({ pg }) {
     if (!schemaReady) schemaReady = pg.query(CREATE_TABLE_SQL).then(() => true);
     return schemaReady;
   }
+  // The counter table is only needed by appendNextRunEvent (auto-seq) — kept
+  // separate so callers that only use appendRunEvent / lastSequence /
+  // listRunEvents never create it.
+  let counterReady = null;
+  function ensureCounterSchema() {
+    if (!counterReady) counterReady = pg.query(CREATE_COUNTER_SQL).then(() => true);
+    return counterReady;
+  }
 
   /**
    * Append one run event.
@@ -100,6 +149,38 @@ function createRunEventStore({ pg }) {
     const r = await pg.query(INSERT_SQL, [runId, seq, type, JSON.stringify(body)]);
     const inserted = Number(r && r.rowCount) > 0;
     return { ok: true, idempotent: !inserted, seq };
+  }
+
+  /**
+   * Append one run event with an atomically allocated next seq.
+   * Replaces the racy read-last → write-last+1 sequence with a single
+   * statement that bumps a per-run counter and inserts the event in the same
+   * transaction (see APPEND_NEXT_SQL): no concurrent writer can allocate the
+   * same seq, so N-way races cannot drop events and seq stays contiguous.
+   * @param {{runId:string, type:string, payload?:object}}
+   * @returns {Promise<{ok:true, idempotent:boolean, seq:(number|null)}
+   *                   |{ok:false, error:{code,message}}>}
+   *   idempotent:false + seq=n   → allocated and inserted at seq n.
+   *   idempotent:true  + seq=null→ the computed seq was already occupied
+   *     (unreachable with the atomic counter; only if a manual insert created
+   *     a gap). Caller should re-allocate, not drop.
+   */
+  async function appendNextRunEvent({ runId, type, payload } = {}) {
+    if (!isNonEmptyString(runId)) return err('INVALID_RUN_ID', 'runId (non-empty string) required');
+    if (!isNonEmptyString(type)) return err('INVALID_TYPE', 'type (non-empty string) required');
+    let body = payload;
+    if (body !== undefined && body !== null && typeof body !== 'object') {
+      return err('INVALID_PAYLOAD', 'payload must be an object');
+    }
+    body = body === undefined ? {} : body;
+    await ensureSchema();
+    await ensureCounterSchema();
+    const r = await pg.query(APPEND_NEXT_SQL, [runId, type, JSON.stringify(body)]);
+    const row = r && r.rows && r.rows[0];
+    if (Number(r && r.rowCount) > 0 && row && row.seq != null) {
+      return { ok: true, idempotent: false, seq: Number(row.seq) };
+    }
+    return { ok: true, idempotent: true, seq: null };
   }
 
   /**
@@ -134,10 +215,10 @@ function createRunEventStore({ pg }) {
     return { seq: Number(row && row.seq) || 0 };
   }
 
-  return { appendRunEvent, listRunEvents, lastSequence };
+  return { appendRunEvent, appendNextRunEvent, listRunEvents, lastSequence };
 }
 
 module.exports = {
   createRunEventStore,
-  SQL: { CREATE_TABLE_SQL, INSERT_SQL, LIST_SQL, LAST_SEQ_SQL },
+  SQL: { CREATE_TABLE_SQL, CREATE_COUNTER_SQL, INSERT_SQL, APPEND_NEXT_SQL, LIST_SQL, LAST_SEQ_SQL },
 };

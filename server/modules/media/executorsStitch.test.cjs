@@ -232,3 +232,21 @@ test('runStitch: structural validation violation (outMs ≤ inMs) → MEDIA_STIT
   assert.ok(/outMs/.test(r.message));
   assert.equal(spawn.calls.length, 0);
 });
+
+// ─── security: output path traversal + ffmpeg option injection ───────────────
+
+test('buildStitchCommand: rejects .. traversal and - prefixed outKey (no option injection)', () => {
+  const seg = [{ source: 'a.mp4', inMs: 0, outMs: 1000 }];
+  assert.throws(() => buildStitchCommand({ segments: seg, outKey: '../o.mp4' }), /'\.\.'/);
+  assert.throws(() => buildStitchCommand({ segments: seg, outKey: '/tmp/../../o.mp4' }), /'\.\.'/);
+  assert.throws(() => buildStitchCommand({ segments: seg, outKey: '-vf' }), /'-'/);
+});
+
+test('runStitch: traversal outKey → MEDIA_STITCH_FAILED with no ffmpeg spawn', async () => {
+  const spawn = makeFakeSpawn();
+  const r = await runStitch({ segments: [{ source: 'a.mp4', inMs: 0, outMs: 1000 }], outKey: '../o.mp4', spawn, timeoutMs: 2000 });
+  assert.equal(r.ok, false);
+  assert.equal(r.code, 'MEDIA_STITCH_FAILED');
+  assert.ok(/\.\./.test(r.message));
+  assert.equal(spawn.calls.length, 0, 'no ffmpeg spawn for an unsafe outKey');
+});

@@ -22,6 +22,7 @@
 
 const DEFAULT_TIMEOUT_MS = 15000;
 const MAX_SEGMENTS = 20;
+const { assertSafeOutputPath } = require('./executorsPathGuard.cjs');
 
 /** Integer milliseconds → ffmpeg seconds with exactly 3 decimals (2000→"2.000"). */
 function msToSeconds(ms) {
@@ -61,6 +62,7 @@ function buildStitchCommand({ segments, outKey } = {}) {
   if (typeof outKey !== 'string' || outKey.length === 0) {
     throw new Error('stitch requires an outKey output path');
   }
+  assertSafeOutputPath(outKey, 'stitch outKey');
   const args = ['-y'];
   const parts = [];
   segments.forEach((seg, i) => {

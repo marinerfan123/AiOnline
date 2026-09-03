@@ -110,7 +110,40 @@ test('G07 models API: bindings-aware view → no key ⇒ available false + lineC
 });
 
 test('G07 models API: bindings-aware view → disabled provider ⇒ available false', async () => {
-  const h = harness({ providers: [{ id: 'prov-1', enabled: false, api_key: 'sk-test-123456' }] });
+  const h = harness({ providers: [{ id: 'prov-1', enabled: false, api_key: '«redacted:sk-…»' }] });
+  await h.api.handle({}, {}, '/api/studio/models', 'GET');
+  const m = h.responses[0].body.models[0];
+  assert.equal(m.lineCount, 0);
+  assert.equal(m.available['video.text2video'], false);
+});
+
+test('G07 models API: pool key (active ≥6) counts even when legacy api_key empty', async () => {
+  const h = harness({
+    providers: [{ id: 'prov-1', enabled: true, api_key: '' }],
+    apiKeys: [{ id: 'k1', provider_id: 'prov-1', api_key: 'testkey123', status: 'active' }],
+  });
+  await h.api.handle({}, {}, '/api/studio/models', 'GET');
+  const m = h.responses[0].body.models[0];
+  assert.equal(m.lineCount, 1);
+  assert.equal(m.available['video.text2video'], true);
+});
+
+test('G07 models API: isolated pool key is NOT dispatchable ⇒ lineCount 0', async () => {
+  const h = harness({
+    providers: [{ id: 'prov-1', enabled: true, api_key: '' }],
+    apiKeys: [{ id: 'k1', provider_id: 'prov-1', api_key: 'testkey123', status: 'isolated' }],
+  });
+  await h.api.handle({}, {}, '/api/studio/models', 'GET');
+  const m = h.responses[0].body.models[0];
+  assert.equal(m.lineCount, 0);
+  assert.equal(m.available['video.text2video'], false);
+});
+
+test('G07 models API: short pool key (<6) is ignored ⇒ lineCount 0', async () => {
+  const h = harness({
+    providers: [{ id: 'prov-1', enabled: true, api_key: '' }],
+    apiKeys: [{ id: 'k1', provider_id: 'prov-1', api_key: 'abc12', status: 'active' }],
+  });
   await h.api.handle({}, {}, '/api/studio/models', 'GET');
   const m = h.responses[0].body.models[0];
   assert.equal(m.lineCount, 0);

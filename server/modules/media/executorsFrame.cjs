@@ -18,6 +18,8 @@
  * the caller's jobDir (created on demand) so concurrent jobs stay isolated.
  */
 
+const { assertSafeOutputPath, sanitizeJobScope } = require('./executorsPathGuard.cjs');
+
 const DEFAULT_TIMEOUT_MS = 15000;
 
 /** Integer milliseconds → ffmpeg seconds with exactly 3 decimals (500→"0.500"). */
@@ -48,8 +50,8 @@ function stemOf(source) {
 function defaultOutKey(source, timeMs, jobDir, jobId) {
   const stem = stemOf(source) || 'frame';
   const name = `${stem}.frame.${String(timeMs)}ms.png`;
-  if (jobDir) return `${String(jobDir).replace(/[^\w.\-/]/g, '_')}/${name}`;
-  if (jobId) return `/tmp/media-jobs/${String(jobId).replace(/[^\w.\-]/g, '_')}/${name}`;
+  if (jobDir) return `${sanitizeJobScope(jobDir)}/${name}`;
+  if (jobId) return `/tmp/media-jobs/${sanitizeJobScope(jobId)}/${name}`;
   return name;
 }
 
@@ -72,6 +74,7 @@ function buildFrameCommand({ source, timeMs, outKey, jobDir, jobId } = {}) {
     typeof outKey === 'string' && outKey.length > 0
       ? outKey
       : defaultOutKey(source, timeMs, jobDir, jobId);
+  assertSafeOutputPath(output, 'frame output path');
   const args = [
     '-y',
     '-ss', seconds,
