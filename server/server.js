@@ -2509,8 +2509,8 @@ async function handleAPI(req, res) {
     if (await assetFoundation.handle(req, res, url.split('?')[0], method)) return;
   }
 
-  // ── G07 Studio Models public API（/api/studio/models）──
-  if (url.startsWith('/api/studio/models')) {
+  // ── G07 Studio Models + Shortcuts public API（/api/studio/models, /api/studio/shortcuts）──
+  if (url.startsWith('/api/studio/models') || url === '/api/studio/shortcuts' || url.startsWith('/api/studio/shortcuts?')) {
     if (await studioModelsApi.handle(req, res, url.split('?')[0], method)) return;
   }
 

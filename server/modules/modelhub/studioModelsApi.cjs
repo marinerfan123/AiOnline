@@ -9,6 +9,7 @@
  * server — keys stay in api_keys/providers rows (04 §23).
  */
 const { projectModelBinding } = require('./modelSchema.cjs');
+const { listShortcuts } = require('./shortcuts.cjs');
 
 function createStudioModelsApi({ pg, sessionUser, sendJSON }) {
   function requireUser(req, res) {
@@ -35,12 +36,17 @@ function createStudioModelsApi({ pg, sessionUser, sendJSON }) {
   }
 
   async function handle(req, res, urlPath, method) {
-    if (!urlPath.startsWith('/api/studio/models')) return false;
+    if (!(urlPath.startsWith('/api/studio/models') || urlPath === '/api/studio/shortcuts')) return false;
     if (method === 'OPTIONS') { sendJSON(res, 204, {}); return true; }
     const user = requireUser(req, res);
     if (!user) return true;
 
     try {
+      // G07 slash shortcut registry (04 §6): server-configured.
+      if (urlPath === '/api/studio/shortcuts' && method === 'GET') {
+        const nodeType = (req.query && String(req.query.nodeType || '').trim()) || undefined;
+        return sendJSON(res, 200, { ok: true, shortcuts: listShortcuts(nodeType ? { nodeType } : {}) });
+      }
       if (urlPath === '/api/studio/models' && method === 'GET') {
         const bindings = await loadBindings();
         return sendJSON(res, 200, {

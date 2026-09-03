@@ -80,3 +80,15 @@ test('G07 models API: OPTIONS returns 204 and other prefixes pass through', asyn
   const r = await h.api.handle({}, {}, '/api/v2/projects', 'GET');
   assert.equal(r, false);
 });
+
+test('G07 shortcuts API: lists server-configured shortcuts, filtered by nodeType', async () => {
+  const h = harness();
+  await h.api.handle({ query: { nodeType: 'text' } }, {}, '/api/studio/shortcuts', 'GET');
+  assert.equal(h.responses[0].code, 200);
+  const all = h.responses[0].body.shortcuts;
+  assert.ok(all.length >= 3);
+  assert.ok(all.every((s) => s.applicableNodeTypes.includes('text')));
+  assert.ok(all.some((s) => s.slash === 'optimize'));
+  await h.api.handle({ query: {} }, {}, '/api/studio/shortcuts', 'GET');
+  assert.ok(h.responses[1].body.shortcuts.length >= all.length);
+});
