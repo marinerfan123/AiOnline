@@ -55,7 +55,7 @@ test('G06 probe: non-zero exit → MEDIA_PROBE_FAILED', async () => {
 });
 
 test('G06 executors: unimplemented kinds return deterministic PENDING code', async () => {
-  for (const kind of ['transcode', 'frame_extract', 'render']) {
+  for (const kind of ['transcode', 'render']) {
     const r = await execute(kind, { source: 'x' });
     assert.equal(r.ok, false);
     assert.ok(r.code.endsWith('EXECUTOR_PENDING'), `${kind} → ${r.code}`);
@@ -65,7 +65,7 @@ test('G06 executors: unimplemented kinds return deterministic PENDING code', asy
 });
 
 test('G06 executors: wired AV kinds require a source (MEDIA_SOURCE_MISSING guard)', async () => {
-  for (const kind of ['thumbnail', 'proxy', 'waveform']) {
+  for (const kind of ['thumbnail', 'proxy', 'waveform', 'frame_extract']) {
     const r = await execute(kind, {});
     assert.equal(r.ok, false);
     assert.equal(r.code, 'MEDIA_SOURCE_MISSING', `${kind} → ${r.code}`);
@@ -159,4 +159,44 @@ test('G06 executors: stitch without segments/segment source → MEDIA_SOURCE_MIS
   assert.equal(partial.ok, false);
   assert.equal(partial.code, 'MEDIA_SOURCE_MISSING');
   assert.equal(spawn.calls.length, 0, 'no ffmpeg spawn may happen when a segment source is missing');
+});
+
+// ─── frame_extract dispatch (G12) ───────────────────────────────────────────
+
+test('G12 executors: frame_extract dispatches to runFrame with a top-level source; ffmpeg gets fast-seek -ss before -i', async () => {
+  const spawn = makeFfmpegSpawn();
+  const r = await execute('frame_extract', { source: '/videos/clip.mp4', timeMs: 500, outKey: '/tmp/clip.frame.500ms.png', spawn, timeoutMs: 2000 });
+  assert.equal(r.ok, true);
+  assert.equal(r.result.output, '/tmp/clip.frame.500ms.png');
+  assert.equal(spawn.calls.length, 1);
+  assert.equal(spawn.calls[0].bin, 'ffmpeg');
+  const args = spawn.calls[0].args;
+  const iSs = args.indexOf('-ss');
+  const iI = args.indexOf('-i');
+  assert.ok(iSs !== -1 && iSs + 1 < iI, '-ss <seconds> must precede -i (fast container seek)');
+  assert.equal(args[iSs + 1], '0.500');
+  assert.equal(args[iI + 1], '/videos/clip.mp4');
+  assert.ok(args.includes('-frames:v'));
+  assert.equal(args[args.length - 1], '/tmp/clip.frame.500ms.png');
+});
+
+test('G12 executors: frame_extract dispatch failure codes (ENOENT → MEDIA_FFMPEG_UNAVAILABLE, non-zero → MEDIA_FRAME_FAILED)', async () => {
+  const enoent = await execute('frame_extract', { source: 'a.mp4', timeMs: 500, outKey: 'o.png', spawn: makeFfmpegSpawn({ enoent: true }), timeoutMs: 2000 });
+  assert.equal(enoent.ok, false);
+  assert.equal(enoent.code, 'MEDIA_FFMPEG_UNAVAILABLE');
+
+  const spawn = makeFfmpegSpawn({ exitCode: 1, stderrData: [Buffer.from('Invalid data found when processing input')] });
+  const failed = await execute('frame_extract', { source: 'a.mp4', timeMs: 500, outKey: 'o.png', spawn, timeoutMs: 2000 });
+  assert.equal(failed.ok, false);
+  assert.equal(failed.code, 'MEDIA_FRAME_FAILED');
+  assert.ok(failed.message.includes('Invalid data found when processing input'));
+});
+
+test('G12 executors: frame_extract without timeMs → MEDIA_FRAME_FAILED (structural violation, no spawn)', async () => {
+  const spawn = makeFfmpegSpawn();
+  const r = await execute('frame_extract', { source: 'a.mp4', outKey: 'o.png', spawn, timeoutMs: 2000 });
+  assert.equal(r.ok, false);
+  assert.equal(r.code, 'MEDIA_FRAME_FAILED');
+  assert.ok(/timeMs/.test(r.message));
+  assert.equal(spawn.calls.length, 0, 'no ffmpeg spawn may happen for a structurally invalid frame job');
 });

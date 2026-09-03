@@ -1,5 +1,9 @@
 'use strict';
 const crypto = require('crypto');
+// G22 — canvas.patch 命令日志: 挂载 collaboration 的 commandLogStore 地基(幂等 append)。
+// 反向依赖安全: commandLogStore.cjs 零 require(纯地基叶), 无环。server.js 未改动时
+// 本模块用同一个注入 pg 自建 store; 合成根日后可经 deps.commandLogStore 注入共享实例。
+const { createCommandLogStore } = require('../collaboration/commandLogStore.cjs');
 
 const PREFIX_RE = /^\/api\/v2\/projects\/([^/]+)\/studio\/canvas(?:\/([^/]+)(?:\/([^/]+))?)?$/;
 const CANVAS_SCHEMA_VERSION = 1;
@@ -139,6 +143,33 @@ function createStudioCanvasPersistence(deps) {
   async function ensureCanvas(client, project, user) { return await getCanvas(client, project.id) || await createCanvasTx(client, project, user, 'Primary Canvas'); }
   async function emit(eventType, payload) { if (!logEvent) return; try { await logEvent(pg, { aggregate: 'studio_canvas', eventType, payload }); } catch (_) {} }
 
+  // G22 — canvas.patch 命令日志。优先用合成根注入的 commandLogStore(需含幂等 appendCommand);
+  // 未注入则用同一 pg 自建 store(server.js 零改动即生效, 挂载地基叶)。recordCanvasPatch
+  // 全程 warn-only —— 命令日志任何失败(抛错/拒绝)绝不让已提交的 PATCH 主链破。
+  const commandLog =
+    deps.commandLogStore && typeof deps.commandLogStore.appendCommand === 'function'
+      ? deps.commandLogStore
+      : (() => {
+          try {
+            return pg && typeof pg.query === 'function' ? createCommandLogStore({ pg }) : null;
+          } catch (e) {
+            console.warn('[studio-canvas] commandLogStore init skipped:', e && e.message);
+            return null;
+          }
+        })();
+  async function recordCanvasPatch({ canvasId, commandId, actorId, baseRevision, ops }) {
+    if (!commandLog) return;
+    try {
+      const r = await commandLog.appendCommand({
+        canvasId, commandId, type: 'canvas.patch', actorId, baseRevision,
+        payload: { baseRevision, ops },
+      });
+      if (r && r.ok === false) console.warn('[studio-canvas] appendCommand rejected:', JSON.stringify(r.errors || r));
+    } catch (e) {
+      console.warn('[studio-canvas] appendCommand failed after commit (PATCH unaffected):', e && e.message);
+    }
+  }
+
   async function handleGet(req, res, user, projectId) {
     const access = await requireProject(pg, res, user, projectId); if (!access) return;
     const canvas = await getCanvas(pg, projectId);
@@ -175,7 +206,12 @@ function createStudioCanvasPersistence(deps) {
       for (const raw of upsertEdges) { const e = normalizeEdge(raw); await client.query(`INSERT INTO studio_canvas_edges (canvas_id,edge_id,source_node_id,source_handle,target_node_id,target_handle,edge_type,data_json,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW(),NOW()) ON CONFLICT (canvas_id,edge_id) DO UPDATE SET source_node_id=EXCLUDED.source_node_id,source_handle=EXCLUDED.source_handle,target_node_id=EXCLUDED.target_node_id,target_handle=EXCLUDED.target_handle,edge_type=EXCLUDED.edge_type,data_json=EXCLUDED.data_json,updated_at=NOW()`, [canvas.id,e.edgeId,e.sourceNodeId,e.sourceHandle,e.targetNodeId,e.targetHandle,e.edgeType,JSON.stringify(e.data)]); }
       const graph = await loadGraph(client, canvas.id); const fresh = (await client.query('SELECT * FROM studio_canvases WHERE id=$1', [canvas.id])).rows[0]; const resp = response(fresh, graph, fresh.viewport_json, { permissions: access.permissions, extra: { applied: true, clientMutationId: cmid } });
       await client.query('INSERT INTO studio_canvas_mutations (canvas_id,client_mutation_id,base_revision,resulting_revision,response_json,created_by) VALUES ($1,$2,$3,$4,$5,$6)', [canvas.id, cmid, base, fresh.revision, JSON.stringify(resp), user.id]);
-      await client.query('COMMIT'); await emit('canvas.updated', { canvas_id: canvas.id, project_id: projectId, workspace_id: fresh.workspace_id, revision: fresh.revision, actor_id: user.id, timestamp: new Date().toISOString() }); return sendJSON(res, 200, resp);
+      await client.query('COMMIT');
+      // G22 — mutation 已提交(CAS 通过)后写 canvas.patch 命令日志。commandId=clientMutationId,
+      // 幂等由 (canvas_id,command_id) 保证 → 同 mutationId 重放安全。失败路径仅在成功分支后
+      // warn-only(见 recordCanvasPatch), 不破主链。409/校验失败/回滚路径永不走到此处。
+      await recordCanvasPatch({ canvasId: canvas.id, commandId: cmid, actorId: user.id, baseRevision: base, ops: { nodeUpserts: upsertNodes.length, nodeDeletes: deleteNodeIds.length, edgeUpserts: upsertEdges.length, edgeDeletes: deleteEdgeIds.length } });
+      await emit('canvas.updated', { canvas_id: canvas.id, project_id: projectId, workspace_id: fresh.workspace_id, revision: fresh.revision, actor_id: user.id, timestamp: new Date().toISOString() }); return sendJSON(res, 200, resp);
     } catch (e) { try { await client.query('ROLLBACK'); } catch (_) {} if (['INVALID_NODE','INVALID_EDGE'].includes(e.message)) return sendErr(sendJSON, res, 400, e.message); if (e.code === '23503') return sendErr(sendJSON, res, 400, 'INTEGRITY_ERROR'); throw e; } finally { client.release(); }
   }
   async function handleVersionList(req, res, user, projectId) { const access = await requireProject(pg, res, user, projectId); if (!access) return; const canvas = await getCanvas(pg, projectId); if (!canvas) return sendJSON(res, 200, { versions: [], pagination: { limit: 20, offset: 0, total: 0, hasMore: false } }); const q = req.query || {}; const limit = Math.min(Math.max(Number(q.limit) || 20, 1), 100); const offset = Math.max(Number(q.offset) || 0, 0); const cr = await pg.query('SELECT COUNT(*)::int AS total FROM studio_canvas_versions WHERE canvas_id=$1', [canvas.id]); const r = await pg.query('SELECT id,canvas_id,revision,version_number,name,description,snapshot_json,created_by,restore_source_version_id,created_at FROM studio_canvas_versions WHERE canvas_id=$1 ORDER BY version_number DESC LIMIT $2 OFFSET $3', [canvas.id, limit, offset]); const versions = r.rows.map(v => ({ id:v.id, canvasId:v.canvas_id, revision:v.revision, versionNumber:v.version_number, name:v.name, description:v.description, createdBy:v.created_by, createdAt:toIso(v.created_at), restoredFromVersionId:v.restore_source_version_id, nodeCount:(v.snapshot_json?.nodes||[]).length, edgeCount:(v.snapshot_json?.edges||[]).length })); return sendJSON(res, 200, { versions, pagination: { limit, offset, total: cr.rows[0].total, hasMore: offset + versions.length < cr.rows[0].total } }); }

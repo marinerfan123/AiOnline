@@ -11,11 +11,43 @@
  *   PATCH  /api/v2/script/rows/:id        merge-update given columns (revalidated)
  *   PUT    /api/v2/script/order           {sceneIndex, rowIds:[...]} reindex 0..n
  *   DELETE /api/v2/script/rows/:id        hard delete (no deleted_at col)
+ *   GET    /api/v2/script/:scriptId/storyboard  (or /api/v2/script/storyboard
+ *          ?scriptId=) storyboard PLAN view — read-only; computes the
+ *          deterministic beats/shots plan from the project's rows (scene order)
+ *          via buildStoryboardPlan. Permissions follow GET /rows (viewer can
+ *          read; owner/editor not required).
  * Rows carry integer-ms timing only (Blueprint hard rule). Speaker enforced for
  * dialogue by validateScriptRow.
  */
 const crypto = require('crypto');
 const { validateScriptRow, buildSceneRows, normalizeContinuityNotes } = require('./scriptModel.cjs');
+const { buildStoryboardPlan } = require('./storyboardPlan.cjs');
+
+/**
+ * Match the storyboard plan-view route on a scriptApi URL. Two spellings are
+ * accepted (same handler, same semantics):
+ *   A) /api/v2/script/:scriptId/storyboard      — scriptId in the path
+ *   B) /api/v2/script/storyboard?scriptId=…     — scriptId in params/query
+ * (projectId is always supplied the way sibling rows routes receive it — from
+ * the query string via req.params, project-bound SQL does the ownership.)
+ * Returns { scriptId } when the URL is a storyboard route (scriptId may be
+ * null when spelling B omits it — the handler then 400s), else null.
+ * The 'rows' / 'order' prefixes are reserved by the CRUD routes, so
+ * /api/v2/script/rows/storyboard stays a rows/:id GET, never a plan view.
+ */
+function matchStoryboardRoute(urlPath, params) {
+  if (urlPath === '/api/v2/script/storyboard') {
+    const sid = params && typeof params.scriptId === 'string' ? params.scriptId.trim() : '';
+    return { scriptId: sid !== '' ? sid : null };
+  }
+  const sm = /^\/api\/v2\/script\/([^/]+)\/storyboard$/.exec(urlPath);
+  if (sm && sm[1] !== 'rows' && sm[1] !== 'order') {
+    let sid = null;
+    try { sid = decodeURIComponent(sm[1]); } catch (e) { sid = null; }
+    return { scriptId: sid };
+  }
+  return null;
+}
 
 function createScriptApi({ pg, sessionUser, sendJSON, parseBody }) {
   function requireUser(req, res) {
@@ -41,8 +73,12 @@ function createScriptApi({ pg, sessionUser, sendJSON, parseBody }) {
   }
 
   async function handle(req, res, urlPath, method) {
+    // Storyboard plan view — GET only in this leaf (a future POST mount that
+    // persists the plan via storyboardShots is the 主线's call, not ours).
+    const storyboard = matchStoryboardRoute(urlPath, req.params || {});
+    if (storyboard && method !== 'GET') return false;
     const m = urlPath.match(/^\/api\/v2\/script\/rows(?:\/([^/]+))?$/) || urlPath.match(/^\/api\/v2\/script\/order$/);
-    if (!m) return false;
+    if (!m && !storyboard) return false;
     const isOrder = urlPath === '/api/v2/script/order';
     const { projectId } = req.params || {};
     if (!projectId) { sendJSON(res, 400, { ok: false, error: 'projectId 必填' }); return true; }
@@ -55,6 +91,66 @@ function createScriptApi({ pg, sessionUser, sendJSON, parseBody }) {
     const WRITE = ['POST', 'PUT', 'DELETE', 'PATCH'];
     if (WRITE.includes(method) && !['owner', 'editor'].includes(project.role)) {
       return sendJSON(res, 403, { ok: false, error: '只读成员不可修改（需 owner/editor）' });
+    }
+
+    // GET /api/v2/script/:scriptId/storyboard — storyboard PLAN view (read-only).
+    // Permissions mirror GET /rows: any member may read (viewer included); the
+    // WRITE gate above never applies to GET. scriptId ownership = project-scope:
+    // a script's content carrier is that project's script_rows (no standalone
+    // scripts table before 0045's note), so the rows SELECT binds project_id in
+    // SQL exactly like the row-level ownership checks — no other project's rows
+    // can ever leak into this plan.
+    if (storyboard) {
+      const scriptId = storyboard.scriptId;
+      if (!scriptId) return sendJSON(res, 400, { ok: false, error: 'scriptId 必填' });
+      const r = await pg.query(
+        `SELECT * FROM script_rows WHERE project_id = $1 ORDER BY scene_index ASC, row_index ASC`,
+        [projectId],
+      );
+      if (!r.rows.length) {
+        return sendJSON(res, 400, { ok: false, error: '计划需至少 1 行脚本行（该项目暂无 script_rows）' });
+      }
+      // Best-effort entity sources for shot subjectRefs. Both live in this
+      // project's bible tables (0027/0028); a read failure must never break the
+      // plan view, so swallow to [] — subjectRefs then stay row-internal
+      // (dialogue speaker only), which is exactly buildStoryboardPlan S4's
+      // never-invent rule.
+      let characters = [];
+      let locations = [];
+      try {
+        const [ch, loc] = await Promise.all([
+          pg.query('SELECT id, name FROM project_characters WHERE project_id = $1', [projectId]),
+          pg.query('SELECT id, name FROM project_environments WHERE project_id = $1', [projectId]),
+        ]);
+        characters = (ch.rows || []).map((x) => ({ id: x.id, name: x.name }));
+        locations = (loc.rows || []).map((x) => ({ id: x.id, name: x.name }));
+      } catch (e) {
+        characters = [];
+        locations = [];
+      }
+      const plan = buildStoryboardPlan({
+        rows: r.rows.map((row) => ({
+          id: row.id,
+          episode_id: row.episode_id,
+          scene_index: row.scene_index,
+          row_index: row.row_index,
+          kind: row.kind,
+          speaker: row.speaker,
+          text: row.text,
+          beat: row.beat,
+          // PG returns BIGINT timing_ms as a string — normalize to an int ms.
+          timing_ms: row.timing_ms == null ? null : Number(row.timing_ms),
+        })),
+        characters,
+        locations,
+      });
+      if (!plan || !Array.isArray(plan.beats)) {
+        return sendJSON(res, 400, {
+          ok: false,
+          errors: plan && Array.isArray(plan.errors) ? plan.errors : ['计划构建失败：脚本行不满足模型校验'],
+        });
+      }
+      return sendJSON(res, 200, { ok: true, plan: { beats: plan.beats, totalShots: plan.totalShots } });
     }
 
     const id = m && m[1] ? decodeURIComponent(m[1]) : null;

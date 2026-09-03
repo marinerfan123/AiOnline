@@ -53,15 +53,15 @@ function runProbe({ source, spawn = require('child_process').spawn, timeoutMs = 
   });
 }
 
-/** Executor registry: kind → runner (probe/thumbnail/proxy/waveform/stitch wired). */
+/** Executor registry: kind → runner (probe/thumbnail/proxy/waveform/stitch/frame_extract wired). */
 const EXECUTORS = {
   probe: runProbe,
   thumbnail: (ctx) => require('./executorsAv.cjs').runThumbnail(ctx),
   proxy: (ctx) => require('./executorsAv.cjs').runProxy(ctx),
   waveform: (ctx) => require('./executorsAv.cjs').runWaveform(ctx),
   stitch: (ctx) => require('./executorsStitch.cjs').runStitch(ctx),
+  frame_extract: (ctx) => require('./executorsFrame.cjs').runFrame(ctx),
   transcode: null,
-  frame_extract: null,
   render: null,
 };
 
