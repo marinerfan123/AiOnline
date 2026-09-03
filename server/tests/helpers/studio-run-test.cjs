@@ -7,15 +7,23 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { Pool } = require('pg');
-const { initTestSchema } = require('./test-db.cjs');
 const { createStudioRunEngine } = require('../../modules/project-foundation/studioRunEngine.cjs');
 
-const MIGRATIONS = [
-  '0012_project_workspace_foundation.sql',
-  '0013_asset_foundation.sql',
-  '0014_studio_canvas_persistence.sql',
-  '0015_studio_run_engine.sql',
-];
+// G15 integration fix (2026-09-04): the bootstrap previously applied a stale
+// schema snapshot + migrations 0012-0015 only, so newer columns (projects.
+// folder_id @0035, media client_request_id @0005, continuity FK @0041, ...)
+// were missing and the spawned API 500'd on createProject. Fresh DBs now get
+// the FULL migration chain 0001..0043 — the same path production migrate.cjs
+// follows (parity with migrate-rebuilt DBs).
+function migrationFiles() {
+  const dir = path.resolve(__dirname, '..', '..', 'db', 'migrations');
+  return fs.readdirSync(dir).filter((f) => /^\d{4}_.*\.sql$/.test(f)).sort();
+}
+async function applyAllMigrations(pg) {
+  for (const m of migrationFiles()) {
+    await pg.query(fs.readFileSync(path.resolve(__dirname, '..', '..', 'db', 'migrations', m), 'utf8'));
+  }
+}
 
 const ADMIN_HOST = process.env.TEST_PG_HOST || process.env.PG_HOST || 'localhost';
 const ADMIN_PORT = Number(process.env.TEST_PG_PORT || process.env.PG_PORT || '5432');
@@ -46,14 +54,11 @@ async function dropDb(name) {
   } catch (_) {}
 }
 
-/** Fresh DB + all migrations through 0015. Returns { dbName, pg }. */
+/** Fresh DB + FULL migration chain (0001..0043) — parity with prod migrate. */
 async function bootstrapRunDb() {
   const dbName = await createDb();
   const pg = new Pool(poolConfig(dbName));
-  await initTestSchema(pg);
-  for (const m of MIGRATIONS) {
-    await pg.query(fs.readFileSync(path.resolve(__dirname, '..', '..', 'db', 'migrations', m), 'utf8'));
-  }
+  await applyAllMigrations(pg);
   return { dbName, pg };
 }
 
