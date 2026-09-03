@@ -56,6 +56,7 @@ import timelineApiMod from './modules/media/timelineApi.cjs';
 import mediaWorkerMod from './modules/media/mediaWorker.cjs';
 import mediaExecMod from './modules/media/executors.cjs';
 import bibleApiMod from './modules/project-foundation/bibleApi.cjs';
+import scriptApiMod from './modules/script/scriptApi.cjs';
 import studioCanvasPersistenceMod from './modules/project-foundation/studioCanvasPersistence.cjs';
 import studioEpisodeApiMod from './modules/project-foundation/studioEpisodeApi.cjs';
 import studioShotApiMod from './modules/project-foundation/studioShotApi.cjs';
@@ -1518,6 +1519,19 @@ const bibleApi = bibleApiMod.createBibleApi({
   parseBody,
 });
 
+// G13 — Script rows (/api/v2/script/rows + /order): validated batch insert,
+// scene-grouped read, merge-PATCH, DELETE, scene reindex. Integer-ms timing.
+const scriptApi = scriptApiMod.createScriptApi({
+  pg: {
+    query: (sql, params) => pgPool
+      ? pgPool.query(sql, params)
+      : Promise.reject(Object.assign(new Error('数据库未就绪'), { status: 503 })),
+  },
+  sessionUser: (req) => session.getUserFromCookie(req),
+  sendJSON,
+  parseBody,
+});
+
 // G06 — General asset upload (/api/v2/uploads + finalize). Signed PUT adapter:
 // active storage config (Aliyun→Tencent), else null → 503.
 // ossMod.loadOssConfigs returns { enabled, activeId, list } — resolve the
@@ -2601,6 +2615,11 @@ async function handleAPI(req, res) {
   // ── G14 Production Bible（/api/v2/bible/characters|environments|references）──
   if (url.startsWith('/api/v2/bible')) {
     if (await bibleApi.handle(req, res, url.split('?')[0], method)) return;
+  }
+
+  // ── G13 Script rows（/api/v2/script/rows, /api/v2/script/order）──
+  if (url.startsWith('/api/v2/script')) {
+    if (await scriptApi.handle(req, res, url.split('?')[0], method)) return;
   }
 
   // ── M01-S Project / Workspace Foundation（/api/v2/workspaces, /api/v2/projects）──
