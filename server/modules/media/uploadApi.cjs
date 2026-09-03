@@ -8,8 +8,8 @@
  *        → return { uploadId, putUrl (signed PUT), objectKey, headers }
  *   2) client PUTs bytes to putUrl directly (never through this API)
  *   3) POST /api/v2/uploads/:id/finalize {checksumSha256,sizeBytes,mime}
- *        → re-assert mime/size → mark uploaded → auto-enqueue 'probe' job
- *        (media normalization continues in the job queue)
+ *        → re-assert size + uploader ownership → mark uploaded → auto-enqueue
+ *        'probe' job (media normalization continues in the job queue)
  * Checksum is stored as provenance; server-side object verification is a
  * G21 audit/reconcile item (OSS read-back), stated honestly.
  */
