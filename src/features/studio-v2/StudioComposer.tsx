@@ -15,18 +15,44 @@ import { cn } from '@/lib/utils';
 
 const SLASH_HINTS = ['optimize', 'rewrite', 'translate'];
 
+// Legacy registry capability vocabulary → blueprint-canonical capability keys
+// (server models API projects canonical capabilities).
+const LEGACY_TO_CANONICAL: Record<string, string> = {
+  text_to_image: 'image.text2image',
+  image_to_video: 'video.image2video',
+  text_to_video: 'video.text2video',
+};
+
+interface ModelOption {
+  bindingId: string;
+  name: string;
+  capabilities: Record<string, boolean | number>;
+}
+
+interface ResolvedRef {
+  token: string;
+  resolution: string;
+  binding?: { entityType: string; entityId: string; canonicalName?: string };
+  candidates?: { entityType: string; entityId: string; canonicalName?: string }[];
+}
+
 function promptValueOf(data: Record<string, unknown>): string {
   const params = (data.parameters ?? {}) as Record<string, unknown>;
   const raw = params.prompt ?? params.content ?? params.scriptText ?? data.prompt;
   return typeof raw === 'string' ? raw : '';
 }
 
-export function StudioComposer() {
+export function StudioComposer({ projectId }: { projectId?: string }) {
   const nodes = useStudioStore((s) => s.nodes);
   const beginEdit = useStudioStore((s) => s.beginEdit);
   const endEdit = useStudioStore((s) => s.endEdit);
   const updateNodeData = useStudioStore((s) => s.updateNodeData);
+  const updateNodeParameter = useStudioStore((s) => s.updateNodeParameter);
   const editing = useRef(false);
+  const flushRef = useRef<number | null>(null);
+  const [models, setModels] = useState<ModelOption[]>([]);
+  const [resolutions, setResolutions] = useState<Record<string, ResolvedRef>>({});
+  const [boundRefs, setBoundRefs] = useState<Record<string, ResolvedRef['binding']>>({});
 
   const selected = nodes.filter((n) => n.selected && n.data.nodeKind !== 'frame');
   const state = deriveComposerState({ selection: { count: selected.length, nodeKind: selected[0]?.data.nodeKind } });
@@ -36,9 +62,72 @@ export function StudioComposer() {
   const [text, setText] = useState('');
   const [savedFlash, setSavedFlash] = useState(false);
 
+  // Load the public model list once (canonical capabilities projection).
+  useEffect(() => {
+    let alive = true;
+    fetch('/api/studio/models', { credentials: 'same-origin' })
+      .then((r) => r.json())
+      .then((d) => { if (alive && Array.isArray(d?.models)) setModels(d.models); })
+      .catch(() => { /* offline composer still works; model row hidden */ });
+    return () => { alive = false; };
+  }, []);
+
+  const capableModels = useMemo(() => {
+    if (!isGeneration || !def?.capabilityRequirements?.length) return [];
+    const wanted = def.capabilityRequirements.map((c) => LEGACY_TO_CANONICAL[c] ?? c);
+    return models.filter((m) => wanted.some((w) => m.capabilities[w] === true));
+  }, [models, isGeneration, def]);
+
+  const params = (node?.data.parameters ?? {}) as Record<string, unknown>;
+  const selectedModel = def?.modelField ? String(params[def.modelField] ?? '') : '';
+  const modelName = capableModels.find((m) => m.bindingId === selectedModel)?.name ?? '';
+
+  // Debounced @resolution against the server (04 §13), project-scoped.
+  useEffect(() => {
+    if (!projectId || !text.includes('@')) { setResolutions({}); return; }
+    const t = window.setTimeout(() => {
+      fetch('/api/studio/autolink/resolve', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ projectId, text }),
+      })
+        .then((r) => r.json())
+        .then((d) => {
+          if (!Array.isArray(d?.results)) return;
+          const map: Record<string, ResolvedRef> = {};
+          for (const rr of d.results) map[rr.token] = rr;
+          setResolutions(map);
+        })
+        .catch(() => {});
+    }, 700);
+    return () => window.clearTimeout(t);
+  }, [projectId, text]);
+
+  // Persist user-confirmed @bindings into the node payload (canvas data.references).
+  const persistedRefsRef = useRef('');
+  useEffect(() => {
+    if (!node) return;
+    const arr = Object.values(boundRefs).filter(Boolean) as NonNullable<ResolvedRef['binding']>[];
+    const sig = JSON.stringify(arr.map((b) => `${b.entityType}:${b.entityId}`));
+    if (sig === persistedRefsRef.current) return;
+    persistedRefsRef.current = sig;
+    updateNodeData(node.id, { references: arr });
+  }, [boundRefs, node, updateNodeData]);
+
+  const chooseBinding = (token: string, b: ResolvedRef['binding']) => {
+    setBoundRefs((prev) => ({ ...prev, [token]: b }));
+  };
+
   // Sync draft text whenever the target node changes (never while editing).
+  const lastNodeId = useRef<string | null>(null);
   useEffect(() => {
     if (editing.current) return;
+    if (lastNodeId.current !== (node?.id ?? null)) {
+      lastNodeId.current = node?.id ?? null;
+      setBoundRefs({});
+      setResolutions({});
+    }
     setText(node ? promptValueOf(node.data) : '');
   }, [node?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -90,13 +179,67 @@ export function StudioComposer() {
           {isGeneration && <span className="ml-auto flex items-center gap-1 text-ml2-accent"><Sparkles className="size-3" />{(def.capabilityRequirements ?? []).join(', ') || 'generation'}</span>}
         </div>
 
+        {isGeneration && def?.modelField && (
+          <div data-test="composer-model-row" className="mb-1.5 flex items-center gap-2">
+            <span className="shrink-0 text-[10px] text-ml2-text-3">Model</span>
+            <select
+              data-test="composer-model-select"
+              value={selectedModel}
+              onChange={(e) => {
+                if (!node) return;
+                if (!editing.current) { beginEdit(); editing.current = true; }
+                updateNodeParameter(node.id, def.modelField!, e.target.value);
+                flushRef.current && window.clearTimeout(flushRef.current);
+                flushRef.current = window.setTimeout(flush, 800);
+              }}
+              className="min-w-0 flex-1 rounded-lg border border-ml2-border bg-ml2-surface-0 px-2 py-1 text-[11px] text-ml2-text outline-none focus:border-ml2-accent/60"
+            >
+              {capableModels.length === 0 && <option value="">{modelName || '模型列表加载中 / 无可用模型'}</option>}
+              {capableModels.map((m) => (
+                <option key={m.bindingId} value={m.bindingId}>{m.name}</option>
+              ))}
+            </select>
+          </div>
+        )}
+
         {refs.length > 0 && (
           <div data-test="composer-ref-chips" className="mb-1 flex flex-wrap gap-1">
-            {refs.map((r, i) => (
-              <span key={`${r.token}-${i}`} data-test="composer-ref-chip" className="rounded-full border border-ml2-accent/30 bg-ml2-accent/10 px-2 py-px text-[10px] text-ml2-accent">
-                @{r.token}
-              </span>
-            ))}
+            {refs.map((r, i) => {
+              const res = resolutions[r.token];
+              const bound = boundRefs[r.token];
+              const opts = bound ? [bound] : (res?.candidates?.length ? res.candidates : res?.binding ? [res.binding] : []);
+              if (opts.length === 0) {
+                return (
+                  <span key={`${r.token}-${i}`} data-test="composer-ref-chip" className="rounded-full border border-ml2-accent/30 bg-ml2-accent/10 px-2 py-px text-[10px] text-ml2-accent">
+                    @{r.token}
+                  </span>
+                );
+              }
+              const boundId = bound ? `${bound.entityType}:${bound.entityId}` : '';
+              return (
+                <select
+                  key={`${r.token}-${i}`}
+                  data-test="composer-ref-chip"
+                  aria-label={`绑定 ${r.token}`}
+                  value={boundId}
+                  onChange={(e) => {
+                    const pick = opts.find((o) => `${o.entityType}:${o.entityId}` === e.target.value);
+                    chooseBinding(r.token, pick ?? null);
+                  }}
+                  className={cn(
+                    'max-w-52 cursor-pointer rounded-full border px-2 py-px text-[10px] outline-none',
+                    bound ? 'border-ml2-accent/60 bg-ml2-accent/20 text-ml2-accent' : 'border-ml2-border bg-ml2-surface-1 text-ml2-text-2',
+                  )}
+                >
+                  <option value="">@{r.token}（未绑定）</option>
+                  {opts.map((o, oi) => (
+                    <option key={`${o.entityType}:${o.entityId}-${oi}`} value={`${o.entityType}:${o.entityId}`}>
+                      {o.entityType} / {o.canonicalName ?? r.token}
+                    </option>
+                  ))}
+                </select>
+              );
+            })}
           </div>
         )}
 

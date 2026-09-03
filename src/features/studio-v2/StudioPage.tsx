@@ -42,7 +42,7 @@ function StudioLayout() {
         <NodeLibrary onAdd={addFromLibrary} />
         <div className="relative min-w-0 flex-1">
           <StudioCanvas />
-          <StudioComposer />
+          <StudioComposer projectId={projectId} />
           {persistence.status === 'Conflict' && (
             <div data-test="studio-conflict-panel" className="absolute right-3 top-3 z-50 max-w-xs rounded-lg border border-red-500/40 bg-ml2-surface-1/95 p-3 text-xs text-red-300 shadow-xl">
               <p className="font-semibold">Server has newer revision</p>

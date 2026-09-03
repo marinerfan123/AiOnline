@@ -10,8 +10,9 @@
  */
 const { projectModelBinding } = require('./modelSchema.cjs');
 const { listShortcuts } = require('./shortcuts.cjs');
+const { resolvePromptTokens } = require('../project-foundation/autoLink.cjs');
 
-function createStudioModelsApi({ pg, sessionUser, sendJSON }) {
+function createStudioModelsApi({ pg, sessionUser, sendJSON, parseBody }) {
   function requireUser(req, res) {
     const user = sessionUser ? sessionUser(req) : null;
     if (!user) {
@@ -36,7 +37,7 @@ function createStudioModelsApi({ pg, sessionUser, sendJSON }) {
   }
 
   async function handle(req, res, urlPath, method) {
-    if (!(urlPath.startsWith('/api/studio/models') || urlPath === '/api/studio/shortcuts')) return false;
+    if (!(urlPath.startsWith('/api/studio/models') || urlPath === '/api/studio/shortcuts' || urlPath === '/api/studio/autolink/resolve')) return false;
     if (method === 'OPTIONS') { sendJSON(res, 204, {}); return true; }
     const user = requireUser(req, res);
     if (!user) return true;
@@ -46,6 +47,22 @@ function createStudioModelsApi({ pg, sessionUser, sendJSON }) {
       if (urlPath === '/api/studio/shortcuts' && method === 'GET') {
         const nodeType = (req.query && String(req.query.nodeType || '').trim()) || undefined;
         return sendJSON(res, 200, { ok: true, shortcuts: listShortcuts(nodeType ? { nodeType } : {}) });
+      }
+      // G07 AutoLink prompt resolution (04 §13): project-scoped, membership-guarded.
+      if (urlPath === '/api/studio/autolink/resolve' && method === 'POST') {
+        const body = (await (parseBody ? parseBody(req) : Promise.resolve({}))) || {};
+        const projectId = String(body.projectId || '').trim();
+        const text = String(body.text ?? '');
+        if (!projectId || !text.trim()) return sendJSON(res, 400, { ok: false, error: 'projectId 与 text 必填' });
+        const mem = await pg.query(
+          `SELECT p.workspace_id FROM projects p
+           JOIN workspace_members wm ON wm.workspace_id = p.workspace_id
+           WHERE p.id = $1 AND wm.user_id = $2 LIMIT 1`,
+          [projectId, user.id],
+        );
+        if (!mem.rows.length) return sendJSON(res, 403, { ok: false, error: '无该项目访问权限' });
+        const results = await resolvePromptTokens(pg, { projectId, text });
+        return sendJSON(res, 200, { ok: true, results });
       }
       if (urlPath === '/api/studio/models' && method === 'GET') {
         const bindings = await loadBindings();

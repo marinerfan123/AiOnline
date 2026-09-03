@@ -81,6 +81,52 @@ test('G07 models API: OPTIONS returns 204 and other prefixes pass through', asyn
   assert.equal(r, false);
 });
 
+test('G07 autolink resolve: 400 without projectId/text', async () => {
+  const responses = [];
+  const api = createStudioModelsApi({
+    pg: { query: async () => ({ rows: [] }) },
+    sessionUser: () => ({ id: 'u1' }),
+    sendJSON: (res, code, body) => responses.push({ code, body }),
+    parseBody: async () => ({}),
+  });
+  await api.handle({}, {}, '/api/studio/autolink/resolve', 'POST');
+  assert.equal(responses[0].code, 400);
+});
+
+test('G07 autolink resolve: membership-guarded + resolves tokens', async () => {
+  const responses = [];
+  const api = createStudioModelsApi({
+    pg: {
+      async query(sql) {
+        if (sql.includes('FROM projects p')) return { rows: [{ workspace_id: 'ws-1' }] };
+        if (sql.includes('FROM project_characters')) return { rows: [{ id: 'ch-1', name: 'Alice' }] };
+        if (sql.includes('FROM project_references')) return { rows: [] };
+        return { rows: [] };
+      },
+    },
+    sessionUser: () => ({ id: 'u1' }),
+    sendJSON: (res, code, body) => responses.push({ code, body }),
+    parseBody: async () => ({ projectId: 'p1', text: '让 @Alice 表演' }),
+  });
+  await api.handle({}, {}, '/api/studio/autolink/resolve', 'POST');
+  assert.equal(responses[0].code, 200);
+  assert.equal(responses[0].body.results.length, 1);
+  assert.equal(responses[0].body.results[0].binding.entityId, 'ch-1');
+  assert.equal(responses[0].body.results[0].resolution, 'exact');
+});
+
+test('G07 autolink resolve: denies cross-project access', async () => {
+  const responses = [];
+  const api = createStudioModelsApi({
+    pg: { query: async () => ({ rows: [] }) },
+    sessionUser: () => ({ id: 'u1' }),
+    sendJSON: (res, code, body) => responses.push({ code, body }),
+    parseBody: async () => ({ projectId: 'p-other', text: '@Alice' }),
+  });
+  await api.handle({}, {}, '/api/studio/autolink/resolve', 'POST');
+  assert.equal(responses[0].code, 403);
+});
+
 test('G07 shortcuts API: lists server-configured shortcuts, filtered by nodeType', async () => {
   const h = harness();
   await h.api.handle({ query: { nodeType: 'text' } }, {}, '/api/studio/shortcuts', 'GET');
