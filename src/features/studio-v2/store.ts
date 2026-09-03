@@ -25,10 +25,10 @@ import {
   type Viewport,
 } from '@xyflow/react';
 import {
-  canConnectToPort,
   getNodeDef,
   type NodeDef,
 } from './registry';
+import { validateNewEdge } from './graphRules';
 import {
   computeStoredStatus,
   directDownstreamIds,
@@ -56,6 +56,7 @@ interface Snapshot {
 export interface InvalidConnectionInfo {
   message: string;
   at: number;
+  code?: string;
 }
 
 interface StudioState {
@@ -238,25 +239,30 @@ export const useStudioStore = create<StudioState>((set, get) => ({
   onConnect: (c) => {
     const s = get();
     if (!c.source || !c.target) return;
-    const sourceNode = s.nodes.find((n) => n.id === c.source);
-    const targetNode = s.nodes.find((n) => n.id === c.target);
-    const outPort = findPort(sourceNode, c.sourceHandle, false);
-    const inPort = findPort(targetNode, c.targetHandle, true);
-    if (!outPort || !inPort) return;
-    // typed port gate (M05-B2: port-level acceptedTypes, else base table)
-    if (!canConnectToPort(outPort.type, inPort)) {
+    // G04 typed-graph connect gate (Blueprint 00 §7): type compatibility →
+    // duplicate → cardinality → cycle policy; structured verdict surfaced as
+    // invalidConnection so the canvas can render a consistent rejection.
+    const verdict = validateNewEdge({
+      nodes: s.nodes,
+      edges: s.edges,
+      source: c.source,
+      target: c.target,
+      sourceHandle: c.sourceHandle,
+      targetHandle: c.targetHandle,
+    });
+    if (!verdict.ok) {
       set({
         invalidConnection: {
-          message: `无法连接：${outPort.label}(${outPort.type}) → ${inPort.label}(${inPort.type}) 类型不兼容`,
+          message: verdict.message || '无法建立该连接',
           at: Date.now(),
+          code: verdict.code,
         },
       });
       return;
     }
-    // duplicate edge gate
-    if (s.edges.some((e) => e.source === c.source && e.target === c.target && e.sourceHandle === c.sourceHandle && e.targetHandle === c.targetHandle)) {
-      return;
-    }
+    const sourceNode = s.nodes.find((n) => n.id === c.source);
+    const outPort = (sourceNode ? findPort(sourceNode, c.sourceHandle, false) : null);
+    if (!outPort) return;
     const edge = buildEdge(c, outPort.type);
     set((st) => {
       const edges = addEdge(edge, st.edges) as StudioEdge[];
