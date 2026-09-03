@@ -4899,6 +4899,25 @@ server.listen(PORT, '0.0.0.0', async () => {
   } catch(e) {
     console.warn('[startup] Key pool init failed:', e.message);
   }
+
+  // G06 — Media normalization workers (MEDIA_JOBS_WORKER=1 on the worker/api
+  // instance): claim media_jobs by kind and run probe/thumbnail/proxy/waveform
+  // via ffmpeg executors. One loop per wired kind; poll is cheap and lease-CAS
+  // keeps multi-instance safe.
+  if (String(process.env.MEDIA_JOBS_WORKER || '') === '1') {
+    try {
+      const { createMediaWorker } = require('./modules/media/mediaWorker.cjs');
+      const { EXECUTORS } = require('./modules/media/executors.cjs');
+      const executors = { probe: EXECUTORS.probe };
+      for (const kind of ['probe', 'thumbnail', 'proxy', 'waveform']) {
+        if (!EXECUTORS[kind]) continue;
+        const w = createMediaWorker({ pg: pgPool, executors: { [kind]: EXECUTORS[kind] }, kind, workerId: `${NODE_ID}-${kind}`, pollMs: 2000 });
+        console.log(`[media-worker:${kind}] started (${NODE_ID}, running=${w.started})`);
+      }
+    } catch (e) {
+      console.warn('[media-worker] init failed:', e && e.message);
+    }
+  }
 });
 
 // ─── 优雅关闭（SIGTERM/SIGINT）──
