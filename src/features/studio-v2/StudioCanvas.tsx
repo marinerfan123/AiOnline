@@ -194,10 +194,21 @@ function CanvasCore() {
       if (mod && e.key.toLowerCase() === 'c') { copySelection(); return; }
       if (mod && e.key.toLowerCase() === 'v') { e.preventDefault(); paste(); return; }
       if (e.key === 'Delete' || e.key === 'Backspace') { removeSelection(); }
+      // G02 canvas input contract (Blueprint 02 §3): F = fit selected, Shift+F = fit all.
+      if (!mod && e.key.toLowerCase() === 'f') {
+        e.preventDefault();
+        const selectedIds = useStudioStore.getState().nodes.filter((n) => n.selected).map((n) => n.id);
+        if (!e.shiftKey && selectedIds.length > 0) {
+          fitView({ nodes: selectedIds.map((id) => ({ id })), padding: 0.3, maxZoom: 1.5, duration: 250 });
+        } else {
+          fitView({ padding: 0.15, duration: 250 });
+        }
+        return;
+      }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [undo, redo, duplicateSelection, copySelection, paste, removeSelection, selectAll]);
+  }, [undo, redo, duplicateSelection, copySelection, paste, removeSelection, selectAll, fitView]);
 
   return (
     <div ref={canvasRef} data-test="studio-canvas" className="relative h-full w-full">
@@ -219,8 +230,11 @@ function CanvasCore() {
         proOptions={{ hideAttribution: true }}
         colorMode="dark"
         deleteKeyCode={null} // we own Delete (input-guarded) in the keyboard handler
-        selectionOnDrag
-        panOnDrag
+        selectionOnDrag // LMB blank drag = box select (Blueprint 02 §3)
+        panOnDrag={[1]} // middle-mouse pan; Space+LMB pan via panActivationKeyCode
+        panActivationKeyCode="Space"
+        zoomOnDoubleClick={false} // reserve double-click for node-create menu (G05)
+        zoomOnScroll
         onPaneContextMenu={(e) => {
           const ev = (e as unknown as { clientX: number; clientY: number });
           const el = e.currentTarget ?? canvasRef.current;
