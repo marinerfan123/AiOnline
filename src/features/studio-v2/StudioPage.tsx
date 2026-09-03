@@ -7,7 +7,7 @@
 // Layout: Top Toolbar / Left Node Library / Center Infinite Canvas /
 // Right Inspector / Bottom Dock. Canvas is the visual subject.
 
-import { useCallback } from 'react';
+import { useCallback, useState } from 'react';
 import { ProjectShell } from '@/features/project-foundation/ProjectShell';
 import { useProjectContext } from '@/features/project-foundation/ProjectContext';
 import { studioCanvasActions } from './store';
@@ -17,6 +17,7 @@ import { NodeLibrary } from './NodeLibrary';
 import { Inspector } from './Inspector';
 import { BottomDock } from './BottomDock';
 import { TopToolbar } from './TopToolbar';
+import { AssetLibraryDrawer } from './AssetLibraryDrawer';
 import { useStudioCanvasPersistence } from './useStudioCanvasPersistence';
 import type { StudioNodeKind } from './types';
 import './studio.css';
@@ -24,6 +25,8 @@ import './studio.css';
 function StudioLayout() {
   const { projectId } = useProjectContext();
   const persistence = useStudioCanvasPersistence(projectId, Boolean(projectId));
+  // G06 Asset Library drawer open state (toggle lives in the TopToolbar).
+  const [assetLibraryOpen, setAssetLibraryOpen] = useState(false);
 
   // Library click-to-add: place at the CURRENT viewport center via the bridge
   // populated by CanvasCore (only it knows the live viewport). This keeps new
@@ -37,12 +40,22 @@ function StudioLayout() {
 
   return (
     <div data-test="studio-page" className="flex h-full min-h-0 flex-col bg-ml2-surface-0">
-      <TopToolbar saveStatus={persistence.status} lastSavedAt={persistence.lastSavedAt} onRetry={persistence.retry} onReload={persistence.reloadFromServer} />
+      <TopToolbar
+        saveStatus={persistence.status}
+        lastSavedAt={persistence.lastSavedAt}
+        onRetry={persistence.retry}
+        onReload={persistence.reloadFromServer}
+        assetLibraryOpen={assetLibraryOpen}
+        onToggleAssetLibrary={() => setAssetLibraryOpen((v) => !v)}
+      />
       <div className="flex min-h-0 flex-1">
         <NodeLibrary onAdd={addFromLibrary} />
         <div className="relative min-w-0 flex-1">
           <StudioCanvas />
           <StudioComposer projectId={projectId} />
+          {assetLibraryOpen && projectId ? (
+            <AssetLibraryDrawer projectId={projectId} onClose={() => setAssetLibraryOpen(false)} />
+          ) : null}
           {persistence.status === 'Conflict' && (
             <div data-test="studio-conflict-panel" className="absolute right-3 top-3 z-50 max-w-xs rounded-lg border border-red-500/40 bg-ml2-surface-1/95 p-3 text-xs text-red-300 shadow-xl">
               <p className="font-semibold">Server has newer revision</p>

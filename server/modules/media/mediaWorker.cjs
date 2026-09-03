@@ -1,0 +1,128 @@
+'use strict';
+/**
+ * G06 — Media job worker poll loop (Blueprint 03 §24).
+ * Polls claimJob for a queued media job of `kind`, runs the matching executor,
+ * and drives the jobQueue state machine (complete / fail + bounded requeue).
+ * The module owns no SQL of its own — all durable transitions go through
+ * jobQueue.cjs (claimJob/completeJob/failJob/requeueJob) so the unit mock only
+ * has to mirror those four statements' real shapes.
+ *
+ * createMediaWorker({ pg, executors, kind, workerId, pollMs, maxRetries }) ->
+ *   { runOnce(pgDep, kindOverride), stop(), started }
+ *
+ * executors: { probe: async (ctx) => ({ ok: true, result }) | ({ ok: false, code, message }) }
+ * ctx = { jobId, assetId, kind, params, job, pg }  (params parsed from params_json)
+ */
+const { claimJob, completeJob, failJob, requeueJob } = require('./jobQueue.cjs');
+
+const EXCEPTION_CODE = 'MEDIA_EXECUTOR_EXCEPTION';
+
+function parseParams(raw) {
+  if (raw == null) return {};
+  if (typeof raw === 'string') {
+    try { return JSON.parse(raw); } catch (_) { return {}; }
+  }
+  return raw;
+}
+
+/**
+ * Single poll round — no sleep. Used by the poll loop and exposed for tests.
+ * @param {object} [pgDep] override pg (defaults to the worker's pg)
+ * @param {string} [kindOverride] override kind (defaults to worker's kind)
+ * @returns {Promise<{claimed:boolean, jobId?:string, status?:string, requeued?:boolean}>}
+ */
+function createMediaWorker({ pg, executors = {}, kind, workerId, pollMs = 500, maxRetries = 3 }) {
+  if (!pg) throw new TypeError('pg required');
+  if (!kind) throw new TypeError('kind required');
+  if (!workerId) throw new TypeError('workerId required');
+
+  let stopped = false;
+  let timer = null;
+  let lastError = null;
+
+  async function runOnce(pgDep, kindOverride) {
+    const db = pgDep || pg;
+    const runKind = kindOverride || kind;
+    const rows = await claimJob(db, { kind: runKind, workerId, leaseSeconds: 60, limit: 1 });
+    if (!rows || !rows.length) return { claimed: false };
+    const job = rows[0];
+
+    const ctx = {
+      jobId: job.id,
+      assetId: job.asset_id,
+      kind: job.kind,
+      params: parseParams(job.params_json),
+      job,
+      pg: db,
+    };
+
+    const fn = executors[kindOverride || kind] || executors[job.kind];
+    let outcome;
+    try {
+      outcome = await fn(ctx);
+    } catch (err) {
+      outcome = {
+        ok: false,
+        code: EXCEPTION_CODE,
+        message: err && err.message != null ? String(err.message) : String(err),
+      };
+    }
+
+    const ok = !!(outcome && outcome.ok === true);
+    if (ok) {
+      const result = outcome && outcome.result !== undefined ? outcome.result : {};
+      const res = await completeJob(db, { jobId: job.id, workerId, result });
+      return { claimed: true, jobId: job.id, status: 'done', requeued: false, changed: res.changed };
+    }
+
+    const code = outcome && outcome.code != null ? String(outcome.code) : EXCEPTION_CODE;
+    const message =
+      outcome && outcome.message != null
+        ? String(outcome.message)
+        : 'executor did not return a result';
+    await failJob(db, { jobId: job.id, workerId, code, message });
+
+    let requeued = false;
+    if (Number(job.attempt_count) < Number(maxRetries)) {
+      const rq = await requeueJob(db, { jobId: job.id, maxRetries });
+      requeued = rq.changed === true;
+    }
+    return { claimed: true, jobId: job.id, status: requeued ? 'queued' : 'failed', requeued };
+  }
+
+  function schedule(delay) {
+    if (stopped) return;
+    timer = setTimeout(tick, delay);
+  }
+
+  /** One poll iteration: claim+execute, then re-arm (idle → pollMs, busy → 0). */
+  async function tick() {
+    if (stopped) return;
+    let claimed = false;
+    try {
+      claimed = (await runOnce()).claimed === true;
+    } catch (err) {
+      lastError = err; // transient DB error: keep polling
+    }
+    if (stopped) return;
+    schedule(claimed ? 0 : pollMs);
+  }
+
+  schedule(0);
+
+  function stop() {
+    stopped = true;
+    if (timer !== null) clearTimeout(timer);
+    timer = null;
+  }
+
+  return {
+    runOnce,
+    stop,
+    get started() {
+      return !stopped;
+    },
+  };
+}
+
+module.exports = { createMediaWorker };

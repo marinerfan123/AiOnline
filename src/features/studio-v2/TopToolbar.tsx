@@ -6,8 +6,9 @@ import { Link } from 'react-router-dom';
 import { useProjectContext } from '@/features/project-foundation/ProjectContext';
 import { Badge } from '@/shared/ui/v2/Badge';
 import type { SaveStatus } from './useStudioCanvasPersistence';
+import { AssetLibraryToggle } from './AssetLibraryDrawer';
 
-export function TopToolbar({ saveStatus = 'Saved', lastSavedAt, onRetry, onReload }: { saveStatus?: SaveStatus; lastSavedAt?: string | null; onRetry?: () => void; onReload?: () => void }) {
+export function TopToolbar({ saveStatus = 'Saved', lastSavedAt, onRetry, onReload, assetLibraryOpen = false, onToggleAssetLibrary }: { saveStatus?: SaveStatus; lastSavedAt?: string | null; onRetry?: () => void; onReload?: () => void; assetLibraryOpen?: boolean; onToggleAssetLibrary?: () => void }) {
   const { projectName, projectType, projectId } = useProjectContext();
   return (
     <header
@@ -31,6 +32,7 @@ export function TopToolbar({ saveStatus = 'Saved', lastSavedAt, onRetry, onReloa
         {projectType}
       </Badge>
       <div className="ml-auto flex items-center gap-2">
+        {onToggleAssetLibrary && <AssetLibraryToggle active={assetLibraryOpen} onClick={onToggleAssetLibrary} />}
         <span data-test="studio-save-status" className="rounded-full border border-ml2-border bg-ml2-surface-2 px-2 py-0.5 text-[10px] text-ml2-text-2">
           {saveStatus}{lastSavedAt && saveStatus === 'Saved' ? ` · ${new Date(lastSavedAt).toLocaleTimeString()}` : ''}
         </span>
