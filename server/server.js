@@ -5069,7 +5069,7 @@ server.listen(PORT, '0.0.0.0', async () => {
         }
         return { ok: true, url: getUrl || objectKey };
       };
-      for (const kind of ['probe', 'thumbnail', 'proxy', 'waveform']) {
+      for (const kind of ['probe', 'thumbnail', 'proxy', 'waveform', 'stitch', 'frame_extract']) {
         if (!EXECUTORS[kind]) continue;
         const w = createMediaWorker({
           pg: pgPool,
