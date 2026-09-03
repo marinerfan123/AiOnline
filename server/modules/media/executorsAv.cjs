@@ -46,10 +46,15 @@ function stemOf(source) {
   return dot > 0 ? name.slice(0, dot) : name;
 }
 
-/** Default local output path derived from the source name (suffix + ext). */
-function defaultOut(source, suffix, ext) {
+/** Default local output path derived from the source name (suffix + ext).
+ *  With a jobId the file lands in /tmp/media-jobs/<jobId>/ so concurrent jobs
+ *  with the same source basename never collide (audit MEDIUM-4 fix). */
+function defaultOut(source, suffix, ext, jobId) {
   const stem = stemOf(source) || 'media';
-  return `${stem}.${suffix}.${ext || 'jpg'}`;
+  const name = `${stem}.${suffix}.${ext || 'jpg'}`;
+  if (!jobId) return name;
+  const dir = `/tmp/media-jobs/${String(jobId).replace(/[^\w.\-]/g, '_')}`;
+  return `${dir}/${name}`;
 }
 
 function clampInt(v, fallback, min, max) {
@@ -64,10 +69,10 @@ function clampInt(v, fallback, min, max) {
  * Video:  same scale plus '-frames:v 1' (single frame) → jpg
  * Returns { args, output, inputKind }.
  */
-function buildThumbnailCommand({ source, outKey }) {
+function buildThumbnailCommand({ source, outKey, jobId }) {
   const inputKind = detectInputKind(source);
   const imageExt = extOf(source);
-  const output = outKey || defaultOut(source, 'thumb', inputKind === 'image' ? (imageExt || 'jpg') : 'jpg');
+  const output = outKey || defaultOut(source, 'thumb', inputKind === 'image' ? (imageExt || 'jpg') : 'jpg', jobId);
   const args = ['-y', '-i', String(source), '-vf', 'scale=-2:512'];
   if (inputKind === 'video') args.push('-frames:v', '1');
   args.push(output);
@@ -80,10 +85,10 @@ function buildThumbnailCommand({ source, outKey }) {
  * libx264 preset veryfast crf 23, yuv420p for player compatibility.
  * Returns { args, output, width, fps }.
  */
-function buildProxyCommand({ source, outKey, width, fps }) {
+function buildProxyCommand({ source, outKey, width, fps, jobId }) {
   const w = clampInt(width, DEFAULT_PROXY_WIDTH, 2, 7680);
   const f = clampInt(fps, DEFAULT_PROXY_FPS, 1, 120);
-  const output = outKey || defaultOut(source, 'proxy', 'mp4');
+  const output = outKey || defaultOut(source, 'proxy', 'mp4', jobId);
   const args = [
     '-y', '-i', String(source),
     '-vf', `scale=${w % 2 === 0 ? w : w - 1}:-2`,
@@ -160,6 +165,13 @@ function runFfmpeg({ spawn = require('child_process').spawn, timeoutMs = DEFAULT
 
     let proc;
     try {
+      // Ensure the output directory exists when a job-scoped path is used
+      // (ffmpeg does not create parent dirs). No-op for pipe:1 waveform.
+      const outPath = cmd && cmd.output ? String(cmd.output) : '';
+      if (outPath.startsWith('/tmp/media-jobs/')) {
+        const dir = outPath.slice(0, outPath.lastIndexOf('/'));
+        try { require('node:fs').mkdirSync(dir, { recursive: true }); } catch (_e) { /* best-effort */ }
+      }
       proc = spawn('ffmpeg', cmd.args, { stdio: ['ignore', 'pipe', 'pipe'] });
     } catch (e) {
       if (e && e.code === 'ENOENT') return done(unavailable(e));

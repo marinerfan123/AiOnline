@@ -85,19 +85,25 @@ function createUploadApi({ pg, sessionUser, sendJSON, parseBody, signPutUrl }) {
         const checksum = String(body.checksumSha256 || body.checksum || '').trim().toLowerCase();
         const size = Number(body.sizeBytes ?? -1);
         if (!/^[a-f0-9]{64}$/.test(checksum)) return sendJSON(res, 400, { ok: false, error: 'checksumSha256 必须为 64 位 hex' });
+        // Audit fix (HIGH-1/MEDIUM-1): re-assert size bounds (never trust an
+        // arbitrary signed size) and enforce ownership — only the uploader may
+        // finalize their own pending upload.
+        if (!Number.isInteger(size) || size <= 0 || size > MAX_UPLOAD_BYTES) {
+          return sendJSON(res, 400, { ok: false, error: `sizeBytes 必须为 0<size≤${MAX_UPLOAD_BYTES} 的整数` });
+        }
+        const own = await pg.query(`SELECT user_id, project_id, status, oss_object_key FROM media WHERE id = $1`, [assetId]);
+        if (!own.rows.length) return sendJSON(res, 404, { ok: false, error: '上传不存在' });
+        if (own.rows[0].user_id !== user.id) return sendJSON(res, 403, { ok: false, error: '只能 finalize 自己发起的上传' });
+        if (own.rows[0].status === 'success') return sendJSON(res, 200, { ok: true, alreadyFinalized: true });
         const row = await pg.query(
           `UPDATE media SET oss_uploaded = TRUE, status = 'success', error_message = NULL,
              updated_at = NOW(), checksum_sha256 = $2, file_size = $3
-           WHERE id = $1 AND status = 'pending_upload' AND oss_object_key IS NOT NULL
+           WHERE id = $1 AND status = 'pending_upload' AND oss_object_key IS NOT NULL AND user_id = $4
            RETURNING id, project_id, mime_type, oss_object_key`,
-          [assetId, checksum, size],
+          [assetId, checksum, size, user.id],
         );
         if (!row.rows.length) {
-          const existing = await pg.query(`SELECT status FROM media WHERE id = $1`, [assetId]);
-          if (existing.rows.length && existing.rows[0].status === 'success') {
-            return sendJSON(res, 200, { ok: true, alreadyFinalized: true });
-          }
-          return sendJSON(res, 404, { ok: false, error: '上传不存在或状态不可终态化' });
+          return sendJSON(res, 409, { ok: false, error: '上传状态不可终态化（非 pending_upload 或已终态）' });
         }
         // Auto-plan normalization jobs (04 §16): probe always; thumbnail for
         // image/video; proxy for video; waveform for audio. Idempotency keys

@@ -5,7 +5,7 @@ const { createUploadApi } = require('./uploadApi.cjs');
 
 function harness({ mediaStatus = 'pending_upload' } = {}) {
   const responses = [];
-  let media = { id: 'm-1', status: mediaStatus };
+  let media = { id: 'm-1', user_id: 'u1', project_id: 'p1', status: mediaStatus, oss_object_key: 'objk' };
   const queries = [];
   const pg = {
     async query(sql, params) {
@@ -17,19 +17,16 @@ function harness({ mediaStatus = 'pending_upload' } = {}) {
       if (sql.startsWith('INSERT INTO media_jobs')) {
         return { rows: [{ id: 'mj-1', status: 'queued' }] };
       }
-      if (sql.startsWith('INSERT INTO media')) { media = { id: params[0], status: 'pending_upload' }; return { rows: [] }; }
+      if (sql.startsWith('INSERT INTO media')) { media = { id: params[0], user_id: 'u1', project_id: 'p1', status: 'pending_upload', oss_object_key: 'objk' }; return { rows: [] }; }
+      if (sql.includes('FROM media WHERE id')) {
+        return { rows: media ? [{ user_id: media.user_id, project_id: media.project_id, status: media.status, oss_object_key: media.oss_object_key }] : [] };
+      }
       if (sql.includes('SET oss_uploaded = TRUE')) {
         if (media && media.status === 'pending_upload') {
           media.status = 'success';
-          return { rows: [{ id: media.id, project_id: 'p1', mime_type: 'image/png' }] };
+          return { rows: [{ id: media.id, project_id: 'p1', mime_type: 'image/png', oss_object_key: 'objk' }] };
         }
         return { rows: [] };
-      }
-      if (sql.includes('SELECT status FROM media')) {
-        return { rows: media ? [{ status: media.status }] : [] };
-      }
-      if (sql.startsWith('INSERT INTO media_jobs')) {
-        return { rows: [{ id: 'mj-1', status: 'queued' }] };
       }
       return { rows: [] };
     },
@@ -125,4 +122,31 @@ test('G06 upload: double finalize is idempotent (alreadyFinalized)', async () =>
   await h.api.handle({ body: { checksumSha256: 'a'.repeat(64), sizeBytes: 10 } }, {}, '/api/v2/uploads/m-1/finalize', 'POST');
   assert.equal(h.responses[1].code, 200);
   assert.equal(h.responses[1].body.alreadyFinalized, true);
+});
+
+test('G06 upload: non-owner finalize rejected (403) — audit HIGH-1 fix', async () => {
+  const responses = [];
+  const pg = {
+    async query(sql) {
+      if (sql.includes('FROM media WHERE id')) return { rows: [{ user_id: 'someone-else', project_id: 'p1', status: 'pending_upload', oss_object_key: 'k' }] };
+      return { rows: [] };
+    },
+  };
+  const api = createUploadApi({
+    pg,
+    sessionUser: () => ({ id: 'u1' }),
+    sendJSON: (res, code, body) => responses.push({ code, body }),
+    parseBody: async () => ({ checksumSha256: 'a'.repeat(64), sizeBytes: 10 }),
+    signPutUrl: async () => 'x',
+  });
+  await api.handle({}, {}, '/api/v2/uploads/m-1/finalize', 'POST');
+  assert.equal(responses[0].code, 403);
+});
+
+test('G06 upload: finalize rejects non-integer / oversized sizeBytes (400) — audit MEDIUM-1 fix', async () => {
+  const h = harness();
+  await h.api.handle({ body: { checksumSha256: 'a'.repeat(64), sizeBytes: 3 * 1024 * 1024 * 1024 } }, {}, '/api/v2/uploads/m-1/finalize', 'POST');
+  assert.equal(h.responses[0].code, 400);
+  await h.api.handle({ body: { checksumSha256: 'a'.repeat(64), sizeBytes: 1.5 } }, {}, '/api/v2/uploads/m-1/finalize', 'POST');
+  assert.equal(h.responses[1].code, 400);
 });

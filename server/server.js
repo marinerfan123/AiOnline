@@ -1519,7 +1519,33 @@ const bibleApi = bibleApiMod.createBibleApi({
 });
 
 // G06 — General asset upload (/api/v2/uploads + finalize). Signed PUT adapter:
-// first enabled storage config (Aliyun→Tencent fallback), else 503.
+// active storage config (Aliyun→Tencent), else null → 503.
+// ossMod.loadOssConfigs returns { enabled, activeId, list } — resolve the
+// active row from the list (audit CRITICAL-2 fix: was treated as an array).
+async function activeOssConfig() {
+  const res = await ossMod.loadOssConfigs(pgPool).catch(() => null);
+  if (!res || !Array.isArray(res.list) || !res.list.length) return null;
+  const byActive = res.list.find((c) => c && res.activeId && String(c.id) === String(res.activeId));
+  if (byActive) return byActive;
+  return res.list.find((c) => c && c.enabled !== false) || res.list[0] || null;
+}
+async function ossSignedPutUrl(objectKey, contentType) {
+  const cfg = await activeOssConfig();
+  if (!cfg) return null;
+  const ct = contentType || 'application/octet-stream';
+  const kind = String(cfg.providerType || cfg.provider || cfg.type || '');
+  const r = kind.includes('tencent') || kind.includes('cos')
+    ? ossMod.tencentCosPutSignUrl(cfg, objectKey, ct)
+    : ossMod.aliyunPutSignUrl(cfg, objectKey, ct);
+  return (r && r.putUrl) || null;
+}
+async function ossSignedGetUrl(objectKey) {
+  const cfg = await activeOssConfig();
+  if (!cfg || !objectKey) return null;
+  const r = ossMod.buildOssGetUrl(cfg, objectKey);
+  return (r && r.getUrl) || null;
+}
+
 const uploadApi = uploadApiMod.createUploadApi({
   pg: {
     query: (sql, params) => pgPool
@@ -1529,16 +1555,7 @@ const uploadApi = uploadApiMod.createUploadApi({
   sessionUser: (req) => session.getUserFromCookie(req),
   sendJSON,
   parseBody,
-  signPutUrl: async ({ objectKey, contentType }) => {
-    const cfgs = await ossMod.loadOssConfigs(pgPool).catch(() => []);
-    const cfg = Array.isArray(cfgs) ? cfgs.find((c) => c && c.enabled) : null;
-    if (!cfg) return null;
-    const kind = String(cfg.provider || cfg.type || '').toLowerCase();
-    const r = kind.includes('tencent') || kind.includes('cos')
-      ? ossMod.tencentCosSignUrl(cfg, objectKey)
-      : ossMod.aliyunBuildSignedUrls(cfg, objectKey);
-    return (r && r.putUrl) || null;
-  },
+  signPutUrl: async ({ objectKey, contentType }) => ossSignedPutUrl(objectKey, contentType),
 });
 
 // M05-C — V2 Studio Canvas persistence (/api/v2/projects/:id/studio/canvas).
@@ -4927,14 +4944,78 @@ server.listen(PORT, '0.0.0.0', async () => {
   // G06 — Media normalization workers (MEDIA_JOBS_WORKER=1 on the worker/api
   // instance): claim media_jobs by kind and run probe/thumbnail/proxy/waveform
   // via ffmpeg executors. One loop per wired kind; poll is cheap and lease-CAS
-  // keeps multi-instance safe.
+  // keeps multi-instance safe. The probe loop doubles as lease housekeeper
+  // (reclaims expired running jobs). OSS hooks: objectKey → signed GET url for
+  // executor input; probe meta written back to the media row; artifacts stored
+  // back to OSS + recorded (best-effort; absent storage ⇒ local-file result only).
   if (String(process.env.MEDIA_JOBS_WORKER || '') === '1') {
     try {
       const EXECUTORS = mediaExecMod.EXECUTORS;
       const { createMediaWorker } = mediaWorkerMod;
+      const rid = () => `av-${globalThis.crypto.randomUUID()}`;
+      const deriveKey = (assetId, kind, fileName) =>
+        `derived/${assetId}/${kind}/${Date.now()}_${String(fileName || 'out').replace(/[^\w.\-]+/g, '_')}`;
+      // Artifact persistence: PUT derived file to active OSS (signed headers),
+      // record an asset_versions row, and point media.thumbnail at it for
+      // thumbnails. No storage configured ⇒ {ok:false} and the local-file
+      // result (proven by executor smoke) is the honest state.
+      const storeDerived = async ({ kind, assetId, file }) => {
+        const cfg = await activeOssConfig();
+        const fpath = String(file || '');
+        const abs = fpath.startsWith('/') ? fpath : `${process.cwd()}/${fpath}`;
+        const buf = await require('node:fs').promises.readFile(abs).catch(() => null);
+        if (!cfg || !buf) return { ok: false, reason: cfg ? 'file-unreadable' : 'no-storage' };
+        const objectKey = deriveKey(assetId, kind, abs.split('/').pop());
+        const contentType = kind === 'thumbnail' ? 'image/jpeg' : kind === 'proxy' ? 'video/mp4' : 'application/octet-stream';
+        let putUrl, putHeaders = null;
+        const pType = String(cfg.providerType || cfg.provider || cfg.type || '');
+        if (pType.includes('tencent') || pType.includes('cos')) {
+          putUrl = `https://${cfg._hostName || `${cfg.bucket}${cfg.appId ? '-' + cfg.appId : ''}.cos.${cfg.region || 'ap-shanghai'}.myqcloud.com`}/${objectKey}`;
+          putHeaders = ossMod.tencentCosPutHeadersStream(cfg, objectKey, buf, contentType);
+        } else {
+          const host = (cfg.endpointExternal || '').includes(cfg.bucket) ? cfg.endpointExternal : `${cfg.bucket}.${cfg.endpointExternal || ''}`;
+          putUrl = `https://${host}/${objectKey}`;
+          putHeaders = ossMod.aliyunPutHeadersStream(cfg, objectKey, buf, contentType);
+        }
+        const h = putHeaders && putHeaders.headers ? putHeaders.headers : putHeaders;
+        const put = await fetch(putUrl, { method: 'PUT', headers: h, body: buf }).catch(() => null);
+        if (!put || put.status >= 300) return { ok: false, reason: `put-${put ? put.status : 'network'}` };
+        const getUrl = await ossSignedGetUrl(objectKey);
+        const meta = await pgPool.query(`SELECT project_id FROM media WHERE id = $1`, [assetId]).catch(() => ({ rows: [] }));
+        const projectId = meta.rows.length ? meta.rows[0].project_id : null;
+        if (projectId) {
+          await pgPool.query(
+            `INSERT INTO asset_versions (version_id, media_id, project_id, kind, status, storage_key, size_bytes, model, provider)
+             VALUES ($1,$2,$3,'derived','ready',$4,$5,'ffmpeg',COALESCE($6,'oss')) ON CONFLICT (version_id) DO NOTHING`,
+            [`${rid()}`, assetId, projectId, objectKey, buf.length, String(cfg.providerType || cfg.provider || '')],
+          ).catch(() => {});
+          if (kind === 'thumbnail' && getUrl) {
+            await pgPool.query(`UPDATE media SET thumbnail = $1, updated_at = NOW() WHERE id = $2`, [getUrl, assetId]).catch(() => {});
+          }
+        }
+        return { ok: true, url: getUrl || objectKey };
+      };
       for (const kind of ['probe', 'thumbnail', 'proxy', 'waveform']) {
         if (!EXECUTORS[kind]) continue;
-        const w = createMediaWorker({ pg: pgPool, executors: { [kind]: EXECUTORS[kind] }, kind, workerId: `${NODE_ID}-${kind}`, pollMs: 2000 });
+        const w = createMediaWorker({
+          pg: pgPool,
+          executors: { [kind]: EXECUTORS[kind] },
+          kind,
+          workerId: `${NODE_ID}-${kind}`,
+          pollMs: 2000,
+          resolveSource: async (params) => (params && params.objectKey ? ossSignedGetUrl(params.objectKey) : null),
+          onProbeMeta: async ({ assetId, meta }) => {
+            if (!meta) return;
+            const cols = {};
+            if (Number.isInteger(meta.width)) cols.width = meta.width;
+            if (Number.isInteger(meta.height)) cols.height = meta.height;
+            if (Number.isInteger(meta.durationMs)) cols.duration_ms = meta.durationMs;
+            if (!Object.keys(cols).length) return;
+            const sets = Object.keys(cols).map((k, i) => `${k} = $${i + 2}`).join(', ');
+            await pgPool.query(`UPDATE media SET ${sets}, updated_at = NOW() WHERE id = $1`, [assetId, ...Object.values(cols)]).catch(() => {});
+          },
+          onArtifact: storeDerived,
+        });
         console.log(`[media-worker:${kind}] started (${NODE_ID}, running=${w.started})`);
       }
     } catch (e) {

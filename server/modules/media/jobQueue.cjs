@@ -22,19 +22,28 @@ async function enqueueJob(pg, { assetId, kind, params = {}, idempotencyKey = nul
   if (!assetId) throw new TypeError('assetId required');
   if (idempotencyKey !== null) {
     const existing = await pg.query(
-      `SELECT * FROM media_jobs WHERE idempotency_key = $1 AND status <> 'done' AND status <> 'cancelled'`,
+      `SELECT * FROM media_jobs WHERE idempotency_key = $1 AND status NOT IN ('done','cancelled','failed')`,
       [idempotencyKey],
     );
     if (existing.rows.length) return { job: existing.rows[0], created: false };
   }
-  const r = await pg.query(
-    `INSERT INTO media_jobs (asset_id, project_id, kind, params_json, idempotency_key, created_by)
-     VALUES ($1, NULLIF($2,'')::text, $3, $4, NULLIF($5,'')::text, NULLIF($6,'')::text)
-     ON CONFLICT (asset_id, kind) WHERE status IN ('queued','running') DO NOTHING
-     RETURNING *`,
-    [assetId, null, kind, JSON.stringify(params), idempotencyKey, createdBy],
-  );
-  if (r.rows.length) return { job: r.rows[0], created: true };
+  let inserted = null;
+  try {
+    const r = await pg.query(
+      `INSERT INTO media_jobs (asset_id, project_id, kind, params_json, idempotency_key, created_by)
+       VALUES ($1, NULLIF($2,'')::text, $3, $4, NULLIF($5,'')::text, NULLIF($6,'')::text)
+       ON CONFLICT (asset_id, kind) WHERE status IN ('queued','running') DO NOTHING
+       RETURNING *`,
+      [assetId, null, kind, JSON.stringify(params), idempotencyKey, createdBy],
+    );
+    inserted = r.rows[0] || null;
+  } catch (e) {
+    // Unique idempotency_key race (uq_media_jobs_idempotency): a concurrent
+    // enqueue with the same key won the INSERT. Fall through to the active-row
+    // lookup instead of surfacing an uncaught 23505.
+    if (!(e && e.code === '23505')) throw e;
+  }
+  if (inserted) return { job: inserted, created: true };
   const active = await pg.query(
     `SELECT * FROM media_jobs WHERE asset_id = $1 AND kind = $2 AND status IN ('queued','running') LIMIT 1`,
     [assetId, kind],
@@ -103,4 +112,19 @@ async function requeueJob(pg, { jobId, maxRetries = 3 }) {
   return { changed: r.rows.length === 1, job: r.rows[0] || null };
 }
 
-module.exports = { JOB_KINDS, TERMINAL, enqueueJob, claimJob, completeJob, failJob, requeueJob };
+/**
+ * Reclaim stale leases: running jobs whose lease expired (worker died without
+ * completing) are returned to queued so any worker can pick them up again.
+ * Idempotent + safe under concurrency (plain UPDATE, re-claim goes through
+ * FOR UPDATE SKIP LOCKED).
+ */
+async function reclaimExpiredLeases(pg) {
+  const r = await pg.query(
+    `UPDATE media_jobs SET status='queued', lease_owner=NULL, lease_expires_at=NULL, updated_at=NOW()
+     WHERE status='running' AND lease_expires_at IS NOT NULL AND lease_expires_at < NOW()
+     RETURNING id`,
+  );
+  return { reclaimed: r.rows.length, ids: r.rows.map((x) => x.id) };
+}
+
+module.exports = { JOB_KINDS, TERMINAL, enqueueJob, claimJob, completeJob, failJob, requeueJob, reclaimExpiredLeases };
