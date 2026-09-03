@@ -53,6 +53,8 @@ import assetFoundationMod from './modules/project-foundation/assetFoundation.cjs
 import studioModelsApiMod from './modules/modelhub/studioModelsApi.cjs';
 import uploadApiMod from './modules/media/uploadApi.cjs';
 import timelineApiMod from './modules/media/timelineApi.cjs';
+import mediaWorkerMod from './modules/media/mediaWorker.cjs';
+import mediaExecMod from './modules/media/executors.cjs';
 import bibleApiMod from './modules/project-foundation/bibleApi.cjs';
 import studioCanvasPersistenceMod from './modules/project-foundation/studioCanvasPersistence.cjs';
 import studioEpisodeApiMod from './modules/project-foundation/studioEpisodeApi.cjs';
@@ -4928,9 +4930,8 @@ server.listen(PORT, '0.0.0.0', async () => {
   // keeps multi-instance safe.
   if (String(process.env.MEDIA_JOBS_WORKER || '') === '1') {
     try {
-      const { createMediaWorker } = require('./modules/media/mediaWorker.cjs');
-      const { EXECUTORS } = require('./modules/media/executors.cjs');
-      const executors = { probe: EXECUTORS.probe };
+      const EXECUTORS = mediaExecMod.EXECUTORS;
+      const { createMediaWorker } = mediaWorkerMod;
       for (const kind of ['probe', 'thumbnail', 'proxy', 'waveform']) {
         if (!EXECUTORS[kind]) continue;
         const w = createMediaWorker({ pg: pgPool, executors: { [kind]: EXECUTORS[kind] }, kind, workerId: `${NODE_ID}-${kind}`, pollMs: 2000 });
