@@ -3,6 +3,8 @@
 
 # ── 构建阶段 ──
 FROM node:22-alpine AS build
+ARG NPM_REGISTRY=https://registry.npmjs.org
+ENV NPM_CONFIG_REGISTRY=$NPM_REGISTRY
 WORKDIR /app
 COPY package*.json ./
 RUN npm install --no-audit --no-fund
@@ -11,6 +13,8 @@ RUN npm run build
 
 # ── 运行阶段 ──
 FROM node:22-alpine AS runtime
+ARG NPM_REGISTRY=https://registry.npmjs.org
+ENV NPM_CONFIG_REGISTRY=$NPM_REGISTRY
 WORKDIR /app
 ENV NODE_ENV=production
 # 仅安装生产依赖（pg / ioredis / dotenv）
