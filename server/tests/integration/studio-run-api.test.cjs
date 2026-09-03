@@ -217,7 +217,7 @@ test('M05-D1 commercial invariant: the production API starts NO studio worker by
     const canvasId = cRes.body.canvas.id;
     await authRequest(base, {
       method: 'PATCH', path: `/api/v2/projects/${project.id}/studio/canvas`,
-      body: { baseRevision: 1, clientMutationId: `wmut-${crypto.randomBytes(4).toString('hex')}`, addNodes: [promptNode('wp1')], addEdges: [] },
+      body: { baseRevision: 1, clientMutationId: `wmut-${crypto.randomBytes(4).toString('hex')}`, upsertNodes: [promptNode('wp1')], upsertEdges: [] },
     }, user.cookies);
     const created = await authRequest(base, {
       method: 'POST', path: `/api/v2/projects/${project.id}/studio/runs`,
