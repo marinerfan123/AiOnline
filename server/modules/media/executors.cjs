@@ -53,12 +53,12 @@ function runProbe({ source, spawn = require('child_process').spawn, timeoutMs = 
   });
 }
 
-/** Executor registry: kind → runner (others pending until binary/infra gate). */
+/** Executor registry: kind → runner (probe/thumbnail/proxy/waveform wired). */
 const EXECUTORS = {
   probe: runProbe,
-  thumbnail: null,
-  proxy: null,
-  waveform: null,
+  thumbnail: (ctx) => require('./executorsAv.cjs').runThumbnail(ctx),
+  proxy: (ctx) => require('./executorsAv.cjs').runProxy(ctx),
+  waveform: (ctx) => require('./executorsAv.cjs').runWaveform(ctx),
   transcode: null,
   frame_extract: null,
   render: null,
@@ -67,6 +67,9 @@ const EXECUTORS = {
 function execute(kind, ctx) {
   const fn = EXECUTORS[kind];
   if (!fn) return Promise.resolve({ ok: false, code: `MEDIA_${kind.toUpperCase().replace('_', '_')}_EXECUTOR_PENDING`, message: `${kind} executor not yet wired (infra gate)` });
+  if (!ctx || !ctx.source) {
+    return Promise.resolve({ ok: false, code: 'MEDIA_SOURCE_MISSING', message: `${kind} executor requires a source (asset object URL)` });
+  }
   return fn(ctx);
 }
 

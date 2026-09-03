@@ -89,7 +89,7 @@ function createUploadApi({ pg, sessionUser, sendJSON, parseBody, signPutUrl }) {
           `UPDATE media SET oss_uploaded = TRUE, status = 'success', error_message = NULL,
              updated_at = NOW(), checksum_sha256 = $2, file_size = $3
            WHERE id = $1 AND status = 'pending_upload' AND oss_object_key IS NOT NULL
-           RETURNING id, project_id, mime_type`,
+           RETURNING id, project_id, mime_type, oss_object_key`,
           [assetId, checksum, size],
         );
         if (!row.rows.length) {
@@ -102,14 +102,16 @@ function createUploadApi({ pg, sessionUser, sendJSON, parseBody, signPutUrl }) {
         // Auto-plan normalization jobs (04 §16): probe always; thumbnail for
         // image/video; proxy for video; waveform for audio. Idempotency keys
         // are deterministic so re-finalize/worker retries never double-queue.
+        // params carry the object key + mime so executors can resolve source.
         const mimeType = String(row.rows[0].mime_type || '');
+        const objectKey = row.rows[0].oss_object_key ? String(row.rows[0].oss_object_key) : null;
         const planned = ['probe'];
         if (mimeType.startsWith('image/')) planned.push('thumbnail');
         if (mimeType.startsWith('video/')) planned.push('thumbnail', 'proxy');
         if (mimeType.startsWith('audio/')) planned.push('waveform');
         const jobs = [];
         for (const kind of planned) {
-          const j = await enqueueJob(pg, { assetId, kind, idempotencyKey: `${assetId}:${kind}` });
+          const j = await enqueueJob(pg, { assetId, kind, idempotencyKey: `${assetId}:${kind}`, params: { objectKey, mimeType } });
           jobs.push(j.job ? j.job.id : null);
         }
         return sendJSON(res, 200, { ok: true, probeJobId: jobs[0], plannedJobs: jobs });

@@ -55,9 +55,19 @@ test('G06 probe: non-zero exit → MEDIA_PROBE_FAILED', async () => {
 });
 
 test('G06 executors: unimplemented kinds return deterministic PENDING code', async () => {
-  const r = await execute('waveform', { source: 'x' });
-  assert.equal(r.ok, false);
-  assert.ok(r.code.endsWith('EXECUTOR_PENDING'));
+  for (const kind of ['transcode', 'frame_extract', 'render']) {
+    const r = await execute(kind, { source: 'x' });
+    assert.equal(r.ok, false);
+    assert.ok(r.code.endsWith('EXECUTOR_PENDING'), `${kind} → ${r.code}`);
+  }
   const probe = await execute('probe', { source: 'x', spawn: fakeSpawn({ format: {}, streams: [] }) });
   assert.equal(probe.ok, true);
+});
+
+test('G06 executors: wired AV kinds require a source (MEDIA_SOURCE_MISSING guard)', async () => {
+  for (const kind of ['thumbnail', 'proxy', 'waveform']) {
+    const r = await execute(kind, {});
+    assert.equal(r.ok, false);
+    assert.equal(r.code, 'MEDIA_SOURCE_MISSING', `${kind} → ${r.code}`);
+  }
 });

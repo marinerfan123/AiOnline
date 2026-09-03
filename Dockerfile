@@ -18,6 +18,8 @@ ENV NODE_ENV=production
 # 存在版本漂移，npm install 会按 package.json 补齐缺失项并复用已锁版本，更稳健。
 COPY package*.json ./
 RUN npm install --omit=dev --no-audit --no-fund && npm cache clean --force
+# Media normalization jobs (G06): ffprobe/ffmpeg for probe/thumbnail/proxy/waveform.
+RUN apk add --no-cache ffmpeg
 COPY server ./server
 # 公共静态资源（如客服群二维码），支持容器内直接替换，无需重新构建
 COPY public ./public
