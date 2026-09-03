@@ -55,6 +55,11 @@ function createMediaWorker({ pg, executors = {}, kind, workerId, pollMs = 500, m
       job,
       pg: db,
     };
+    // Executors read ctx.source (executors.cjs guards MEDIA_SOURCE_MISSING).
+    // Map it from job params: an explicit `source` (URL or local path) wins;
+    // otherwise fall back to the objectKey recorded at upload/finalize time.
+    const p = ctx.params || {};
+    ctx.source = p.source || p.objectKey || null;
 
     const fn = executors[kindOverride || kind] || executors[job.kind];
     let outcome;
