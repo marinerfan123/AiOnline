@@ -37,11 +37,13 @@ async function newWorkspaceProject(baseUrl, user) {
 
 test('M05-D1 Studio Run API: create/list/detail/cancel over HTTP', { concurrency: 1 }, async (t) => {
   let server, pg, dbName, user, project, canvasId;
+  let base;
 
   t.before(async () => {
     ({ dbName, pg } = await bootstrapRunDb());
     process.env.TEST_PG_DATABASE = dbName;
     server = await spawnTestServer();
+    base = server.baseUrl; // set in hook — suite body runs before hooks (G15 2026-09-04)
   });
   t.after(async () => {
     if (server) await server.stop();
@@ -49,8 +51,6 @@ test('M05-D1 Studio Run API: create/list/detail/cancel over HTTP', { concurrency
     if (pg) await pg.end();
     if (dbName) await dropDb(dbName);
   });
-
-  const base = server.baseUrl;
 
   await t.test('setup: user + project + canvas with prompt->output graph (rev 2)', async () => {
     user = await register(base, { email: `m05d-api-${Date.now()}@test.local` });
