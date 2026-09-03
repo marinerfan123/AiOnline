@@ -51,6 +51,7 @@ import aiControlRouterMod from './modules/ai-control/routes/aiControlRoutes.cjs'
 import projectFoundationMod from './modules/project-foundation/projectFoundation.cjs';
 import assetFoundationMod from './modules/project-foundation/assetFoundation.cjs';
 import studioModelsApiMod from './modules/modelhub/studioModelsApi.cjs';
+import uploadApiMod from './modules/media/uploadApi.cjs';
 import studioCanvasPersistenceMod from './modules/project-foundation/studioCanvasPersistence.cjs';
 import studioEpisodeApiMod from './modules/project-foundation/studioEpisodeApi.cjs';
 import studioShotApiMod from './modules/project-foundation/studioShotApi.cjs';
@@ -1487,6 +1488,29 @@ const studioModelsApi = studioModelsApiMod.createStudioModelsApi({
   sendJSON,
 });
 
+// G06 — General asset upload (/api/v2/uploads + finalize). Signed PUT adapter:
+// first enabled storage config (Aliyun→Tencent fallback), else 503.
+const uploadApi = uploadApiMod.createUploadApi({
+  pg: {
+    query: (sql, params) => pgPool
+      ? pgPool.query(sql, params)
+      : Promise.reject(Object.assign(new Error('数据库未就绪'), { status: 503 })),
+  },
+  sessionUser: (req) => session.getUserFromCookie(req),
+  sendJSON,
+  parseBody,
+  signPutUrl: async ({ objectKey, contentType }) => {
+    const cfgs = await ossMod.loadOssConfigs(pgPool).catch(() => []);
+    const cfg = Array.isArray(cfgs) ? cfgs.find((c) => c && c.enabled) : null;
+    if (!cfg) return null;
+    const kind = String(cfg.provider || cfg.type || '').toLowerCase();
+    const r = kind.includes('tencent') || kind.includes('cos')
+      ? ossMod.tencentCosSignUrl(cfg, objectKey)
+      : ossMod.aliyunBuildSignedUrls(cfg, objectKey);
+    return (r && r.putUrl) || null;
+  },
+});
+
 // M05-C — V2 Studio Canvas persistence (/api/v2/projects/:id/studio/canvas).
 const studioCanvasPersistence = studioCanvasPersistenceMod.createStudioCanvasPersistence({
   pg: {
@@ -2512,6 +2536,11 @@ async function handleAPI(req, res) {
   // ── G07 Studio Models + Shortcuts + AutoLink public API ──
   if (url.startsWith('/api/studio/models') || url === '/api/studio/shortcuts' || url.startsWith('/api/studio/shortcuts?') || url === '/api/studio/autolink/resolve') {
     if (await studioModelsApi.handle(req, res, url.split('?')[0], method)) return;
+  }
+
+  // ── G06 General asset upload（/api/v2/uploads）──
+  if (url.startsWith('/api/v2/uploads')) {
+    if (await uploadApi.handle(req, res, url.split('?')[0], method)) return;
   }
 
   // ── M01-S Project / Workspace Foundation（/api/v2/workspaces, /api/v2/projects）──
