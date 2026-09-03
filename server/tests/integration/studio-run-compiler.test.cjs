@@ -273,7 +273,7 @@ test('compile: FROM_NODE side input — downstream join pulls in side node Y but
   assert.equal(r.ok, true, JSON.stringify(r.error));
   assert.deepEqual(r.graph.nodes.map((n) => n.nodeId).sort(), ['A', 'B', 'C', 'D', 'Y']);
   const d = r.graph.nodes.find((n) => n.nodeId === 'D');
-  assert.deepEqual(d.dependencies.sort(), ['C', 'Y']);
+  assert.deepEqual([...d.dependencies].sort(), ['C', 'Y']);
 });
 
 test('compile: diamond — SELECTED join pulls both mid branches; FROM_NODE source runs everything', () => {
@@ -507,7 +507,7 @@ test('compile: spec fan-in example — A->C->D plus X->C; FROM_NODE C = {A,X,C,D
   assert.equal(r.ok, true, JSON.stringify(r.error));
   assert.deepEqual(r.graph.nodes.map((n) => n.nodeId).sort(), ['A', 'C', 'D', 'X'], 'FROM_NODE C includes A, X, C, D and excludes Z');
   const c = r.graph.nodes.find((n) => n.nodeId === 'C');
-  assert.deepEqual(c.dependencies.sort(), ['A', 'X'], 'fan-in: C waits for both A and X');
+  assert.deepEqual([...c.dependencies].sort(), ['A', 'X'], 'fan-in: C waits for both A and X');
   // Same graph, SELECTED C = {A, C, X} — D (downstream) excluded; proves the
   // two modes are distinct on the fan-in shape too.
   const sel = compileStudioGraph({ ...common, runMode: 'SELECTED', selectedNodeIds: ['C'] });

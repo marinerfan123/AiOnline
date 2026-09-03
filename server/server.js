@@ -63,6 +63,7 @@ import studioEpisodeApiMod from './modules/project-foundation/studioEpisodeApi.c
 import studioShotApiMod from './modules/project-foundation/studioShotApi.cjs';
 import studioStructureApiMod from './modules/project-foundation/studioStructureApi.cjs';
 import studioRunApiMod from './modules/project-foundation/studioRunApi.cjs';
+import studioRunEngineMod from './modules/project-foundation/studioRunEngine.cjs';
 import generationV2Shadow from './modules/generation-v2/shadow.cjs';
 // ModelHub V3 Phase 1 — 唯一模型身份 resolver（server.js 仅在此一处调用，不再散落处理 display_name）
 import modelHubResolver from './modules/modelhub/resolver.cjs';
@@ -1632,6 +1633,21 @@ const studioShotApi = studioShotApiMod.createStudioShotApi({
 });
 
 // M05-E — V2 Studio Run API (/api/v2/projects/:id/studio/runs).
+// Audit fix (G15 CRITICAL-1): the API previously got NO engine instance, so
+// create/get/cancel threw (engine undefined) → 500 in production. A stateless
+// engine (same factory studio-worker.cjs uses) serves the API reads/writes;
+// the worker daemon drives claims/reaper in its own process.
+const studioRunEngine = studioRunEngineMod.createStudioRunEngine({
+  pg: {
+    query: (sql, params) => pgPool
+      ? pgPool.query(sql, params)
+      : Promise.reject(Object.assign(new Error('数据库未就绪'), { status: 503 })),
+    connect: () => pgPool
+      ? pgPool.connect()
+      : Promise.reject(Object.assign(new Error('数据库未就绪'), { status: 503 })),
+  },
+  workerId: `${NODE_ID || 'api'}-runapi`,
+});
 const studioRunApi = studioRunApiMod.createStudioRunApi({
   pg: {
     query: (sql, params) => pgPool
@@ -1641,6 +1657,7 @@ const studioRunApi = studioRunApiMod.createStudioRunApi({
       ? pgPool.connect()
       : Promise.reject(Object.assign(new Error('数据库未就绪'), { status: 503 })),
   },
+  engine: studioRunEngine,
   sessionUser: (req) => session.getUserFromCookie(req),
   sendJSON,
   parseBody,

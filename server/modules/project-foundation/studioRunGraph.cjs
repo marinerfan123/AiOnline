@@ -47,12 +47,14 @@ class CompileError extends Error {
 /** Durable-safe node execution input (B2 parameter subset; no secrets). */
 const FORBIDDEN_INPUT_KEYS = new Set(['temporaryPreviewUrl', 'tempPreviewUrl', 'signedUrl', 'signedURL', 'apiKey', 'api_key', 'credential', 'credentials', 'jwt', 'token', 'cookie', 'localPath']);
 
-function stripForbidden(obj) {
-  if (!obj || typeof obj !== 'object') return {};
+function stripForbidden(obj, depth = 0) {
+  if (!obj || typeof obj !== 'object') return obj;
+  if (depth > 8) return obj; // bounded recursion guard
+  if (Array.isArray(obj)) return obj.map((x) => stripForbidden(x, depth + 1));
   const out = {};
   for (const [k, v] of Object.entries(obj)) {
-    if (FORBIDDEN_INPUT_KEYS.has(k)) continue;
-    out[k] = v;
+    if (FORBIDDEN_INPUT_KEYS.has(k)) continue; // nested keys stripped too (G15 LOW-1 fix)
+    out[k] = v && typeof v === 'object' ? stripForbidden(v, depth + 1) : v;
   }
   return out;
 }
