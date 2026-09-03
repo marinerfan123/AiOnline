@@ -6,11 +6,19 @@
  *  - GET    /api/v2/projects/:projectId/studio/runs               list runs (paginated)
  *  - GET    /api/v2/projects/:projectId/studio/runs/:runId        run detail (nodes + counts)
  *  - POST   /api/v2/projects/:projectId/studio/runs/:runId/cancel request durable cancellation (D1 foundation)
+ *  - GET    /api/v2/projects/:projectId/studio/runs/:runId/events  run event stream (G21 SSE read side)
  *
  * Authorization reuses M01 project permissions (workspace membership).
  * Run id is never a scope bypass: every read re-joins project+workspace.
+ *
+ * G21 — run events SSE read side:
+ *   handleRunEventsSse(req, res, { runId, user }) lives on the API instance and
+ *   is exported for direct mounting (the mount point itself is server.js's job).
+ *   Ownership is verified INSIDE the SSE handler (404/403) because a streaming
+ *   endpoint has no dispatcher role gate — see createRunEventsSse below.
  */
 const { LIMITS: GRAPH_LIMITS } = require('./studioRunGraph.cjs');
+const { createRunEventStore } = require('./runEventStore.cjs');
 
 const RUNS_RE = /^\/api\/v2\/projects\/([^/]+)\/studio\/runs(?:\/([^/]+)(?:\/([^/]+))?)?$/;
 
@@ -38,6 +46,281 @@ const FORMAT_RUN = (row) => ({
 });
 
 function toIso(v) { return v ? new Date(v).toISOString() : null; }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// G21 — run events SSE read side.
+//
+// EventSource (drill semantics): client opens GET /runs/:id/events, receives the
+// full `run_events` replay (each event one SSE message, `id: <seq>` so the
+// browser records Last-Event-ID), then the server polls the store every pollMs
+// for a monotonically growing per-run `seq` watermark and streams the delta.
+// The window is capped at maxWindowMs; the server then closes with HTTP 200 and
+// the CLIENT is responsible for re-subscribing (EventSource auto-reconnects with
+// Last-Event-ID, which the server honours as afterSeq).
+//
+// Wire format per SSE message (default `message` event — generic onmessage):
+//   id: <seq>
+//   data: {"seq":<seq>,"type":"...","payload":{...},"ts":"<ISO>"}
+//
+// Guarding: this read path deliberately runs its own ownership check instead of
+// relying on the request dispatcher — a long-lived streaming response bypasses
+// the normal JSON dispatch/role chain, so 404/403 must be answered here, before
+// the first SSE byte. Semantics mirror the run GET handler: admin/system role
+// bypasses workspace membership; any workspace_members row grants read; missing
+// run → 404, missing membership → 403.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const DEFAULT_SSE_POLL_MS = 2000;
+const DEFAULT_SSE_MAX_WINDOW_MS = 60000;
+const DEFAULT_SSE_BATCH_LIMIT = 500;
+
+const SSE_EVENTS_SQL = `
+SELECT seq, type, payload_json, created_at
+  FROM run_events
+ WHERE run_id = $1 AND seq > $2
+ ORDER BY seq ASC
+ LIMIT $3`;
+
+const SSE_RUN_OWNER_SQL = `
+SELECT r.id AS run_id, r.project_id, p.workspace_id, w.owner_id AS workspace_owner_id
+  FROM studio_runs r
+  JOIN projects p ON p.id = r.project_id
+  JOIN workspaces w ON w.id = p.workspace_id
+ WHERE r.id = $1`;
+
+const SSE_MEMBERSHIP_SQL = `
+SELECT workspace_id, user_id, role
+  FROM workspace_members
+ WHERE workspace_id = $1 AND user_id = $2`;
+
+function isAdminUser(user) {
+  return Boolean(user && (user.role === 'admin' || user.role === 'system'));
+}
+
+function parsePayloadJsonValue(v) {
+  if (typeof v === 'string') { try { return JSON.parse(v); } catch (_) { return v; } }
+  return v === undefined || v === null ? {} : v;
+}
+
+/**
+ * Run-scoped ownership guard for the SSE reader (404 unknown run, 403 run that
+ * belongs to a workspace the user is not a member of; admin/system bypass).
+ */
+async function authorizeRunSse(pg, { runId, user }) {
+  if (!user || !user.id) return { allowed: false, status: 401, error: '未登录' };
+  if (typeof runId !== 'string' || !runId.trim()) return { allowed: false, status: 404, error: 'RUN_NOT_FOUND' };
+  const r = await pg.query(SSE_RUN_OWNER_SQL, [runId]);
+  const row = r && r.rows && r.rows[0];
+  if (!row) return { allowed: false, status: 404, error: 'RUN_NOT_FOUND' };
+  if (isAdminUser(user)) return { allowed: true, run: row };
+  const m = await pg.query(SSE_MEMBERSHIP_SQL, [row.workspace_id, user.id]);
+  if (!m || !m.rows || !m.rows.length) return { allowed: false, status: 403, error: '无项目权限' };
+  return { allowed: true, run: row };
+}
+
+function writeGuardError(res, status, error) {
+  if (!res || res.writableEnded) return;
+  try {
+    const body = JSON.stringify({ ok: false, error });
+    if (!res.headersSent && typeof res.writeHead === 'function') {
+      res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+    }
+    if (typeof res.end === 'function') res.end(body);
+  } catch (_) { /* client already gone — nothing to answer */ }
+}
+
+/**
+ * Standalone SSE read-side factory (mount point lives in server.js / the API
+ * dispatcher — see handleRunEventsSse on the API instance).
+ *
+ * @param {{pg: {query: Function}, store?: object}} deps
+ *   `pg` is required (pool/query mock). `store` is an optional pre-built
+ *   runEventStore (test seam); production builds it from pg internally.
+ * @returns {{ streamRunEvents: Function }}
+ *   streamRunEvents({ req, res, runId, user, opts }) → { stop, done, closed, ... }
+ *   - Guarded inside (401/403/404 before any SSE byte).
+ *   - Headers: text/event-stream + no-cache (same shape as monitor.cjs).
+ *   - First flush = full replay of listRunEvents-equivalent rows, or resumption
+ *     at afterSeq when req Last-Event-ID carries a non-negative integer.
+ *   - Then polls lastSequence every pollMs (default 2s), streaming new events.
+ *   - Window capped at maxWindowMs (default 60s) → 200 close; client resubscribes.
+ *   - Cleanup on: explicit stop(), client disconnect (req/res close), window end.
+ *   - done resolves with { reason, status } once the stream is fully torn down.
+ */
+function createRunEventsSse({ pg, store } = {}) {
+  if (!pg || typeof pg.query !== 'function') {
+    throw new TypeError('createRunEventsSse: { pg } with query() required');
+  }
+  const eventStore = store || createRunEventStore({ pg });
+  const { lastSequence } = eventStore;
+
+  function rowToEvent(row) {
+    return {
+      seq: Number(row.seq),
+      type: row.type,
+      payload: parsePayloadJsonValue(row.payload_json),
+      ts: row.created_at ? new Date(row.created_at).toISOString() : new Date().toISOString(),
+    };
+  }
+
+  async function fetchEvents({ runId, afterSeq, limit }) {
+    const r = await pg.query(SSE_EVENTS_SQL, [runId, afterSeq, limit]);
+    return ((r && r.rows) || []).map(rowToEvent);
+  }
+
+  async function streamRunEvents({ req, res, runId, user, opts = {} } = {}) {
+    const pollMs = opts && Number.isFinite(opts.pollMs) && opts.pollMs >= 5 ? opts.pollMs : DEFAULT_SSE_POLL_MS;
+    const maxWindowMs = opts && Number.isFinite(opts.maxWindowMs) && opts.maxWindowMs > 0 ? opts.maxWindowMs : DEFAULT_SSE_MAX_WINDOW_MS;
+    const batchLimit = opts && Number.isInteger(opts.batchLimit) && opts.batchLimit > 0
+      ? Math.min(opts.batchLimit, 1000)
+      : DEFAULT_SSE_BATCH_LIMIT;
+
+    const state = { closed: false, reason: null, status: 200 };
+    let resolveDone = null;
+    const done = new Promise((resolve) => { resolveDone = resolve; });
+    let schedulerTimer = null;
+    let headersStarted = false;
+
+    const finish = (reason, status = 200) => {
+      if (state.closed) return;
+      state.closed = true;
+      state.reason = reason;
+      state.status = status;
+      if (schedulerTimer) { clearTimeout(schedulerTimer); schedulerTimer = null; }
+      try {
+        if (headersStarted && res && !res.writableEnded && typeof res.end === 'function') res.end();
+      } catch (_) { /* socket already gone */ }
+      if (resolveDone) resolveDone({ reason, status });
+    };
+
+    // Ownership guard FIRST — no dispatcher role gate exists for SSE, so this is
+    // the only authorization surface for the stream.
+    let auth;
+    try {
+      auth = await authorizeRunSse(pg, { runId, user });
+    } catch (_) {
+      auth = { allowed: false, status: 500, error: '服务内部错误' };
+    }
+    if (!auth.allowed) {
+      state.closed = true;
+      state.reason = 'guard';
+      state.status = auth.status;
+      writeGuardError(res, auth.status, auth.error);
+      if (resolveDone) resolveDone({ reason: 'guard', status: auth.status });
+      return { stop: () => {}, done, closed: () => true, reason: 'guard', status: auth.status };
+    }
+
+    // ── SSE open (house shape — see monitor.cjs). ──
+    if (res && !res.headersSent && typeof res.writeHead === 'function') {
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream; charset=utf-8',
+        'Cache-Control': 'no-cache, no-transform',
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no',
+      });
+    }
+    headersStarted = true;
+    if (res && typeof res.flushHeaders === 'function') { try { res.flushHeaders(); } catch (_) {} }
+
+    // Client-disconnect/error listeners attach BEFORE the first replay write, so
+    // an async EPIPE (socket died during replay) is never an unhandled 'error'.
+    const startedAt = Date.now();
+    const stop = (reason = 'stopped') => finish(reason);
+    const onClientClose = () => finish('client-closed');
+    if (req && typeof req.on === 'function') {
+      req.on('close', onClientClose);
+      req.on('error', onClientClose);
+    }
+    if (res && typeof res.on === 'function') {
+      res.on('error', () => {}); // swallow EPIPE — cleanup already ran
+      res.on('close', onClientClose);
+    }
+
+    const send = (chunk) => {
+      if (state.closed || !res || res.writableEnded) return false;
+      try { res.write(chunk); return true; } catch (_) { state.closed = true; return false; }
+    };
+
+    const writeEventLine = (ev) => {
+      const data = JSON.stringify({ seq: ev.seq, type: ev.type, payload: ev.payload, ts: ev.ts });
+      return send(`id: ${ev.seq}\ndata: ${data}\n\n`);
+    };
+    const writeHeartbeat = () => send(': hb\n\n');
+
+    // Resume cursor from Last-Event-ID; anything else → full replay from seq 1.
+    const leiRaw = req && req.headers ? req.headers['last-event-id'] : undefined;
+    const lei = Array.isArray(leiRaw) ? leiRaw[0] : leiRaw;
+    let cursor = 0;
+    if (lei !== undefined && lei !== null && String(lei).trim() !== '') {
+      const n = Number(String(lei).trim());
+      if (Number.isInteger(n) && n >= 0) cursor = n;
+    }
+
+    const sendUpTo = async (after) => {
+      let pages = 0;
+      while (!state.closed && pages < 10000) {
+        const rows = await fetchEvents({ runId, afterSeq: after, limit: batchLimit });
+        if (!rows.length) break;
+        for (const ev of rows) {
+          if (!writeEventLine(ev)) return after; // socket gone mid-replay
+          after = ev.seq;
+        }
+        if (rows.length < batchLimit) break;
+        pages += 1;
+      }
+      return after;
+    };
+
+    try {
+      cursor = await sendUpTo(cursor);
+    } catch (_) {
+      // Replay read failed — close the stream (client re-subscribes via drill).
+      state.closed = true;
+      state.reason = 'replay-failed';
+      state.status = 500;
+      try { if (res && !res.writableEnded && typeof res.end === 'function') res.end(); } catch (_) {}
+      if (resolveDone) resolveDone({ reason: 'replay-failed', status: 500 });
+      return { stop: () => {}, done, closed: () => true, reason: 'replay-failed', status: 500 };
+    }
+
+    send('retry: 2000\n\n'); // EventSource reconnect hint for the next drill
+
+    const poll = async () => {
+      if (state.closed) return;
+      try {
+        const last = await lastSequence({ runId });
+        const lastSeq = last && Number(last.seq) || 0;
+        if (lastSeq > cursor) cursor = await sendUpTo(cursor);
+      } catch (_) {
+        // transient DB error — keep the stream alive, retry next cycle
+      }
+      writeHeartbeat();
+    };
+
+    const scheduleNext = () => {
+      if (state.closed) return;
+      schedulerTimer = setTimeout(async () => {
+        schedulerTimer = null;
+        if (state.closed) return;
+        if (Date.now() - startedAt >= maxWindowMs) { finish('max-window'); return; }
+        await poll();
+        scheduleNext();
+      }, pollMs);
+    };
+    scheduleNext();
+
+    return {
+      stop,
+      done,
+      closed: () => state.closed,
+      reason: () => state.reason,
+      status: state.status,
+      afterSeq: () => cursor,
+    };
+  }
+
+  return { streamRunEvents };
+}
 
 function formatRunNode(r) {
   const out = {
@@ -222,6 +505,20 @@ function createStudioRunApi(deps) {
     } finally { client.release(); }
   }
 
+  /**
+   * G21 — run events SSE. Mount point is wired by server.js/dispatcher; this is
+   * the handler that owns authorization (no dispatcher role gate for SSE).
+   * `user` may be pre-resolved by the caller; otherwise resolved from the
+   * session cookie exactly like every other studio/runs read (run GET).
+   * Returns the stream control handle ({ stop, done, closed }) from
+   * createRunEventsSse, or null when unauthenticated (401 already written).
+   */
+  async function handleRunEventsSse(req, res, { runId, user } = {}) {
+    const u = user || requireUser(req, res);
+    if (!u) return null;
+    return createRunEventsSse({ pg }).streamRunEvents({ req, res, runId, user: u });
+  }
+
   async function handle(req, res, urlPath, method) {
     const m = urlPath.match(RUNS_RE);
     if (!m) return false;
@@ -234,15 +531,25 @@ function createStudioRunApi(deps) {
     try {
       if (!runId && method === 'GET') return await handleList(req, res, user, projectId), true;
       if (!runId && method === 'POST') return await handleCreate(req, res, user, projectId), true;
+      if (runId && seg2 === 'events' && method === 'GET') {
+        // SSE: handleRunEventsSse guards + streams; awaited here only for its
+        // (fast) setup — the stream itself keeps running until stop/disconnect/60s.
+        await handleRunEventsSse(req, res, { runId, user });
+        return true;
+      }
       if (runId && !seg2 && method === 'GET') return await handleGet(req, res, user, projectId, runId), true;
       if (runId && seg2 === 'cancel' && method === 'POST') return await handleCancel(req, res, user, projectId, runId), true;
       return sendJSON(res, 404, { ok: false, error: 'Not Found' }), true;
     } catch (e) {
       console.error('[studio-runs] route error:', e && e.stack);
+      if (res && res.headersSent) {
+        try { res.end(); } catch (_) {}
+        return true;
+      }
       return sendJSON(res, 500, { ok: false, error: '服务内部错误' }), true;
     }
   }
-  return { handle, FORMAT_RUN, formatRunNode };
+  return { handle, FORMAT_RUN, formatRunNode, handleRunEventsSse };
 }
 
-module.exports = { createStudioRunApi, FORMAT_RUN, formatRunNode };
+module.exports = { createStudioRunApi, createRunEventsSse, FORMAT_RUN, formatRunNode };

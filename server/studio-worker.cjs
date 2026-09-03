@@ -33,6 +33,7 @@ const os = require('os');
 const crypto = require('crypto');
 const { Pool } = require('pg');
 const { createStudioRunEngine } = require('./modules/project-foundation/studioRunEngine.cjs');
+const { createRunEventRelay } = require('./modules/project-foundation/runEventRelay.cjs');
 const { createWorkerDaemon } = require('./modules/generation-v2/worker-daemon.cjs');
 
 function buildPgPool() {
@@ -87,6 +88,9 @@ async function main() {
       connect: () => pgPool.connect(),
     },
     workerId,
+    // G21: every engine emit also lands in run_events (durable SSE log) via the
+    // relay — failures warn-only, never block execution (relay own autocommit pool).
+    relay: createRunEventRelay({ pg: { query: (sql, params) => pgPool.query(sql, params) } }),
     onLog: (tag, payload) => { try { console.log(JSON.stringify({ tag: 'studio-run', event: tag, ...(payload || {}) })); } catch (_) {} },
   });
 
