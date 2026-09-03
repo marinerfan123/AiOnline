@@ -92,7 +92,8 @@ function createBibleApi({ pg, sessionUser, sendJSON, parseBody }) {
       [r.rows[0].workspace_id, user.id],
     );
     if (!m.rows.length) { sendJSON(res, 403, { ok: false, error: '无项目权限' }); return null; }
-    return r.rows[0];
+    // Attach membership role so handlers can gate mutating routes (viewer = read-only).
+    return { ...r.rows[0], role: m.rows[0].role };
   }
 
   const ENTITY = {
@@ -407,6 +408,12 @@ function createBibleApi({ pg, sessionUser, sendJSON, parseBody }) {
     if (!user) return true;
     const project = await requireProject(res, user, projectId);
     if (!project) return true;
+    // Audit fix (G14 v4pro M1): viewer is read-only — mutating routes need an
+    // owner/editor role.
+    const WRITE = ['POST', 'PUT', 'DELETE'];
+    if (WRITE.includes(method) && !['owner', 'editor'].includes(project.role)) {
+      return sendJSON(res, 403, { ok: false, error: '只读成员不可修改（需 owner/editor）' });
+    }
     const id = m[2] ? decodeURIComponent(m[2]) : null;
 
     if (m[1] === 'characters') return charactersHandle(req, res, method, id, project);

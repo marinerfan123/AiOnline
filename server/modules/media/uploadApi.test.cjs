@@ -150,3 +150,23 @@ test('G06 upload: finalize rejects non-integer / oversized sizeBytes (400) — a
   await h.api.handle({ body: { checksumSha256: 'a'.repeat(64), sizeBytes: 1.5 } }, {}, '/api/v2/uploads/m-1/finalize', 'POST');
   assert.equal(h.responses[1].code, 400);
 });
+
+test('G06 upload: viewer role cannot create (403) — audit M1 fix', async () => {
+  const responses = [];
+  const pg = {
+    async query(sql) {
+      if (sql.includes('FROM projects p') && sql.includes('JOIN workspaces')) return { rows: [{ id: 'p1', workspace_id: 'ws-1' }] };
+      if (sql.includes('FROM workspace_members')) return { rows: [{ role: 'viewer' }] };
+      return { rows: [] };
+    },
+  };
+  const api = createUploadApi({
+    pg,
+    sessionUser: () => ({ id: 'u1' }),
+    sendJSON: (res, code, body) => responses.push({ code, body }),
+    parseBody: async () => ({ projectId: 'p1', filename: 'a.png', mime: 'image/png', size: 10 }),
+    signPutUrl: async () => 'x',
+  });
+  await api.handle({}, {}, '/api/v2/uploads', 'POST');
+  assert.equal(responses[0].code, 403);
+});

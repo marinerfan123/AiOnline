@@ -38,7 +38,8 @@ function createUploadApi({ pg, sessionUser, sendJSON, parseBody, signPutUrl }) {
       [r.rows[0].workspace_id, user.id],
     );
     if (!m.rows.length) { sendJSON(res, 403, { ok: false, error: '无项目权限' }); return null; }
-    return r.rows[0];
+    // Attach membership role so handlers can gate mutating routes (viewer = read-only).
+    return { ...r.rows[0], role: m.rows[0].role };
   }
 
   async function handle(req, res, urlPath, method) {
@@ -62,6 +63,10 @@ function createUploadApi({ pg, sessionUser, sendJSON, parseBody, signPutUrl }) {
         }
         const project = await requireProject(res, user, projectId);
         if (!project) return true;
+        // Audit fix (G14 v4pro M1): viewer cannot create uploads.
+        if (!['owner', 'editor'].includes(project.role)) {
+          return sendJSON(res, 403, { ok: false, error: '只读成员不可上传（需 owner/editor）' });
+        }
 
         const assetId = `m-${require('crypto').randomUUID()}`;
         const objectKey = `uploads/${projectId}/${assetId}/${filename}`;

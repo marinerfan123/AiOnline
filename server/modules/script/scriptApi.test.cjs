@@ -134,3 +134,17 @@ test('G13: non-script route → false', async () => {
   const handled = await api.handle(h({}, { projectId: 'p-1' }), res, '/api/v2/bible/characters', 'GET');
   assert.equal(handled, false);
 });
+
+test('G13: viewer role cannot write (403) — audit M1 fix', async () => {
+  const responses = [];
+  const pg = {
+    async query(sql) {
+      if (/FROM projects p JOIN workspaces/.test(sql)) return { rows: [{ id: 'p-1', workspace_id: 'w-1', name: 'P' }] };
+      if (/FROM workspace_members/.test(sql)) return { rows: [{ role: 'viewer' }] };
+      return { rows: [] };
+    },
+  };
+  const api = createScriptApi({ pg, sessionUser: () => ({ id: 'u-1' }), sendJSON: (res, code, body) => responses.push({ code, body }), parseBody: async () => ({ rows: [{ kind: 'action', text: 'x' }] }) });
+  await api.handle({ _body: {}, params: { projectId: 'p-1' } }, {}, '/api/v2/script/rows', 'POST');
+  assert.equal(responses[0].code, 403);
+});
