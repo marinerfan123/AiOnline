@@ -75,3 +75,15 @@ describe('G04 typed graph — validateNewEdge gate order', () => {
     expect(hasPath(edges, 'c', 'a')).toBe(false);
   });
 });
+
+it('STRUCTURAL pass-through does not hide a dataflow cycle (audit fix)', () => {
+  // storyboard is STRUCTURAL but carries IMAGE in+out ports: image-gen → sb
+  // followed by sb → image-gen must be rejected (would close a loop through
+  // the pass-through node).
+  const gen = n('image-generation', 'gen');
+  const sb = n('storyboard', 'sb');
+  const edges = [e('x', 'gen', 'image', 'sb', 'image')];
+  const verdict = validateNewEdge({ nodes: [gen, sb], edges, source: 'sb', target: 'gen', sourceHandle: 'image', targetHandle: 'image' });
+  expect(verdict.ok).toBe(false);
+  expect(verdict.code).toBe('GRAPH_CYCLE');
+});

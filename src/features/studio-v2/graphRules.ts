@@ -110,8 +110,12 @@ export function validateNewEdge(input: NewEdgeInput): ConnectionVerdict {
   }
 
   // cycle policy: connecting source→target is illegal if target already
-  // reaches source (would close a loop) over dataflow (non-structural) nodes.
-  if (isDataflowNode(sourceNode) && isDataflowNode(targetNode)) {
+  // reaches source (would close a loop). STRUCTURAL nodes (frame/group/
+  // storyboard) are pass-through: a path through one is still a dataflow
+  // cycle (e.g. image-gen ⇄ storyboard when storyboard carries image ports),
+  // so the check runs unless BOTH endpoints are STRUCTURAL. (audit G04 2026-09-04)
+  const bothStructural = !isDataflowNode(sourceNode) && !isDataflowNode(targetNode);
+  if (!bothStructural) {
     const reach = hasPath(edges, target, source);
     if (reach) return { ok: false, code: 'GRAPH_CYCLE', message: '该连接会形成循环，已拒绝' };
   }
