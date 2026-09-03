@@ -9,7 +9,7 @@
 // Structural (frame) nodes render as pure containers.
 
 import { memo } from 'react';
-import { Handle, Position, type NodeProps } from '@xyflow/react';
+import { Handle, NodeResizer, Position, type NodeProps } from '@xyflow/react';
 import { useQuery } from '@tanstack/react-query';
 import { Loader2, AlertCircle, User } from 'lucide-react';
 import { getNodeDef } from './registry';
@@ -96,7 +96,7 @@ function GenerationPlaceholder({ status }: { status: string }) {
   );
 }
 
-function StudioNodeInner({ id, data, selected }: NodeProps<StudioNode>) {
+function StudioNodeInner({ id, data, selected, width }: NodeProps<StudioNode>) {
   void id;
   const def = getNodeDef(data.nodeKind);
   if (!def) {
@@ -123,8 +123,9 @@ function StudioNodeInner({ id, data, selected }: NodeProps<StudioNode>) {
         data.status === 'disabled' && 'opacity-60',
         isFrame && 'w-full',
       )}
-      style={isFrame ? undefined : { width: def.width }}
+      style={isFrame ? undefined : { width: width ?? def.width }}
     >
+      {!isFrame && <NodeResizer isVisible={selected} minWidth={240} minHeight={90} />}
       <div className="flex items-center gap-1.5 border-b border-ml2-border bg-ml2-surface-2 px-2 py-1.5">
         <NodeIcon name={def.icon} className="size-3.5 shrink-0 text-ml2-text-2" />
         <span className="truncate text-[11px] font-medium text-ml2-text">{data.title}</span>

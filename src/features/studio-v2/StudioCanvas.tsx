@@ -21,8 +21,9 @@ import {
   studioCanvasActions,
 } from './store';
 import { StudioNodeComponent } from './StudioNode';
-import { NODE_DEFS_LIST } from './registry';
+import { NODE_DEFS_LIST, canConnectToPort, getNodeDef } from './registry';
 import type { StudioNodeKind } from './types';
+import type { PortType } from './types';
 import { Button } from '@/shared/ui/v2/Button';
 import { IconButton } from '@/shared/ui/v2/IconButton';
 import { Undo2, Redo2, Maximize2, Scan, X, Copy, Trash2 } from "lucide-react";
@@ -51,18 +52,31 @@ class StudioErrorBoundary extends Component<{ children: ReactNode }, { hasError:
   }
 }
 
-function ContextMenu({ at, onAdd, onClose }: { at: { x: number; y: number }; onAdd: (k: StudioNodeKind) => void; onClose: () => void }) {
+function ContextMenu({
+  at,
+  onAdd,
+  onClose,
+  kinds,
+  header,
+}: {
+  at: { x: number; y: number };
+  onAdd: (k: StudioNodeKind) => void;
+  onClose: () => void;
+  kinds?: StudioNodeKind[]; // G05 edge-to-empty: filtered to compatible targets
+  header?: string;
+}) {
   // M05-B2: derived from the registry (never a hardcoded second node list).
-  const kinds = useMemo(() => NODE_DEFS_LIST.map((d) => d.id), []);
+  const allKinds = useMemo(() => NODE_DEFS_LIST.map((d) => d.id), []);
+  const list = kinds ?? allKinds;
   return (
     <div
       data-test="canvas-context-menu"
-      className="absolute z-50 w-40 overflow-hidden rounded-lg border border-ml2-border bg-ml2-surface-1 py-1 shadow-2xl"
+      className="absolute z-50 w-44 overflow-hidden rounded-lg border border-ml2-border bg-ml2-surface-1 py-1 shadow-2xl"
       style={{ left: at.x, top: at.y }}
       onContextMenu={(e) => { e.preventDefault(); onClose(); }}
     >
-      <div className="px-3 py-1 text-[10px] text-ml2-text-3">在此处添加节点</div>
-      {kinds.map((k) => {
+      <div className="px-3 py-1 text-[10px] text-ml2-text-3">{header ?? '在此处添加节点'}</div>
+      {list.map((k) => {
         const def = NODE_DEFS_LIST.find((d) => d.id === k);
         return (
           <button key={k} data-test={`context-menu-${k}`} onClick={() => { onAdd(k); onClose(); }}
@@ -129,9 +143,29 @@ function CanvasCore() {
   const onNodeDragStart = useStudioStore((s) => s.onNodeDragStart);
   const onNodeDragStop = useStudioStore((s) => s.onNodeDragStop);
   const onViewportChange = useStudioStore((s) => s.onViewportChange);
-  const [menu, setMenu] = useState<{ x: number; y: number; fx: number; fy: number } | null>(null);
+  const [menu, setMenu] = useState<{
+    x: number; y: number; fx: number; fy: number;
+    edgeFrom?: { nodeId: string; handleId: string; portType: PortType };
+  } | null>(null);
   const { screenToFlowPosition, fitView } = useReactFlow();
   const canvasRef = useRef<HTMLDivElement>(null);
+
+  // G05 edge-to-empty: node kinds whose input accepts the dragged output type.
+  const compatibleTargetKinds = useCallback((portType: PortType): StudioNodeKind[] => {
+    const out: StudioNodeKind[] = [];
+    for (const def of NODE_DEFS_LIST) {
+      if (def.inputPorts.some((p) => canConnectToPort(portType, p))) out.push(def.id);
+    }
+    return out;
+  }, []);
+
+  // First compatible input port id of a target node kind for the output type.
+  const firstCompatibleInput = useCallback((kind: StudioNodeKind, portType: PortType): string | null => {
+    const def = NODE_DEFS_LIST.find((d) => d.id === kind);
+    if (!def) return null;
+    const port = def.inputPorts.find((p) => canConnectToPort(portType, p));
+    return port?.id ?? null;
+  }, []);
 
   // Controlled pattern: the zustand store is the single source of truth.
   // onNodesChange (position/selection/dimensions) is applied back via applyNodeChanges.
@@ -191,6 +225,7 @@ function CanvasCore() {
       if (mod && e.key.toLowerCase() === 'y') { e.preventDefault(); redo(); return; }
       if (mod && e.key.toLowerCase() === 'a') { e.preventDefault(); selectAll(); return; }
       if (mod && e.key.toLowerCase() === 'd') { e.preventDefault(); duplicateSelection(); return; }
+      if (mod && e.key.toLowerCase() === 'g') { e.preventDefault(); useStudioStore.getState().groupSelection(); return; }
       if (mod && e.key.toLowerCase() === 'c') { copySelection(); return; }
       if (mod && e.key.toLowerCase() === 'v') { e.preventDefault(); paste(); return; }
       if (e.key === 'Delete' || e.key === 'Backspace') { removeSelection(); }
@@ -247,11 +282,36 @@ function CanvasCore() {
         onDrop={(e) => {
           e.preventDefault();
           const kind = e.dataTransfer.getData('application/x-studio-node-kind') as StudioNodeKind;
-          if (!kind) return;
-          const f = screenToFlowPosition({ x: e.clientX, y: e.clientY });
-          addNode(kind, { x: f.x - 120, y: f.y - 60 });
+          if (kind && getNodeDef(kind)) {
+            const f = screenToFlowPosition({ x: e.clientX, y: e.clientY });
+            addNode(kind, { x: f.x - 120, y: f.y - 60 });
+          }
+          // Real file drop (G05 interaction): creates a Reference node at the
+          // drop point; the actual upload→asset binding ships with G06.
+          const hasFile = e.dataTransfer?.files?.length > 0;
+          if (hasFile) {
+            const f = screenToFlowPosition({ x: e.clientX, y: e.clientY });
+            addNode('reference', { x: f.x - 120, y: f.y - 60 });
+          }
         }}
         onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; }}
+        onConnectEnd={(event, connectionState) => {
+          // G05 edge-to-empty: a connection drag released over blank canvas opens
+          // a filtered create menu (compatible target node kinds only).
+          const from = connectionState?.fromNode;
+          const fromHandle = connectionState?.fromHandle;
+          const droppedOnTarget = connectionState?.toNode;
+          if (!from || !fromHandle || droppedOnTarget) return;
+          const handleId = (fromHandle as unknown as { id?: string })?.id ?? String(fromHandle);
+          const fromDef = getNodeDef(String((from.data as { nodeKind?: string })?.nodeKind ?? from.type));
+          const outPort = fromDef?.outputPorts.find((p) => p.id === handleId);
+          if (!outPort) return;
+          const ev = event as unknown as { clientX?: number; clientY?: number };
+          const x = typeof ev.clientX === 'number' ? ev.clientX : 0;
+          const y = typeof ev.clientY === 'number' ? ev.clientY : 0;
+          const f = screenToFlowPosition({ x, y });
+          setMenu({ x: x - 40, y: y - 10, fx: f.x, fy: f.y, edgeFrom: { nodeId: from.id, handleId, portType: outPort.type } });
+        }}
         onDoubleClick={(e) => {
           const target = e.target as HTMLElement;
           if (!target.classList.contains('react-flow__pane')) return;
@@ -280,7 +340,22 @@ function CanvasCore() {
       {menu && (
         <ContextMenu
           at={{ x: menu.x, y: menu.y }}
-          onAdd={(k) => addNode(k, { x: menu.fx - 120, y: menu.fy - 60 })}
+          header={menu.edgeFrom ? '连接到此新节点' : undefined}
+          kinds={menu.edgeFrom ? compatibleTargetKinds(menu.edgeFrom.portType) : undefined}
+          onAdd={(k) => {
+            const id = addNode(k, { x: menu.fx - 120, y: menu.fy - 60 });
+            if (id && menu.edgeFrom) {
+              const targetHandle = firstCompatibleInput(k, menu.edgeFrom.portType);
+              if (targetHandle) {
+                onConnect({
+                  source: menu.edgeFrom.nodeId,
+                  sourceHandle: menu.edgeFrom.handleId,
+                  target: id,
+                  targetHandle,
+                });
+              }
+            }
+          }}
           onClose={() => setMenu(null)}
         />
       )}
