@@ -224,31 +224,36 @@ export function AssetLibraryDrawer({ projectId, onClose }: { projectId: string; 
 
   // Lazily resolve detail (getAsset) for the currently-visible items so the
   // read-only favorite star (and tag-based Styles/References matching) can be
-  // truthful. Capped; failures degrade silently to a hollow star.
+  // truthful. Capped; failures degrade silently to a hollow star and are NOT
+  // marked fetched, so a later window change retries them (audit MEDIUM-3 fix:
+  // previously targets were marked before the async call, so a failure or a
+  // re-render that cancelled the run left the star permanently hollow).
   useEffect(() => {
     let alive = true;
     const targets = visible.slice(0, DETAIL_FETCH_CAP).filter((a) => !fetched.has(a.assetId));
     if (targets.length === 0) return;
-    setFetched((prev) => {
-      const next = new Set(prev);
-      targets.forEach((a) => next.add(a.assetId));
-      return next;
-    });
     void (async () => {
       const favDelta: Record<string, boolean> = {};
       const tagDelta: Record<string, string[]> = {};
+      const okIds: string[] = [];
       for (const a of targets) {
         try {
           const detail = await v2asset.getAsset(a.assetId);
-          if (alive) {
-            favDelta[a.assetId] = detail.asset.isFavorite;
-            tagDelta[a.assetId] = detail.asset.tags ?? [];
-          }
+          if (!alive) return;
+          favDelta[a.assetId] = detail.asset.isFavorite;
+          tagDelta[a.assetId] = detail.asset.tags ?? [];
+          okIds.push(a.assetId);
         } catch {
-          // Read-only window: an unresolvable detail just keeps a hollow star.
+          // Read-only window: unresolvable detail keeps a hollow star and stays
+          // unfetched so the next window change gives it another chance.
         }
       }
       if (!alive) return;
+      if (okIds.length > 0) setFetched((prev) => {
+        const next = new Set(prev);
+        okIds.forEach((id) => next.add(id));
+        return next;
+      });
       if (Object.keys(favDelta).length > 0) setFavorites((prev) => ({ ...prev, ...favDelta }));
       if (Object.keys(tagDelta).length > 0) setTagMap((prev) => ({ ...prev, ...tagDelta }));
     })();
