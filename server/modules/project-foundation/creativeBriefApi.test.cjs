@@ -59,10 +59,12 @@ function makeHarness(initialProject) {
       if (/^INSERT INTO projects/i.test(s)) {
         const p = params;
         state.project = {
-          id: p[0], workspace_id: p[1], owner_id: p[2], name: p[3], description: p[4],
-          project_type: p[5], status: p[6], cover_asset_id: null,
-          creative_brief: p[7] ? JSON.parse(p[7]) : {},
-          version: 1, archived_at: null,
+          id: p[0], workspace_id: p[1], owner_id: p[2], folder_id: p[3], name: p[4], description: p[5],
+          project_type: p[6], status: p[7], cover_asset_id: null,
+          creative_brief: p[8] ? JSON.parse(p[8]) : {},
+          delivery_spec: p[9] ? JSON.parse(p[9]) : {},
+          schema_version: 1,
+          version: 1, archived_at: null, deleted_at: null, last_opened_at: null,
           created_at: '2026-01-01T00:00:00.000Z', updated_at: '2026-01-01T00:00:00.000Z',
         };
         return { rows: [state.project] };

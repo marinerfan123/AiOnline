@@ -22,7 +22,7 @@ const { validateCreativeBrief, sanitizeCreativeBrief } = require('./creativeBrie
 const { validateDeliverySpec, sanitizeDeliverySpec } = require('./deliverySpec.cjs');
 const { ALLOWED_PROJECT_TYPES } = require('./projectTypeModes.cjs');
 
-const PREFIXES = ['/api/v2/workspaces', '/api/v2/projects'];
+const PREFIXES = ['/api/v2/workspaces', '/api/v2/projects', '/api/v2/folders'];
 
 const PROJECT_TYPES = new Set(ALLOWED_PROJECT_TYPES);
 const PROJECT_STATUSES = new Set(['draft', 'active', 'archived']);
@@ -53,6 +53,7 @@ function sanitizeProjectInput(body) {
   if (body.projectType !== undefined) out.project_type = String(body.projectType || '').trim().toLowerCase();
   if (body.coverAssetId !== undefined) out.cover_asset_id = body.coverAssetId === null ? null : String(body.coverAssetId || '').trim();
   if (body.status !== undefined) out.status = String(body.status || '').trim().toLowerCase();
+  if (body.folderId !== undefined) out.folder_id = body.folderId === null ? null : String(body.folderId || '').trim();
   return out;
 }
 
@@ -169,13 +170,15 @@ function createProjectFoundation(deps) {
     const role = membership.role;
     const isOwner = role === 'owner' || isAdmin(user);
     const archived = project.status === 'archived';
+    const deleted = Boolean(project.deleted_at);
     return {
       role,
       canRead: true,
-      canUpdate: isOwner && !archived,
-      canArchive: isOwner && !archived,
-      canRestore: isOwner && archived,
-      canDelete: false,
+      canUpdate: isOwner && !archived && !deleted,
+      canArchive: isOwner && !archived && !deleted,
+      canRestore: isOwner && (archived || deleted),
+      canRecycle: isOwner && !deleted && !archived,
+      canDelete: isOwner && deleted,
     };
   }
 
@@ -189,10 +192,14 @@ function createProjectFoundation(deps) {
       projectType: row.project_type,
       status: row.status,
       coverAssetId: row.cover_asset_id,
+      folderId: row.folder_id || null,
+      schemaVersion: row.schema_version || 1,
       creative_brief: row.creative_brief,
       delivery_spec: row.delivery_spec,
       version: row.version,
       archivedAt: row.archived_at,
+      deletedAt: row.deleted_at || null,
+      lastOpenedAt: row.last_opened_at || null,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
     };
@@ -313,6 +320,9 @@ function createProjectFoundation(deps) {
     const params = [];
     let idx = 1;
 
+    const recycle = (q.recycle === 'true' || q.recycle === '1');
+    where += recycle ? ` AND p.deleted_at IS NOT NULL` : ` AND p.deleted_at IS NULL`;
+
     if (workspaceId) {
       const m = await requireWorkspaceAccess(res, user, workspaceId);
       if (!m) return;
@@ -322,6 +332,11 @@ function createProjectFoundation(deps) {
       // Restrict to all workspaces the user is a member of.
       where += ` AND p.workspace_id IN (SELECT workspace_id FROM workspace_members WHERE user_id = $${idx++})`;
       params.push(user.id);
+    }
+
+    if (q.folder) {
+      where += ` AND p.folder_id = $${idx++}`;
+      params.push(String(q.folder).trim());
     }
 
     if (status) {
@@ -350,11 +365,12 @@ function createProjectFoundation(deps) {
 
     const dataR = await pg.query(
       `SELECT p.id, p.workspace_id, p.owner_id, p.name, p.description,
-              p.project_type, p.status, p.cover_asset_id, p.creative_brief, p.delivery_spec, p.version,
-              p.archived_at, p.created_at, p.updated_at
+              p.project_type, p.status, p.cover_asset_id, p.folder_id,
+              p.schema_version, p.creative_brief, p.delivery_spec, p.version,
+              p.archived_at, p.deleted_at, p.last_opened_at, p.created_at, p.updated_at
        FROM projects p
        WHERE ${where}
-       ORDER BY p.updated_at DESC
+       ORDER BY ${q.sort === 'recent' ? 'COALESCE(p.last_opened_at, p.updated_at) DESC NULLS LAST' : 'p.updated_at DESC'}
        LIMIT $${idx++} OFFSET $${idx++}`,
       [...params, limit, offset],
     );
@@ -385,6 +401,16 @@ function createProjectFoundation(deps) {
     const m = await requireWorkspaceAccess(res, user, workspaceId);
     if (!m) return;
 
+    let folderId = null;
+    if (body.folderId || body.folder_id) {
+      folderId = String(body.folderId || body.folder_id).trim();
+      const f = await pg.query(
+        `SELECT id FROM workspace_folders WHERE id = $1 AND workspace_id = $2 AND deleted_at IS NULL`,
+        [folderId, workspaceId],
+      );
+      if (!f.rows.length) return sendJSON(res, 400, { ok: false, error: '文件夹不存在或不属于该工作空间' });
+    }
+
     const projectId = `proj-${crypto.randomUUID()}`;
     const status = body.status && PROJECT_STATUSES.has(String(body.status).trim().toLowerCase())
       ? String(body.status).trim().toLowerCase()
@@ -406,11 +432,11 @@ function createProjectFoundation(deps) {
     }
 
     const r = await pg.query(
-      `INSERT INTO projects (id, workspace_id, owner_id, name, description, project_type, status,
-                            cover_asset_id, creative_brief, delivery_spec, version, archived_at, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, $8, $9, 1, NULL, NOW(), NOW())
+      `INSERT INTO projects (id, workspace_id, owner_id, folder_id, name, description, project_type, status,
+                            cover_asset_id, creative_brief, delivery_spec, version, schema_version, archived_at, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, $9, $10, 1, 1, NULL, NOW(), NOW())
        RETURNING *`,
-      [projectId, workspaceId, user.id, name, description, projectType, status, JSON.stringify(brief), JSON.stringify(deliverySpec)],
+      [projectId, workspaceId, user.id, folderId, name, description, projectType, status, JSON.stringify(brief), JSON.stringify(deliverySpec)],
     );
     const project = r.rows[0];
 
@@ -463,7 +489,14 @@ function createProjectFoundation(deps) {
       updates.delivery_spec = JSON.stringify(sanitizeDeliverySpec(dsRaw || {}, { version: (project.delivery_spec && project.delivery_spec.version) || 1 }));
     }
 
-    const allowed = ['name', 'description', 'project_type', 'cover_asset_id', 'creative_brief', 'delivery_spec'];
+    const allowed = ['name', 'description', 'project_type', 'cover_asset_id', 'creative_brief', 'delivery_spec', 'folder_id'];
+    if (updates.folder_id !== undefined && updates.folder_id !== null) {
+      const f = await pg.query(
+        `SELECT id FROM workspace_folders WHERE id = $1 AND workspace_id = $2 AND deleted_at IS NULL`,
+        [updates.folder_id, project.workspace_id],
+      );
+      if (!f.rows.length) return sendJSON(res, 400, { ok: false, error: '目标文件夹不存在或不属于该项目工作空间' });
+    }
     const setFields = [];
     const values = [];
     let idx = 1;
@@ -548,6 +581,222 @@ function createProjectFoundation(deps) {
     });
   }
 
+  // ── G01: recycle bin (soft delete) / restore-from-recycle ─────────────
+  async function recycleProject(req, res, user, projectId) {
+    const access = await requireProjectAccess(res, user, projectId);
+    if (!access) return;
+    const { project, membership } = access;
+    const perms = projectPermissions(project, membership, user);
+    if (!perms.canRecycle) return sendJSON(res, 403, { ok: false, error: '无权删除该项目' });
+    if (project.deleted_at) return sendJSON(res, 409, { ok: false, error: '项目已在回收站' });
+
+    const r = await pg.query(
+      `UPDATE projects SET deleted_at = NOW(), updated_at = NOW(), version = version + 1
+       WHERE id = $1 RETURNING *`,
+      [projectId],
+    );
+    const updated = r.rows[0];
+    await audit(user.id, 'project.recycled', updated.id, { workspace_id: updated.workspace_id });
+    await emitProjectEvent(pg, 'project.recycled', updated, user.id, req);
+    return sendJSON(res, 200, { project: projectSummary(updated) });
+  }
+
+  async function restoreProjectFromRecycle(req, res, user, projectId) {
+    const access = await requireProjectAccess(res, user, projectId);
+    if (!access) return;
+    const { project, membership } = access;
+    const perms = projectPermissions(project, membership, user);
+    if (!perms.canRestore) return sendJSON(res, 403, { ok: false, error: '无权恢复该项目' });
+    if (!project.deleted_at) {
+      // Existing semantics: restore from archive.
+      return restoreProject(req, res, user, projectId);
+    }
+    const r = await pg.query(
+      `UPDATE projects SET deleted_at = NULL, updated_at = NOW(), version = version + 1
+       WHERE id = $1 RETURNING *`,
+      [projectId],
+    );
+    const updated = r.rows[0];
+    await audit(user.id, 'project.restored', updated.id, { workspace_id: updated.workspace_id });
+    await emitProjectEvent(pg, 'project.restored', updated, user.id, req);
+    return sendJSON(res, 200, { project: projectSummary(updated) });
+  }
+
+  // DELETE /api/v2/projects/:id  (permanent — high-risk confirm required)
+  async function permanentlyDeleteProject(req, res, user, projectId) {
+    const access = await requireProjectAccess(res, user, projectId);
+    if (!access) return;
+    const { project, membership } = access;
+    const perms = projectPermissions(project, membership, user);
+    if (!perms.canDelete) return sendJSON(res, 403, { ok: false, error: '仅回收站中的项目可永久删除' });
+    const body = (await parseBody(req)) || {};
+    if (body.confirm !== true) return sendJSON(res, 400, { ok: false, error: '永久删除需 confirm:true（高风险操作）' });
+
+    await pg.query(`DELETE FROM projects WHERE id = $1`, [projectId]);
+    await audit(user.id, 'project.permanently_deleted', projectId, { workspace_id: project.workspace_id });
+    return sendJSON(res, 200, { ok: true });
+  }
+
+  // POST /api/v2/projects/:id/open — record recency (Project Manager "最近打开")
+  async function openProject(req, res, user, projectId) {
+    const access = await requireProjectAccess(res, user, projectId);
+    if (!access) return;
+    await pg.query(`UPDATE projects SET last_opened_at = NOW() WHERE id = $1`, [projectId]);
+    return sendJSON(res, 200, { ok: true });
+  }
+
+  // POST /api/v2/projects/:id/copy — duplicate project + primary canvas subgraph
+  async function copyProject(req, res, user, projectId) {
+    const access = await requireProjectAccess(res, user, projectId);
+    if (!access) return;
+    const { project, membership } = access;
+    if (!projectPermissions(project, membership, user).canRead) {
+      return sendJSON(res, 403, { ok: false, error: '无权限' });
+    }
+    const body = (await parseBody(req)) || {};
+    const suffix = (body.name && String(body.name).trim()) || `${project.name} Copy`;
+    const newId = `proj-${crypto.randomUUID()}`;
+    const client = await pg.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        `INSERT INTO projects (id, workspace_id, owner_id, folder_id, name, description, project_type, status,
+                               cover_asset_id, creative_brief, delivery_spec, version, schema_version, archived_at, deleted_at, created_at, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,'active',$8,$9,$10,1,$11,NULL,NULL,NOW(),NOW())`,
+        [newId, project.workspace_id, user.id, project.folder_id, suffix, project.description,
+         project.project_type, project.cover_asset_id,
+         JSON.stringify(project.creative_brief || {}), JSON.stringify(project.delivery_spec || {}),
+         project.schema_version || 1],
+      );
+      const c = await client.query(
+        `SELECT id FROM studio_canvases WHERE project_id = $1 AND archived_at IS NULL ORDER BY is_primary DESC, created_at ASC LIMIT 1`,
+        [projectId],
+      );
+      if (c.rows.length) {
+        const newCanvas = `canvas-${crypto.randomUUID()}`;
+        const srcCanvas = c.rows[0].id;
+        await client.query(
+          `INSERT INTO studio_canvases (id, project_id, workspace_id, name, revision, schema_version, viewport_json, is_primary, created_by, updated_by)
+           VALUES ($1,$2,$3,$4,1,1,(SELECT viewport_json FROM studio_canvases WHERE id=$5),TRUE,$6,$6)`,
+          [newCanvas, newId, project.workspace_id, 'Primary Canvas', srcCanvas, user.id],
+        );
+        await client.query(
+          `INSERT INTO studio_canvas_nodes (id, canvas_id, node_id, node_type, node_schema_version, position_x, position_y, width, height, z_index, data_json, created_at, updated_at)
+           SELECT 'scn-' || gen_random_uuid()::text, $1, node_id, node_type, node_schema_version, position_x, position_y, width, height, z_index, data_json, NOW(), NOW()
+           FROM studio_canvas_nodes WHERE canvas_id = $2`,
+          [newCanvas, srcCanvas],
+        );
+        await client.query(
+          `INSERT INTO studio_canvas_edges (id, canvas_id, edge_id, source_node_id, source_handle, target_node_id, target_handle, edge_type, data_json, created_at, updated_at)
+           SELECT 'sce-' || gen_random_uuid()::text, $1, edge_id, source_node_id, source_handle, target_node_id, target_handle, edge_type, data_json, NOW(), NOW()
+           FROM studio_canvas_edges WHERE canvas_id = $2`,
+          [newCanvas, srcCanvas],
+        );
+      }
+      await client.query('COMMIT');
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw e;
+    } finally {
+      client.release();
+    }
+    await audit(user.id, 'project.copied', newId, { source_project_id: projectId });
+    const row = await pg.query(`SELECT * FROM projects WHERE id = $1`, [newId]);
+    return sendJSON(res, 201, { project: projectSummary(row.rows[0]) });
+  }
+
+  // ── G01: workspace folders ────────────────────────────────────────────
+  async function listFolders(req, res, user, workspaceId) {
+    const m = await requireWorkspaceAccess(res, user, workspaceId);
+    if (!m) return;
+    const r = await pg.query(
+      `SELECT id, workspace_id, parent_id, name, created_at, updated_at
+       FROM workspace_folders WHERE workspace_id = $1 AND deleted_at IS NULL
+       ORDER BY name ASC`,
+      [workspaceId],
+    );
+    return sendJSON(res, 200, { folders: r.rows.map(toCamel) });
+  }
+
+  async function createFolder(req, res, user, workspaceId) {
+    const m = await requireWorkspaceAccess(res, user, workspaceId);
+    if (!m) return;
+    const body = (await parseBody(req)) || {};
+    const name = String(body.name || '').trim();
+    if (!name || name.length > 120) return sendJSON(res, 400, { ok: false, error: '文件夹名称必填且不能超过120字符' });
+    const parentId = body.parentId ? String(body.parentId).trim() : null;
+    if (parentId) {
+      const p = await pg.query(`SELECT id FROM workspace_folders WHERE id=$1 AND workspace_id=$2 AND deleted_at IS NULL`, [parentId, workspaceId]);
+      if (!p.rows.length) return sendJSON(res, 400, { ok: false, error: '父文件夹不存在或不属于该工作空间' });
+    }
+    const id = `folder-${crypto.randomUUID()}`;
+    const r = await pg.query(
+      `INSERT INTO workspace_folders (id, workspace_id, parent_id, name, created_by) VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+      [id, workspaceId, parentId, name, user.id],
+    );
+    return sendJSON(res, 201, { folder: toCamel(r.rows[0]) });
+  }
+
+  async function updateFolder(req, res, user, folderId) {
+    const f = await pg.query(
+      `SELECT f.*, w.owner_id AS workspace_owner_id FROM workspace_folders f
+       JOIN workspaces w ON w.id = f.workspace_id WHERE f.id = $1`,
+      [folderId],
+    );
+    if (!f.rows.length) return sendJSON(res, 404, { ok: false, error: '文件夹不存在' });
+    if (!isAdmin(user)) {
+      const me = await getMembership(user.id, f.rows[0].workspace_id);
+      if (!me || me.role !== 'owner') return sendJSON(res, 403, { ok: false, error: '无权编辑该文件夹' });
+    }
+    const body = (await parseBody(req)) || {};
+    const sets = [];
+    const vals = [];
+    let idx = 1;
+    if (body.name !== undefined) {
+      const name = String(body.name || '').trim();
+      if (!name) return sendJSON(res, 400, { ok: false, error: '名称不能为空' });
+      sets.push(`name = $${idx++}`); vals.push(name);
+    }
+    if (body.parentId !== undefined && body.parentId !== null) {
+      const pid = String(body.parentId).trim();
+      if (pid === folderId) return sendJSON(res, 400, { ok: false, error: '文件夹不能作为自己的父级' });
+      sets.push(`parent_id = $${idx++}`); vals.push(pid);
+    }
+    if (body.parentId === null) { sets.push(`parent_id = NULL`); }
+    if (!sets.length) return sendJSON(res, 200, { folder: toCamel(f.rows[0]) });
+    vals.push(folderId);
+    const r = await pg.query(`UPDATE workspace_folders SET ${sets.join(', ')}, updated_at = NOW() WHERE id = $${idx} RETURNING *`, vals);
+    return sendJSON(res, 200, { folder: toCamel(r.rows[0]) });
+  }
+
+  // DELETE /api/v2/folders/:id — soft delete (projects keep folder_id but hidden);
+  // ?permanent=true&confirm=true removes the row (children must be moved/deleted first).
+  async function deleteFolder(req, res, user, folderId) {
+    const f = await pg.query(
+      `SELECT f.*, w.owner_id AS workspace_owner_id FROM workspace_folders f
+       JOIN workspaces w ON w.id = f.workspace_id WHERE f.id = $1`,
+      [folderId],
+    );
+    if (!f.rows.length) return sendJSON(res, 404, { ok: false, error: '文件夹不存在' });
+    if (!isAdmin(user)) {
+      const me = await getMembership(user.id, f.rows[0].workspace_id);
+      if (!me || me.role !== 'owner') return sendJSON(res, 403, { ok: false, error: '无权删除该文件夹' });
+    }
+    const q = req.query || {};
+    if (q.permanent === 'true') {
+      if (q.confirm !== 'true') return sendJSON(res, 400, { ok: false, error: '永久删除需 confirm=true（高风险操作）' });
+      const child = await pg.query(`SELECT 1 FROM workspace_folders WHERE parent_id=$1 AND deleted_at IS NULL LIMIT 1`, [folderId]);
+      const used = await pg.query(`SELECT 1 FROM projects WHERE folder_id=$1 AND deleted_at IS NULL LIMIT 1`, [folderId]);
+      if (child.rows.length || used.rows.length) {
+        return sendJSON(res, 409, { ok: false, error: '文件夹非空：请先移动/删除子文件夹与项目' });
+      }
+      await pg.query(`DELETE FROM workspace_folders WHERE id=$1`, [folderId]);
+      return sendJSON(res, 200, { ok: true });
+    }
+    await pg.query(`UPDATE workspace_folders SET deleted_at = NOW(), updated_at = NOW() WHERE id=$1`, [folderId]);
+    return sendJSON(res, 200, { ok: true });
+  }
+
   async function handle(req, res, urlPath, method) {
     const prefix = PREFIXES.find((p) => urlPath === p || urlPath.startsWith(`${p}/`));
     if (!prefix) return false;
@@ -560,6 +809,22 @@ function createProjectFoundation(deps) {
       if (prefix === '/api/v2/workspaces') {
         if (urlPath === '/api/v2/workspaces' && method === 'GET') {
           return await listWorkspaces(req, res, user);
+        }
+        const foldersMatch = urlPath.match(/^\/api\/v2\/workspaces\/([^/]+)\/folders$/);
+        if (foldersMatch) {
+          const wsId = decodeURIComponent(foldersMatch[1]);
+          if (method === 'GET') return await listFolders(req, res, user, wsId);
+          if (method === 'POST') return await createFolder(req, res, user, wsId);
+        }
+        return sendJSON(res, 404, { ok: false, error: 'Not Found' });
+      }
+
+      if (prefix === '/api/v2/folders') {
+        const fm = urlPath.match(/^\/api\/v2\/folders\/([^/]+)$/);
+        if (fm) {
+          const folderId = decodeURIComponent(fm[1]);
+          if (method === 'PATCH') return await updateFolder(req, res, user, folderId);
+          if (method === 'DELETE') return await deleteFolder(req, res, user, folderId);
         }
         return sendJSON(res, 404, { ok: false, error: 'Not Found' });
       }
@@ -577,6 +842,22 @@ function createProjectFoundation(deps) {
         const projectId = decodeURIComponent(detailMatch[1]);
         if (method === 'GET') return await getProject(req, res, user, projectId);
         if (method === 'PATCH') return await updateProject(req, res, user, projectId);
+        if (method === 'DELETE') return await permanentlyDeleteProject(req, res, user, projectId);
+      }
+
+      const recycleMatch = urlPath.match(/^\/api\/v2\/projects\/([^/]+)\/recycle$/);
+      if (recycleMatch && method === 'POST') {
+        return await recycleProject(req, res, user, decodeURIComponent(recycleMatch[1]));
+      }
+
+      const openMatch = urlPath.match(/^\/api\/v2\/projects\/([^/]+)\/open$/);
+      if (openMatch && method === 'POST') {
+        return await openProject(req, res, user, decodeURIComponent(openMatch[1]));
+      }
+
+      const copyMatch = urlPath.match(/^\/api\/v2\/projects\/([^/]+)\/copy$/);
+      if (copyMatch && method === 'POST') {
+        return await copyProject(req, res, user, decodeURIComponent(copyMatch[1]));
       }
 
       const archiveMatch = urlPath.match(/^\/api\/v2\/projects\/([^/]+)\/archive$/);
@@ -586,7 +867,7 @@ function createProjectFoundation(deps) {
 
       const restoreMatch = urlPath.match(/^\/api\/v2\/projects\/([^/]+)\/restore$/);
       if (restoreMatch && method === 'POST') {
-        return await restoreProject(req, res, user, decodeURIComponent(restoreMatch[1]));
+        return await restoreProjectFromRecycle(req, res, user, decodeURIComponent(restoreMatch[1]));
       }
 
       const deliverySpecMatch = urlPath.match(/^\/api\/v2\/projects\/([^/]+)\/delivery-spec$/);
