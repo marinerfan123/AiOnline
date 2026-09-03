@@ -36,7 +36,7 @@ async function newWorkspaceProject(baseUrl, user) {
 }
 
 test('M05-D1 Studio Run API: create/list/detail/cancel over HTTP', { concurrency: 1 }, async (t) => {
-  let server, pg, dbName, user, project, canvasId;
+  let server, pg, dbName, user, project, canvasId, workspace;
   let base;
 
   t.before(async () => {
