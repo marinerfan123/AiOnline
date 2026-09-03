@@ -57,6 +57,7 @@ import mediaWorkerMod from './modules/media/mediaWorker.cjs';
 import mediaExecMod from './modules/media/executors.cjs';
 import bibleApiMod from './modules/project-foundation/bibleApi.cjs';
 import scriptApiMod from './modules/script/scriptApi.cjs';
+import continuityApiMod from './modules/project-foundation/continuityApi.cjs';
 import studioCanvasPersistenceMod from './modules/project-foundation/studioCanvasPersistence.cjs';
 import studioEpisodeApiMod from './modules/project-foundation/studioEpisodeApi.cjs';
 import studioShotApiMod from './modules/project-foundation/studioShotApi.cjs';
@@ -1532,6 +1533,19 @@ const scriptApi = scriptApiMod.createScriptApi({
   parseBody,
 });
 
+// G14 — Continuity snapshots (/api/v2/bible/continuity/:shotId): wire the
+// continuityStore (0038) into the role-gated v2 API (viewer read-only).
+const continuityApi = continuityApiMod.createContinuityApi({
+  pg: {
+    query: (sql, params) => pgPool
+      ? pgPool.query(sql, params)
+      : Promise.reject(Object.assign(new Error('数据库未就绪'), { status: 503 })),
+  },
+  sessionUser: (req) => session.getUserFromCookie(req),
+  sendJSON,
+  parseBody,
+});
+
 // G06 — General asset upload (/api/v2/uploads + finalize). Signed PUT adapter:
 // active storage config (Aliyun→Tencent), else null → 503.
 // ossMod.loadOssConfigs returns { enabled, activeId, list } — resolve the
@@ -2610,6 +2624,11 @@ async function handleAPI(req, res) {
   // ── G18 Project timeline（/api/v2/timelines）──
   if (url.startsWith('/api/v2/timelines')) {
     if (await timelineApi.handle(req, res, url.split('?')[0], method)) return;
+  }
+
+  // ── G14 Continuity snapshots（/api/v2/bible/continuity/:shotId）──
+  if (url.startsWith('/api/v2/bible/continuity')) {
+    if (await continuityApi.handle(req, res, url.split('?')[0], method)) return;
   }
 
   // ── G14 Production Bible（/api/v2/bible/characters|environments|references）──
