@@ -103,7 +103,7 @@ function createTimelineApi({ pg, sessionUser, sendJSON, parseBody }) {
         `SELECT c.id, c.shot_id, c.asset_version_id, c.order_index, c.start_ms, c.duration_ms,
                 COALESCE(av.mime_type, '') AS mime_type
            FROM timeline_clips c
-           LEFT JOIN asset_versions av ON av.id = c.asset_version_id
+           LEFT JOIN asset_versions av ON av.version_id = c.asset_version_id
           WHERE c.track_id = $1 ORDER BY c.order_index, c.start_ms`,
         [trackId],
       );
@@ -120,6 +120,12 @@ function createTimelineApi({ pg, sessionUser, sendJSON, parseBody }) {
       validateTiming(body.startMs, 'startMs', errors);
       if (errors.length) { sendJSON(res, 400, { ok: false, errors }); return true; }
       const trackId = await ensureVideoTrack(timelineId);
+      // Audit fix (G18 H3): assetVersionId must exist AND belong to this project —
+      // never bind a clip to a forged/foreign version id.
+      if (body.assetVersionId) {
+        const v = await pg.query(`SELECT 1 FROM asset_versions WHERE version_id = $1 AND project_id = $2`, [body.assetVersionId, projectId]);
+        if (!v.rows.length) return sendJSON(res, 422, { ok: false, error: 'assetVersionId 不存在或不属于该项目' });
+      }
       const max = await pg.query(`SELECT COALESCE(MAX(order_index), -1) AS m FROM timeline_clips WHERE track_id = $1`, [trackId]);
       const id = rid('cl');
       await pg.query(
@@ -132,10 +138,15 @@ function createTimelineApi({ pg, sessionUser, sendJSON, parseBody }) {
     }
 
     // ── clip remove (immutable source untouched) ──
+    // Audit fix (G18 H2): scope by track of the CURRENT timeline — a foreign
+    // clip id must not be deletable through this project's timeline.
     if (method === 'DELETE' && timelineId && sub === 'clips') {
       if (!tail) { sendJSON(res, 400, { ok: false, error: 'clipId 必填' }); return true; }
-      const r = await pg.query(`DELETE FROM timeline_clips WHERE id = $1`, [tail]);
-      return sendJSON(res, r.rowCount ? 200 : 404, { ok: r.rowCount ? true : false, error: r.rowCount ? undefined : 'clip 不存在' });
+      const r = await pg.query(
+        `DELETE FROM timeline_clips WHERE id = $1 AND track_id IN (SELECT id FROM timeline_tracks WHERE timeline_id = $2)`,
+        [tail, timelineId],
+      );
+      return sendJSON(res, r.rowCount ? 200 : 404, { ok: r.rowCount ? true : false, error: r.rowCount ? undefined : 'clip 不存在或不属于该时间线' });
     }
 
     // ── clip reorder (replace order_index list, reindex 0..n) ──
@@ -149,11 +160,19 @@ function createTimelineApi({ pg, sessionUser, sendJSON, parseBody }) {
         client = typeof pg.connect === 'function' ? await pg.connect() : null;
         const q = client || pg;
         if (client) await client.query('BEGIN');
+        let updated = 0;
         for (let i = 0; i < order.length; i++) {
-          await q.query(
+          const u = await q.query(
             `UPDATE timeline_clips SET order_index = $1, updated_at = NOW() WHERE id = $2 AND track_id = $3`,
             [i, order[i], trackId],
           );
+          updated += (u && u.rowCount) || 0;
+        }
+        if (updated < order.length) {
+          // Audit fix (G18 M1): never report a fake success — some clip ids were
+          // not on this track.
+          if (client) await client.query('ROLLBACK').catch(() => {});
+          return sendJSON(res, 409, { ok: false, error: `部分 clip 不属于该时间线 (${order.length - updated} 个未找到)` });
         }
         if (client) await client.query('COMMIT');
         return sendJSON(res, 200, { ok: true, reordered: order.length });

@@ -15,6 +15,7 @@ function makeHarness({ timelineExists = true, memberFor = ['p-1'] } = {}) {
         return { rows: [] };
       }
       if (/DELETE FROM timeline_clips/.test(sql)) { state.deleted++; return { rowCount: 1 }; }
+      if (sql.includes('FROM asset_versions WHERE version_id')) return { rows: [{ ok: 1 }] };
       if (/FROM project_timeline t JOIN projects/.test(sql)) {
         if (!timelineExists) return { rows: [] };
         if (!state.timelines.length) state.timelines.push({ id: 'tl-1', project_id: 'p-1', workspace_id: 'w-1', name: 'T' });
@@ -37,7 +38,7 @@ function makeHarness({ timelineExists = true, memberFor = ['p-1'] } = {}) {
       if (/COALESCE\(MAX\(order_index\)/.test(sql)) { return { rows: [{ m: state.clips.length - 1 }] }; }
       if (/LEFT JOIN asset_versions/.test(sql)) { return { rows: [...state.clips].sort((a, b) => a.order_index - b.order_index) }; }
       if (/FROM project_timeline WHERE project_id/.test(sql)) { return { rows: state.timelines }; }
-      if (/UPDATE timeline_clips SET order_index/.test(sql)) { const c = state.clips.find((x) => x.id === params[1]); if (c) c.order_index = params[0]; return { rows: [] }; }
+      if (/UPDATE timeline_clips SET order_index/.test(sql)) { const c = state.clips.find((x) => x.id === params[1]); if (c) c.order_index = params[0]; return { rows: [], rowCount: 1 }; }
       return { rows: [] };
     },
   };
@@ -144,4 +145,38 @@ test('G18: viewer role cannot write (403) — audit M1 fix', async () => {
   const api = createTimelineApi({ pg, sessionUser: () => ({ id: 'u-1' }), sendJSON: (res, code, body) => responses.push({ code, body }), parseBody: async () => ({ name: 'T' }) });
   await api.handle({ _body: {}, params: { projectId: 'p-1' } }, {}, '/api/v2/timelines', 'POST');
   assert.equal(responses[0].code, 403);
+});
+
+test('G18: append with foreign/nonexistent assetVersionId → 422 (audit H3 fix)', async () => {
+  const responses = [];
+  const pg = {
+    async query(sql, params) {
+      if (/FROM projects p JOIN workspaces/.test(sql)) return { rows: [{ id: 'p-1', workspace_id: 'w-1', name: 'P' }] };
+      if (/FROM workspace_members/.test(sql)) return { rows: [{ role: 'editor' }] };
+      if (/FROM project_timeline t JOIN projects/.test(sql)) return { rows: [{ id: 'tl-1', project_id: 'p-1' }] };
+      if (/SELECT id FROM timeline_tracks/.test(sql)) return { rows: [{ id: 'tr-1' }] };
+      return { rows: [] }; // asset_versions lookup → no row → 422
+    },
+  };
+  const api = createTimelineApi({ pg, sessionUser: () => ({ id: 'u-1' }), sendJSON: (res, code, body) => { responses.push({ code, body }); res.status = code; res.body = body; }, parseBody: async () => ({ assetVersionId: 'av-foreign', durationMs: 1000 }) });
+  const res = {};
+  await api.handle({ _body: {}, params: { projectId: 'p-1' } }, res, '/api/v2/timelines/tl-1/clips', 'POST');
+  assert.equal(responses[0].code, 422);
+});
+
+test('G18: DELETE clip of another timeline → 404 (audit H2 fix)', async () => {
+  const responses = [];
+  const pg = {
+    async query(sql, params) {
+      if (/FROM projects p JOIN workspaces/.test(sql)) return { rows: [{ id: 'p-1', workspace_id: 'w-1', name: 'P' }] };
+      if (/FROM workspace_members/.test(sql)) return { rows: [{ role: 'editor' }] };
+      if (/FROM project_timeline t JOIN projects/.test(sql)) return { rows: [{ id: 'tl-1', project_id: 'p-1' }] };
+      if (/DELETE FROM timeline_clips/.test(sql)) return { rows: [], rowCount: 0 }; // not on this timeline's tracks
+      return { rows: [] };
+    },
+  };
+  const api = createTimelineApi({ pg, sessionUser: () => ({ id: 'u-1' }), sendJSON: (res, code, body) => { responses.push({ code, body }); res.status = code; res.body = body; }, parseBody: async () => ({}) });
+  const res = {};
+  await api.handle({ _body: {}, params: { projectId: 'p-1' } }, res, '/api/v2/timelines/tl-1/clips/cl-foreign', 'DELETE');
+  assert.equal(responses[0].code, 404);
 });
