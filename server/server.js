@@ -52,6 +52,7 @@ import projectFoundationMod from './modules/project-foundation/projectFoundation
 import assetFoundationMod from './modules/project-foundation/assetFoundation.cjs';
 import studioModelsApiMod from './modules/modelhub/studioModelsApi.cjs';
 import uploadApiMod from './modules/media/uploadApi.cjs';
+import timelineApiMod from './modules/media/timelineApi.cjs';
 import studioCanvasPersistenceMod from './modules/project-foundation/studioCanvasPersistence.cjs';
 import studioEpisodeApiMod from './modules/project-foundation/studioEpisodeApi.cjs';
 import studioShotApiMod from './modules/project-foundation/studioShotApi.cjs';
@@ -1488,6 +1489,19 @@ const studioModelsApi = studioModelsApiMod.createStudioModelsApi({
   sendJSON,
 });
 
+// G18 — Project timeline (/api/v2/timelines): ordered shot/asset-version clips,
+// integer-ms timing, immutable source (clips bind asset VERSION ids).
+const timelineApi = timelineApiMod.createTimelineApi({
+  pg: {
+    query: (sql, params) => pgPool
+      ? pgPool.query(sql, params)
+      : Promise.reject(Object.assign(new Error('数据库未就绪'), { status: 503 })),
+  },
+  sessionUser: (req) => session.getUserFromCookie(req),
+  sendJSON,
+  parseBody,
+});
+
 // G06 — General asset upload (/api/v2/uploads + finalize). Signed PUT adapter:
 // first enabled storage config (Aliyun→Tencent fallback), else 503.
 const uploadApi = uploadApiMod.createUploadApi({
@@ -2541,6 +2555,11 @@ async function handleAPI(req, res) {
   // ── G06 General asset upload（/api/v2/uploads）──
   if (url.startsWith('/api/v2/uploads')) {
     if (await uploadApi.handle(req, res, url.split('?')[0], method)) return;
+  }
+
+  // ── G18 Project timeline（/api/v2/timelines）──
+  if (url.startsWith('/api/v2/timelines')) {
+    if (await timelineApi.handle(req, res, url.split('?')[0], method)) return;
   }
 
   // ── M01-S Project / Workspace Foundation（/api/v2/workspaces, /api/v2/projects）──
