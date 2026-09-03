@@ -12,6 +12,7 @@ import { ProjectShell } from '@/features/project-foundation/ProjectShell';
 import { useProjectContext } from '@/features/project-foundation/ProjectContext';
 import { studioCanvasActions } from './store';
 import { StudioCanvas } from './StudioCanvas';
+import { StudioComposer } from './StudioComposer';
 import { NodeLibrary } from './NodeLibrary';
 import { Inspector } from './Inspector';
 import { BottomDock } from './BottomDock';
@@ -41,6 +42,7 @@ function StudioLayout() {
         <NodeLibrary onAdd={addFromLibrary} />
         <div className="relative min-w-0 flex-1">
           <StudioCanvas />
+          <StudioComposer />
           {persistence.status === 'Conflict' && (
             <div data-test="studio-conflict-panel" className="absolute right-3 top-3 z-50 max-w-xs rounded-lg border border-red-500/40 bg-ml2-surface-1/95 p-3 text-xs text-red-300 shadow-xl">
               <p className="font-semibold">Server has newer revision</p>
