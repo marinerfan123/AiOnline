@@ -34,7 +34,7 @@ function makeHarness() {
       queries.push({ sql, params });
       // authz reads
       if (sql.includes('workspace_members')) {
-        return { rows: [{ workspace_id: 'ws-1', user_id: user.id, role: 'owner' }] };
+        return { rows: [{ workspace_id: 'ws-1', user_id: user.id, role: user.role }] };
       }
       if (sql.includes('FROM projects p') && sql.includes('JOIN workspaces')) {
         return { rows: state.project ? [{ ...state.project, workspace_owner_id: 'u-1' }] : [] };
@@ -65,6 +65,9 @@ function makeHarness() {
         if (sql.includes('last_opened_at = NOW()')) upd.last_opened_at = '2026-09-03T00:00:00.000Z';
         if (sql.includes('WHERE id = $1 RETURNING *') && sql.includes('UPDATE workspace_folders')) return { rows: [state.folder] };
         return { rows: [upd] };
+      }
+      if (sql.includes('SELECT parent_id FROM workspace_folders')) {
+        return { rows: params[0] === 'folder-sub' ? [{ parent_id: 'folder-1' }] : [] };
       }
       if (sql.startsWith('INSERT INTO workspace_folders')) {
         state.folder = { id: 'folder-1', workspace_id: 'ws-1', parent_id: null, name: 'F1', created_at: '2026-01-01T00:00:00.000Z', updated_at: '2026-01-01T00:00:00.000Z' };
@@ -99,7 +102,7 @@ function makeHarness() {
   };
 
   const { handle } = createProjectFoundation({ pg, sessionUser: () => user, sendJSON, parseBody });
-  return { handle, responses, queries, state };
+  return { handle, responses, queries, state, user, pg };
 }
 
 const ADMIN = { id: 'admin', role: 'admin', email: 'a@x.com' };
@@ -204,5 +207,33 @@ test('G01 folder create rejects folder not in workspace', async () => {
   const h = makeHarness();
   h.state.folder = null; // folder ownership check returns empty → 400
   await h.handle({ _body: { workspaceId: 'ws-1', name: 'X', folderId: 'other' } }, {}, '/api/v2/projects', 'POST');
+  assert.equal(h.responses[0].code, 400);
+});
+
+test('G01 audit H1: viewer cannot create project (403)', async () => {
+  const h = makeHarness();
+  h.user.role = 'viewer';
+  await h.handle({ _body: { workspaceId: 'ws-1', name: 'X' } }, {}, '/api/v2/projects', 'POST');
+  assert.equal(h.responses[0].code, 403);
+});
+
+test('G01 audit H1: viewer cannot create folder (403)', async () => {
+  const h = makeHarness();
+  h.user.role = 'viewer';
+  await h.handle({ _body: { name: 'F' } }, {}, '/api/v2/workspaces/ws-1/folders', 'POST');
+  assert.equal(h.responses[0].code, 403);
+});
+
+test('G01 audit H2: folder move to missing/cross-workspace parent → 400', async () => {
+  const h = makeHarness();
+  h.state.folder = { id: 'folder-1', workspace_id: 'ws-1', parent_id: null, name: 'F1', created_at: '2026-01-01T00:00:00.000Z', updated_at: '2026-01-01T00:00:00.000Z' };
+  await h.handle({ _body: { parentId: 'missing' } }, {}, '/api/v2/folders/folder-1', 'PATCH');
+  assert.equal(h.responses[0].code, 400);
+});
+
+test('G01 audit H2: folder move into own descendant → 400 (cycle)', async () => {
+  const h = makeHarness();
+  h.state.folder = { id: 'folder-1', workspace_id: 'ws-1', parent_id: null, name: 'F1', created_at: '2026-01-01T00:00:00.000Z', updated_at: '2026-01-01T00:00:00.000Z' };
+  await h.handle({ _body: { parentId: 'folder-sub' } }, {}, '/api/v2/folders/folder-1', 'PATCH');
   assert.equal(h.responses[0].code, 400);
 });

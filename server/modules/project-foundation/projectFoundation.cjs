@@ -144,6 +144,19 @@ function createProjectFoundation(deps) {
     return m;
   }
 
+  // G01 audit H1 fix (2026-09-04): creation is a workspace mutation and must
+  // sit behind the same owner gate as update/delete — a read-only member must
+  // not be able to create projects or folders.
+  async function requireWorkspaceOwner(res, user, workspaceId) {
+    if (isAdmin(user)) return { workspace_id: workspaceId, user_id: user.id, role: 'owner' };
+    const m = await getMembership(user.id, workspaceId);
+    if (!m || m.role !== 'owner') {
+      sendJSON(res, 403, { ok: false, error: '仅工作空间 owner 可执行此操作' });
+      return null;
+    }
+    return m;
+  }
+
   async function requireProjectAccess(res, user, projectId) {
     const r = await pg.query(
       `SELECT p.*, w.owner_id AS workspace_owner_id
@@ -398,7 +411,7 @@ function createProjectFoundation(deps) {
     if (!name || name.length > 200) return sendJSON(res, 400, { ok: false, error: '项目名称必填且不能超过200字符' });
     if (!PROJECT_TYPES.has(projectType)) return sendJSON(res, 400, { ok: false, error: '无效的项目类型' });
 
-    const m = await requireWorkspaceAccess(res, user, workspaceId);
+    const m = await requireWorkspaceOwner(res, user, workspaceId);
     if (!m) return;
 
     let folderId = null;
@@ -719,7 +732,7 @@ function createProjectFoundation(deps) {
   }
 
   async function createFolder(req, res, user, workspaceId) {
-    const m = await requireWorkspaceAccess(res, user, workspaceId);
+    const m = await requireWorkspaceOwner(res, user, workspaceId);
     if (!m) return;
     const body = (await parseBody(req)) || {};
     const name = String(body.name || '').trim();
@@ -760,6 +773,21 @@ function createProjectFoundation(deps) {
     if (body.parentId !== undefined && body.parentId !== null) {
       const pid = String(body.parentId).trim();
       if (pid === folderId) return sendJSON(res, 400, { ok: false, error: '文件夹不能作为自己的父级' });
+      // G01 audit H2 fix: target parent must exist, belong to the SAME
+      // workspace, and not be soft-deleted — and must not be a descendant of
+      // the folder being moved (would create a folder cycle).
+      const wsId = f.rows[0].workspace_id;
+      const p = await pg.query(
+        `SELECT 1 FROM workspace_folders WHERE id=$1 AND workspace_id=$2 AND deleted_at IS NULL`,
+        [pid, wsId],
+      );
+      if (!p.rows.length) return sendJSON(res, 400, { ok: false, error: '目标父文件夹不存在/已删除/不属于该工作空间' });
+      let cur = pid;
+      for (let depth = 0; depth < 100 && cur; depth++) {
+        const pr = await pg.query(`SELECT parent_id FROM workspace_folders WHERE id=$1`, [cur]);
+        cur = pr.rows.length ? pr.rows[0].parent_id : null;
+        if (cur === folderId) return sendJSON(res, 400, { ok: false, error: '不能移动到自身的子文件夹下（会形成环）' });
+      }
       sets.push(`parent_id = $${idx++}`); vals.push(pid);
     }
     if (body.parentId === null) { sets.push(`parent_id = NULL`); }
