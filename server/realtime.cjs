@@ -77,11 +77,17 @@ function emitTaskUpdate(userId, payload) {
 }
 
 // 注册一个 SSE 连接（res 为 Node http.ServerResponse）。返回取消订阅函数。
+const MAX_SSE_PER_USER = 5; // P0: bound per-user SSE connections (SSE DoS guard)
 function subscribe(userId, res) {
   if (!userId) return () => {};
   const key = `u:${userId}`;
   if (!conns.has(userId)) conns.set(userId, new Set());
   const set = conns.get(userId);
+  if (set.size >= MAX_SSE_PER_USER) {
+    // P0: reject excess connections so one user cannot exhaust sockets/emitters.
+    try { res.end(`data: ${JSON.stringify({ status: 'too_many_connections' })}\n\n`); } catch (_) {}
+    return () => {};
+  }
   set.add(res);
   const onEvt = (payload) => {
     try {

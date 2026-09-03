@@ -10,6 +10,8 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/sha
 import { StatusBadge } from '@/shared/ui/v2/StatusBadge';
 import { v2project } from '@/shared/api/contract/project-client';
 import { toast } from 'sonner';
+import { DeliverySpecPanel } from '@/pages/ProjectsPage/DeliverySpecPanel';
+import { BriefPanel } from '@/pages/ProjectsPage/BriefPanel';
 
 function QuickAction({
   icon: Icon,
@@ -101,6 +103,12 @@ function OverviewContent() {
           </div>
         </CardContent>
       </Card>
+
+      {/* DeliverySpec (W1-07): visible, editable, validated, exact echo */}
+      <DeliverySpecPanel projectId={ctx.projectId} canUpdate={ctx.permissions.canUpdate} />
+
+      {/* Creative Brief (W1-06): visible, editable, validated, exact echo */}
+      <BriefPanel projectId={ctx.projectId} canUpdate={ctx.permissions.canUpdate} />
 
       {/* Quick actions */}
       <Card>

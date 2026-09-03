@@ -3,6 +3,29 @@
 // 实时：GET /api/admin/console/stream（SSE，§H.1 五事件 metrics/traffic/flow/log/agent）
 // 依赖（由 server.js 注入）：getPg / session / sendJSON / fromSnake / toSnake / parseBody / traffic
 // 设计依据：docs/MASTER_DESIGN.md（M3 §H.1/§H.3，M4 §B.9）+ 实际 schema（users.credits / credit_transactions.kind）
+//
+// W1A: recharge() is now wrapped in tx() for atomicity (no drift on query failure).
+
+/**
+ * Run fn inside a single PG transaction on the given pool.
+ */
+function tx(pg, fn) {
+  const own = typeof pg.connect === 'function';
+  const client = own ? pg.connect() : pg;
+  return (async () => {
+    try {
+      await (await client).query('BEGIN');
+      const result = await fn(await client);
+      await (await client).query('COMMIT');
+      return result;
+    } catch (e) {
+      try { await (await client).query('ROLLBACK'); } catch (_) {}
+      throw e;
+    } finally {
+      if (own && client.release) (await client).release();
+    }
+  })();
+}
 
 function createAdmin(ctx) {
   const { getPg, session, sendJSON, fromSnake, parseBody } = ctx;
@@ -43,6 +66,7 @@ function createAdmin(ctx) {
 
   // 管理员手动充值 / 调整（§C.7，M2 后台调整流水；kind='adjust'，审计留痕）
   // pool: 'recharge' | 'reward'，支持小数（users 已 NUMERIC(18,4)）
+  // W1A: wrapped in tx() — UPDATE + transaction + audit are all-or-nothing.
   async function recharge(userId, amount, note, actorId, pool = 'recharge') {
     const col = pool === 'reward' ? 'reward_credits' : 'recharge_credits';
     const amt = Number(Number(amount).toFixed(4));
@@ -52,27 +76,30 @@ function createAdmin(ctx) {
       if (!cur.rows.length) throw new Error('用户不存在');
       if (Number(cur.rows[0][col]) + amt < 0) throw new Error('扣减后余额不能为负');
     }
-    const u = await pg().query(
-      `UPDATE users SET ${col} = ${col} + $1, updated_at=NOW() WHERE id=$2 RETURNING credits`,
-      [amt, userId],
-    );
-    if (!u.rows.length) throw new Error('用户不存在');
-    const newCredits = u.rows[0].credits;
-    await pg().query(
-      `INSERT INTO credit_transactions (user_id, kind, amount, ref, pool, balance_after)
-       VALUES ($1,'adjust',$2,$3,$4,(SELECT credits FROM users WHERE id=$1))`,
-      [userId, amt, `admin:${actorId}:${note || ''}`, pool],
-    );
-    await pg().query(
-      `INSERT INTO audit_logs (actor_id, action, target, detail)
-       VALUES ($1,'recharge',$2,$3)`,
-      [actorId, userId, JSON.stringify({
-        level: amt > 0 ? 'info' : 'warn',
-        msg: `管理员${amt > 0 ? '增加' : '扣减'}${pool === 'reward' ? '赠送' : '充值'}积分 ${Math.abs(amt)}`,
-        note: note || '', amount: amt, pool,
-      })],
-    );
-    return { ok: true, credits: newCredits };
+    const ref = `admin:${actorId}:${note || ''}`;
+    return tx(pg(), async (client) => {
+      const u = await client.query(
+        `UPDATE users SET ${col} = ${col} + $1, updated_at=NOW() WHERE id=$2 RETURNING credits`,
+        [amt, userId],
+      );
+      if (!u.rows.length) throw new Error('用户不存在');
+      const newCredits = u.rows[0].credits;
+      await client.query(
+        `INSERT INTO credit_transactions (user_id, kind, amount, ref, pool, balance_after)
+         VALUES ($1,'adjust',$2,$3,$4,(SELECT credits FROM users WHERE id=$1))`,
+        [userId, amt, ref, pool],
+      );
+      await client.query(
+        `INSERT INTO audit_logs (actor_id, action, target, detail)
+         VALUES ($1,'recharge',$2,$3)`,
+        [actorId, userId, JSON.stringify({
+          level: amt > 0 ? 'info' : 'warn',
+          msg: `管理员${amt > 0 ? '增加' : '扣减'}${pool === 'reward' ? '赠送' : '充值'}积分 ${Math.abs(amt)}`,
+          note: note || '', amount: amt, pool,
+        })],
+      );
+      return { ok: true, credits: newCredits };
+    });
   }
 
   async function setUserPassword(userId, password) {

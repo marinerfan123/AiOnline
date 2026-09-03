@@ -73,6 +73,34 @@ export const ProjectPermissionsSchema = z.object({
   canDelete: z.boolean(),
 });
 
+// ── W1-01 Creative Brief (persisted on projects.creative_brief JSONB) ───────
+// Mirrors server/modules/project-foundation/creativeBrief.cjs. All 16 fields are
+// optional except goal/audience (required by the form / backend when provided),
+// but the backend tolerates an absent optional field, so only non-empty values
+// are sent by the client. `platform` may be a single string or array; `brand` /
+// `budget` may be a string/number or an object; `tone` / `style` a string or
+// array; `references` an array of strings or objects.
+export const CreativeBriefSchema = z
+  .object({
+    goal: z.string().min(1).optional(),
+    audience: z.string().min(1).optional(),
+    platform: z.union([z.string(), z.array(z.string())]).optional(),
+    duration: z.number().nonnegative().optional(),
+    aspect_ratio: z.string().optional(),
+    language: z.string().optional(),
+    key_message: z.string().optional(),
+    cta: z.string().optional(),
+    brand: z.union([z.string(), z.record(z.string(), z.unknown())]).optional(),
+    tone: z.union([z.string(), z.array(z.string())]).optional(),
+    style: z.union([z.string(), z.array(z.string())]).optional(),
+    references: z.array(z.union([z.string(), z.record(z.string(), z.unknown())])).optional(),
+    budget: z.union([z.number(), z.record(z.string(), z.unknown())]).optional(),
+    deadline: z.string().optional(),
+    deliverables: z.array(z.string()).optional(),
+    restrictions: z.array(z.string()).optional(),
+  })
+  .catchall(z.unknown());
+
 export const ProjectSummarySchema = z.object({
   id: z.string(),
   workspaceId: z.string(),
@@ -82,6 +110,7 @@ export const ProjectSummarySchema = z.object({
   projectType: z.enum(['general', 'studio', 'short_drama']),
   status: z.enum(['draft', 'active', 'archived']),
   coverAssetId: z.string().nullable().optional(),
+  creative_brief: CreativeBriefSchema.optional(),
   version: z.number().optional(),
   archivedAt: z.string().datetime().or(z.string()).nullable().optional(),
   createdAt: z.string().datetime().or(z.string()),
@@ -108,6 +137,7 @@ export const CreateProjectRequestSchema = z.object({
   name: z.string().min(1).max(200),
   description: z.string().optional(),
   projectType: z.enum(['general', 'studio', 'short_drama']).optional(),
+  creativeBrief: CreativeBriefSchema.optional(),
 });
 
 export const UpdateProjectRequestSchema = z.object({
@@ -115,6 +145,7 @@ export const UpdateProjectRequestSchema = z.object({
   description: z.string().optional(),
   projectType: z.enum(['general', 'studio', 'short_drama']).optional(),
   coverAssetId: z.string().nullable().optional(),
+  creativeBrief: CreativeBriefSchema.optional(),
 });
 
 // ── M04-S Asset Foundation ─────────────────────────────────────────────────
@@ -289,6 +320,7 @@ export type ProjectSummary = z.infer<typeof ProjectSummarySchema>;
 export type ProjectDetail = z.infer<typeof ProjectDetailSchema>;
 export type ProjectListResponse = z.infer<typeof ProjectListResponseSchema>;
 export type ProjectPermissions = z.infer<typeof ProjectPermissionsSchema>;
+export type CreativeBrief = z.infer<typeof CreativeBriefSchema>;
 export type CreateProjectRequest = z.infer<typeof CreateProjectRequestSchema>;
 export type UpdateProjectRequest = z.infer<typeof UpdateProjectRequestSchema>;
 export type AssetType = z.infer<typeof AssetTypeSchema>;

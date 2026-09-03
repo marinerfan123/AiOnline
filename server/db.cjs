@@ -5,12 +5,15 @@ const path = require('path');
 require('dotenv').config({ path: path.resolve(__dirname, '..', '.env') });
 
 // ── PostgreSQL Pool ──
+const isProd = process.env.NODE_ENV === 'production';
+// 生产必须显式设置 PG_PASSWORD（fail-closed）；dev/test 才允许本地兜底。
+const defaultPassword = isProd ? (() => { throw new Error('PG_PASSWORD is required in production (fail-closed)'); })() : 'postgres';
 const pool = new Pool({
   host: process.env.PG_HOST || 'localhost',
   port: parseInt(process.env.PG_PORT || '5432', 10),
   database: process.env.PG_DATABASE || 'huabu',
   user: process.env.PG_USER || 'postgres',
-  password: process.env.PG_PASSWORD || 'postgres',
+  password: process.env.PG_PASSWORD || defaultPassword,
   max: 10,
   idleTimeoutMillis: 30000,
 });

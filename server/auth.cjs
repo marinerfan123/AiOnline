@@ -3,11 +3,11 @@
 // 复刻 docs/phase-a/auth.js 设计，去 jose 依赖，用 node:crypto HMAC-SHA256 签验。
 const crypto = require('crypto');
 
+const isProd = process.env.NODE_ENV === 'production';
 const COOKIE_NAME = 'sid'; // 访问会话（短效）
 const RT_COOKIE = 'rid'; // 刷新令牌（长效，Phase B 轮换用，当前未强制）
-// 生产务必设置 JWT_SECRET；缺省用固定 dev 串（固定值，dev 会话重启不失效）。
-const SECRET = process.env.JWT_SECRET || 'dev-only-change-me';
-const isProd = process.env.NODE_ENV === 'production';
+// 生产必须显式设置 JWT_SECRET（fail-closed）；dev/test 才有固定 dev 串兜底。
+const SECRET = process.env.JWT_SECRET || (isProd ? (() => { throw new Error('JWT_SECRET is required in production (fail-closed)'); })() : 'dev-only-change-me');
 const ACCESS_TTL_SEC = 60 * 60 * 24 * 7; // 7 天（Phase A 简化：单 cookie，无独立 refresh 轮换）
 
 // ── base64url ──

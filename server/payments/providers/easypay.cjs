@@ -79,9 +79,43 @@ class EasyPayProvider extends ServiceProvider {
     };
   }
 
-  async refund(/* ctx */) {
-    // 易支付退款需走平台 API，此处留接口；是否启用取决于 payment_providers.allow_refund
-    throw new Error('easypay 退款未实现');
+  async refund({ pid, pkey, api_base, outTradeNo, amount, channelTradeNo }) {
+    // 易支付退款标准 API
+    // 签名算法同 _sign，参与字段：pid, out_trade_no, trade_no(mobile), money, sign, sign_type
+    // 注意：不同二开平台字段名可能略有差异，此处采用主流标准
+    const key = pkey;
+    const params = {
+      pid,
+      out_trade_no: outTradeNo,
+      money: (Number(amount) / 100).toFixed(2), // 分→元
+      trade_no: channelTradeNo || '',
+    };
+    const sign = this._sign(params, key);
+    params.sign = sign;
+    params.sign_type = 'MD5';
+    params.action = 'refund';
+
+    const qs = new URLSearchParams(params).toString();
+    const refundUrl = `${String(api_base || '').replace(/\/$/, '')}/refund.php?${qs}`;
+
+    const res = await fetch(refundUrl, { method: 'GET' });
+    const text = await res.text();
+
+    // 易支付退款响应：通常返回 JSON 或纯文本，需要解析
+    let data;
+    try { data = JSON.parse(text); } catch { data = { result: text }; }
+
+    // 标准字段：result_code / msg / refund_id
+    // 不同平台有差异，此处采用容错解析
+    const resultCode = data.result_code || data.code || data.status;
+    if (resultCode !== 1 && resultCode !== '1' && resultCode !== 'SUCCESS' && resultCode !== 'true') {
+      throw new Error(`退款失败: ${data.msg || text}`);
+    }
+    return {
+      ok: true,
+      channelRefundId: data.refund_id || data.trade_no || null,
+      raw: data,
+    };
   }
 }
 

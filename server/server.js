@@ -51,6 +51,10 @@ import aiControlRouterMod from './modules/ai-control/routes/aiControlRoutes.cjs'
 import projectFoundationMod from './modules/project-foundation/projectFoundation.cjs';
 import assetFoundationMod from './modules/project-foundation/assetFoundation.cjs';
 import studioCanvasPersistenceMod from './modules/project-foundation/studioCanvasPersistence.cjs';
+import studioEpisodeApiMod from './modules/project-foundation/studioEpisodeApi.cjs';
+import studioShotApiMod from './modules/project-foundation/studioShotApi.cjs';
+import studioStructureApiMod from './modules/project-foundation/studioStructureApi.cjs';
+import studioRunApiMod from './modules/project-foundation/studioRunApi.cjs';
 import generationV2Shadow from './modules/generation-v2/shadow.cjs';
 // ModelHub V3 Phase 1 — 唯一模型身份 resolver（server.js 仅在此一处调用，不再散落处理 display_name）
 import modelHubResolver from './modules/modelhub/resolver.cjs';
@@ -1486,6 +1490,66 @@ const studioCanvasPersistence = studioCanvasPersistenceMod.createStudioCanvasPer
   parseBody,
 });
 
+// M05-E — V2 Studio Episode API (/api/v2/projects/:id/episodes).
+const studioEpisodeApi = studioEpisodeApiMod.createStudioEpisodeApi({
+  pg: {
+    query: (sql, params) => pgPool
+      ? pgPool.query(sql, params)
+      : Promise.reject(Object.assign(new Error('数据库未就绪'), { status: 503 })),
+    connect: () => pgPool
+      ? pgPool.connect()
+      : Promise.reject(Object.assign(new Error('数据库未就绪'), { status: 503 })),
+  },
+  sessionUser: (req) => session.getUserFromCookie(req),
+  sendJSON,
+  parseBody,
+});
+
+// M05-E — V2 Studio Shot API (/api/v2/projects/:id/episodes/:epId/shots).
+const studioShotApi = studioShotApiMod.createStudioShotApi({
+  pg: {
+    query: (sql, params) => pgPool
+      ? pgPool.query(sql, params)
+      : Promise.reject(Object.assign(new Error('数据库未就绪'), { status: 503 })),
+    connect: () => pgPool
+      ? pgPool.connect()
+      : Promise.reject(Object.assign(new Error('数据库未就绪'), { status: 503 })),
+  },
+  sessionUser: (req) => session.getUserFromCookie(req),
+  sendJSON,
+  parseBody,
+});
+
+// M05-E — V2 Studio Run API (/api/v2/projects/:id/studio/runs).
+const studioRunApi = studioRunApiMod.createStudioRunApi({
+  pg: {
+    query: (sql, params) => pgPool
+      ? pgPool.query(sql, params)
+      : Promise.reject(Object.assign(new Error('数据库未就绪'), { status: 503 })),
+    connect: () => pgPool
+      ? pgPool.connect()
+      : Promise.reject(Object.assign(new Error('数据库未就绪'), { status: 503 })),
+  },
+  sessionUser: (req) => session.getUserFromCookie(req),
+  sendJSON,
+  parseBody,
+});
+
+// W1-14 — V2 Studio Structure API (/api/v2/projects/:id/structure).
+const studioStructureApi = studioStructureApiMod.createStudioStructureApi({
+  pg: {
+    query: (sql, params) => pgPool
+      ? pgPool.query(sql, params)
+      : Promise.reject(Object.assign(new Error('数据库未就绪'), { status: 503 })),
+    connect: () => pgPool
+      ? pgPool.connect()
+      : Promise.reject(Object.assign(new Error('数据库未就绪'), { status: 503 })),
+  },
+  sessionUser: (req) => session.getUserFromCookie(req),
+  sendJSON,
+  parseBody,
+});
+
 const referenceStyles = referenceStylesMod.createReferenceStyles({
   getPg: () => pgPool,
   session,
@@ -1513,6 +1577,7 @@ const finance = financeMod.createFinance({
   parseBody,
   // 支付服务商变更后让 loader 缓存立即失效（payments 在下方定义，闭包延迟取值）
   invalidateProviders: () => { try { if (payments && payments.invalidateProviderCache) payments.invalidateProviderCache(); } catch (e) {} },
+  loader: () => payments.getLoader(),
 });
 const me = meMod.createMe({
   getPg: () => pgPool,
@@ -2405,6 +2470,26 @@ async function handleAPI(req, res) {
   // ── M05-C Studio Canvas Persistence（/api/v2/projects/:id/studio/canvas）──
   if (/\/api\/v2\/projects\/[^/]+\/studio\/canvas/.test(url)) {
     if (await studioCanvasPersistence.handle(req, res, url.split('?')[0], method)) return;
+  }
+
+  // ── W1-14 Studio Structure API（/api/v2/projects/:id/structure）──
+  if (/\/api\/v2\/projects\/[^/]+\/structure/.test(url)) {
+    if (await studioStructureApi.handle(req, res, url.split('?')[0], method)) return;
+  }
+
+  // ── M05-E Studio Episode + Shot APIs（/api/v2/projects/:id/episodes, /shots）──
+  // Shots must be checked BEFORE episodes because /episodes/:id/shots also
+  // matches the episode regex (as seg2=shots). Reverse order prevents that.
+  if (/\/api\/v2\/projects\/[^/]+\/episodes\/[^/]+\/shots/.test(url)) {
+    if (await studioShotApi.handle(req, res, url.split('?')[0], method)) return;
+  }
+  if (/\/api\/v2\/projects\/[^/]+\/episodes/.test(url)) {
+    if (await studioEpisodeApi.handle(req, res, url.split('?')[0], method)) return;
+  }
+
+  // ── M05-E Studio Run API（/api/v2/projects/:id/studio/runs）──
+  if (/\/api\/v2\/projects\/[^/]+\/studio\/runs/.test(url)) {
+    if (await studioRunApi.handle(req, res, url.split('?')[0], method)) return;
   }
 
   // ── M04-S Asset Foundation（/api/v2/assets, /api/v2/projects/:id/assets）──

@@ -24,6 +24,24 @@ function assertTestDatabase(dbName) {
   }
 }
 
+/**
+ * G0-04 — migration classification / non-destructive default.
+ * Returns { kind, ops[], dataOps[] }. kind ∈ additive|data|destructive.
+ * Destructive (DROP/TRUNCATE) defaults to BLOCKED unless ALLOW_DESTRUCTIVE_MIGRATION=1.
+ */
+function classifyMigration(sql) {
+  const s = String(sql || '').toUpperCase();
+  const destructive = [];
+  // Data-losing DDL is destructive ONLY when it lacks the idempotent IF EXISTS guard.
+  if (/DROP\s+TABLE(?!\s+IF\s+EXISTS)/.test(s)) destructive.push('DROP TABLE');
+  if (/DROP\s+COLUMN(?!\s+IF\s+EXISTS)/.test(s)) destructive.push('DROP COLUMN');
+  if (/TRUNCATE(?!\s+IF\s+EXISTS)/.test(s)) destructive.push('TRUNCATE');
+  const dataOps = [];
+  for (const op of ['INSERT', 'UPDATE', 'DELETE']) if (new RegExp('\\b' + op + '\\b').test(s)) dataOps.push(op);
+  const kind = destructive.length ? 'destructive' : (dataOps.length ? 'data' : 'additive');
+  return { kind, ops: destructive, dataOps };
+}
+
 function discoverMigrations() {
   if (!fs.existsSync(MIGRATIONS_DIR)) return [];
   return fs.readdirSync(MIGRATIONS_DIR)
@@ -114,6 +132,12 @@ async function migrate(pgPool, options = {}) {
 
       console.log(`[migrate] Applying ${m.version} ${m.name}...`);
       try {
+        // G0-04: non-destructive default — a destructive migration is BLOCKED unless explicitly allowed.
+        const cls = classifyMigration(sql);
+        if (cls.kind === 'destructive' && !process.env.ALLOW_DESTRUCTIVE_MIGRATION) {
+          await client.query('ROLLBACK');
+          throw new Error(`[migrate] ${m.version} ${m.name}: DESTRUCTIVE migration (${cls.ops.join(',')}) blocked by non-destructive default. Set ALLOW_DESTRUCTIVE_MIGRATION=1 to override.`);
+        }
         await client.query(sql);
         await store.recordMigration(client, m.version, m.name, checksum);
         appliedCount++;
@@ -158,4 +182,4 @@ if (require.main === module) {
   })();
 }
 
-module.exports = { migrate, status, discoverMigrations, assertTestDatabase };
+module.exports = { migrate, status, discoverMigrations, assertTestDatabase, classifyMigration };

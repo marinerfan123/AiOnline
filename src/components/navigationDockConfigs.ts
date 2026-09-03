@@ -23,6 +23,7 @@ import {
 import type { MediaCounts } from '@/services/api';
 import type { NavigationDockProps, NavSection } from '@/components/NavigationDock';
 import { ADMIN_MODULES, ADMIN_GROUP_ORDER } from '@/config/adminRegistry';
+import { isFeatureEnabled, FF } from '@/shared/config/featureFlags';
 
 // ───────────────────────────────────────────────
 // 全站跨模块导航（每个导航台底部都带，方便任意页面跳转）
@@ -36,7 +37,9 @@ function globalNavSection(
       ? []
       : [{ key: 'global-workspace', label: '工作台', icon: LayoutGrid, path: '/workspace', end: true }]),
     { key: 'global-studio', label: '创作工作室', icon: Clapperboard, path: '/studio', end: true },
-    { key: 'global-shop', label: 'AI 市集', icon: ShoppingBag, path: '/shop', end: true },
+    ...(isFeatureEnabled(FF.SHOP_ENABLED)
+      ? [{ key: 'global-shop', label: 'AI 市集', icon: ShoppingBag, path: '/shop', end: true }]
+      : []),
     ...(userRole === 'admin'
       ? [{ key: 'global-admin', label: '管理后台', icon: ShieldAlert, path: '/admin', end: true }]
       : []),

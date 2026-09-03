@@ -88,7 +88,7 @@ function ensureConnection(): void {
 export function waitForTask(taskId: string, opts?: { timeoutMs?: number }): Promise<TaskUpdate> {
   const timeoutMs = opts?.timeoutMs ?? 95 * 60 * 1000;
   ensureConnection();
-  return new Promise<TaskUpdate>((resolve) => {
+  const p = new Promise<TaskUpdate>((resolve) => {
     let settled = false;
     let last: TaskUpdate = { taskId, status: 'running' };
     const settle = (u: TaskUpdate) => {
@@ -123,4 +123,19 @@ export function waitForTask(taskId: string, opts?: { timeoutMs?: number }): Prom
     }, 10000);
     fallbacks.set(taskId, fb);
   });
+  // P0: prevent module-level singleton leak — if the caller abandons the wait (e.g. component
+  // unmounts before a terminal state), ensure the fallback poll + listener are released.
+  (p as unknown as { __cleanup: (t: string) => void }).__cleanup = cancelWait;
+  return p;
+}
+
+/** P0: explicitly release a task's listener + fallback poll (no module-level singleton leak). */
+export function cancelWait(taskId: string): void {
+  const fb = fallbacks.get(taskId);
+  if (fb) {
+    clearInterval(fb);
+    fallbacks.delete(taskId);
+  }
+  listeners.delete(taskId);
+  void taskId;
 }

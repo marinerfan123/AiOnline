@@ -6,10 +6,10 @@ async function settleHold(pg, { itemId, action } = {}) {
   const target = action === 'commit' ? 'committed' : 'released';
   const result = await pg.query(
     `UPDATE generation_credit_holds_v2
-        SET status='${target}', settled_at=NOW()
+        SET status=$2, settled_at=NOW()
       WHERE item_id=$1 AND status='held'
       RETURNING hold_id,item_id,user_id,pool,amount,status`,
-    [itemId],
+    [itemId, target],
   );
   const hold = result.rows && result.rows[0] ? result.rows[0] : null;
   return { changed: !!hold, hold };

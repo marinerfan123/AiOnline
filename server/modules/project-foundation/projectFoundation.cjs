@@ -18,10 +18,13 @@
  */
 
 const crypto = require('crypto');
+const { validateCreativeBrief, sanitizeCreativeBrief } = require('./creativeBrief.cjs');
+const { validateDeliverySpec, sanitizeDeliverySpec } = require('./deliverySpec.cjs');
+const { ALLOWED_PROJECT_TYPES } = require('./projectTypeModes.cjs');
 
 const PREFIXES = ['/api/v2/workspaces', '/api/v2/projects'];
 
-const PROJECT_TYPES = new Set(['general', 'studio', 'short_drama']);
+const PROJECT_TYPES = new Set(ALLOWED_PROJECT_TYPES);
 const PROJECT_STATUSES = new Set(['draft', 'active', 'archived']);
 
 function isAdmin(user) {
@@ -186,6 +189,8 @@ function createProjectFoundation(deps) {
       projectType: row.project_type,
       status: row.status,
       coverAssetId: row.cover_asset_id,
+      creative_brief: row.creative_brief,
+      delivery_spec: row.delivery_spec,
       version: row.version,
       archivedAt: row.archived_at,
       createdAt: row.created_at,
@@ -216,6 +221,67 @@ function createProjectFoundation(deps) {
         timestamp: new Date().toISOString(),
         correlation_id: correlationId(req),
       },
+    });
+  }
+
+  // GET /api/v2/projects/:id/delivery-spec
+  // Reads the project's current DeliverySpec (W1-04). The persisted `delivery_spec`
+  // JSONB carries its own `version`, so this is a versioned read — we return the
+  // current spec plus an explicit top-level `version` for convenience.
+  async function getDeliverySpec(req, res, user, projectId) {
+    const access = await requireProjectAccess(res, user, projectId);
+    if (!access) return;
+    const { project } = access;
+    const spec = project.delivery_spec && typeof project.delivery_spec === 'object'
+      ? project.delivery_spec
+      : {};
+    const version = (spec && spec.version) || 1;
+    return sendJSON(res, 200, { ok: true, delivery_spec: spec, version });
+  }
+
+  // POST|PUT /api/v2/projects/:id/delivery-spec
+  // Creates or updates the project's DeliverySpec (W1-04). Requires workspace
+  // edit permission, validates with validateDeliverySpec (invalid => 400), then
+  // sanitizes with versioning (bumps from the persisted version) and records an
+  // update audit event (uniform with project.updated).
+  async function upsertDeliverySpec(req, res, user, projectId) {
+    const access = await requireProjectAccess(res, user, projectId);
+    if (!access) return;
+    const { project, membership } = access;
+    const perms = projectPermissions(project, membership, user);
+    if (!perms.canUpdate) {
+      return sendJSON(res, 403, { ok: false, error: '无权编辑该项目' });
+    }
+
+    const body = (await parseBody(req)) || {};
+    // Accept the spec directly, or wrapped under deliverySpec / delivery_spec.
+    const dsRaw = body.deliverySpec !== undefined ? body.deliverySpec
+      : body.delivery_spec !== undefined ? body.delivery_spec
+      : body;
+
+    const v = validateDeliverySpec(dsRaw || {});
+    if (!v.ok) return sendJSON(res, 400, { ok: false, error: '无效的交付规格: ' + v.errors.join('; ') });
+
+    const baseVersion = (project.delivery_spec && project.delivery_spec.version) || 1;
+    const spec = sanitizeDeliverySpec(dsRaw || {}, { version: baseVersion });
+
+    const r = await pg.query(
+      `UPDATE projects SET delivery_spec = $1, updated_at = NOW(), version = version + 1
+       WHERE id = $2 RETURNING *`,
+      [JSON.stringify(spec), projectId],
+    );
+    if (!r.rows.length) return sendJSON(res, 404, { ok: false, error: '项目不存在' });
+    const updated = r.rows[0];
+
+    await audit(user.id, 'project.updated', updated.id, { fields: ['delivery_spec'], delivery_spec_version: spec.version });
+    await emitProjectEvent(pg, 'project.updated', updated, user.id, req);
+
+    return sendJSON(res, 200, {
+      ok: true,
+      delivery_spec: updated.delivery_spec,
+      version: (updated.delivery_spec && updated.delivery_spec.version) || spec.version,
+      project: projectSummary(updated),
+      permissions: projectPermissions(updated, membership, user),
     });
   }
 
@@ -284,7 +350,7 @@ function createProjectFoundation(deps) {
 
     const dataR = await pg.query(
       `SELECT p.id, p.workspace_id, p.owner_id, p.name, p.description,
-              p.project_type, p.status, p.cover_asset_id, p.version,
+              p.project_type, p.status, p.cover_asset_id, p.creative_brief, p.delivery_spec, p.version,
               p.archived_at, p.created_at, p.updated_at
        FROM projects p
        WHERE ${where}
@@ -324,12 +390,27 @@ function createProjectFoundation(deps) {
       ? String(body.status).trim().toLowerCase()
       : 'active';
 
+    const briefRaw = body.creativeBrief !== undefined ? body.creativeBrief : body.creative_brief;
+    let brief = {};
+    if (briefRaw !== undefined && briefRaw !== null) {
+      const v = validateCreativeBrief(briefRaw);
+      if (!v.ok) return sendJSON(res, 400, { ok: false, error: '无效的创意简报: ' + v.errors.join('; ') });
+      brief = sanitizeCreativeBrief(briefRaw);
+    }
+    const dsRaw = body.deliverySpec !== undefined ? body.deliverySpec : body.delivery_spec;
+    let deliverySpec = {};
+    if (dsRaw !== undefined && dsRaw !== null) {
+      const v = validateDeliverySpec(dsRaw);
+      if (!v.ok) return sendJSON(res, 400, { ok: false, error: '无效的交付规格: ' + v.errors.join('; ') });
+      deliverySpec = sanitizeDeliverySpec(dsRaw);
+    }
+
     const r = await pg.query(
       `INSERT INTO projects (id, workspace_id, owner_id, name, description, project_type, status,
-                            cover_asset_id, version, archived_at, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, 1, NULL, NOW(), NOW())
+                            cover_asset_id, creative_brief, delivery_spec, version, archived_at, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, $8, $9, 1, NULL, NOW(), NOW())
        RETURNING *`,
-      [projectId, workspaceId, user.id, name, description, projectType, status],
+      [projectId, workspaceId, user.id, name, description, projectType, status, JSON.stringify(brief), JSON.stringify(deliverySpec)],
     );
     const project = r.rows[0];
 
@@ -368,8 +449,21 @@ function createProjectFoundation(deps) {
     if (updates.project_type && !PROJECT_TYPES.has(updates.project_type)) {
       return sendJSON(res, 400, { ok: false, error: '无效的项目类型' });
     }
+    if (body.creativeBrief !== undefined || body.creative_brief !== undefined) {
+      const briefRaw = body.creativeBrief !== undefined ? body.creativeBrief : body.creative_brief;
+      const v = validateCreativeBrief(briefRaw || {});
+      if (!v.ok) return sendJSON(res, 400, { ok: false, error: '无效的创意简报: ' + v.errors.join('; ') });
+      updates.creative_brief = JSON.stringify(sanitizeCreativeBrief(briefRaw || {}));
+    }
+    if (body.deliverySpec !== undefined || body.delivery_spec !== undefined) {
+      const dsRaw = body.deliverySpec !== undefined ? body.deliverySpec : body.delivery_spec;
+      const v = validateDeliverySpec(dsRaw || {});
+      if (!v.ok) return sendJSON(res, 400, { ok: false, error: '无效的交付规格: ' + v.errors.join('; ') });
+      // sanitize with versioning; derive current version from the persisted row if present.
+      updates.delivery_spec = JSON.stringify(sanitizeDeliverySpec(dsRaw || {}, { version: (project.delivery_spec && project.delivery_spec.version) || 1 }));
+    }
 
-    const allowed = ['name', 'description', 'project_type', 'cover_asset_id'];
+    const allowed = ['name', 'description', 'project_type', 'cover_asset_id', 'creative_brief', 'delivery_spec'];
     const setFields = [];
     const values = [];
     let idx = 1;
@@ -493,6 +587,13 @@ function createProjectFoundation(deps) {
       const restoreMatch = urlPath.match(/^\/api\/v2\/projects\/([^/]+)\/restore$/);
       if (restoreMatch && method === 'POST') {
         return await restoreProject(req, res, user, decodeURIComponent(restoreMatch[1]));
+      }
+
+      const deliverySpecMatch = urlPath.match(/^\/api\/v2\/projects\/([^/]+)\/delivery-spec$/);
+      if (deliverySpecMatch) {
+        const projectId = decodeURIComponent(deliverySpecMatch[1]);
+        if (method === 'GET') return await getDeliverySpec(req, res, user, projectId);
+        if (method === 'POST' || method === 'PUT') return await upsertDeliverySpec(req, res, user, projectId);
       }
 
       return sendJSON(res, 404, { ok: false, error: 'Not Found' });

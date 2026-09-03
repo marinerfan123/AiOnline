@@ -43,6 +43,9 @@ function durableNodeData(raw) {
   if (typeof d.prompt === 'string') out.prompt = d.prompt;
   if (d.validation && typeof d.validation === 'object') out.validation = d.validation;
   if (typeof d.frameLabel === 'string') out.frameLabel = d.frameLabel;
+  // W2-06: authoritative structure/Shot binding survives durability.
+  if (typeof d.shotId === 'string' || d.shotId === null) out.shotId = d.shotId;
+  if (typeof d.structureNodeId === 'string' || d.structureNodeId === null) out.structureNodeId = d.structureNodeId;
   return stripForbiddenData(out);
 }
 function normalizeNode(raw) {
@@ -201,4 +204,16 @@ function createStudioCanvasPersistence(deps) {
   }
   return { handle, LIMITS };
 }
-module.exports = { createStudioCanvasPersistence, normalizeNode, normalizeEdge, durableNodeData, bulkInsertNodes, bulkInsertEdges, LIMITS };
+function validateAuthoritativeBindings(nodes, { shotIds = [], structureNodeIds = [] } = {}) {
+  const errors = [];
+  for (const n of nodes || []) {
+    const data = n.data || {};
+    const sid = data.shotId;
+    const snid = data.structureNodeId;
+    if (sid != null && !shotIds.includes(sid)) errors.push(`node.${n.nodeId}: shotId ${sid} is not an authoritative project shot`);
+    if (snid != null && !structureNodeIds.includes(snid)) errors.push(`node.${n.nodeId}: structureNodeId ${snid} is not an authoritative project structure node`);
+  }
+  return { ok: errors.length === 0, errors };
+}
+
+module.exports = { createStudioCanvasPersistence, normalizeNode, normalizeEdge, durableNodeData, bulkInsertNodes, bulkInsertEdges, validateAuthoritativeBindings, LIMITS };

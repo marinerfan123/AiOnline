@@ -44,7 +44,21 @@ function parseQuery(url) {
 function createWebhook(ctx) {
   const { getPg, loader, sendJSON } = ctx;
 
+  // P0: per-IP webhook rate limit — an unauthenticated flood must not reach the
+  // (verify + audit) path and exhaust PG. Simple in-memory bucket; verify still fails-closed.
+  const _rlim = new Map(); // ip -> {count, reset}
+  function webhookThrottled(ip) {
+    const now = Date.now();
+    const b = _rlim.get(ip) || { count: 0, reset: now + 60000 };
+    if (now > b.reset) { b.count = 0; b.reset = now + 60000; }
+    b.count += 1;
+    _rlim.set(ip, b);
+    return b.count > 30; // >30 webhook req/min from one IP → throttle
+  }
+
   async function handleWebhook(req, res, type) {
+    const ip = (req.headers && req.headers['x-forwarded-for']) || req.socket?.remoteAddress || 'unknown';
+    if (webhookThrottled(String(ip).split(',')[0].trim())) return sendJSON(res, 429, { error: 'too many requests' });
     const pg = getPg();
     if (!pg) return sendJSON(res, 503, { error: '数据库不可用' });
 

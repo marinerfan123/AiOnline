@@ -57,6 +57,7 @@ const billing = {
 
   // Atomically deduct balance and insert reserve transaction in a single PG transaction.
   // WHERE col >= amount provides CAS so concurrent reserves cannot overspend.
+  // W1C: now writes balance_after (snapshot after deduct).
   async reserveCredits(pg, userId, amount, ref, pool = 'recharge') {
     if (!amount || amount <= 0) return true;
     const col = pool === 'reward' ? 'reward_credits' : 'recharge_credits';
@@ -67,8 +68,8 @@ const billing = {
       );
       if (r.rowCount === 0) throw new Error('Balance insufficient');
       await txClient.query(
-        `INSERT INTO credit_transactions (user_id, kind, amount, ref, pool)
-         VALUES ($1, 'reserve', $2, $3, $4)
+        `INSERT INTO credit_transactions (user_id, kind, amount, ref, pool, balance_after)
+         VALUES ($1, 'reserve', $2, $3, $4, (SELECT credits FROM users WHERE id = $1))
          ON CONFLICT (ref, kind) DO NOTHING`,
         [userId, amount, ref, pool],
       );
@@ -92,14 +93,15 @@ const billing = {
   // Release: atomically refund balance and insert release transaction.
   // Idempotent: ON CONFLICT prevents double refund.
   // Wrapped in transaction so balance + transaction are atomic.
+  // W1C: now writes balance_after (snapshot after refund).
   async releaseCredits(pg, userId, amount, ref, pool = 'recharge') {
     if (!amount || amount <= 0) return true;
     const col = pool === 'reward' ? 'reward_credits' : 'recharge_credits';
     return tx(pg, async (txClient) => {
       // ON CONFLICT ensures only one release per (ref, 'release').
       const inserted = await txClient.query(
-        `INSERT INTO credit_transactions (user_id, kind, amount, ref, pool)
-         VALUES ($1, 'release', $2, $3, $4)
+        `INSERT INTO credit_transactions (user_id, kind, amount, ref, pool, balance_after)
+         VALUES ($1, 'release', $2, $3, $4, (SELECT credits FROM users WHERE id = $1))
          ON CONFLICT (ref, kind) DO NOTHING
          RETURNING id`,
         [userId, amount, ref, pool],

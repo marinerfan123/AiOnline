@@ -13,12 +13,13 @@
 //   对账引擎据此混合重建，对任何漏记/重复记账都能暴露漂移。
 
 function createFinance(ctx) {
-  const { getPg, session, sendJSON, fromSnake, parseBody, invalidateProviders } = ctx;
+  const { getPg, session, sendJSON, fromSnake, parseBody, invalidateProviders, loader } = ctx;
   const pg = () => getPg();
   const hasPg = () => !!getPg();
   const crypto = require('crypto');
   // 支付密钥加密（AES-256-GCM）：pid/pkey/webhook_secret 入库前必须加密；API 永不返回明文
-  const { encrypt } = require('./payments/crypto.cjs');
+  const { encrypt, decrypt } = require('./payments/crypto.cjs');
+  const { processRefund } = require('./payments/refund.cjs');
 
   // 管理员闸门：与 admin.cjs 一致
   function requireAdmin(req) {
@@ -655,6 +656,14 @@ function createFinance(ctx) {
       try { return sendJSON(res, 200, await deleteProvider(decodeURIComponent(m[1]), actorId)); }
       catch (e) { return sendJSON(res, 400, { error: e.message }); }
     }
+
+    // ───────────────── 退款 ─────────────────
+    if (url === '/api/admin/finance/refund' && method === 'POST') {
+      const body = await parseBody(req).catch(() => ({}));
+      try { return sendJSON(res, 200, await processRefund(pg(), loader, { body, user: req.user })); }
+      catch (e) { return sendJSON(res, 400, { error: e.message }); }
+    }
+
     return sendJSON(res, 404, { error: 'Not Found' });
   }
 
@@ -671,6 +680,7 @@ function createFinance(ctx) {
     handleFinance, handlePublic,
     overview, listRecharges, reconcile, userLedger,
     listPackages, publicPackages, createPackage, updatePackage, deletePackage,
+    processRefund,
   };
 }
 

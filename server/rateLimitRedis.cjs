@@ -10,6 +10,15 @@ const crypto = require('crypto');
 
 let _redis = null;
 let _redisUp = false;
+// P0: observability — record the FIRST degradation after a quiet period (avoid spamming).
+let _lastDegradeWarn = 0;
+function warnDegrade(msg) {
+  const now = Date.now();
+  if (now - _lastDegradeWarn > 60000) {
+    _lastDegradeWarn = now;
+    console.warn('[rate-limit] DEGRADED to in-memory fallback:', msg);
+  }
+}
 function redis() {
   // P1-02: re-check Redis connectivity on each call so the application
   // can recover after a Redis outage without process restart.
@@ -23,7 +32,7 @@ function redis() {
     const mod = require('./redis.cjs');
     const r = mod.getRedis && mod.getRedis();
     if (r && mod.isRedisUp && mod.isRedisUp()) { _redis = r; _redisUp = true; return r; }
-  } catch (e) { /* redis 未就绪 → 降级内存态 */ }
+  } catch (e) { warnDegrade(`redis unavailable: ${e && e.message}`); }
   return null;
 }
 

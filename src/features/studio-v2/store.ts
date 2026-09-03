@@ -100,6 +100,8 @@ interface StudioState {
   clearInvalidConnection: () => void;
   /** benchmark/test helper / server hydration — replace whole graph in one batch (no undo push) */
   loadGraph: (nodes: StudioNode[], edges: StudioEdge[], viewport?: Viewport) => void;
+  /** P0: project-switch isolation — fully reset ephemeral session state (no cross-project leak). */
+  resetProjectState: () => void;
 }
 
 /**
@@ -536,7 +538,20 @@ export const useStudioStore = create<StudioState>((set, get) => ({
 
   clearInvalidConnection: () => set({ invalidConnection: null }),
 
-  loadGraph: (nodes, edges, viewport) => set({ nodes, edges, ...(viewport ? { viewport } : {}), undoStack: [], redoStack: [] }),
+  loadGraph: (nodes, edges, viewport) => set({ nodes, edges, ...(viewport ? { viewport } : {}), undoStack: [], redoStack: [], clipboard: null, dragSnapshot: null, editSnapshot: null, invalidConnection: null }),
+
+  resetProjectState: () =>
+    set({
+      nodes: [],
+      edges: [],
+      viewport: { x: 0, y: 0, zoom: 1 },
+      undoStack: [],
+      redoStack: [],
+      clipboard: null,
+      dragSnapshot: null,
+      editSnapshot: null,
+      invalidConnection: null,
+    }),
 }));
 
 // ── Convenience selectors ─────────────────────────────────────────────────
