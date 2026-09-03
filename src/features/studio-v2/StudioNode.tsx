@@ -68,6 +68,18 @@ function TextPreview({ text, hint }: { text?: string; hint: string }) {
 }
 
 /** M05-B2 honest result placeholder for generation nodes — never fake media. */
+function AssetPlaceholder({ label, hint }: { label: string; hint: string }) {
+  return (
+    <div className="grid h-24 place-items-center bg-ml2-surface-3 text-center">
+      <span className="px-2 text-[10px] leading-relaxed text-ml2-text-3">
+        {label}
+        <br />
+        {hint}
+      </span>
+    </div>
+  );
+}
+
 function GenerationPlaceholder({ status }: { status: string }) {
   const label =
     status === 'STALE' || status === 'stale'
@@ -99,7 +111,7 @@ function StudioNodeInner({ id, data, selected }: NodeProps<StudioNode>) {
   const status = STATUS_META[data.status] ?? STATUS_META.idle;
   const isFrame = def.executionKind === 'STRUCTURAL';
   const params = (data.parameters ?? {}) as Record<string, unknown>;
-  const text = (params.prompt ?? params.scriptText ?? params.name ?? params.description ?? data.prompt) as string | undefined;
+  const text = (params.prompt ?? params.scriptText ?? params.name ?? params.description ?? params.content ?? data.prompt) as string | undefined;
 
   return (
     <div
@@ -162,6 +174,25 @@ function StudioNodeInner({ id, data, selected }: NodeProps<StudioNode>) {
           data.assetId
             ? <AssetPreview assetId={data.assetId} kind="video" />
             : <GenerationPlaceholder status={data.status} />
+        )}
+        {def.id === 'text' && <TextPreview text={text} hint="在右侧 Inspector 编辑文本" />}
+        {def.id === 'image' && (
+          data.assetId
+            ? <AssetPreview assetId={data.assetId} kind="image" />
+            : <AssetPlaceholder label="未选择图片素材" hint="在 Inspector 中绑定图片资产 (active version)" />
+        )}
+        {def.id === 'audio' && (
+          <AssetPlaceholder label={data.assetId ? '音频素材' : '未选择音频素材'} hint={data.assetId ? String(params.voiceId || 'waveform 于 G06') : '在 Inspector 中绑定音频资产'} />
+        )}
+        {def.id === 'video-clip' && (
+          data.assetId
+            ? <AssetPreview assetId={data.assetId} kind="video" />
+            : <AssetPlaceholder label="未选择视频片段" hint="在 Inspector 中绑定视频资产" />
+        )}
+        {def.id === 'storyboard' && (
+          data.assetId
+            ? <AssetPreview assetId={data.assetId} kind="image" />
+            : <AssetPlaceholder label={params.shotId ? `Shot ${String(params.shotId)} 候选待生成` : '分镜候选板'} hint="绑定 Shot 或先生成候选图 (G13)" />
         )}
         {def.id === 'output' && (
           <div className="grid h-24 place-items-center bg-ml2-surface-3">

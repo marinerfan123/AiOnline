@@ -9,6 +9,8 @@ import {
   Frame,
   User,
   Play,
+  Music2,
+  LayoutGrid,
   type LucideIcon,
 } from 'lucide-react';
 
@@ -23,6 +25,8 @@ const ICONS: Record<string, LucideIcon> = {
   user: User,
   'clapperboard-image': ImagePlus,
   'film-play': Play,
+  audio: Music2,
+  storyboard: LayoutGrid,
 };
 
 export function NodeIcon({ name, className }: { name: string; className?: string }) {

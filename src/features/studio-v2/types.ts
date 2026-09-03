@@ -19,11 +19,20 @@ export type PortType =
 export type NodeCategory = 'Input' | 'Creative' | 'Media' | 'Output' | 'Structure';
 
 /**
- * M05-B2 stable production node identities. UI labels are display-only and
- * NEVER used as node identity. The old `image` id is a generation node;
- * video assets keep the `video` id from M05-A for backward compatibility.
+ * M05-B2 stable production node identities + Blueprint V2.0 G03 base node kinds.
+ * UI labels are display-only and NEVER used as node identity. The old `image`
+ * id is a generation node; video assets keep the `video` id from M05-A for
+ * backward compatibility. Blueprint base kinds (02 §4 / 05 G03): text, image,
+ * video, audio, script, storyboard, video-clip — added additively; legacy ids
+ * (prompt/image-generation/text-to-video/...) remain first-class and persisted
+ * canvases keep their stored nodeType untouched.
  */
 export type StudioNodeKind =
+  | 'text' // Blueprint base: text node (manual/generated text)
+  | 'image' // Blueprint base: image asset node (active version preview)
+  | 'audio' // Blueprint base: audio asset node (waveform/voice)
+  | 'storyboard' // Blueprint base: per-shot candidate board (G13 expands)
+  | 'video-clip' // Blueprint base: video clip asset node (timeline clip entity)
   | 'prompt'
   | 'script'
   | 'character'

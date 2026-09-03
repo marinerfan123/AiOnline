@@ -42,12 +42,15 @@ const T2V_CAP = { capabilities: { type: 'text_to_video' } };
 
 describe('M05-B2 production core node set', () => {
   const EXPECTED_IDS: StudioNodeKind[] = [
-    'prompt', 'script', 'character', 'reference',
+    // Blueprint V2.0 G03 base kinds (7: text/image/video/audio/script/storyboard/video-clip)
+    'text', 'image', 'video', 'audio', 'script', 'storyboard', 'video-clip',
+    // Legacy M05 identities preserved (additive — persisted canvases untouched)
+    'prompt', 'character', 'reference',
     'image-generation', 'image-to-video', 'text-to-video',
-    'video', 'output', 'frame',
+    'output', 'frame',
   ];
 
-  it('registers exactly the 10 production core identities (stable ids, no UI-label identity)', () => {
+  it('registers the Blueprint G03 base kinds + legacy M05 identities (15 total; stable ids, no UI-label identity)', () => {
     expect(NODE_DEFS_LIST.map((d) => d.id).sort()).toEqual([...EXPECTED_IDS].sort());
     for (const id of EXPECTED_IDS) {
       const def = NODE_DEFS[id as StudioNodeKind];

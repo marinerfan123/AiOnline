@@ -181,6 +181,37 @@ const FRAME_SCHEMA = [
   field({ key: 'frameLabel', label: 'Frame Label', type: 'string', required: true, defaultValue: 'Frame', group: 'Content' }),
 ];
 
+// ── Blueprint V2.0 G03 base-node schemas (additive; legacy kinds untouched) ──
+
+const TEXT_NODE_SCHEMA = [
+  field({ key: 'content', label: 'Text', description: 'Text content (manual or downstream output).', type: 'textarea', required: true, defaultValue: '', group: 'Content' }),
+  field({ key: 'title', label: 'Title', type: 'string', defaultValue: '', group: 'Content' }),
+];
+
+const IMAGE_ASSET_SCHEMA = [
+  field({ key: 'assetId', label: 'Image Asset', description: 'Durable image assetId (active version is displayed on the node).', type: 'asset', defaultValue: null, group: 'Reference', assetTypes: ['IMAGE'] }),
+  field({ key: 'title', label: 'Title', type: 'string', defaultValue: '', group: 'Content' }),
+];
+
+const AUDIO_ASSET_SCHEMA = [
+  field({ key: 'assetId', label: 'Audio Asset', description: 'Durable audio assetId (waveform/playback shown on node).', type: 'asset', defaultValue: null, group: 'Reference', assetTypes: ['AUDIO'] }),
+  field({ key: 'voiceId', label: 'Voice / Model', description: 'Optional voice identity when TTS-produced (G07 model schema expands).', type: 'string', defaultValue: '', group: 'Reference' }),
+  field({ key: 'title', label: 'Title', type: 'string', defaultValue: '', group: 'Content' }),
+];
+
+const STORYBOARD_SCHEMA = [
+  field({ key: 'shotId', label: 'Shot', description: 'Bound Shot identity (production domain; canvas stores the reference only).', type: 'string', defaultValue: '', group: 'Reference' }),
+  field({ key: 'assetId', label: 'Active Candidate', description: 'Active storyboard image candidate (assetId).', type: 'asset', defaultValue: null, group: 'Reference', assetTypes: ['IMAGE'] }),
+  field({ key: 'prompt', label: 'Shot Prompt', type: 'textarea', defaultValue: '', group: 'Content' }),
+];
+
+const VIDEO_CLIP_SCHEMA = [
+  field({ key: 'assetId', label: 'Video Asset', description: 'Durable video assetId this clip references.', type: 'asset', defaultValue: null, group: 'Reference', assetTypes: ['VIDEO'] }),
+  field({ key: 'clipLabel', label: 'Clip Label', type: 'string', defaultValue: '', group: 'Content' }),
+  field({ key: 'sourceInMs', label: 'Source In (ms)', description: 'Trim in-point on the source asset (timeline domain; G18 expands).', type: 'number', min: 0, defaultValue: 0, group: 'Advanced', advanced: true }),
+  field({ key: 'durationMs', label: 'Duration (ms)', type: 'number', min: 0, defaultValue: 0, group: 'Advanced', advanced: true }),
+];
+
 // ── Registry ───────────────────────────────────────────────────────────────
 
 export const NODE_DEFS: Record<StudioNodeKind, NodeDef> = {
@@ -310,6 +341,62 @@ export const NODE_DEFS: Record<StudioNodeKind, NodeDef> = {
     capabilityRequirements: [], isGeneration: false, modelField: null,
     resultContract: { outputs: [], durableRefs: 'assetId' }, width: 320,
     defaultData: { frameLabel: 'Frame', status: 'IDLE' },
+  }),
+  // ── Blueprint V2.0 G03 base kinds (additive; persisted nodeType untouched) ──
+  text: makeDef({
+    id: 'text', version: 1, category: 'Input', title: 'Text',
+    description: '基础文本节点：手动文本/生成结果，向下游输出 TEXT（Blueprint base）。', icon: 'type',
+    executionKind: 'SOURCE',
+    inputPorts: [port('text', '文本', 'TEXT', true, false)],
+    outputPorts: [port('text', '文本', 'TEXT', false)],
+    parameterSchema: TEXT_NODE_SCHEMA, defaultParameters: defaults(TEXT_NODE_SCHEMA),
+    capabilityRequirements: [], isGeneration: false, modelField: null,
+    resultContract: { outputs: ['TEXT'], durableRefs: 'assetId' }, width: 260,
+    defaultData: { content: '', status: 'IDLE' },
+  }),
+  image: makeDef({
+    id: 'image', version: 1, category: 'Media', title: 'Image',
+    description: '图片素材节点（Blueprint base）：引用 image assetId，节点预览 active version；不是生成节点。', icon: 'image',
+    executionKind: 'ASSET',
+    inputPorts: [port('image', '图像', 'IMAGE', true, false)],
+    outputPorts: [port('image', '图像', 'IMAGE', false)],
+    parameterSchema: IMAGE_ASSET_SCHEMA, defaultParameters: defaults(IMAGE_ASSET_SCHEMA),
+    capabilityRequirements: [], isGeneration: false, modelField: null,
+    resultContract: { outputs: ['IMAGE', 'ASSET_REF'], durableRefs: 'assetId' }, width: 240,
+    defaultData: { assetId: null, status: 'IDLE' },
+  }),
+  audio: makeDef({
+    id: 'audio', version: 1, category: 'Media', title: 'Audio',
+    description: '音频素材节点（Blueprint base）：waveform/播放/voice；引用 audio assetId。', icon: 'audio',
+    executionKind: 'ASSET',
+    inputPorts: [port('audio', '音频', 'AUDIO', true, false)],
+    outputPorts: [port('audio', '音频', 'AUDIO', false)],
+    parameterSchema: AUDIO_ASSET_SCHEMA, defaultParameters: defaults(AUDIO_ASSET_SCHEMA),
+    capabilityRequirements: [], isGeneration: false, modelField: null,
+    resultContract: { outputs: ['AUDIO', 'ASSET_REF'], durableRefs: 'assetId' }, width: 240,
+    defaultData: { assetId: null, status: 'IDLE' },
+  }),
+  storyboard: makeDef({
+    id: 'storyboard', version: 1, category: 'Creative', title: 'Storyboard',
+    description: '分镜候选板（Blueprint base）：绑定 shotId + active candidate；批量生成/候选管理随 G13。', icon: 'storyboard',
+    executionKind: 'STRUCTURAL',
+    inputPorts: [port('image', '图像', 'IMAGE', true, false)],
+    outputPorts: [port('image', '图像', 'IMAGE', false)],
+    parameterSchema: STORYBOARD_SCHEMA, defaultParameters: defaults(STORYBOARD_SCHEMA),
+    capabilityRequirements: [], isGeneration: false, modelField: null,
+    resultContract: { outputs: ['IMAGE'], durableRefs: 'assetId' }, width: 280,
+    defaultData: { shotId: '', assetId: null, prompt: '', status: 'IDLE' },
+  }),
+  'video-clip': makeDef({
+    id: 'video-clip', version: 1, category: 'Media', title: 'Video Clip',
+    description: '视频片段节点（Blueprint base）：引用 video assetId + 裁剪 in/duration；timeline 实体（G18 展开）。', icon: 'film',
+    executionKind: 'ASSET',
+    inputPorts: [port('video', '视频', 'VIDEO', true, false)],
+    outputPorts: [port('video', '视频', 'VIDEO', false)],
+    parameterSchema: VIDEO_CLIP_SCHEMA, defaultParameters: defaults(VIDEO_CLIP_SCHEMA),
+    capabilityRequirements: [], isGeneration: false, modelField: null,
+    resultContract: { outputs: ['VIDEO', 'ASSET_REF'], durableRefs: 'assetId' }, width: 240,
+    defaultData: { assetId: null, clipLabel: '', status: 'IDLE' },
   }),
 };
 
