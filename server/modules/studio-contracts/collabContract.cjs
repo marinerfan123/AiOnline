@@ -74,15 +74,22 @@ function validateCommandEnvelope(env) {
  *      studioCanvasPersistence 的 409 CONFLICT {serverRevision, canvasId} 完全一致，
  *      客户端走既有 conflict-panel 整图 reload。
  *   2) last-write-wins（参数/几何 patch）: node.move/resize/update、canvas.viewport、
- *      group/director/script.row/shot/timeline 的 update 类。无拓扑影响，整行覆写即可，
- *      与服务端节点级 LWW 覆写语义一致；不需因他人改参数而拒绝本地参数保存。
+ *      group/director/script.row/shot/timeline 的 update 类。整行覆写即可。
  *   3) merge（列表/边元素级操作）: 边的 create/delete、script 行增删与 reorder、
  *      timeline clip/track 增删 —— 元素可独立落库（每元素独立主键 = 元素级 LWW 组合成
  *      merge），操作对象是列表成员而非画布整体结构，可并入并集/按元素应用。
  *   4) append（纯追加）: presence./comment./annotation. 等日志/标注/在线信号类 ——
  *      只增不改既有结构，任意 revision 都安全叠加，永不冲突。
  *   5) 其余/未知 kind → 保守 reject-409（未在 COMMAND_TYPES 登记的 kind 拒绝执行）。
- * 注：append 目前尚未进入 envelopes.COMMAND_TYPES（那 33 种无纯追加语义），
+ *
+ * ⚠️ 审计（2026-09-04, G22 v4-pro）语义声明 vs 实现底座：
+ *   服务端现状是「整画布单 revision CAS」—— 任何 mutation（含纯参数 patch 与
+ *   viewport）都 revision+1，CAS 失败一律 409 + 整图 reload。跨客户端并发改不同
+ *   节点同样 409；「节点级 LWW」只存在于单个获胜 CAS patch 内部的行 upsert，不是
+ *   跨客户端并发语义。故 2)/3)/4) 目前是【声明性目标策略】——需把整画布 CAS 改造为
+ *   按 kind 差异化执行（每 kind 独立 revision 域或命令日志）才有实现底座；本映射表
+ *   冻结决策供该改造消费，改造前任何客户端都不能依赖 LWW/merge/append 生效。
+ * 注：append 尚未进入 envelopes.COMMAND_TYPES（现 35 种无纯追加语义），
  *     此前缀规则为 presence/标注类扩展预留；已知命令全部落在前 3 类 + 默认。
  */
 const CONFLICT_POLICY_BY_KIND = Object.freeze({

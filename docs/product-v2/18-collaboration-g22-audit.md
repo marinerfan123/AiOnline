@@ -26,7 +26,7 @@
   payload, clientTimestamp? (ISO) }                     // payload 必填
 ```
 
-- `COMMAND_TYPES` 注册表 33 种命令类型（`node.* / edge.* / script.row.* / director.* / timeline.* / run.* / workflow.*` 等），并有 `isKnownCommandType` 守卫。
+- `COMMAND_TYPES` 注册表 35 种命令类型 (2026-09-04 审计修正: 实测 35, 原 33 为注释滞后)（`node.* / edge.* / script.row.* / director.* / timeline.* / run.* / workflow.*` 等），并有 `isKnownCommandType` 守卫。
 - **关键缺口**：该信封目前是**纯契约、未接入任何执行端点**。实际 canvas 写路径（`studioCanvasPersistence.cjs`）消费的是另一套报文 `{ baseRevision, clientMutationId, upsertNodes, deleteNodeIds, upsertEdges, deleteEdgeIds, viewport }` —— 没有 kind、没有 actor 信封、没有命令级类型分派。即「命令信封」与「落库协议」两套格式并存，G22 需收敛。
 - 幂等：服务端以 `(canvas_id, client_mutation_id)` 唯一键做重放（`studio_canvas_mutations` 表存响应，命中直接回放 `{idempotent:true}`），与信封 `idempotencyKey` 语义同源、命名不同。
 
@@ -46,7 +46,7 @@
 
 1. **整画布单 revision 计数器**（`studio_canvases.revision`，初始 1），**任何** mutation（包括纯参数 patch、viewport）都执行 `UPDATE ... SET revision=revision+1 WHERE id=$1 AND revision=$base`。
 2. CAS 失败（0 行）→ **409 `CONFLICT`**，body 携带 `{ serverRevision, canvasId }` —— revision 是整画布全局值，非每节点。
-3. 节点/边 upsert 为**全行覆写**（`ON CONFLICT (canvas_id,node_id) DO UPDATE SET data_json=EXCLUDED.data_json ...`）→ 单节点粒度天然 **last-write-wins**，无字段级 merge、无 CRDT/OT。
+3. 节点/边 upsert 为**全行覆写**（`ON CONFLICT (canvas_id,node_id) DO UPDATE SET data_json=EXCLUDED.data_json ...`）→ 单次获胜 CAS patch 内行 upsert 为 **last-write-wins**，无字段级 merge、无 CRDT/OT；跨客户端并发是整画布 CAS 409，非并发 LWW (2026-09-04 审计修正措辞)。
 4. 冲突解决在客户端：`useStudioCanvasPersistence.ts` 捕获 `409` 后 `blockedRef=true` 冻结保存、置 `status='Conflict'`，`StudioPage.tsx` 渲染 `data-test="studio-conflict-panel"`，仅提供 **「Reload server version」= 整图拉取替换**（`reloadFromServer` → `store.loadGraph`），**本地未保存编辑整体丢弃**。
 
 ### 已有：客户端 undo/redo（本地快照栈，M05-A）
