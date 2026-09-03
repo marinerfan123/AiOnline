@@ -3,7 +3,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { createContinuityApi } = require('./continuityApi.cjs');
 
-function makeHarness({ role = 'editor', snapshot = null, removedCount = 1 } = {}) {
+function makeHarness({ role = 'editor', snapshot = null, removedCount = 1, charRows = [] } = {}) {
   const responses = [];
   const calls = [];
   const pg = {
@@ -13,6 +13,8 @@ function makeHarness({ role = 'editor', snapshot = null, removedCount = 1 } = {}
       if (/FROM workspace_members/.test(sql)) return { rows: role ? [{ role }] : [] };
       if (/INSERT INTO production_continuity_snapshots/.test(sql)) return { rows: [], rowCount: 1 };
       if (/DELETE FROM production_continuity_snapshots/.test(sql)) return { rows: [], rowCount: removedCount };
+      if (sql.includes('FROM project_characters')) return { rows: charRows };
+      if (sql.includes('FROM project_environments')) return { rows: [] };
       if (sql.trim().startsWith('SELECT') && sql.includes('production_continuity_snapshots')) return { rows: snapshot ? [snapshot] : [] };
       return { rows: [] };
     },
@@ -95,4 +97,18 @@ test('G14: unknown path → false', async () => {
   const res = {};
   const h = await makeHarness().api.handle({ _body: {}, params: { projectId: 'p-1' } }, res, '/api/v2/bible/characters', 'GET');
   assert.equal(h, false);
+});
+
+test('G14: PUT derive mode — empty inputs rejected (400)', async () => {
+  const h = makeHarness();
+  const res = await h.call('PUT', '/api/v2/bible/continuity/s-1', { derive: true, characterIds: [], environmentId: null });
+  assert.equal(res.status, 400);
+});
+
+test('G14: PUT derive mode — derives from character rows and stores (200)', async () => {
+  const h = makeHarness({ charRows: [{ id: 'c-1', name: 'Luo', canonical_appearance: { hair: 'dark' }, wardrobe: {}, voice: {} }] });
+  const res = await h.call('PUT', '/api/v2/bible/continuity/s-1', { derive: true, characterIds: ['c-1'] });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.derived, true);
+  assert.ok(h.calls.some((s) => s.includes('INSERT INTO production_continuity_snapshots')));
 });

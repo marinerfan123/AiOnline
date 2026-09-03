@@ -13,6 +13,7 @@
  */
 const { validateContinuityState } = require('../prompt-ir/continuity.cjs');
 const continuityStore = require('../prompt-ir/continuityStore.cjs');
+const { deriveAndStoreSnapshot } = require('../prompt-ir/continuityDerive.cjs');
 
 function createContinuityApi({ pg, sessionUser, sendJSON, parseBody }) {
   function requireUser(req, res) {
@@ -59,6 +60,24 @@ function createContinuityApi({ pg, sessionUser, sendJSON, parseBody }) {
 
     if (method === 'PUT') {
       const body = (await parseBody(req)) || {};
+      // Derive mode: load character/environment rows and derive the snapshot
+      // (derive-on-write call site; closes the audit derive-gap).
+      if (body.derive === true || (body.characterIds && Array.isArray(body.characterIds))) {
+        const out = await deriveAndStoreSnapshot(pg, {
+          projectId,
+          shotId,
+          characterIds: Array.isArray(body.characterIds) ? body.characterIds : [],
+          environmentId: body.environmentId || null,
+          mode: body.mode || 'narrative',
+          capturedBy: user.id,
+          source: 'derive',
+        });
+        if (!out.ok) {
+          if (out.code === 'SHOT_NOT_FOUND') return sendJSON(res, 404, { ok: false, error: 'shot 不存在（FK）' });
+          return sendJSON(res, 400, { ok: false, errors: out.errors || [out.code || 'derive 失败'] });
+        }
+        return sendJSON(res, 200, { ok: true, shotId, derived: true });
+      }
       const record = {
         project_id: projectId,
         shot_id: shotId,
