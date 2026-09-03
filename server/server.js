@@ -49,6 +49,8 @@ let pgPool = null;
 import dispatcher from './dispatcher.cjs';
 import aiControlRouterMod from './modules/ai-control/routes/aiControlRoutes.cjs';
 import projectFoundationMod from './modules/project-foundation/projectFoundation.cjs';
+import presenceApiMod from './modules/collaboration/presenceApi.cjs';
+import presenceBusMod from './modules/collaboration/presenceBus.cjs';
 import assetFoundationMod from './modules/project-foundation/assetFoundation.cjs';
 import studioModelsApiMod from './modules/modelhub/studioModelsApi.cjs';
 import uploadApiMod from './modules/media/uploadApi.cjs';
@@ -1547,6 +1549,18 @@ const continuityApi = continuityApiMod.createContinuityApi({
   parseBody,
 });
 
+// G22 — Presence API (/api/v2/presence): in-process memory presence bus
+// (createPresenceBus defaults to its memory store) with periodic TTL sweep.
+// Production swaps a PG/Redis store via the same seam.
+const presenceBus = presenceBusMod.createPresenceBus({});
+const presenceApi = presenceApiMod.createPresenceApi({
+  bus: presenceBus,
+  sessionUser: (req) => session.getUserFromCookie(req),
+  sendJSON,
+  parseBody,
+});
+setInterval(() => { try { presenceBus.sweep(); } catch (_) {} }, 15000);
+
 // G06 — General asset upload (/api/v2/uploads + finalize). Signed PUT adapter:
 // active storage config (Aliyun→Tencent), else null → 503.
 // ossMod.loadOssConfigs returns { enabled, activeId, list } — resolve the
@@ -2656,6 +2670,11 @@ async function handleAPI(req, res) {
   // ── G13 Script rows（/api/v2/script/rows, /api/v2/script/order）──
   if (url.startsWith('/api/v2/script')) {
     if (await scriptApi.handle(req, res, url.split('?')[0], method)) return;
+  }
+
+  // ── G22 Presence（/api/v2/presence/heartbeat|peers/:canvasId）──
+  if (url.startsWith('/api/v2/presence')) {
+    if (await presenceApi.handle(req, res, url.split('?')[0], method)) return;
   }
 
   // ── M01-S Project / Workspace Foundation（/api/v2/workspaces, /api/v2/projects）──
