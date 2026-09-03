@@ -28,7 +28,9 @@ function poolConfig(database, max = 8) {
 
 async function createDb() {
   const admin = new Pool(poolConfig('postgres', 1));
-  const name = `moling_m05d_${crypto.randomBytes(4).toString('hex')}`;
+  // Name MUST contain 'test' — the app-under-test refuses to boot against a
+  // DB whose name lacks it (test-db.cjs guard). (G15 audit HIGH-1 fix.)
+  const name = `moling_test_m05d_${crypto.randomBytes(4).toString('hex')}`;
   await admin.query(`DROP DATABASE IF EXISTS ${name}`);
   await admin.query(`CREATE DATABASE ${name}`);
   await admin.end();
