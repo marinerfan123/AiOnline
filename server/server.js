@@ -53,6 +53,7 @@ import assetFoundationMod from './modules/project-foundation/assetFoundation.cjs
 import studioModelsApiMod from './modules/modelhub/studioModelsApi.cjs';
 import uploadApiMod from './modules/media/uploadApi.cjs';
 import timelineApiMod from './modules/media/timelineApi.cjs';
+import bibleApiMod from './modules/project-foundation/bibleApi.cjs';
 import studioCanvasPersistenceMod from './modules/project-foundation/studioCanvasPersistence.cjs';
 import studioEpisodeApiMod from './modules/project-foundation/studioEpisodeApi.cjs';
 import studioShotApiMod from './modules/project-foundation/studioShotApi.cjs';
@@ -1502,6 +1503,19 @@ const timelineApi = timelineApiMod.createTimelineApi({
   parseBody,
 });
 
+// G14 — Production Bible (/api/v2/bible/characters|environments|references):
+// project-scoped character/environment/reference CRUD (migrations 0026–0028 + 0038).
+const bibleApi = bibleApiMod.createBibleApi({
+  pg: {
+    query: (sql, params) => pgPool
+      ? pgPool.query(sql, params)
+      : Promise.reject(Object.assign(new Error('数据库未就绪'), { status: 503 })),
+  },
+  sessionUser: (req) => session.getUserFromCookie(req),
+  sendJSON,
+  parseBody,
+});
+
 // G06 — General asset upload (/api/v2/uploads + finalize). Signed PUT adapter:
 // first enabled storage config (Aliyun→Tencent fallback), else 503.
 const uploadApi = uploadApiMod.createUploadApi({
@@ -2011,6 +2025,9 @@ async function handleAPI(req, res) {
   const method = req.method;
   const reqUrl = new URL(req.url, 'http://localhost');
   req.query = Object.fromEntries(reqUrl.searchParams);
+  // v2 module APIs (uploads/timelines/bible/…) read projectId from req.params;
+  // populate it from the query string so live HTTP calls work end-to-end.
+  req.params = Object.fromEntries(reqUrl.searchParams);
 
   // Phase 0 健康检查：公开端点，网关前放行，供 nginx/容器探针与压测使用
   // /api/healthz — process alive (liveness probe)
@@ -2560,6 +2577,11 @@ async function handleAPI(req, res) {
   // ── G18 Project timeline（/api/v2/timelines）──
   if (url.startsWith('/api/v2/timelines')) {
     if (await timelineApi.handle(req, res, url.split('?')[0], method)) return;
+  }
+
+  // ── G14 Production Bible（/api/v2/bible/characters|environments|references）──
+  if (url.startsWith('/api/v2/bible')) {
+    if (await bibleApi.handle(req, res, url.split('?')[0], method)) return;
   }
 
   // ── M01-S Project / Workspace Foundation（/api/v2/workspaces, /api/v2/projects）──
