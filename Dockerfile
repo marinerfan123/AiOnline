@@ -23,7 +23,9 @@ ENV NODE_ENV=production
 COPY package*.json ./
 RUN npm install --omit=dev --no-audit --no-fund && npm cache clean --force
 # Media normalization jobs (G06): ffprobe/ffmpeg for probe/thumbnail/proxy/waveform.
-RUN apk add --no-cache ffmpeg
+# Alpine repo mirror is parameterized (CN boxes: dl-cdn unreachable → aliyun/tuna).
+ARG ALPINE_BASE=https://dl-cdn.alpinelinux.org/alpine
+RUN printf '%s/v3.24/main\n%s/v3.24/community\n' "$ALPINE_BASE" "$ALPINE_BASE" > /etc/apk/repositories && apk add --no-cache ffmpeg
 COPY server ./server
 # 公共静态资源（如客服群二维码），支持容器内直接替换，无需重新构建
 COPY public ./public
