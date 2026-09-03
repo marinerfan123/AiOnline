@@ -10,10 +10,8 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { Sparkles, Send, AlertTriangle } from 'lucide-react';
 import { useStudioStore } from './store';
 import { getNodeDef } from './registry';
-import { deriveComposerState, detectSlashCommand, parseRefTokens } from './composerModel';
+import { deriveComposerState, detectSlashCommand, parseRefTokens, filterAvailableModels, type ModelAvailability } from './composerModel';
 import { cn } from '@/lib/utils';
-
-const SLASH_HINTS = ['optimize', 'rewrite', 'translate'];
 
 // Legacy registry capability vocabulary → blueprint-canonical capability keys
 // (server models API projects canonical capabilities).
@@ -23,10 +21,11 @@ const LEGACY_TO_CANONICAL: Record<string, string> = {
   text_to_video: 'video.text2video',
 };
 
-interface ModelOption {
+interface ModelOption extends ModelAvailability {
   bindingId: string;
   name: string;
   capabilities: Record<string, boolean | number>;
+  lineCount?: number;
 }
 
 interface ResolvedRef {
@@ -51,6 +50,7 @@ export function StudioComposer({ projectId }: { projectId?: string }) {
   const editing = useRef(false);
   const flushRef = useRef<number | null>(null);
   const [models, setModels] = useState<ModelOption[]>([]);
+  const [slashHints, setSlashHints] = useState<string[]>([]);
   const [resolutions, setResolutions] = useState<Record<string, ResolvedRef>>({});
   const [boundRefs, setBoundRefs] = useState<Record<string, ResolvedRef['binding']>>({});
 
@@ -72,10 +72,25 @@ export function StudioComposer({ projectId }: { projectId?: string }) {
     return () => { alive = false; };
   }, []);
 
+  // Slash hints come from the server slash registry (single source of truth) —
+  // no hardcoded copy in the composer.
+  useEffect(() => {
+    let alive = true;
+    fetch('/api/studio/shortcuts', { credentials: 'same-origin' })
+      .then((r) => r.json())
+      .then((d) => {
+        if (alive && Array.isArray(d?.shortcuts)) {
+          setSlashHints(d.shortcuts.map((s: { slash?: string }) => s.slash).filter(Boolean) as string[]);
+        }
+      })
+      .catch(() => { /* registry unavailable; hints stay empty */ });
+    return () => { alive = false; };
+  }, []);
+
   const capableModels = useMemo(() => {
     if (!isGeneration || !def?.capabilityRequirements?.length) return [];
     const wanted = def.capabilityRequirements.map((c) => LEGACY_TO_CANONICAL[c] ?? c);
-    return models.filter((m) => wanted.some((w) => m.capabilities[w] === true));
+    return filterAvailableModels(models, wanted);
   }, [models, isGeneration, def]);
 
   const params = (node?.data.parameters ?? {}) as Record<string, unknown>;
@@ -132,7 +147,7 @@ export function StudioComposer({ projectId }: { projectId?: string }) {
   }, [node?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const refs = useMemo(() => (text ? parseRefTokens(text) : []), [text]);
-  const slash = useMemo(() => (text ? detectSlashCommand(text, SLASH_HINTS) : null), [text]);
+  const slash = useMemo(() => (text ? detectSlashCommand(text, slashHints) : null), [text, slashHints]);
   const dirty = text !== (node ? promptValueOf(node.data) : '');
 
   const commit = (value: string) => {
@@ -255,7 +270,7 @@ export function StudioComposer({ projectId }: { projectId?: string }) {
           />
           {slash && (
             <div data-test="composer-slash-hint" className="absolute bottom-full left-2 mb-1 flex gap-1 rounded-lg border border-ml2-border bg-ml2-surface-1 p-1 shadow-xl">
-              {SLASH_HINTS.filter((s) => s.startsWith(slash.slash)).map((s) => (
+              {slashHints.filter((s) => s.startsWith(slash.slash)).map((s) => (
                 <button key={s} data-test={`slash-${s}`} className="rounded-md px-2 py-1 text-[10px] text-ml2-text-2 hover:bg-ml2-surface-3 hover:text-ml2-text">/{s}</button>
               ))}
             </div>

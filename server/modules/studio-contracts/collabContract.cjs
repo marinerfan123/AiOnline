@@ -1,7 +1,9 @@
 'use strict';
+const { isKnownCommandType } = require('./envelopes.cjs');
 /**
  * G22 — COLLABORATION CONTRACT CORE (Blueprint V2.0).
- * Pure contract module (no I/O, no deps, not mounted to any router).
+ * Pure contract module (no I/O; 单一纯模块依赖 envelopes.cjs —— 复用其 COMMAND_TYPES/
+ * isKnownCommandType 命令类型注册表，见 validateCommandEnvelope；未挂载任何 router)。
  * 依据 docs/product-v2/18-collaboration-g22-audit.md 的审计缺口落点：
  * 仓库现状 = 有命令信封纯契约(envelopes.cjs)、有整画布 CAS revision + 409 + 整图 reload，
  *           但 零 presence 协议、零 逐命令冲突策略、零 多端并发 actor 模型。
@@ -14,22 +16,46 @@
 /* ── presence 协议常量 ─────────────────────────────────────────────
  * G22 presence: 每个连接中的 actor 以 (actorId, projectId) 上报在线状态，
  * 服务端按 presenceTtlMs 判定过期(降级 offline/清理)。本模块只冻结字面量。
- * 设计注：busy=正在执行 run/生成，away=失焦/低活跃；heartbeat 间隔建议 < presenceTtlMs/3。
+ * 设计注：editing=正在编辑画布（legacy 名 busy，同语义），away=失焦/低活跃；
+ *         heartbeat 发送间隔 = HEARTBEAT_INTERVAL_MS（同源 presenceTtlMs，见下）。
+ *
+ * ⚠️ 单一真源（G22 v4-pro 2026-09-04）：presence 枚举 canonical =
+ *   online/away/editing/offline，与 server/modules/collaboration/presenceBus.cjs
+ *   的 PRESENCE_STATES 逐字一致（复制而非 require，避免跨目录循环依赖）。
+ *   busy 为 legacy alias（旧契约状态名，与 editing 同语义「编辑中/执行中」），
+ *   由接入层 presenceBus.heartbeat 归一 busy→editing，不进入 canonical 枚举。
  */
 const PRESENCE_STATES = Object.freeze({
   ONLINE: 'online',
   AWAY: 'away',
+  EDITING: 'editing',
   OFFLINE: 'offline',
-  BUSY: 'busy',
 });
 
 /** presence 记录（actor 最后一次心跳后）视为过期的毫秒数。 */
 const presenceTtlMs = 30_000;
 
+/**
+ * 客户端心跳上报间隔（ms）。与 presenceTtlMs 同源（= presenceTtlMs / 2，即 15_000）：
+ * interval < ttl 且 2×interval = ttl —— 允许客户端漏报一次心跳（连续两次上报
+ * 间隔 = ttl）而不被误判过期；接入层 presenceBus.cjs 的 HEARTBEAT_TTL_MS(=15_000)
+ * 与之一致（客户端发送节奏 = 服务端记录 TTL，同源同一 presence 协议设计）。
+ */
+const HEARTBEAT_INTERVAL_MS = presenceTtlMs / 2;
+
 /** 枚举顺序即协议序列化顺序。 */
 const PRESENCE_STATE_LIST = Object.freeze(Object.values(PRESENCE_STATES));
 
 function isPresenceState(v) { return PRESENCE_STATE_LIST.includes(v); }
+
+/**
+ * legacy alias → canonical 归一映射（单一真源）。busy（旧契约名，与 editing
+ * 同语义「编辑中/执行中」）由接入层 presenceBus.heartbeat 归一为 editing；
+ * canonical 枚举见 PRESENCE_STATES。
+ */
+const PRESENCE_LEGACY_ALIASES = Object.freeze({
+  busy: PRESENCE_STATES.EDITING,
+});
 
 /* ── 信封内部谓词（对齐 envelopes.cjs 风格） ──────────────────────── */
 const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -42,18 +68,38 @@ const isIsoTs = (v) => typeof v === 'string' && !Number.isNaN(Date.parse(v));
  * 命名不同：G22 面向多端并发写路径，actorId 平铺、clientSeq 用于同端排序/去重）：
  *   id        必填非空字符串 — 命令全局唯一 id（幂等/去重主键，取代 G00 idempotencyKey 层）
  *   actorId   必填非空字符串 — 发起 actor（协作参与者身份，非仅鉴权主体）
- *   kind      必填非空字符串 — 命令类型（见 conflictPolicy 映射）
+ *   kind      必填非空字符串 — 命令类型，必须是 envelopes.COMMAND_TYPES 登记的已知类型
+ *             （经 isKnownCommandType 校验，未知类型拒绝）
  *   payload   必填非空纯对象 — 命令效果载体；空 payload 视为畸形(无效果可执行)拒绝
  *   clientSeq 可选，若提供必须为非负整数 — 单 actor 单调序号(排序)；float/负数/字符串拒绝
  *   projectId 可选非空字符串；ts 可选 ISO 字符串（仅当提供时校验类型）
  * 返回 { ok:boolean, errors:string[] }。
+ *
+ * ── 收敛决策（审计 ① 双命令模型未收敛，2026-09-04 G22 v4-pro）──
+ * G00 validateCommand 与 G22 validateCommandEnvelope 字段命名分歧（type/kind、
+ * idempotencyKey/id、actor.id/actorId、projectId 必填/可选）。经查调用方：两者均为
+ * 纯契约、尚未接入执行端点，各自仅有单测消费、互不冲突 —— 故不改名破坏任一已冻结
+ * 契约，而在本信封层做「规范别名映射」的最小破坏收敛：
+ *   - kind ↔ type 同域：均落在 envelopes.COMMAND_TYPES（isKnownCommandType 值域），
+ *     故接受 G00 遗留字段 `type` 作为 `kind` 的规范别名 —— kind 存在时以 kind 为准，
+ *     仅 type 存在时归一为 kind 校验。这是唯一添加的别名。
+ *   - id/idempotencyKey、actorId/actor.id、projectId 必填性 三处分歧**不做隐式别名**：
+ *     语义不同（idempotencyKey=服务端重放去重、id=协作命令主键；actorId 平铺 vs
+ *     actor.id 嵌套；G22 projectId 因跨画布协作可缺省），留待命令总线接入点显式转换。
  */
 function validateCommandEnvelope(env) {
   if (!isPlainObject(env)) return { ok: false, errors: ['envelope must be an object'] };
   const errs = [];
   if (!isNonEmptyString(env.id)) errs.push('id (non-empty string) required');
   if (!isNonEmptyString(env.actorId)) errs.push('actorId (non-empty string) required');
-  if (!isNonEmptyString(env.kind)) errs.push('kind (non-empty string) required');
+  // 规范别名（收敛决策 ①）：kind 存在以 kind 为准，否则回退 G00 遗留字段 type。
+  const hasKind = Object.prototype.hasOwnProperty.call(env, 'kind');
+  const kind = hasKind ? env.kind : env.type;
+  if (!isNonEmptyString(kind)) {
+    errs.push(hasKind ? 'kind (non-empty string) required' : 'kind (or legacy alias `type`) (non-empty string) required');
+  } else if (!isKnownCommandType(kind)) {
+    errs.push(`kind must be a known command type (got: ${JSON.stringify(kind)})`);
+  }
   if (!isPlainObject(env.payload) || Object.keys(env.payload).length === 0) {
     errs.push('payload (non-empty plain object) required');
   }
@@ -156,7 +202,9 @@ const CONFLICT_POLICIES = Object.freeze(['last-write-wins', 'reject-409', 'merge
 module.exports = {
   PRESENCE_STATES,
   PRESENCE_STATE_LIST,
+  PRESENCE_LEGACY_ALIASES,
   presenceTtlMs,
+  HEARTBEAT_INTERVAL_MS,
   isPresenceState,
   validateCommandEnvelope,
   conflictPolicy,

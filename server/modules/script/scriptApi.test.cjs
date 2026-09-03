@@ -9,7 +9,7 @@ function makeHarness({ memberFor = ['p-1'] } = {}) {
   const pg = {
     async query(sql, params = []) {
       if (/INSERT INTO script_rows/.test(sql)) {
-        state.rows.push({ id: params[0], project_id: params[1], scene_index: params[3], row_index: params[4], kind: params[5], text: params[7] });
+        state.rows.push({ id: params[0], project_id: params[1], scene_index: params[3], row_index: params[4], kind: params[5], text: params[7], continuity_notes: params[10] });
         return { rows: [] };
       }
       if (/DELETE FROM script_rows/.test(sql)) { state.deleted++; return { rowCount: 1 }; }
@@ -147,4 +147,58 @@ test('G13: viewer role cannot write (403) — audit M1 fix', async () => {
   const api = createScriptApi({ pg, sessionUser: () => ({ id: 'u-1' }), sendJSON: (res, code, body) => responses.push({ code, body }), parseBody: async () => ({ rows: [{ kind: 'action', text: 'x' }] }) });
   await api.handle({ _body: {}, params: { projectId: 'p-1' } }, {}, '/api/v2/script/rows', 'POST');
   assert.equal(responses[0].code, 403);
+});
+
+test('G13: viewer role cannot PATCH script rows (403) — audit LOW ②', async () => {
+  const responses = [];
+  const pg = {
+    async query(sql) {
+      if (/FROM projects p JOIN workspaces/.test(sql)) return { rows: [{ id: 'p-1', workspace_id: 'w-1', name: 'P' }] };
+      if (/FROM workspace_members/.test(sql)) return { rows: [{ role: 'viewer' }] };
+      return { rows: [] };
+    },
+  };
+  const api = createScriptApi({ pg, sessionUser: () => ({ id: 'u-1' }), sendJSON: (res, code, body) => responses.push({ code, body }), parseBody: async () => ({ text: 'x' }) });
+  await api.handle({ _body: {}, params: { projectId: 'p-1' } }, {}, '/api/v2/script/rows/sr-1', 'PATCH');
+  assert.equal(responses[0].code, 403);
+});
+
+test('G13: continuity_notes JSON string single-encoded on POST (no double encoding, LOW ④)', async () => {
+  const { api, state } = makeHarness();
+  const res = await call(api, 'POST', {
+    rows: [
+      { kind: 'action', text: 'x', continuity_notes: '{"lock":true}' },
+      { kind: 'action', text: 'y', continuity_notes: { lock: true } },
+    ],
+  }, '/api/v2/script/rows');
+  assert.equal(res.status, 201);
+  assert.equal(res.body.inserted.length, 2);
+  // Both the pre-encoded JSON string and the object must land as the same
+  // single-encoded JSON — NOT the double-encoded '"{\"lock\":true}"'.
+  assert.equal(state.rows[0].continuity_notes, '{"lock":true}');
+  assert.equal(state.rows[1].continuity_notes, '{"lock":true}');
+});
+
+test('G13: continuity_notes normalized on PATCH (JSON string → object, LOW ④)', async () => {
+  let updateParams = null;
+  const pg = {
+    async query(sql, params = []) {
+      if (/FROM projects p JOIN workspaces/.test(sql)) return { rows: [{ id: 'p-1', workspace_id: 'w-1', name: 'P' }] };
+      if (/FROM workspace_members/.test(sql)) return { rows: [{ role: 'editor' }] };
+      if (/FROM script_rows WHERE id/.test(sql)) return { rows: [{ id: 'sr-1', project_id: 'p-1', kind: 'action', text: 'x', scene_index: 0, row_index: 0 }] };
+      if (/UPDATE script_rows SET /.test(sql)) { updateParams = params; return { rows: [{ id: 'sr-1' }] }; }
+      return { rows: [] };
+    },
+  };
+  const api = createScriptApi({
+    pg, sessionUser: () => ({ id: 'u-1' }),
+    sendJSON: (res, c) => { res.status = c; },
+    parseBody: async () => ({ continuity_notes: '{"lock":true}' }),
+  });
+  const res = {};
+  await api.handle({ _body: {}, params: { projectId: 'p-1' } }, res, '/api/v2/script/rows/sr-1', 'PATCH');
+  assert.equal(res.status, 200);
+  // UPDATE params = [id, projectId, ...vals] → $3 is the normalized continuity_notes.
+  // After normalization the pre-encoded string must be an object, not a string.
+  assert.deepEqual(updateParams[2], { lock: true });
 });

@@ -26,6 +26,18 @@ function isNonNegativeInt(v) {
 }
 
 /**
+ * True when `v` is a usable non-negative safe integer (accepts integer numeric
+ * strings). Used for timing_ms: JS numbers beyond 2^53-1 are lossy, so a BIGINT
+ * column cannot be filled faithfully from a JS number above MAX_SAFE_INTEGER.
+ */
+function isNonNegativeSafeInt(v) {
+  if (v === undefined || v === null || v === '') return null; // absent -> caller default
+  if (typeof v === 'boolean' || typeof v === 'object') return false;
+  const n = Number(v);
+  return Number.isSafeInteger(n) && n >= 0 ? n : false;
+}
+
+/**
  * Validate one script row.
  * Rules:
  *  - kind: defaults to 'dialogue'; if present it must be in SCRIPT_ROW_KINDS.
@@ -50,7 +62,11 @@ function validateScriptRow(row) {
   }
 
   if (typeof row.text !== 'string' || row.text.trim().length === 0) {
-    errors.push('text is required and must be a non-empty string');
+    if (kind === 'shot_direction') {
+      errors.push('shot_direction text is empty — a bare ">" marker must carry direction text (e.g. "> CLOSE ON: ...")');
+    } else {
+      errors.push('text is required and must be a non-empty string');
+    }
   }
 
   if (kind === 'dialogue') {
@@ -61,8 +77,8 @@ function validateScriptRow(row) {
   }
 
   if (row.timing_ms !== undefined && row.timing_ms !== null && row.timing_ms !== '') {
-    if (isNonNegativeInt(row.timing_ms) === false) {
-      errors.push('timing_ms must be a non-negative integer (milliseconds)');
+    if (isNonNegativeSafeInt(row.timing_ms) === false) {
+      errors.push('timing_ms must be a non-negative safe integer (milliseconds, ≤ 2^53-1)');
     }
   }
 
@@ -172,4 +188,30 @@ function buildSceneRows(rows) {
   return out;
 }
 
-module.exports = { SCRIPT_ROW_KINDS, validateScriptRow, splitScriptToRows, buildSceneRows };
+/**
+ * Normalize `continuity_notes` for the JSONB column (0039_script_rows). Returns
+ * a value such that `JSON.stringify(result)` is the intended stored JSON:
+ *  - a JSON *string* input is parsed, so it is NOT double-encoded;
+ *  - an object/array passes through;
+ *  - a non-JSON string is kept as a JSON string scalar (single-encoded);
+ *  - absent / null / '' → {} (the column default).
+ */
+function normalizeContinuityNotes(v) {
+  if (v === undefined || v === null || v === '') return {};
+  if (typeof v === 'string') {
+    try {
+      return JSON.parse(v);
+    } catch {
+      return v; // not JSON — JSON.stringify quotes it once into a string scalar
+    }
+  }
+  return v;
+}
+
+module.exports = {
+  SCRIPT_ROW_KINDS,
+  validateScriptRow,
+  splitScriptToRows,
+  buildSceneRows,
+  normalizeContinuityNotes,
+};

@@ -15,6 +15,13 @@
  * Legacy safety:
  *   - Does not read or write `studio_projects`.
  *   - Existing legacy Studio routes remain untouched.
+ *
+ * Copy limitations (G01 audit M2):
+ *   - POST /api/v2/projects/:id/copy is a PARTIAL copy: project row + primary
+ *     canvas + nodes + edges only. Assets, scripts, canvas history/versions,
+ *     episodes, shots, structure nodes, timeline clips and continuity snapshots
+ *     are NOT copied; the endpoint reports this per-resource via its `copied`
+ *     response object.
  */
 
 const crypto = require('crypto');
@@ -624,15 +631,39 @@ function createProjectFoundation(deps) {
       // Existing semantics: restore from archive.
       return restoreProject(req, res, user, projectId);
     }
+
+    // G01 audit M1 fix (2026-09-04): a project restored from the recycle bin may
+    // still point at a folder that was soft-deleted (or hard-deleted) while it sat
+    // in the bin. Restoring it as-is leaves a project that lists in the project
+    // manager but is unreachable in the folder tree (dangling folder_id). Reset
+    // such a folder_id to NULL ("全部项目") and surface folderReset:true so the UI
+    // can notify the user.
+    let folderId = project.folder_id || null;
+    let folderReset = false;
+    if (folderId) {
+      const f = await pg.query(
+        `SELECT 1 FROM workspace_folders WHERE id = $1 AND workspace_id = $2 AND deleted_at IS NULL`,
+        [folderId, project.workspace_id],
+      );
+      if (!f.rows.length) {
+        folderId = null;
+        folderReset = true;
+      }
+    }
+
     const r = await pg.query(
-      `UPDATE projects SET deleted_at = NULL, updated_at = NOW(), version = version + 1
-       WHERE id = $1 RETURNING *`,
-      [projectId],
+      `UPDATE projects SET deleted_at = NULL, folder_id = $1, updated_at = NOW(), version = version + 1
+       WHERE id = $2 RETURNING *`,
+      [folderId, projectId],
     );
     const updated = r.rows[0];
-    await audit(user.id, 'project.restored', updated.id, { workspace_id: updated.workspace_id });
+    await audit(user.id, 'project.restored', updated.id, { workspace_id: updated.workspace_id, folder_reset: folderReset });
     await emitProjectEvent(pg, 'project.restored', updated, user.id, req);
-    return sendJSON(res, 200, { project: projectSummary(updated) });
+    return sendJSON(res, 200, {
+      project: projectSummary(updated),
+      permissions: projectPermissions(updated, membership, user),
+      folderReset,
+    });
   }
 
   // DELETE /api/v2/projects/:id  (permanent — high-risk confirm required)
@@ -659,6 +690,19 @@ function createProjectFoundation(deps) {
   }
 
   // POST /api/v2/projects/:id/copy — duplicate project + primary canvas subgraph
+  //
+  // G01 audit M2 disclosure (2026-09-04): this endpoint performs a PARTIAL copy.
+  // It duplicates ONLY:
+  //   - the project row (metadata, creative_brief, delivery_spec)
+  //   - the primary studio_canvases row (viewport_json)
+  //   - its studio_canvas_nodes and studio_canvas_edges rows
+  // It does NOT copy (each reported as `false` in the `copied` response object):
+  //   - canvas history / versions  (studio_canvas_versions, studio_canvas_mutations)
+  //   - project assets             (project_assets relations + media rows)
+  //   - scripts                    (script_rows)
+  //   - episodes / shots / structure_nodes / timeline_clips / continuity_snapshots
+  // The `copied` payload reports each sub-resource truthfully so clients never
+  // assume a full clone.
   async function copyProject(req, res, user, projectId) {
     const access = await requireProjectAccess(res, user, projectId);
     if (!access) return;
@@ -669,6 +713,7 @@ function createProjectFoundation(deps) {
     const body = (await parseBody(req)) || {};
     const suffix = (body.name && String(body.name).trim()) || `${project.name} Copy`;
     const newId = `proj-${crypto.randomUUID()}`;
+    let canvasCopied = false;
     const client = await pg.connect();
     try {
       await client.query('BEGIN');
@@ -686,6 +731,7 @@ function createProjectFoundation(deps) {
         [projectId],
       );
       if (c.rows.length) {
+        canvasCopied = true;
         const newCanvas = `canvas-${crypto.randomUUID()}`;
         const srcCanvas = c.rows[0].id;
         await client.query(
@@ -715,7 +761,23 @@ function createProjectFoundation(deps) {
     }
     await audit(user.id, 'project.copied', newId, { source_project_id: projectId });
     const row = await pg.query(`SELECT * FROM projects WHERE id = $1`, [newId]);
-    return sendJSON(res, 201, { project: projectSummary(row.rows[0]) });
+    return sendJSON(res, 201, {
+      project: projectSummary(row.rows[0]),
+      copied: {
+        project: true,
+        primaryCanvas: canvasCopied,
+        nodes: canvasCopied,
+        edges: canvasCopied,
+        canvasHistory: false,
+        assets: false,
+        scripts: false,
+        episodes: false,
+        shots: false,
+        structureNodes: false,
+        timelineClips: false,
+        continuitySnapshots: false,
+      },
+    });
   }
 
   // ── G01: workspace folders ────────────────────────────────────────────

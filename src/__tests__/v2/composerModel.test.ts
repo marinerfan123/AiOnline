@@ -4,6 +4,9 @@ import {
   detectSlashCommand,
   parseRefTokens,
   insertRefToken,
+  isModelAvailableFor,
+  filterAvailableModels,
+  type ModelAvailability,
 } from '@/features/studio-v2/composerModel';
 
 describe('G07 composer model', () => {
@@ -39,5 +42,31 @@ describe('G07 composer model', () => {
   it('inserts a reference chip at caret', () => {
     const out = insertRefToken('让  表演', 2, '小美');
     expect(out).toBe('让 @小美  表演');
+  });
+
+  it('model availability trusts the bindings-aware `available` field', () => {
+    const live: ModelAvailability = { available: { 'video.text2video': true }, capabilities: { 'video.text2video': true } };
+    expect(isModelAvailableFor(live, ['video.text2video'])).toBe(true);
+
+    // declared capability but no live dispatch line → unavailable
+    const noLine: ModelAvailability = { available: { 'video.text2video': false }, capabilities: { 'video.text2video': true } };
+    expect(isModelAvailableFor(noLine, ['video.text2video'])).toBe(false);
+  });
+
+  it('model availability falls back to capabilities boolean when `available` absent', () => {
+    const legacy: ModelAvailability = { capabilities: { 'video.text2video': true } };
+    expect(isModelAvailableFor(legacy, ['video.text2video'])).toBe(true);
+    expect(isModelAvailableFor({ capabilities: { 'video.text2video': false } }, ['video.text2video'])).toBe(false);
+  });
+
+  it('filters a model list down to actually-available capabilities', () => {
+    type M = ModelAvailability & { bindingId: string };
+    const models: M[] = [
+      { bindingId: 'a', available: { 'video.text2video': true }, capabilities: { 'video.text2video': true } },
+      { bindingId: 'b', available: { 'video.text2video': false }, capabilities: { 'video.text2video': true } },
+      { bindingId: 'c', capabilities: { 'video.text2video': true } },
+    ];
+    const got = filterAvailableModels(models, ['video.text2video']);
+    expect(got.map((m) => m.bindingId)).toEqual(['a', 'c']);
   });
 });

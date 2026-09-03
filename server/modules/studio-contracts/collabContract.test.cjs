@@ -67,6 +67,32 @@ test('G22 envelope: kind required non-empty string (missing / empty / non-string
   }
 });
 
+/* ── 信封：kind/type 规范别名（收敛决策 ①） ─────────────────────── */
+test('G22 envelope: G00 legacy alias `type` accepted in place of `kind`', () => {
+  const { kind, ...rest } = VALID();
+  const r = C.validateCommandEnvelope({ ...rest, type: 'node.update' });
+  assert.equal(r.ok, true, JSON.stringify(r.errors));
+});
+
+test('G22 envelope: `kind` wins — unknown `type` ignored when `kind` present', () => {
+  const r = C.validateCommandEnvelope({ ...VALID(), type: 'bogus.kind' });
+  assert.equal(r.ok, true, JSON.stringify(r.errors));
+});
+
+test('G22 envelope: unknown kind/type rejected via isKnownCommandType', async (t) => {
+  for (const [label, mutate] of [
+    ['unknown kind', (v) => ({ ...v, kind: 'bogus.kind' })],
+    ['unknown type alias', (v) => { const { kind, ...r } = v; return { ...r, type: 'bogus.kind' }; }],
+    ['append-prefix not in COMMAND_TYPES', (v) => ({ ...v, kind: 'presence.heartbeat' })],
+  ]) {
+    await t.test(label, () => {
+      const r = C.validateCommandEnvelope(mutate(VALID()));
+      assert.equal(r.ok, false);
+      assert.ok(r.errors.some((e) => e.includes('kind') && e.includes('known')), JSON.stringify(r.errors));
+    });
+  }
+});
+
 /* ── 信封：clientSeq ────────────────────────────────────────────── */
 test('G22 envelope: clientSeq float rejected', () => {
   const r = C.validateCommandEnvelope({ ...VALID(), clientSeq: 1.5 });
@@ -123,12 +149,12 @@ test('G22 envelope: bad projectId / ts rejected when provided', () => {
 });
 
 /* ── presence 状态枚举 ──────────────────────────────────────────── */
-test('G22 presence: states are exactly online/away/offline/busy', () => {
-  assert.deepEqual(C.PRESENCE_STATE_LIST, ['online', 'away', 'offline', 'busy']);
+test('G22 presence: states are exactly online/away/editing/offline (busy 为 legacy alias)', () => {
+  assert.deepEqual(C.PRESENCE_STATE_LIST, ['online', 'away', 'editing', 'offline']);
   assert.equal(C.PRESENCE_STATES.ONLINE, 'online');
   assert.equal(C.PRESENCE_STATES.AWAY, 'away');
+  assert.equal(C.PRESENCE_STATES.EDITING, 'editing');
   assert.equal(C.PRESENCE_STATES.OFFLINE, 'offline');
-  assert.equal(C.PRESENCE_STATES.BUSY, 'busy');
 });
 
 test('G22 presence: isPresenceState validates the enum', () => {
@@ -136,9 +162,21 @@ test('G22 presence: isPresenceState validates the enum', () => {
   for (const bad of ['invisible', '', 'ONLINE', 'busy ', null, 1]) assert.equal(C.isPresenceState(bad), false);
 });
 
+test('G22 presence: busy 声明为 legacy alias → editing（不进入 canonical 枚举）', () => {
+  assert.equal(C.PRESENCE_LEGACY_ALIASES.busy, 'editing');
+  assert.equal(C.isPresenceState('busy'), false);
+  assert.equal(C.isPresenceState('editing'), true);
+});
+
 test('G22 presence: presenceTtlMs is a positive finite constant', () => {
   assert.ok(Number.isFinite(C.presenceTtlMs) && C.presenceTtlMs > 0);
   assert.equal(typeof C.presenceTtlMs, 'number');
+});
+
+test('G22 presence: HEARTBEAT_INTERVAL_MS = 15000 且与 presenceTtlMs 同源 (= ttl/2)', () => {
+  assert.equal(C.HEARTBEAT_INTERVAL_MS, 15000);
+  assert.equal(C.HEARTBEAT_INTERVAL_MS, C.presenceTtlMs / 2);
+  assert.ok(C.HEARTBEAT_INTERVAL_MS < C.presenceTtlMs);
 });
 
 /* ── conflictPolicy 映射 ────────────────────────────────────────── */

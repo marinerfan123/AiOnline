@@ -9,8 +9,29 @@
  * server — keys stay in api_keys/providers rows (04 §23).
  */
 const { projectModelBinding } = require('./modelSchema.cjs');
+const { loadDispatchPairs } = require('./bindings.cjs');
 const { listShortcuts } = require('./shortcuts.cjs');
 const { resolvePromptTokens } = require('../project-foundation/autoLink.cjs');
+
+/**
+ * Compute per-canonical-capability availability from the real dispatch surface.
+ * A boolean capability is "available" only when the model declares it AND at
+ * least one live line can serve it (provider_model_bindings enabled + provider
+ * enabled + configured key). Numeric limit keys (video.maxDurationMs /
+ * reference.*.max) are limits, not boolean capabilities — skipped. Pure, no PG.
+ * @param {object} capabilities  canonical capabilities object (booleans + numeric limits)
+ * @param {number} lineCount     live dispatch line count for this model
+ * @returns {object}  { [canonicalCapability]: boolean }
+ */
+function computeAvailable(capabilities, lineCount) {
+  const available = {};
+  const caps = capabilities || {};
+  for (const [k, v] of Object.entries(caps)) {
+    if (typeof v === 'number') continue; // numeric limit, not a boolean capability
+    available[k] = Boolean(v) && lineCount > 0;
+  }
+  return available;
+}
 
 function createStudioModelsApi({ pg, sessionUser, sendJSON, parseBody }) {
   function requireUser(req, res) {
@@ -31,9 +52,26 @@ function createStudioModelsApi({ pg, sessionUser, sendJSON, parseBody }) {
        ORDER BY m.model_id ASC`,
       [],
     );
-    return r.rows.map((row) =>
-      projectModelBinding(row, { id: row.provider_row_id, name: row.provider_name }),
-    );
+    const models = r.rows.map((row) => ({
+      ...projectModelBinding(row, { id: row.provider_row_id, name: row.provider_name }),
+      _modelId: row.model_id || row.id,
+    }));
+    // 锚定真实派发面：provider_model_bindings（多线路）+ provider.enabled + api_keys。
+    // loadDispatchPairs 与 dispatcher 共用同一读取层（单一数据源），其返回值即
+    // 真实可派发线路；按 model_id 归并出每模型的线路数。
+    const modelIds = [...new Set(models.map((m) => m._modelId).filter(Boolean))];
+    const pairs = modelIds.length ? await loadDispatchPairs(pg, modelIds) : [];
+    const lineCountByModel = new Map();
+    for (const pair of pairs) {
+      const mid = pair.model && pair.model.model_id;
+      if (mid == null) continue;
+      lineCountByModel.set(mid, (lineCountByModel.get(mid) || 0) + 1);
+    }
+    return models.map((m) => {
+      const { _modelId, ...rest } = m;
+      const lineCount = lineCountByModel.get(_modelId) || 0;
+      return { ...rest, available: computeAvailable(rest.capabilities, lineCount), lineCount };
+    });
   }
 
   async function handle(req, res, urlPath, method) {
@@ -91,4 +129,4 @@ function createStudioModelsApi({ pg, sessionUser, sendJSON, parseBody }) {
   return { handle, PREFIXES: ['/api/studio/models'] };
 }
 
-module.exports = { createStudioModelsApi };
+module.exports = { createStudioModelsApi, computeAvailable };

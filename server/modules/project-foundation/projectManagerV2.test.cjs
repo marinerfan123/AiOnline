@@ -62,6 +62,7 @@ function makeHarness() {
         const upd = seedProject({ ...state.project });
         if (sql.includes('deleted_at = NOW()')) upd.deleted_at = '2026-09-03T00:00:00.000Z';
         if (sql.includes('deleted_at = NULL')) upd.deleted_at = null;
+        if (sql.includes('folder_id = $1')) upd.folder_id = params[0];
         if (sql.includes('last_opened_at = NOW()')) upd.last_opened_at = '2026-09-03T00:00:00.000Z';
         if (sql.includes('WHERE id = $1 RETURNING *') && sql.includes('UPDATE workspace_folders')) return { rows: [state.folder] };
         return { rows: [upd] };
@@ -133,6 +134,38 @@ test('G01 restore: clears deleted_at (from recycle)', async () => {
   assert.equal(h.responses[0].body.project.deletedAt, null);
 });
 
+test('G01 restore orphan: dangling folder_id reset to NULL + folderReset:true', async () => {
+  const h = makeHarness();
+  h.state.project.deleted_at = '2026-09-03T00:00:00.000Z';
+  h.state.project.folder_id = 'folder-orphan';
+  h.state.folder = null; // folder soft-deleted / missing → orphan
+  await h.handle({}, {}, '/api/v2/projects/proj-1/restore', 'POST');
+  assert.equal(h.responses[0].code, 200);
+  assert.equal(h.responses[0].body.folderReset, true);
+  assert.equal(h.responses[0].body.project.folderId, null);
+  assert.equal(h.responses[0].body.project.deletedAt, null);
+  // folder usability check must be issued before the UPDATE
+  assert.ok(
+    h.queries.some((q) => q.sql.includes('FROM workspace_folders WHERE') && q.sql.includes('deleted_at IS NULL')),
+    'folder usability check issued',
+  );
+  // the UPDATE must carry folder_id = NULL
+  const upd = h.queries.find((q) => q.sql.startsWith('UPDATE projects') && q.sql.includes('deleted_at = NULL'));
+  assert.ok(upd, 'restore UPDATE issued');
+  assert.equal(upd.params[0], null);
+});
+
+test('G01 restore: valid folder_id preserved (folderReset:false)', async () => {
+  const h = makeHarness();
+  h.state.project.deleted_at = '2026-09-03T00:00:00.000Z';
+  h.state.project.folder_id = 'folder-ok';
+  h.state.folder = { id: 'folder-ok', workspace_id: 'ws-1' };
+  await h.handle({}, {}, '/api/v2/projects/proj-1/restore', 'POST');
+  assert.equal(h.responses[0].code, 200);
+  assert.equal(h.responses[0].body.folderReset, false);
+  assert.equal(h.responses[0].body.project.folderId, 'folder-ok');
+});
+
 test('G01 permanent delete: requires confirm:true and recycle state', async () => {
   // active project → permission denied (canDelete requires deleted)
   const h1 = makeHarness();
@@ -193,6 +226,27 @@ test('G01 copy: duplicates project + canvas + nodes + edges in one transaction',
   assert.ok(copySqls.some((s) => s.startsWith('INSERT INTO projects')));
   assert.ok(copySqls.some((s) => s.includes('FROM studio_canvas_nodes')));
   assert.ok(copySqls.some((s) => s.includes('FROM studio_canvas_edges')));
+});
+
+test('G01 copy: response reports `copied` per-resource booleans honestly', async () => {
+  const h = makeHarness();
+  await h.handle({ _body: {} }, {}, '/api/v2/projects/proj-1/copy', 'POST');
+  assert.equal(h.responses[0].code, 201);
+  const copied = h.responses[0].body.copied;
+  assert.ok(copied, 'copied payload present');
+  assert.equal(copied.project, true);
+  assert.equal(copied.primaryCanvas, true);
+  assert.equal(copied.nodes, true);
+  assert.equal(copied.edges, true);
+  // sub-resources that are NOT deep-copied must be disclosed as false
+  assert.equal(copied.canvasHistory, false);
+  assert.equal(copied.assets, false);
+  assert.equal(copied.scripts, false);
+  assert.equal(copied.episodes, false);
+  assert.equal(copied.shots, false);
+  assert.equal(copied.structureNodes, false);
+  assert.equal(copied.timelineClips, false);
+  assert.equal(copied.continuitySnapshots, false);
 });
 
 test('G01 move project into folder via PATCH folderId', async () => {

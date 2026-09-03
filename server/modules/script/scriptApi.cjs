@@ -15,7 +15,7 @@
  * dialogue by validateScriptRow.
  */
 const crypto = require('crypto');
-const { validateScriptRow, buildSceneRows } = require('./scriptModel.cjs');
+const { validateScriptRow, buildSceneRows, normalizeContinuityNotes } = require('./scriptModel.cjs');
 
 function createScriptApi({ pg, sessionUser, sendJSON, parseBody }) {
   function requireUser(req, res) {
@@ -100,7 +100,12 @@ function createScriptApi({ pg, sessionUser, sendJSON, parseBody }) {
       const sets = [];
       const vals = [];
       for (const k of allowed) {
-        if (body[k] !== undefined) { merged[k] = body[k]; sets.push(`${k} = $${sets.length + 2}`); vals.push(body[k]); }
+        if (body[k] !== undefined) {
+          // continuity_notes is JSONB: normalize so a pre-encoded JSON string
+          // is not double-encoded on the way to the column.
+          const v = k === 'continuity_notes' ? normalizeContinuityNotes(body[k]) : body[k];
+          merged[k] = v; sets.push(`${k} = $${sets.length + 2}`); vals.push(v);
+        }
       }
       if (!sets.length) return sendJSON(res, 400, { ok: false, error: '无更新字段' });
       const check = validateScriptRow({ ...merged, id: existing.id || id || 'row-x' });
@@ -143,7 +148,7 @@ function createScriptApi({ pg, sessionUser, sendJSON, parseBody }) {
           kind: raw.kind || 'dialogue', speaker: raw.speaker || null,
           text: String(raw.text || ''), beat: raw.beat || null,
           timing_ms: raw.timing_ms != null ? raw.timing_ms : null,
-          continuity_notes: raw.continuity_notes || {},
+          continuity_notes: normalizeContinuityNotes(raw.continuity_notes),
         };
         await pg.query(
           `INSERT INTO script_rows (id, project_id, episode_id, scene_index, row_index, kind, speaker, text, beat, timing_ms, continuity_notes)

@@ -85,3 +85,29 @@ export function insertRefToken(text: string, caret: number, entityName: string):
   const token = `@${entityName} `;
   return text.slice(0, caret) + token + text.slice(caret);
 }
+
+/** Model payload shape from GET /api/studio/models (bindings-aware view). */
+export interface ModelAvailability {
+  /** canonical capability → actually dispatchable (enabled provider + key line). */
+  available?: Record<string, boolean>;
+  /** canonical capabilities projection (booleans + numeric limits). */
+  capabilities?: Record<string, boolean | number>;
+}
+
+/**
+ * Is a model actually usable for at least one wanted canonical capability?
+ * Trusts the server's bindings-aware `available` field when present (真实派发面:
+ * provider_model_bindings 多线路 + provider.enabled + api_keys); falls back to
+ * the legacy capabilities boolean when the field is absent (older API shape).
+ */
+export function isModelAvailableFor(model: ModelAvailability, wanted: string[]): boolean {
+  if (model.available && typeof model.available === 'object') {
+    return wanted.some((w) => model.available![w] === true);
+  }
+  return wanted.some((w) => model.capabilities?.[w] === true);
+}
+
+/** Filter a model list down to those usable for at least one wanted capability. */
+export function filterAvailableModels<T extends ModelAvailability>(models: T[], wanted: string[]): T[] {
+  return models.filter((m) => isModelAvailableFor(m, wanted));
+}

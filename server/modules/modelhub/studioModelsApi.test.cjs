@@ -1,7 +1,7 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { createStudioModelsApi } = require('./studioModelsApi.cjs');
+const { createStudioModelsApi, computeAvailable } = require('./studioModelsApi.cjs');
 
 const MODEL_ROW = {
   model_id: 'seedance-2.5',
@@ -17,14 +17,52 @@ const MODEL_ROW = {
 };
 const PROVIDER_ROW = { id: 'prov-1', name: 'Seedance' };
 
-function harness() {
+// ── Fake dispatch surface rows (mirror bindings.cjs loadDispatchPairs reads) ──
+const BINDING_ROW = { id: 'b-a', model_id: 'seedance-2.5', provider_id: 'prov-1', upstream_model_name: 'seedance-2.5', enabled: true, priority: 0, weight: 0 };
+const DISPATCH_MODEL_ROW = { model_id: 'seedance-2.5', provider_id: 'prov-1', enabled: true };
+const LIVE_PROVIDER = { id: 'prov-1', enabled: true, api_key: 'sk-test-123456' };
+
+/**
+ * Fake PG pool serving both loadBindings (models list) and loadDispatchPairs
+ * (provider_model_bindings / models / providers / api_keys) queries.
+ */
+function makePool({ modelRows, bindings, dispatchModels, providers, apiKeys } = {}) {
+  return {
+    async query(sql, params = []) {
+      const T = (sql || '').toUpperCase();
+      if (T.includes('PROVIDER_MODEL_BINDINGS')) {
+        const ids = params[0] || [];
+        return { rows: (bindings || []).filter((b) => b.enabled && ids.includes(b.model_id)) };
+      }
+      if (T.includes('LEFT JOIN PROVIDERS')) {
+        return { rows: modelRows || [] };
+      }
+      if (T.includes('FROM MODELS')) {
+        return { rows: (dispatchModels || []).filter((m) => m.enabled !== false) };
+      }
+      if (T.includes('FROM PROVIDERS')) {
+        return { rows: providers || [] };
+      }
+      if (T.includes('FROM API_KEYS')) {
+        return { rows: apiKeys || [] };
+      }
+      return { rows: [] };
+    },
+  };
+}
+
+function harness(overrides = {}) {
   const responses = [];
   const sendJSON = (res, code, body) => responses.push({ code, body });
-  const api = createStudioModelsApi({
-    pg: { async query() { return { rows: [{ ...MODEL_ROW, provider_name: PROVIDER_ROW.name, provider_row_id: PROVIDER_ROW.id }] }; } },
-    sessionUser: () => ({ id: 'u1' }),
-    sendJSON,
+  const modelRows = overrides.modelRows ?? [{ ...MODEL_ROW, provider_name: PROVIDER_ROW.name, provider_row_id: PROVIDER_ROW.id }];
+  const pg = makePool({
+    modelRows,
+    bindings: overrides.bindings ?? [BINDING_ROW],
+    dispatchModels: overrides.dispatchModels ?? [DISPATCH_MODEL_ROW],
+    providers: overrides.providers ?? [LIVE_PROVIDER],
+    apiKeys: overrides.apiKeys ?? [],
   });
+  const api = createStudioModelsApi({ pg, sessionUser: () => ({ id: 'u1' }), sendJSON });
   return { api, responses };
 }
 
@@ -51,6 +89,40 @@ test('G07 models API: list projects canonical bindings (no provider secrets)', a
   // schema & legacy aliases are NOT part of the list payload
   assert.equal('schema' in models[0], false);
   assert.equal('legacyCapabilities' in models[0], false);
+});
+
+test('G07 models API: bindings-aware view → available true + lineCount with live line', async () => {
+  const h = harness();
+  await h.api.handle({}, {}, '/api/studio/models', 'GET');
+  const m = h.responses[0].body.models[0];
+  assert.equal(m.lineCount, 1);
+  assert.equal(m.available['video.text2video'], true);
+  // numeric limit keys are not boolean capabilities → never in `available`
+  assert.equal('video.maxDurationMs' in m.available, false);
+});
+
+test('G07 models API: bindings-aware view → no key ⇒ available false + lineCount 0', async () => {
+  const h = harness({ providers: [{ id: 'prov-1', enabled: true, api_key: '' }], apiKeys: [] });
+  await h.api.handle({}, {}, '/api/studio/models', 'GET');
+  const m = h.responses[0].body.models[0];
+  assert.equal(m.lineCount, 0);
+  assert.equal(m.available['video.text2video'], false);
+});
+
+test('G07 models API: bindings-aware view → disabled provider ⇒ available false', async () => {
+  const h = harness({ providers: [{ id: 'prov-1', enabled: false, api_key: 'sk-test-123456' }] });
+  await h.api.handle({}, {}, '/api/studio/models', 'GET');
+  const m = h.responses[0].body.models[0];
+  assert.equal(m.lineCount, 0);
+  assert.equal(m.available['video.text2video'], false);
+});
+
+test('computeAvailable: numeric limits skipped; booleans gated by lineCount', () => {
+  const caps = { 'video.text2video': true, 'video.maxDurationMs': 30000, 'image.text2image': true };
+  assert.deepEqual(computeAvailable(caps, 2), { 'video.text2video': true, 'image.text2image': true });
+  assert.deepEqual(computeAvailable(caps, 0), { 'video.text2video': false, 'image.text2image': false });
+  assert.deepEqual(computeAvailable({ 'video.text2video': false }, 5), { 'video.text2video': false });
+  assert.deepEqual(computeAvailable(undefined, 0), {});
 });
 
 test('G07 models API: schema endpoint returns dynamic ModelSchema', async () => {

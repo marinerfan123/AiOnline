@@ -6,6 +6,7 @@ const {
   validateScriptRow,
   splitScriptToRows,
   buildSceneRows,
+  normalizeContinuityNotes,
 } = require('./scriptModel.cjs');
 
 // ---------------------------------------------------------------- validation
@@ -54,6 +55,21 @@ test('validateScriptRow: timing_ms float / negative / NaN rejected, integers ok'
   // absent / null timing_ms is fine (column nullable)
   assert.equal(validateScriptRow({ kind: 'action', text: 'x' }).ok, true);
   assert.equal(validateScriptRow({ kind: 'action', text: 'x', timing_ms: null }).ok, true);
+});
+
+test('validateScriptRow: timing_ms above MAX_SAFE_INTEGER rejected (LOW ③)', () => {
+  assert.equal(validateScriptRow({ kind: 'action', text: 'x', timing_ms: Number.MAX_SAFE_INTEGER + 1 }).ok, false);
+  assert.equal(validateScriptRow({ kind: 'action', text: 'x', timing_ms: '9007199254740992' }).ok, false);
+  assert.equal(validateScriptRow({ kind: 'action', text: 'x', timing_ms: 9007199254740992 }).ok, false);
+  // boundary: MAX_SAFE_INTEGER itself is accepted
+  assert.equal(validateScriptRow({ kind: 'action', text: 'x', timing_ms: Number.MAX_SAFE_INTEGER }).ok, true);
+  assert.equal(validateScriptRow({ kind: 'action', text: 'x', timing_ms: '9007199254740991' }).ok, true);
+});
+
+test('validateScriptRow: shot_direction with empty text → row-level error with clear message (LOW ①)', () => {
+  const r = validateScriptRow({ kind: 'shot_direction', text: '' });
+  assert.equal(r.ok, false);
+  assert.ok(r.errors.some((e) => e.includes('shot_direction') && /empty/.test(e)), `got errors: ${JSON.stringify(r.errors)}`);
 });
 
 test('validateScriptRow: scene_index / row_index must be non-negative integers', () => {
@@ -126,6 +142,28 @@ test('splitScriptToRows: empty / null / whitespace-only input -> []', () => {
   assert.deepEqual(splitScriptToRows(''), []);
   assert.deepEqual(splitScriptToRows(null), []);
   assert.deepEqual(splitScriptToRows('   \n\n  '), []);
+});
+
+test('splitScriptToRows: bare ">" marker yields empty-text shot_direction (rejected downstream, LOW ①)', () => {
+  const rows = splitScriptToRows('>\n>  ');
+  assert.equal(rows.length, 2);
+  assert.deepEqual(rows.map((r) => r.kind), ['shot_direction', 'shot_direction']);
+  assert.equal(rows[0].text, '');
+  assert.equal(rows[1].text, '');
+  // empty-text shot_direction is a row-level error, not silently defaulted
+  assert.equal(validateScriptRow(rows[0]).ok, false);
+  assert.equal(validateScriptRow(rows[1]).ok, false);
+});
+
+// ---------------------------------------------------------------- continuity_notes
+test('normalizeContinuityNotes: JSON string parsed (no double encoding), object passthrough, absent → {}', () => {
+  assert.deepEqual(normalizeContinuityNotes('{"lock":true}'), { lock: true });       // pre-encoded JSON string → object
+  assert.deepEqual(normalizeContinuityNotes({ lock: true }), { lock: true });         // object passthrough
+  assert.deepEqual(normalizeContinuityNotes([1, 2]), [1, 2]);                          // array passthrough
+  assert.equal(normalizeContinuityNotes('not json'), 'not json');                      // non-JSON string kept
+  assert.deepEqual(normalizeContinuityNotes(undefined), {});
+  assert.deepEqual(normalizeContinuityNotes(null), {});
+  assert.deepEqual(normalizeContinuityNotes(''), {});
 });
 
 // ---------------------------------------------------------------- grouping
