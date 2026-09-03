@@ -22,7 +22,9 @@ test('settleHold commit 只允许 held→committed CAS', async () => {
   const result = await settleHold(pg, { itemId: 'gi-1', action: 'commit' });
   assert.equal(result.changed, true);
   const call = pg.calls[0];
-  assert.match(call.sql, /SET status='committed'/);
+  // P0 fix 8cafea8: parameterized status (never interpolated).
+  assert.match(call.sql, /SET status=\$2, settled_at=NOW\(\)/);
+  assert.equal(call.params[1], 'committed');
   assert.match(call.sql, /WHERE item_id=\$1 AND status='held'/);
 });
 
@@ -30,7 +32,9 @@ test('settleHold release 只允许 held→released CAS', async () => {
   const pg = fakePg([{ hold_id: 2, item_id: 'gi-2', status: 'released', amount: '50' }]);
   const result = await settleHold(pg, { itemId: 'gi-2', action: 'release' });
   assert.equal(result.changed, true);
-  assert.match(pg.calls[0].sql, /SET status='released'/);
+  const call = pg.calls[0];
+  assert.match(call.sql, /SET status=\$2, settled_at=NOW\(\)/);
+  assert.equal(call.params[1], 'released');
 });
 
 test('settleHold CAS未命中视为幂等，无重复commit/release', async () => {
