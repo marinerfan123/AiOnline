@@ -9,7 +9,7 @@
  * separately; this module owns ONLY the durable state transitions.
  */
 
-const JOB_KINDS = new Set(['probe', 'transcode', 'proxy', 'thumbnail', 'waveform', 'frame_extract', 'render']);
+const JOB_KINDS = new Set(['probe', 'transcode', 'proxy', 'thumbnail', 'waveform', 'frame_extract', 'render', 'stitch']);
 const TERMINAL = new Set(['done', 'failed', 'cancelled']);
 
 function assertKind(kind) {

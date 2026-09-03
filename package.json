@@ -2,6 +2,7 @@
   "name": "ai-image-studio",
   "version": "0.1.0",
   "private": true,
+  "bin": { "mlg": "server/cli/mlg.cjs" },
   "type": "module",
   "scripts": {
     "dev": "concurrently -k \"vite\" \"node server/server.js\"",

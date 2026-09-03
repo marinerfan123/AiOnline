@@ -83,6 +83,12 @@ function bulkInsertRunEdges(client, rows) {
 
 function createStudioRunEngine(deps) {
   const { pg, workerId } = deps;
+  // G21: optional run_events relay (createRunEventRelay from runEventRelay.cjs).
+  // When present, every durable engine event is ALSO appended to the run_events
+  // log; the relay owns seq allocation (lastSequence+1) and (run_id, seq)
+  // idempotency. Absent / not callable → engine behaviour is byte-for-byte the
+  // pre-relay path (no relay calls at all).
+  const relay = deps.relay && typeof deps.relay.relayRunEvent === 'function' ? deps.relay : null;
   const registry = createStudioExecutorRegistry({ executors: deps.executors || null });
   const leaseSeconds = Math.max(1, Number(deps.leaseSeconds) || LIMITS.leaseSeconds);
   const pollLimit = Math.max(1, Math.min(100, Number(deps.leasePollLimit) || LIMITS.leasePollLimit));
@@ -91,7 +97,28 @@ function createStudioRunEngine(deps) {
   const emitLog = deps.onLog || null;
   const log = (tag, payload) => { try { if (emitLog) emitLog(tag, payload); } catch (_) {} };
 
-  /** Durable domain event (sanitized payload only) + structured log. */
+  /**
+   * Durable domain event (sanitized payload only) + structured log + optional
+   * run_events relay bridge (G21).
+   *
+   * This is the engine's ONLY event-emission funnel — every `studio.run*` /
+   * `studio.run_node*` event passes through here (the engine has no
+   * EventEmitter and no SSE; it persists durable events, and callers/SSE read
+   * them back). Every call site sits strictly AFTER the run row exists in
+   * studio_runs (lease/complete/fail/reap/cancel/aggregate all operate on an
+   * already-created run), so a relayed runId always satisfies the run_events
+   * FK to studio_runs.
+   *
+   * Relay bridge is best-effort ONLY and can never disturb run execution:
+   *   - it runs on the RELAY's own pool connection (autocommit), never on this
+   *     transaction `client` — a run_events row may become visible before the
+   *     surrounding tx commits and survives a later ROLLBACK (accepted for an
+   *     append-only log; see runEventRelay.cjs header) — so it adds no
+   *     write coupling to the engine transaction;
+   *   - failures are logged ('event.relay_failed') and never thrown.
+   *   - the relay allocates seq itself (lastSequence+1); (run_id, seq) PK
+   *     absorbs duplicate delivery (idempotent no-op).
+   */
   async function emitEvent(client, runId, runNodeId, eventType, payload) {
     try {
       await client.query(
@@ -99,6 +126,27 @@ function createStudioRunEngine(deps) {
         [runId, runNodeId || null, eventType, JSON.stringify(payload || {})]
       );
     } catch (e) { log('event.insert_failed', { runId, eventType, error: e.message }); }
+
+    if (relay) {
+      try {
+        const body = payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : {};
+        // Bridge shape documented in runEventRelay.cjs: fold the positional
+        // runNodeId into the payload as run_node_id (payload wins if it already
+        // carried one — every engine site passes the same value) so replayed
+        // events carry node identity like studio_run_events does. `type` is the
+        // engine eventType verbatim; the relay treats it as opaque.
+        const result = await relay.relayRunEvent({
+          runId,
+          type: eventType,
+          payload: runNodeId ? { run_node_id: runNodeId, ...body } : body,
+        });
+        if (!result || result.ok !== true) {
+          log('event.relay_failed', { runId, eventType, error: (result && result.errors) || 'relayRunEvent returned a non-ok result' });
+        }
+      } catch (e) {
+        log('event.relay_failed', { runId, eventType, error: e && e.message ? e.message : String(e) });
+      }
+    }
   }
 
   // ── SECTION:create-run ─────────────────────────────────────────────────

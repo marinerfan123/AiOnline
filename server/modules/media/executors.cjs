@@ -53,21 +53,30 @@ function runProbe({ source, spawn = require('child_process').spawn, timeoutMs = 
   });
 }
 
-/** Executor registry: kind → runner (probe/thumbnail/proxy/waveform wired). */
+/** Executor registry: kind → runner (probe/thumbnail/proxy/waveform/stitch wired). */
 const EXECUTORS = {
   probe: runProbe,
   thumbnail: (ctx) => require('./executorsAv.cjs').runThumbnail(ctx),
   proxy: (ctx) => require('./executorsAv.cjs').runProxy(ctx),
   waveform: (ctx) => require('./executorsAv.cjs').runWaveform(ctx),
+  stitch: (ctx) => require('./executorsStitch.cjs').runStitch(ctx),
   transcode: null,
   frame_extract: null,
   render: null,
 };
 
+/**
+ * Kinds whose ctx contract carries per-segment sources (`segments`:
+ * [{source, inMs, outMs}, ...]) instead of one top-level `source`. They bypass
+ * the generic source gate below — runStitch validates every segment source and
+ * returns MEDIA_SOURCE_MISSING itself when any is absent.
+ */
+const SEGMENT_BASED_KINDS = new Set(['stitch']);
+
 function execute(kind, ctx) {
   const fn = EXECUTORS[kind];
   if (!fn) return Promise.resolve({ ok: false, code: `MEDIA_${kind.toUpperCase().replace('_', '_')}_EXECUTOR_PENDING`, message: `${kind} executor not yet wired (infra gate)` });
-  if (!ctx || !ctx.source) {
+  if (!SEGMENT_BASED_KINDS.has(kind) && (!ctx || !ctx.source)) {
     return Promise.resolve({ ok: false, code: 'MEDIA_SOURCE_MISSING', message: `${kind} executor requires a source (asset object URL)` });
   }
   return fn(ctx);
