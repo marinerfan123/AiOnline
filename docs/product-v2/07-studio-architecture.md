@@ -1,5 +1,9 @@
 # 07 — Moling Studio 架构 (无限画布)
 
+> 2026-09-03 SUPERSEDED: 本文件为历史愿景记录。权威设计蓝图见
+> `15-infinite-canvas-v2-decision.md`（将来形态决定：Shot-centric 生产事实层；
+> 节点清单以 registry 为准，非 16 类硬编码）。
+
 日期: 2026-08-27
 定位: 产品核心。全屏独立 Shell。技术: @xyflow/react (v12) + Zustand (画布状态) + Tailwind。
 替代: 旧 src/features/canvas (React context 内存态, 4 节点, 无持久化 — 全量重写)。
