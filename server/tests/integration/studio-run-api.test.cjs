@@ -160,13 +160,15 @@ test('M05-D1 Studio Run API: create/list/detail/cancel over HTTP', { concurrency
     assert.equal(r.status, 200, JSON.stringify(r.body));
     const runRow = (await pg.query('SELECT status, cancel_requested_at FROM studio_runs WHERE id=$1', [runId])).rows[0];
     assert.ok(runRow.cancel_requested_at, 'durable cancel_requested_at set');
-    // production worker not running in this API process: drive the cancel
-    // aggregation directly to prove the engine honors the flag.
+    // Lease eligibility excludes cancel-flagged runs (engine lease SQL filters
+    // r.cancel_requested_at IS NULL), so the CANCELLED run must never be
+    // progressed. A global lease may still pick nodes of OTHER queued runs
+    // (api-sel2) — assert on the cancelled run itself.
     const eng = makeEngine(pg, { workerId: 'api-test-w' });
-    const agg = await eng.aggregateRun; // sanity: exists
-    void agg;
-    // cancel already set the flag; a lease attempt must return nothing
-    assert.equal(await eng.leaseReadyNode({}), null, 'no new lease after cancel request');
+    const leased = await eng.leaseReadyNode({});
+    if (leased) assert.notEqual(leased.run_id, runId, 'cancelled run must not be leased');
+    const after = (await pg.query(`SELECT COUNT(*)::int c FROM studio_run_nodes WHERE run_id=$1 AND status='RUNNING'`, [runId])).rows[0].c;
+    assert.equal(after, 0, 'no node of the cancelled run may be RUNNING');
     const detail = await authRequest(base, { method: 'GET', path: `/api/v2/projects/${project.id}/studio/runs/${runId}` }, user.cookies);
     assert.equal(detail.body.run.cancelRequestedAt != null, true);
   });
