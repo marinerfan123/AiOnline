@@ -15,10 +15,15 @@
  *   - paramSchema  per-field contract: type + CLOSED-interval [min,max] bounds
  *                  (both ends inclusive) + explicit unit on every numeric field
  *
- * NATIVE CLASSIFICATION IS HONEST: annotate / focus / grid are marked native
- * (requiresProvider:false — pure local processing, no model dependency). Their
- * ACTUAL EXECUTORS ARE STILL MISSING — executorStatus is 'NOT_IMPLEMENTED' on
- * every tool; this gate fixes the contract first, later gates ship executors.
+ * EXECUTOR STATUS IS HONEST (per-tool executorStatus, enum EXECUTOR_STATUS):
+ *   - grid / annotate → IMPLEMENTED_NATIVE (executorsGrid / executorsAnnotate are
+ *     wired via imageToolsExec.cjs; pure local ffmpeg, no provider model).
+ *   - focus → NOT_IMPLEMENTED (no executor shipped yet; the local sharpen pass
+ *     is still pending).
+ *   - enhance / outpaint / relight / inpaint / remove-bg / upscale → PROVIDER_GATED
+ *     (need an image-edit provider model; no in-repo executor is wired).
+ *   - frame is an internal primitive (executorsFrame.cjs, G12) and is NOT one of
+ *     these 9 registry tools.
  *
  * TIME-UNIT NAMING POLICY (project convention: 16-blender §4.1, mediaMeta.cjs):
  *   - Time is NEVER a float millisecond and NEVER a bare field. A time field's
@@ -36,6 +41,21 @@ const FIELD_TYPES = ['string', 'integer', 'number', 'boolean', 'enum', 'region']
 
 /** Allowed explicit units; 'ms'/'sec' additionally demand the key-suffix rule. */
 const ALLOWED_UNITS = ['px', 'ratio', 'multiplier', 'count', 'percent', 'ms', 'sec'];
+
+/**
+ * executorStatus enum — honest execution-readiness of each tool's executor.
+ *   - 'NOT_IMPLEMENTED'   : no executor exists yet (invoking it would fail).
+ *   - 'IMPLEMENTED_NATIVE': a real local executor is wired — no provider model
+ *                           needed (e.g. executorsGrid / executorsAnnotate).
+ *   - 'PROVIDER_GATED'    : execution requires a provider model; no in-repo
+ *                           executor is wired (routed through a provider adapter
+ *                           when a model advertising the capability is present).
+ */
+const EXECUTOR_STATUS = Object.freeze({
+  NOT_IMPLEMENTED: 'NOT_IMPLEMENTED',
+  IMPLEMENTED_NATIVE: 'IMPLEMENTED_NATIVE',
+  PROVIDER_GATED: 'PROVIDER_GATED',
+});
 
 /**
  * Region member semantics shared by inpaint/focus: a plain object
@@ -241,7 +261,7 @@ const TOOL_DEFS = Object.freeze([
     capability: 'image.enhance',
     shortcutSlash: 'enhance',
     providerHint: { requiresProvider: true, why: 'quality synthesis needs an image-edit provider model (image.enhance).' },
-    executorStatus: 'NOT_IMPLEMENTED',
+    executorStatus: EXECUTOR_STATUS.PROVIDER_GATED,
     paramSchema: ENHANCE_SCHEMA,
   },
   {
@@ -250,7 +270,7 @@ const TOOL_DEFS = Object.freeze([
     capability: 'image.outpaint',
     shortcutSlash: 'outpaint',
     providerHint: { requiresProvider: true, why: 'extended pixels are synthesized by a provider model (image.outpaint).' },
-    executorStatus: 'NOT_IMPLEMENTED',
+    executorStatus: EXECUTOR_STATUS.PROVIDER_GATED,
     paramSchema: OUTPAINT_SCHEMA,
   },
   {
@@ -259,7 +279,7 @@ const TOOL_DEFS = Object.freeze([
     capability: 'image.relight',
     shortcutSlash: '',
     providerHint: { requiresProvider: true, why: 'relighting needs a provider image-edit model (image.relight).' },
-    executorStatus: 'NOT_IMPLEMENTED',
+    executorStatus: EXECUTOR_STATUS.PROVIDER_GATED,
     paramSchema: RELIGHT_SCHEMA,
   },
   {
@@ -268,7 +288,7 @@ const TOOL_DEFS = Object.freeze([
     capability: 'image.inpaint',
     shortcutSlash: '',
     providerHint: { requiresProvider: true, why: 'region redraw needs a provider inpainting model (image.inpaint).' },
-    executorStatus: 'NOT_IMPLEMENTED',
+    executorStatus: EXECUTOR_STATUS.PROVIDER_GATED,
     paramSchema: INPAINT_SCHEMA,
   },
   {
@@ -277,7 +297,7 @@ const TOOL_DEFS = Object.freeze([
     capability: 'image.backgroundRemove',
     shortcutSlash: 'remove-bg',
     providerHint: { requiresProvider: true, why: 'background removal runs on a provider model (image.backgroundRemove).' },
-    executorStatus: 'NOT_IMPLEMENTED',
+    executorStatus: EXECUTOR_STATUS.PROVIDER_GATED,
     paramSchema: REMOVEBG_SCHEMA,
   },
   {
@@ -286,7 +306,7 @@ const TOOL_DEFS = Object.freeze([
     capability: 'image.enhance', // provider advertises upscale under enhance family today
     shortcutSlash: '',
     providerHint: { requiresProvider: true, why: 'resolution upscale needs a provider model (image.enhance family).' },
-    executorStatus: 'NOT_IMPLEMENTED',
+    executorStatus: EXECUTOR_STATUS.PROVIDER_GATED,
     paramSchema: UPSCALE_SCHEMA,
   },
   {
@@ -294,8 +314,8 @@ const TOOL_DEFS = Object.freeze([
     displayName: '宫格切分',
     capability: 'image.gridSplit',
     shortcutSlash: '',
-    providerHint: { requiresProvider: false, why: 'pure local slicing — no model. EXECUTOR STILL MISSING (contract first).' },
-    executorStatus: 'NOT_IMPLEMENTED',
+    providerHint: { requiresProvider: false, why: 'pure local slicing — no model (executorsGrid wired).' },
+    executorStatus: EXECUTOR_STATUS.IMPLEMENTED_NATIVE,
     paramSchema: GRID_SCHEMA,
   },
   {
@@ -303,8 +323,8 @@ const TOOL_DEFS = Object.freeze([
     displayName: '文字标注',
     capability: 'image.annotate',
     shortcutSlash: '',
-    providerHint: { requiresProvider: false, why: 'pure local text overlay — no model. EXECUTOR STILL MISSING (contract first).' },
-    executorStatus: 'NOT_IMPLEMENTED',
+    providerHint: { requiresProvider: false, why: 'pure local text overlay — no model (executorsAnnotate wired).' },
+    executorStatus: EXECUTOR_STATUS.IMPLEMENTED_NATIVE,
     paramSchema: ANNOTATE_SCHEMA,
   },
   {
@@ -312,8 +332,8 @@ const TOOL_DEFS = Object.freeze([
     displayName: '焦点编辑',
     capability: 'image.focusEdit',
     shortcutSlash: '',
-    providerHint: { requiresProvider: false, why: 'local region clarity pass — no model. EXECUTOR STILL MISSING (contract first).' },
-    executorStatus: 'NOT_IMPLEMENTED',
+    providerHint: { requiresProvider: false, why: 'local region clarity pass — no model. Executor still pending.' },
+    executorStatus: EXECUTOR_STATUS.NOT_IMPLEMENTED,
     paramSchema: FOCUS_SCHEMA,
   },
 ]);
@@ -389,9 +409,10 @@ function getToolDef(kind) {
 }
 
 /**
- * Native = locally doable with NO provider model. Honest caveat (see header):
- * native tools have no provider dependency, but their executors are still
- * NOT_IMPLEMENTED — this contract predates execution. Unknown kind → false.
+ * Native = locally doable with NO provider model. 'Native' is about provider
+ * dependency, NOT executor readiness: grid/annotate are native AND implemented,
+ * focus is native but still NOT_IMPLEMENTED (see EXECUTOR_STATUS header note).
+ * Unknown kind → false.
  */
 function isNative(kind) {
   return NATIVE_KIND_SET.has(kind);
@@ -566,6 +587,7 @@ module.exports = {
   TOOL_DEFS,
   KINDS,
   NATIVE_KINDS,
+  EXECUTOR_STATUS,
   getToolDef,
   isNative,
   validateToolRequest,

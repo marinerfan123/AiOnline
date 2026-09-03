@@ -35,10 +35,25 @@ interface ResolvedRef {
   candidates?: { entityType: string; entityId: string; canonicalName?: string }[];
 }
 
-function promptValueOf(data: Record<string, unknown>): string {
+/** Render-path read of a node's primary text payload (parameters first, then legacy denormalization). */
+export function promptValueOf(data: Record<string, unknown>): string {
   const params = (data.parameters ?? {}) as Record<string, unknown>;
   const raw = params.prompt ?? params.content ?? params.scriptText ?? data.prompt;
   return typeof raw === 'string' ? raw : '';
+}
+
+/**
+ * Primary text parameter key per node kind — the registry parameterSchema key
+ * is the single source of truth (prompt→parameters.prompt, script→scriptText,
+ * text→content). Mirrors the promptValueOf read order so dirty stays accurate.
+ */
+function primaryTextParameterKey(kind: string): string | null {
+  switch (kind) {
+    case 'prompt': return 'prompt';
+    case 'script': return 'scriptText';
+    case 'text': return 'content';
+    default: return null;
+  }
 }
 
 export function StudioComposer({ projectId }: { projectId?: string }) {
@@ -156,7 +171,20 @@ export function StudioComposer({ projectId }: { projectId?: string }) {
       beginEdit();
       editing.current = true;
     }
-    updateNodeData(node.id, { prompt: value });
+    // M05-B2 HIGH fix: write the node's PRIMARY text parameter via
+    // updateNodeParameter (schema authority = registry parameterSchema key),
+    // not only the denormalized data.prompt. updateNodeParameter owns
+    // STALE/readiness propagation AND the data.prompt denormalization mirror
+    // for 'prompt'/'scriptText' — so no explicit data.prompt write is needed
+    // here (the render path promptValueOf reads parameters.* first).
+    const key = primaryTextParameterKey(node.data.nodeKind);
+    if (key) {
+      updateNodeParameter(node.id, key, value);
+    } else {
+      // kinds without a schema text parameter (e.g. generation nodes) keep the
+      // legacy denormalized data.prompt mirror that promptValueOf falls back to.
+      updateNodeData(node.id, { prompt: value });
+    }
   };
 
   const flush = () => {

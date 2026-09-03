@@ -9,7 +9,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
-  TOOL_DEFS, KINDS, NATIVE_KINDS,
+  TOOL_DEFS, KINDS, NATIVE_KINDS, EXECUTOR_STATUS,
   getToolDef, isNative, validateToolRequest,
   lintToolDef, lintToolDefs,
 } = require('./imageToolsRegistry.cjs');
@@ -30,6 +30,23 @@ const errHas = (r, needle) => {
 /* Contract metadata + load-time lint                                  */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Honest executor-readiness expectation (synced with the executors actually
+ * wired): grid/annotate are IMPLEMENTED_NATIVE, focus is NOT_IMPLEMENTED,
+ * and the six provider tools are PROVIDER_GATED.
+ */
+const EXPECTED_EXECUTOR_STATUS = {
+  grid: 'IMPLEMENTED_NATIVE',
+  annotate: 'IMPLEMENTED_NATIVE',
+  focus: 'NOT_IMPLEMENTED',
+  enhance: 'PROVIDER_GATED',
+  outpaint: 'PROVIDER_GATED',
+  relight: 'PROVIDER_GATED',
+  inpaint: 'PROVIDER_GATED',
+  'remove-bg': 'PROVIDER_GATED',
+  upscale: 'PROVIDER_GATED',
+};
+
 test('G09 registry: exactly the 9 image tool kinds, unique, complete defs', () => {
   const expected = ['enhance', 'outpaint', 'relight', 'inpaint', 'remove-bg',
     'upscale', 'grid', 'annotate', 'focus'];
@@ -41,8 +58,26 @@ test('G09 registry: exactly the 9 image tool kinds, unique, complete defs', () =
     assert.ok(Array.isArray(def.paramSchema.fields) && def.paramSchema.fields.length > 0);
     assert.ok(def.providerHint && typeof def.providerHint.requiresProvider === 'boolean');
     assert.ok(typeof def.providerHint.why === 'string' && def.providerHint.why.length > 0);
-    assert.equal(def.executorStatus, 'NOT_IMPLEMENTED'); // honest: executors still missing
+    assert.equal(def.executorStatus, EXPECTED_EXECUTOR_STATUS[def.kind],
+      `kind ${def.kind}: executorStatus must be ${EXPECTED_EXECUTOR_STATUS[def.kind]}`);
     assert.equal(def.paramSchema, getToolDef(def.kind).paramSchema);
+  }
+});
+
+test('G09 registry: EXECUTOR_STATUS enum lists exactly the three legal values', () => {
+  assert.deepEqual(
+    { ...EXECUTOR_STATUS },
+    { NOT_IMPLEMENTED: 'NOT_IMPLEMENTED', IMPLEMENTED_NATIVE: 'IMPLEMENTED_NATIVE', PROVIDER_GATED: 'PROVIDER_GATED' },
+  );
+});
+
+test('G09 registry: grid/annotate are IMPLEMENTED_NATIVE, focus NOT_IMPLEMENTED, provider six PROVIDER_GATED', () => {
+  for (const k of ['grid', 'annotate']) {
+    assert.equal(getToolDef(k).executorStatus, 'IMPLEMENTED_NATIVE', `${k} must be IMPLEMENTED_NATIVE`);
+  }
+  assert.equal(getToolDef('focus').executorStatus, 'NOT_IMPLEMENTED', 'focus must stay NOT_IMPLEMENTED');
+  for (const k of ['enhance', 'outpaint', 'relight', 'inpaint', 'remove-bg', 'upscale']) {
+    assert.equal(getToolDef(k).executorStatus, 'PROVIDER_GATED', `${k} must be PROVIDER_GATED`);
   }
 });
 
