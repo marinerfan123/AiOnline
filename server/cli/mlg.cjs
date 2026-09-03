@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 'use strict';
 /**
- * mlg — G19 Agent CLI（status 已接 run_events 真读；run 仍为 dry-run 占位）。
+ * mlg — G19 Agent CLI。
+ * 已接真读：status（run_events）+ models/providers/keys/actions/audit（ai-control 只读 admin 面）。
+ * run 仍为 dry-run 占位（引擎未接线）。
  *
  * 状态（G19 推进）：
  *  - package.json 已注册 "bin": { "mlg": "server/cli/mlg.cjs" }（本文件头部含 shebang，
@@ -13,15 +15,28 @@
  *        输出 { runId, lastSeq, events:[{type,seq,ts}] }（JSON）。
  *      · 测试可经 run(argv, { pg }) 注入假 pg，复用同一真读路径（见 mlg.test.cjs）。
  *  - `mlg run <target>` 仍是 dry-run 占位：不派发引擎，但输出明确列出引擎未接线项（unwired[]）。
- *  - 除 status 真读外仍不 require 仓库业务模块：真读路径内 require runEventStore.cjs
+ *  - `mlg models|providers|keys|actions|audit`（ai-control 只读 admin 面）：
+ *      · 直连 PG（懒加载 buildPgPool，与 status 同路径）读对应表，输出 JSON 摘要：
+ *        models→models（total/enabled）、providers→providers（total/active）、
+ *        keys→api_keys（total/active，不回读完整 secret）、
+ *        actions→ai_routing_decisions（最近路由决策行）、audit→audit_logs（最近审计行）。
+ *      · TEST_DB / 无 PG 配置且未注入 pg → 占位 + reason（不读真库）。
+ *      · actions/audit 等表缺失（PG 42P01）→ 输出 missing:true + reasons[]，绝不伪造行。
+ *  - 除真读路径外不 require 仓库业务模块：status 内 require runEventStore.cjs
  *    （runEventStore.createRunEventStore({ pg }) 即任务所述可选工厂，注入测试用假 pg）。
+ *    models/... 等只读子命令直写 SQL（不引 repository/service，保持 CLI 独立、可注入假 pg 测试）。
  *
  * 命令面：
  *   mlg run <canvasId|projectId> [--dry-run] [--json]   dry-run 占位（引擎未接线）
  *   mlg status <runId>            [--json]              TEST_DB/无 PG 配置→占位；否则读 run_events 真状态
+ *   mlg models                    [--json]              ai-control 只读：逻辑模型摘要（models 表）
+ *   mlg providers                 [--json]              ai-control 只读：服务商摘要（providers 表）
+ *   mlg keys                      [--json]              ai-control 只读：key 池摘要（api_keys 表，脱敏）
+ *   mlg actions                   [--json]              ai-control 只读：最近路由决策（ai_routing_decisions）
+ *   mlg audit                     [--json]              ai-control 只读：最近审计行（audit_logs）
  *   mlg help | --help | -h                              用法
  *   （未知命令 / 空 argv → 打印 usage 并以 2 退出）
- * 保留全局标志（草案）：--dry-run / --json；models|providers|keys|actions|audit 等子命令留待后续接入。
+ * 全局标志（草案）：--dry-run / --json。
  */
 
 const fs = require('fs');
@@ -29,6 +44,17 @@ const path = require('path');
 
 const PROG = 'mlg';
 const STATUS_TAIL_N = 50; // status 真读：输出末 N 条 run_events
+const RECENT_TAIL_N = 20; // actions/audit 真读：输出最近 N 行
+
+// 只读 ai-control 子命令 → 数据源表（单表直读，不引 repository/service）。
+const READ_TABLES = {
+  models: 'models',
+  providers: 'providers',
+  keys: 'api_keys',
+  actions: 'ai_routing_decisions',
+  audit: 'audit_logs',
+};
+const READ_COMMANDS = Object.keys(READ_TABLES);
 
 // bin 自仓库任意 cwd 启动时，dotenv 的默认 cwd 语义失效——按本文件位置显式加载仓库根 .env
 // （仅当存在；真实进程 env 优先，dotenv 默认不覆盖）。读取须在判 pg 配置前完成。
@@ -42,16 +68,21 @@ const STATUS_TAIL_N = 50; // status 真读：输出末 N 条 run_events
 const USAGE_TEXT = `用法:
   ${PROG} run <canvasId|projectId> [--dry-run] [--json]   派发生成任务（占位：dry-run 计划，引擎未接线）
   ${PROG} status <runId> [--json]                         查询任务状态（读 run_events；TEST_DB/无 PG 配置时占位）
+  ${PROG} models [--json]                                 ai-control 只读：逻辑模型摘要（models 表）
+  ${PROG} providers [--json]                              ai-control 只读：服务商摘要（providers 表）
+  ${PROG} keys [--json]                                   ai-control 只读：key 池摘要（api_keys 表，脱敏）
+  ${PROG} actions [--json]                                ai-control 只读：最近路由决策（ai_routing_decisions）
+  ${PROG} audit [--json]                                  ai-control 只读：最近审计行（audit_logs）
   ${PROG} help | --help | -h                              显示本用法
 
 全局标志:
   --dry-run    只计划不写（run 恒为 dry-run 占位）
-  --json       结构化 JSON 输出（run/status 当前恒输出 JSON）
+  --json       结构化 JSON 输出（所有子命令恒输出 JSON）
 
-status 真读前提：非 TEST_DB 环境且检测到 PG_* 配置（PG_HOST/PG_PORT/PG_DATABASE/PG_USER/PG_PASSWORD 之一，
+真读前提：非 TEST_DB 环境且检测到 PG_* 配置（PG_HOST/PG_PORT/PG_DATABASE/PG_USER/PG_PASSWORD 之一，
 或仓库根 .env 提供；亦可用 run(argv,{pg}) 注入连接）。其余情况输出占位 JSON 并注明原因。
-
-草案后续子命令（审计 §4，未实现）: models / providers / keys / actions / audit。`;
+models/providers/keys/actions/audit 为只读 admin 面：直连 PG 读 ai-control 相关表，不写任何数据；
+actions/audit 依赖表缺失时输出 missing:true + reasons[]，绝不伪造行。`;
 
 const HELP_TEXT = `${USAGE_TEXT}
 exit 码: 0=成功(help/run/status)  1=真读失败(DB 错误)  2=用法错误(未知命令/缺参/空 argv)`;
@@ -189,6 +220,201 @@ async function runStatusReal({ pg, runId, emit, jsonIndent, exit }) {
 }
 
 /**
+ * ── 只读 ai-control 子命令（models/providers/keys/actions/audit）───────────────
+ * 直连 PG 读单表，输出 JSON 摘要。安全铁律：
+ *  - 不回读完整 secret（api_keys.api_key 不入 SELECT；providers.api_key 亦不入）。
+ *  - 表缺失（PG 42P01）→ missing:true + reasons[]，绝不伪造行。
+ *  - 其它 DB 错误上抛，由 runReadCommand 统一转 exit 1。
+ */
+
+/** PG 42P01（relation ... does not exist）判定：表缺失而非一般 DB 错误。 */
+function isMissingTable(e) {
+  return !!(e && (e.code === '42P01' || /does not exist/i.test(String(e && e.message))));
+}
+
+/** 无 PG 注入 + 无 env / TEST_DB 置位时的占位（与 status 占位同语义）。 */
+function readPlaceholder(command, reason) {
+  return {
+    ok: true,
+    dryRun: true,
+    command,
+    table: READ_TABLES[command],
+    message: `${command} 未接入真读（占位 dry-run）`,
+    reason,
+  };
+}
+
+/** 表缺失时的诚实占位：missing:true + reasons[]，不伪造任何行。 */
+function missingTableSummary(command, reasons) {
+  return {
+    ok: true,
+    dryRun: false,
+    command,
+    table: READ_TABLES[command],
+    missing: true,
+    reasons: Array.isArray(reasons) ? reasons : [reasons],
+    message: `${command} 依赖的表缺失，无法读取（已列 reasons，不伪造数据）`,
+  };
+}
+
+/** 只读真读执行体（async）：与 runStatusReal 同构；readFn 返回摘要对象。 */
+async function runReadCommand({ pg, command, readFn, label, jsonIndent, emit, exit }) {
+  let ownPool = null;
+  try {
+    if (!pg) { ownPool = buildPgPool(); pg = ownPool; }
+    const summary = await readFn({ pg });
+    emit(JSON.stringify(summary, null, jsonIndent));
+    exit(0);
+    return 0;
+  } catch (e) {
+    emit(JSON.stringify({
+      ok: false,
+      command,
+      error: { code: 'DB_READ_FAILED', message: `读 ${label} 失败: ${e && e.message ? e.message : String(e)}` },
+    }, null, jsonIndent));
+    exit(1);
+    return 1;
+  } finally {
+    if (ownPool) { try { await ownPool.end(); } catch (_) { /* 忽略关闭错误 */ } }
+  }
+}
+
+/** providers 摘要：providers 表（total + active；不回读 api_key 列）。 */
+async function readProvidersSummary({ pg }) {
+  try {
+    const r = await pg.query(
+      'SELECT id, name, type, base_url, protocol, enabled, supported_types, capacity_model, created_at, updated_at FROM providers ORDER BY created_at',
+    );
+    const rows = r.rows || [];
+    const active = rows.filter((p) => p.enabled !== false).length;
+    return {
+      ok: true, dryRun: false, command: 'providers', table: 'providers',
+      total: rows.length, active,
+      providers: rows.map((p) => ({
+        id: p.id, name: p.name, type: p.type, protocol: p.protocol,
+        base_url: p.base_url, enabled: p.enabled !== false,
+      })),
+    };
+  } catch (e) {
+    if (isMissingTable(e)) return missingTableSummary('providers', [
+      '表 providers 不存在（schema 未初始化或未迁移）',
+      '无服务商数据可读，拒绝伪造占位行',
+    ]);
+    throw e;
+  }
+}
+
+/** models 摘要：models 表（total + enabled）。 */
+async function readModelsSummary({ pg }) {
+  try {
+    const r = await pg.query(
+      'SELECT id, model_id, display_name, type, enabled, created_at FROM models ORDER BY created_at',
+    );
+    const rows = r.rows || [];
+    const enabled = rows.filter((m) => m.enabled !== false).length;
+    return {
+      ok: true, dryRun: false, command: 'models', table: 'models',
+      total: rows.length, enabled,
+      models: rows.map((m) => ({
+        id: m.id, model_id: m.model_id, display_name: m.display_name,
+        type: m.type, enabled: m.enabled !== false,
+      })),
+    };
+  } catch (e) {
+    if (isMissingTable(e)) return missingTableSummary('models', [
+      '表 models 不存在（schema 未初始化或未迁移）',
+      '无模型数据可读，拒绝伪造占位行',
+    ]);
+    throw e;
+  }
+}
+
+/** keys 摘要：api_keys 表（total + active；只选脱敏安全列，绝不 SELECT api_key）。 */
+async function readKeysSummary({ pg }) {
+  try {
+    const r = await pg.query(
+      'SELECT id, provider_id, label, status, weight, created_at FROM api_keys ORDER BY created_at',
+    );
+    const rows = r.rows || [];
+    const active = rows.filter((k) => k.status === 'active').length;
+    return {
+      ok: true, dryRun: false, command: 'keys', table: 'api_keys',
+      total: rows.length, active,
+      keys: rows.map((k) => ({
+        id: k.id, provider_id: k.provider_id, label: k.label,
+        status: k.status, weight: k.weight,
+      })),
+    };
+  } catch (e) {
+    if (isMissingTable(e)) return missingTableSummary('keys', [
+      '表 api_keys 不存在（schema 未初始化或未迁移）',
+      '无 key 池数据可读，拒绝伪造占位行',
+    ]);
+    throw e;
+  }
+}
+
+/** actions 摘要：ai_routing_decisions 表（最近路由决策行）。 */
+async function readActionsSummary({ pg }) {
+  try {
+    const r = await pg.query(
+      'SELECT id, model_id, capability, region, selected_provider_id, selected_binding_id, reason, created_at FROM ai_routing_decisions ORDER BY created_at DESC LIMIT $1',
+      [RECENT_TAIL_N],
+    );
+    const rows = r.rows || [];
+    return {
+      ok: true, dryRun: false, command: 'actions', table: 'ai_routing_decisions',
+      recentCount: rows.length,
+      recent: rows.map((a) => ({
+        id: a.id, model_id: a.model_id, capability: a.capability, region: a.region,
+        selected_provider_id: a.selected_provider_id, selected_binding_id: a.selected_binding_id,
+        reason: a.reason, created_at: a.created_at,
+      })),
+    };
+  } catch (e) {
+    if (isMissingTable(e)) return missingTableSummary('actions', [
+      '表 ai_routing_decisions 不存在（M02-B 迁移 0010 未执行或未创建）',
+      '无路由决策动作数据可读，拒绝伪造占位行',
+    ]);
+    throw e;
+  }
+}
+
+/** audit 摘要：audit_logs 表（最近审计行）。 */
+async function readAuditSummary({ pg }) {
+  try {
+    const r = await pg.query(
+      'SELECT id, actor_id, action, target, detail, created_at FROM audit_logs ORDER BY id DESC LIMIT $1',
+      [RECENT_TAIL_N],
+    );
+    const rows = r.rows || [];
+    return {
+      ok: true, dryRun: false, command: 'audit', table: 'audit_logs',
+      recentCount: rows.length,
+      recent: rows.map((x) => ({
+        id: Number(x.id), actor_id: x.actor_id, action: x.action,
+        target: x.target, detail: x.detail || {}, created_at: x.created_at,
+      })),
+    };
+  } catch (e) {
+    if (isMissingTable(e)) return missingTableSummary('audit', [
+      '表 audit_logs 不存在（schema 未初始化或未迁移）',
+      '无审计日志数据可读，拒绝伪造占位行',
+    ]);
+    throw e;
+  }
+}
+
+/** 命令 → 读函数（真读分发用）。 */
+const READ_HANDLERS = {
+  models: readModelsSummary,
+  providers: readProvidersSummary,
+  keys: readKeysSummary,
+  actions: readActionsSummary,
+  audit: readAuditSummary,
+};
+
+/**
  * CLI 入口：纯函数化便于测试（注入 print/exit/pg）。
  * @param {string[]} argv  不含 node/脚本名 的参数
  * @param {{print?: Function, exit?: Function, pg?: object}} [opts]
@@ -248,6 +474,22 @@ function run(argv = [], { print = console.log, exit = process.exit, pg } = {}) {
           emit(JSON.stringify(placeholder(runId, 'status', {
             reason: '未检测到 pg 配置（PG_HOST/PG_PORT/PG_DATABASE/PG_USER/PG_PASSWORD 或 .env）——维持占位',
           }), null, jsonIndent));
+        }
+        break;
+      }
+      case 'models':
+      case 'providers':
+      case 'keys':
+      case 'actions':
+      case 'audit': {
+        if (process.env.TEST_DB) {
+          // 测试态铁律：TEST_DB 置位即不读真库（即使注入了 pg 也维持占位）。
+          emit(JSON.stringify(readPlaceholder(sub, '进程 env TEST_DB 置位（测试态）——维持占位，不读真库'), null, jsonIndent));
+        } else if (pg || envHasPgConfig()) {
+          // 真读路径：注入 pg（测试假 pg / 真 Pool）优先，否则 env PG_* 自建池。
+          return runReadCommand({ pg, command: sub, readFn: READ_HANDLERS[sub], label: sub, jsonIndent, emit, exit });
+        } else {
+          emit(JSON.stringify(readPlaceholder(sub, '未检测到 pg 配置（PG_HOST/PG_PORT/PG_DATABASE/PG_USER/PG_PASSWORD 或 .env）——维持占位'), null, jsonIndent));
         }
         break;
       }

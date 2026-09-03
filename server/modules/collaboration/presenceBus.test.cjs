@@ -6,6 +6,8 @@ const {
   createMemoryPresenceStore,
   PRESENCE_STATES,
   PRESENCE_STATE_LIST,
+  PRESENCE_LEGACY_ALIASES,
+  isPresenceState,
   HEARTBEAT_TTL_MS,
 } = require('./presenceBus.cjs');
 
@@ -104,7 +106,7 @@ test('G22 presenceBus: 缺失/空 userId、canvasId、state 一律拒 (status 40
 
 test('G22 presenceBus: state 不在枚举内拒 (400)，不降级 online', async (t) => {
   const bus = createPresenceBus();
-  const bad = ['busy', 'idle', 'online ', 'OFFLINE', 42, ['online'], { state: 'away' }];
+  const bad = ['idle', 'online ', 'OFFLINE', 42, ['online'], { state: 'away' }];
   for (const state of bad) {
     await t.test(JSON.stringify(state), () => {
       const r = bus.heartbeat({ userId: 'u-1', canvasId: 'c-1', state });
@@ -122,6 +124,25 @@ test('G22 presenceBus: 枚举常量完整性（online/away/editing/offline 冻�
   assert.ok(Object.isFrozen(PRESENCE_STATES));
   assert.equal(HEARTBEAT_TTL_MS, 15_000);
   assert.deepEqual(Object.values(PRESENCE_STATES), PRESENCE_STATE_LIST);
+});
+
+/* ── legacy alias 归一：busy → editing ─────────────────────────── */
+test('G22 presenceBus: heartbeat 接受 legacy alias busy → 归一为 editing', () => {
+  const store = createMemoryPresenceStore();
+  const bus = createPresenceBus({ store });
+  const r = bus.heartbeat({ userId: 'u-legacy', canvasId: 'c-1', state: 'busy' });
+  assert.equal(r.ok, true);
+  assert.equal(r.presence.state, EDITING, 'busy 归一为 editing 后落库/返回');
+  assert.equal(store.list()[0].state, EDITING);
+  const [p] = bus.peers('c-1');
+  assert.equal(p.state, EDITING, 'peers 只见 canonical editing，不见 busy');
+});
+
+test('G22 presenceBus: busy 是 alias 不是 canonical —— 不在枚举列表且 isPresenceState(busy)=false', () => {
+  assert.equal(PRESENCE_LEGACY_ALIASES.busy, EDITING);
+  assert.equal(isPresenceState('busy'), false);
+  assert.equal(isPresenceState('editing'), true);
+  assert.ok(!PRESENCE_STATE_LIST.includes('busy'));
 });
 
 /* ── offline 心跳 = 离开画布，摘除记录 ──────────────────────────── */

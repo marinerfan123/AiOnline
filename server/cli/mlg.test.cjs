@@ -260,3 +260,256 @@ test('shebang + require.main 守卫（bin 可执行前提）', () => {
   assert.ok(src.startsWith('#!/usr/bin/env node'), '头部须有 shebang');
   assert.match(src, /require\.main === module/);
 });
+
+// ────────────────────────────────────────────────────────────────────────────
+// G19 推进：只读 ai-control 子命令（models/providers/keys/actions/audit）
+// ────────────────────────────────────────────────────────────────────────────
+
+const READ_SUBCOMMANDS = ['models', 'providers', 'keys', 'actions', 'audit'];
+const READ_TABLES = {
+  models: 'models',
+  providers: 'providers',
+  keys: 'api_keys',
+  actions: 'ai_routing_decisions',
+  audit: 'audit_logs',
+};
+
+/**
+ * ai-control 只读子命令的假 pg：按 SQL 命中的表名返回预置行；missing 表抛 42P01。
+ * 契约与真实 pg.query 一致：{ query }。
+ */
+function createAiControlFakePg({ providers = [], models = [], api_keys = [], ai_routing_decisions = [], audit_logs = [], missing = [] } = {}) {
+  const tables = { providers, models, api_keys, ai_routing_decisions, audit_logs };
+  async function query(text, params = []) {
+    const sql = String(text);
+    let table = null;
+    // 顺序敏感：先匹配含下划线/长表名，再匹配短名（避免子串误命中）。
+    if (sql.includes('ai_routing_decisions')) table = 'ai_routing_decisions';
+    else if (sql.includes('audit_logs')) table = 'audit_logs';
+    else if (sql.includes('api_keys')) table = 'api_keys';
+    else if (sql.includes('models')) table = 'models';
+    else if (sql.includes('providers')) table = 'providers';
+    if (!table) throw new Error(`ai-control fake pg: unhandled SQL: ${sql}`);
+    if (missing.includes(table)) {
+      const e = new Error(`relation "${table}" does not exist`);
+      e.code = '42P01';
+      throw e;
+    }
+    const rows = tables[table] || [];
+    return { rows, rowCount: rows.length };
+  }
+  return { pg: { query }, tables };
+}
+
+test('只读子命令占位路径（无 pg 配置）：5 命令均占位 + reason，退出码 0', () => {
+  const restore = withoutPgEnv();
+  try {
+    for (const sub of READ_SUBCOMMANDS) {
+      const { code, exitCode, text } = invoke([sub]);
+      assert.equal(code, 0, `${sub} 应退出 0`);
+      assert.equal(exitCode, 0);
+      const payload = JSON.parse(text);
+      assert.equal(payload.command, sub);
+      assert.equal(payload.dryRun, true, `${sub} 占位应为 dryRun`);
+      assert.equal(payload.table, READ_TABLES[sub]);
+      assert.match(payload.reason, /未检测到 pg 配置|TEST_DB/);
+      // 占位不得含真读字段
+      assert.ok(!('total' in payload) && !('providers' in payload) && !('recent' in payload), `${sub} 占位不得含真读字段`);
+    }
+  } finally { restore(); }
+});
+
+test('providers 真读（注入假 pg）：total/active/providers 摘要，退出码 0', async () => {
+  const restore = withoutPgEnv();
+  try {
+    const fake = createAiControlFakePg({
+      providers: [
+        { id: 'p1', name: 'OpenAI', type: 'official', protocol: 'openai-compatible', base_url: 'https://api.openai.com', enabled: true },
+        { id: 'p2', name: 'Mock', type: 'custom', protocol: 'openai-compatible', base_url: '', enabled: false },
+      ],
+    });
+    const { code, exitCode, text } = await invokeAsync(['providers'], { pg: fake.pg });
+    assert.equal(code, 0);
+    assert.equal(exitCode, 0);
+    const payload = JSON.parse(text);
+    assert.equal(payload.ok, true);
+    assert.equal(payload.dryRun, false);
+    assert.equal(payload.command, 'providers');
+    assert.equal(payload.table, 'providers');
+    assert.equal(payload.total, 2);
+    assert.equal(payload.active, 1); // 仅 p1 enabled
+    assert.equal(payload.providers.length, 2);
+    assert.equal(payload.providers[0].id, 'p1');
+    assert.equal(payload.providers[0].enabled, true);
+    assert.equal(payload.providers[1].enabled, false);
+    // 绝不回读 secret 列
+    assert.ok(!('api_key' in payload.providers[0]), 'providers 输出不得含 api_key');
+  } finally { restore(); }
+});
+
+test('models 真读（注入假 pg）：total/enabled/models 摘要', async () => {
+  const restore = withoutPgEnv();
+  try {
+    const fake = createAiControlFakePg({
+      models: [
+        { id: 'm1', model_id: 'gpt-4o', display_name: 'GPT-4o', type: 'text', enabled: true },
+        { id: 'm2', model_id: 'sd-xl', display_name: 'SDXL', type: 'image', enabled: true },
+        { id: 'm3', model_id: 'old', display_name: 'Old', type: 'image', enabled: false },
+      ],
+    });
+    const { code, text } = await invokeAsync(['models'], { pg: fake.pg });
+    assert.equal(code, 0);
+    const payload = JSON.parse(text);
+    assert.equal(payload.ok, true);
+    assert.equal(payload.dryRun, false);
+    assert.equal(payload.command, 'models');
+    assert.equal(payload.table, 'models');
+    assert.equal(payload.total, 3);
+    assert.equal(payload.enabled, 2);
+    assert.equal(payload.models.length, 3);
+    assert.deepEqual(payload.models.map((m) => m.model_id), ['gpt-4o', 'sd-xl', 'old']);
+  } finally { restore(); }
+});
+
+test('keys 真读（注入假 pg）：total/active/keys 摘要，且不回读完整 secret', async () => {
+  const restore = withoutPgEnv();
+  try {
+    const fake = createAiControlFakePg({
+      api_keys: [
+        { id: 'k1', provider_id: 'p1', label: 'main', status: 'active', weight: 100 },
+        { id: 'k2', provider_id: 'p1', label: 'backup', status: 'disabled', weight: 50 },
+        { id: 'k3', provider_id: 'p2', label: 'x', status: 'active', weight: 100 },
+      ],
+    });
+    const { code, text } = await invokeAsync(['keys'], { pg: fake.pg });
+    assert.equal(code, 0);
+    const payload = JSON.parse(text);
+    assert.equal(payload.ok, true);
+    assert.equal(payload.command, 'keys');
+    assert.equal(payload.table, 'api_keys');
+    assert.equal(payload.total, 3);
+    assert.equal(payload.active, 2);
+    assert.equal(payload.keys.length, 3);
+    for (const k of payload.keys) {
+      assert.ok('id' in k && 'provider_id' in k && 'status' in k);
+      assert.ok(!('api_key' in k), 'keys 输出不得含 api_key（完整 secret）');
+    }
+  } finally { restore(); }
+});
+
+test('actions 真读（注入假 pg）：recent 路由决策行', async () => {
+  const restore = withoutPgEnv();
+  try {
+    const fake = createAiControlFakePg({
+      ai_routing_decisions: [
+        { id: 'rd-1', model_id: 'gpt-4o', capability: 'text', region: 'cn', selected_provider_id: 'p1', selected_binding_id: 'pmb-1', reason: 'first', created_at: '2026-09-04T00:00:00Z' },
+      ],
+    });
+    const { code, text } = await invokeAsync(['actions'], { pg: fake.pg });
+    assert.equal(code, 0);
+    const payload = JSON.parse(text);
+    assert.equal(payload.ok, true);
+    assert.equal(payload.dryRun, false);
+    assert.equal(payload.command, 'actions');
+    assert.equal(payload.table, 'ai_routing_decisions');
+    assert.equal(payload.recentCount, 1);
+    assert.equal(payload.recent.length, 1);
+    assert.equal(payload.recent[0].id, 'rd-1');
+    assert.equal(payload.recent[0].model_id, 'gpt-4o');
+    assert.equal(payload.recent[0].selected_provider_id, 'p1');
+  } finally { restore(); }
+});
+
+test('audit 真读（注入假 pg）：recent 审计行', async () => {
+  const restore = withoutPgEnv();
+  try {
+    const fake = createAiControlFakePg({
+      audit_logs: [
+        { id: 1, actor_id: 'admin', action: 'provider.create', target: 'p1', detail: { name: 'OpenAI' }, created_at: '2026-09-04T00:00:00Z' },
+      ],
+    });
+    const { code, text } = await invokeAsync(['audit'], { pg: fake.pg });
+    assert.equal(code, 0);
+    const payload = JSON.parse(text);
+    assert.equal(payload.ok, true);
+    assert.equal(payload.dryRun, false);
+    assert.equal(payload.command, 'audit');
+    assert.equal(payload.table, 'audit_logs');
+    assert.equal(payload.recentCount, 1);
+    assert.equal(payload.recent.length, 1);
+    assert.equal(payload.recent[0].id, 1);
+    assert.equal(payload.recent[0].action, 'provider.create');
+    assert.equal(payload.recent[0].target, 'p1');
+  } finally { restore(); }
+});
+
+test('actions 表缺失：missing:true + reasons[]，不伪造行', async () => {
+  const restore = withoutPgEnv();
+  try {
+    const fake = createAiControlFakePg({ missing: ['ai_routing_decisions'] });
+    const { code, text } = await invokeAsync(['actions'], { pg: fake.pg });
+    assert.equal(code, 0);
+    const payload = JSON.parse(text);
+    assert.equal(payload.ok, true);
+    assert.equal(payload.command, 'actions');
+    assert.equal(payload.table, 'ai_routing_decisions');
+    assert.equal(payload.missing, true);
+    assert.ok(Array.isArray(payload.reasons) && payload.reasons.length >= 1, '须列 reasons');
+    assert.match(payload.reasons[0], /ai_routing_decisions/);
+    // 不伪造行：不得出现 recent/total 真读字段
+    assert.ok(!('recent' in payload) && !('total' in payload) && !('recentCount' in payload), '表缺失不得伪造行');
+  } finally { restore(); }
+});
+
+test('audit 表缺失：missing:true + reasons[]，不伪造行', async () => {
+  const restore = withoutPgEnv();
+  try {
+    const fake = createAiControlFakePg({ missing: ['audit_logs'] });
+    const { code, text } = await invokeAsync(['audit'], { pg: fake.pg });
+    assert.equal(code, 0);
+    const payload = JSON.parse(text);
+    assert.equal(payload.ok, true);
+    assert.equal(payload.command, 'audit');
+    assert.equal(payload.table, 'audit_logs');
+    assert.equal(payload.missing, true);
+    assert.ok(Array.isArray(payload.reasons) && payload.reasons.length >= 1);
+    assert.match(payload.reasons[0], /audit_logs/);
+    assert.ok(!('recent' in payload) && !('total' in payload), '表缺失不得伪造行');
+  } finally { restore(); }
+});
+
+test('TEST_DB 置位：只读子命令即使注入 pg 也维持占位（不读真库）', async () => {
+  const restore = withoutPgEnv();
+  process.env.TEST_DB = '1';
+  try {
+    const fake = createAiControlFakePg({
+      providers: [{ id: 'p1', name: 'X', type: 'official', protocol: 'openai-compatible', base_url: '', enabled: true }],
+    });
+    const { code, text } = await invokeAsync(['providers'], { pg: fake.pg });
+    assert.equal(code, 0);
+    const payload = JSON.parse(text);
+    assert.equal(payload.dryRun, true);
+    assert.equal(payload.command, 'providers');
+    assert.match(payload.reason, /TEST_DB/);
+    assert.ok(!('total' in payload) && !('providers' in payload), 'TEST_DB 占位不得含真读字段');
+  } finally { restore(); }
+});
+
+test('help 文本含只读子命令与各数据源表', () => {
+  const { code, text } = invoke(['help']);
+  assert.equal(code, 0);
+  for (const sub of READ_SUBCOMMANDS) {
+    assert.match(text, new RegExp(`mlg ${sub}`), `help 应含 mlg ${sub}`);
+  }
+  assert.match(text, /ai_routing_decisions/);
+  assert.match(text, /audit_logs/);
+  assert.match(text, /api_keys/);
+});
+
+test('usage 文本列出全部只读子命令（与 READ_TABLES 一致）', () => {
+  const { code, text } = invoke([]); // 空 argv → 打印 USAGE 并 exit 2
+  assert.equal(code, 2);
+  for (const sub of READ_SUBCOMMANDS) {
+    assert.match(text, new RegExp(`mlg ${sub}`));
+  }
+});

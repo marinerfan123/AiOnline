@@ -159,14 +159,41 @@ export class DirtyOperationBuffer {
   }
   viewport(viewport: Viewport) { this.viewportValue = viewport; }
   isEmpty() { return !this.nodes.size && !this.deletedNodes.size && !this.edges.size && !this.deletedEdges.size && !this.viewportValue; }
-  flush(base: { baseRevision: number; clientMutationId: string }): CanvasPatchRequest {
+
+  // Build a patch from the CURRENT accumulated state WITHOUT clearing it. This
+  // lets the caller keep the buffer for conflict replay/rebase (F1) and only
+  // drop the operations that were actually applied (via commitSnapshot).
+  peek(base: { baseRevision: number; clientMutationId: string }): CanvasPatchRequest {
     const out: CanvasPatchRequest = { baseRevision: base.baseRevision, clientMutationId: base.clientMutationId };
     if (this.nodes.size) out.upsertNodes = Array.from(this.nodes.values());
     if (this.deletedNodes.size) out.deleteNodeIds = Array.from(this.deletedNodes.values());
     if (this.edges.size) out.upsertEdges = Array.from(this.edges.values());
     if (this.deletedEdges.size) out.deleteEdgeIds = Array.from(this.deletedEdges.values());
     if (this.viewportValue) out.viewport = this.viewportValue;
+    return out;
+  }
+
+  // Drop ONLY the operations captured in `patch`. Ops that arrived after the
+  // matching peek() are preserved: a re-upsert replaces the map entry with a
+  // NEW object, so reference identity distinguishes "unchanged since peek"
+  // (safe to drop) from "edited again mid-flight" (must be kept).
+  commitSnapshot(patch: CanvasPatchRequest) {
+    if (patch.upsertNodes) for (const n of patch.upsertNodes) if (this.nodes.get(n.nodeId) === n) this.nodes.delete(n.nodeId);
+    if (patch.deleteNodeIds) for (const id of patch.deleteNodeIds) this.deletedNodes.delete(id);
+    if (patch.upsertEdges) for (const e of patch.upsertEdges) if (this.edges.get(e.edgeId) === e) this.edges.delete(e.edgeId);
+    if (patch.deleteEdgeIds) for (const id of patch.deleteEdgeIds) this.deletedEdges.delete(id);
+    if (patch.viewport && this.viewportValue === patch.viewport) this.viewportValue = null;
+  }
+
+  clear() {
     this.nodes.clear(); this.deletedNodes.clear(); this.edges.clear(); this.deletedEdges.clear(); this.viewportValue = null;
+  }
+
+  // Legacy all-or-nothing flush: peek + clear (used by the serialization unit
+  // tests and any caller that does not need conflict replay).
+  flush(base: { baseRevision: number; clientMutationId: string }): CanvasPatchRequest {
+    const out = this.peek(base);
+    this.clear();
     return out;
   }
 }

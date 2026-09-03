@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
 import type { Viewport } from '@xyflow/react';
 import { useStudioStore, type StudioEdge, type StudioNode } from './store';
-import { AUTOSAVE_DEBOUNCE_MS, DirtyOperationBuffer, deserializeStudioEdge, deserializeStudioNode, serializeStudioEdge, serializeStudioNode } from './persistence';
+import { AUTOSAVE_DEBOUNCE_MS, DirtyOperationBuffer, deserializeStudioEdge, deserializeStudioNode, serializeStudioEdge, serializeStudioNode, type CanvasPatchRequest } from './persistence';
 import { v2studio, StudioCanvasApiError } from '@/shared/api/contract/studio-canvas-client';
+import type { StudioCanvasResponse } from '@/shared/api/contract/schemas';
 
 export type SaveStatus = 'Loading' | 'Saved' | 'Saving' | 'Unsaved' | 'Offline' | 'Save failed' | 'Conflict';
 
@@ -15,16 +16,23 @@ function nodeSig(n: StudioNode) { return JSON.stringify(serializeStudioNode(n));
 function edgeSig(e: StudioEdge) { return JSON.stringify(serializeStudioEdge(e)); }
 function viewportSig(v: Viewport) { return `${v.x}:${v.y}:${v.zoom}`; }
 
+type ConflictInfo = { serverRevision: number; canvasId: string };
+
 export function useStudioCanvasPersistence(projectId: string, enabled = true) {
   const [status, setStatus] = useState<SaveStatus>('Loading');
   const [revision, setRevision] = useState<number | null>(null);
   const [lastSavedAt, setLastSavedAt] = useState<string | null>(null);
-  const [conflict, setConflict] = useState<{ serverRevision: number; canvasId: string } | null>(null);
+  const [conflict, setConflict] = useState<ConflictInfo | null>(null);
   const bufferRef = useRef(new DirtyOperationBuffer());
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const revisionRef = useRef<number | null>(null);
   const suppressRef = useRef(false);
   const blockedRef = useRef(false);
+  const conflictRef = useRef<ConflictInfo | null>(null);
+  // F2: single-flight mutex + pending flag so concurrent flush requests are
+  // serialized instead of racing with a stale baseRevision (self-inflicted 409).
+  const inFlightRef = useRef(false);
+  const pendingFlushRef = useRef(false);
   const prevNodesRef = useRef(new Map<string, string>());
   const prevEdgesRef = useRef(new Map<string, string>());
   const prevViewportRef = useRef('');
@@ -35,28 +43,86 @@ export function useStudioCanvasPersistence(projectId: string, enabled = true) {
     prevViewportRef.current = viewportSig(viewport);
   };
 
-  const flush = async () => {
-    if (blockedRef.current || bufferRef.current.isEmpty() || !projectId || revisionRef.current == null) return;
-    const baseRevision = revisionRef.current;
-    const patch = bufferRef.current.flush({ baseRevision, clientMutationId: mutationId() });
-    setStatus('Saving');
+  const commitAndSave = (res: StudioCanvasResponse, patch: CanvasPatchRequest) => {
+    // Drop only the ops we just applied; edits that landed mid-flight stay queued.
+    bufferRef.current.commitSnapshot(patch);
+    const rev = res.canvas!.revision;
+    revisionRef.current = rev;
+    setRevision(rev);
+    setLastSavedAt(new Date().toISOString());
+    setStatus('Saved');
+    markClean(useStudioStore.getState().nodes, useStudioStore.getState().edges, useStudioStore.getState().viewport);
+  };
+
+  // One patch attempt against `baseRevision`. Returns the patch that was peeked
+  // so the caller can commit exactly those ops on success.
+  const attempt = async (baseRevision: number, cmid: string) => {
+    const patch = bufferRef.current.peek({ baseRevision, clientMutationId: cmid });
     try {
       const res = await v2studio.patchCanvas(projectId, patch);
       if (!res.canvas) throw new Error('missing canvas');
-      revisionRef.current = res.canvas.revision;
-      setRevision(res.canvas.revision);
-      setLastSavedAt(new Date().toISOString());
-      setStatus('Saved');
-      markClean(useStudioStore.getState().nodes, useStudioStore.getState().edges, useStudioStore.getState().viewport);
+      return { ok: true as const, res, patch };
     } catch (e) {
       if (e instanceof StudioCanvasApiError && e.status === 409 && e.serverRevision && e.canvasId) {
+        return { ok: false as const, conflict: { serverRevision: e.serverRevision, canvasId: e.canvasId } };
+      }
+      return { ok: false as const, error: e };
+    }
+  };
+
+  const doFlush = async () => {
+    if (blockedRef.current || !projectId || revisionRef.current == null) return;
+    if (bufferRef.current.isEmpty()) return;
+    setStatus('Saving');
+
+    const cmid = mutationId();
+    const first = await attempt(revisionRef.current, cmid);
+
+    if (first.ok) { commitAndSave(first.res, first.patch); return; }
+
+    if (first.conflict) {
+      // F1: server has moved past our base. Keep the uncommitted buffer and
+      // replay once on top of the server's revision.
+      const rebased = await attempt(first.conflict.serverRevision, mutationId());
+      if (rebased.ok) { commitAndSave(rebased.res, rebased.patch); return; }
+      if (rebased.conflict) {
+        // Still conflicting: enter conflict state, but KEEP the buffer so the
+        // user's local edits survive for a later retry.
         blockedRef.current = true;
-        setConflict({ serverRevision: e.serverRevision, canvasId: e.canvasId });
+        conflictRef.current = rebased.conflict;
+        setConflict(rebased.conflict);
         setStatus('Conflict');
         return;
       }
       setStatus(navigator.onLine === false ? 'Offline' : 'Save failed');
+      return;
     }
+
+    // Non-conflict failure (network, transient): retry once with the SAME
+    // clientMutationId so the server's idempotency guard dedupes a patch that
+    // committed but lost its response (F2).
+    const retried = await attempt(revisionRef.current, cmid);
+    if (retried.ok) { commitAndSave(retried.res, retried.patch); return; }
+    setStatus(navigator.onLine === false ? 'Offline' : 'Save failed');
+  };
+
+  // F2 serialization gate: at most one flush in flight. A flush requested while
+  // one is running is queued and re-run after the current one settles.
+  const flush = () => {
+    if (blockedRef.current) return;
+    if (inFlightRef.current) { pendingFlushRef.current = true; return; }
+    inFlightRef.current = true;
+    void (async () => {
+      try {
+        await doFlush();
+      } finally {
+        inFlightRef.current = false;
+        if (pendingFlushRef.current && !blockedRef.current) {
+          pendingFlushRef.current = false;
+          flush();
+        }
+      }
+    })();
   };
 
   const schedule = () => {
@@ -70,7 +136,10 @@ export function useStudioCanvasPersistence(projectId: string, enabled = true) {
     if (!projectId) return;
     setStatus('Loading');
     blockedRef.current = false;
+    conflictRef.current = null;
     setConflict(null);
+    // Reload discards any uncommitted local edits (explicit user action).
+    bufferRef.current.clear();
     const res = await v2studio.getCanvas(projectId);
     const data = res.canvas ? res : await v2studio.createCanvas(projectId, { name: 'Primary Canvas' });
     const nodes = data.nodes.map(deserializeStudioNode);
@@ -90,7 +159,9 @@ export function useStudioCanvasPersistence(projectId: string, enabled = true) {
     if (!enabled || !projectId) return;
     void reloadFromServer().catch(() => setStatus('Save failed'));
     const unsub = useStudioStore.subscribe((state) => {
-      if (suppressRef.current || revisionRef.current == null || blockedRef.current) return;
+      // NOTE: edits keep buffering even while blocked (conflict) so the retained
+      // buffer accumulates any further local work for the user's later retry.
+      if (suppressRef.current || revisionRef.current == null) return;
       const prevNodes = prevNodesRef.current;
       const nextNodes = new Map(state.nodes.map((n) => [nodeKey(n), nodeSig(n)]));
       for (const n of state.nodes) if (prevNodes.get(n.id) !== nextNodes.get(n.id)) bufferRef.current.upsertNode(n);
@@ -105,6 +176,21 @@ export function useStudioCanvasPersistence(projectId: string, enabled = true) {
     return () => { unsub(); if (timerRef.current) clearTimeout(timerRef.current); };
   }, [projectId, enabled]);
 
-  const retry = () => { if (!blockedRef.current) void flush(); };
+  const retry = () => {
+    if (blockedRef.current) {
+      // Adopt the server's revision as the new base so the retained buffer
+      // replays on top of the latest server state.
+      const c = conflictRef.current;
+      if (c) {
+        revisionRef.current = c.serverRevision;
+        setRevision(c.serverRevision);
+      }
+      blockedRef.current = false;
+      conflictRef.current = null;
+      setConflict(null);
+    }
+    flush();
+  };
+
   return { status, revision, lastSavedAt, conflict, retry, reloadFromServer };
 }

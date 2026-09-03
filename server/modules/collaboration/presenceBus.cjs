@@ -9,9 +9,10 @@
  *     默认注入内存 Map 实现（createMemoryPresenceStore），仅用于开发/单测；
  *     生产环境应注入 PG/Redis 实现（同一接口：upsert/list/remove，寻址键由实现自定，
  *     推荐 (canvas_id, user_id) 复合主键；bus 不构造存储键，只传记录/查询条件）。
- *   - presence 枚举：online / away / editing / offline。
- *     注：collabContract.cjs 冻结过 online/away/offline/busy；本叶按 G22 地基任务
- *     字面量采用 editing，接入时需在契约层对齐（editing vs busy）——见模块头下方注释。
+ *   - presence 枚举（单一真源）：online / away / editing / offline。
+ *     与 collabContract.cjs 的 PRESENCE_STATES 逐字一致（两模块复制同一 frozen 枚举，
+ *     跨目录 require 会引入循环，故复制并标注同源）。busy 为 legacy alias（旧契约名，
+ *     与 editing 同语义「编辑中/执行中」），heartbeat 入列前归一 busy→editing。
  *   - heartbeat 校验 userId/canvasId 必填、state ∈ 枚举；不合法一律拒（status 400 + errors），
  *     不降级 online（显式优于隐式）。state=offline 视为「离开画布」：删除该 (canvas,user) 记录。
  *   - TTL：HEARTBEAT_TTL_MS=15000；peers() 只返回 ≤TTL 内且非 offline 的成员（惰性过滤，
@@ -21,11 +22,16 @@
 
 const HEARTBEAT_TTL_MS = 15_000;
 
-/* ── presence 状态枚举 ────────────────────────────────────────────
+/* ── presence 状态枚举（单一真源） ────────────────────────────────
  * online  连接中且活跃（可收到协作广播）
  * away    连接中但失焦/低活跃（编辑器后台、切走标签页）
  * editing 连接中且正在编辑画布（可选细分，前端可在 input/pointer 事件时上报）
  * offline 已离开/断连（heartbeat(offline) 即摘除 presence 记录）
+ *
+ * ⚠️ 单一真源：本枚举与 server/modules/studio-contracts/collabContract.cjs 的
+ *   PRESENCE_STATES 逐字一致（复制而非 require，避免跨目录循环依赖）。
+ *   busy 为 legacy alias（旧契约状态名，与 editing 同语义），由 heartbeat 归一
+ *   busy→editing，不进入 canonical 枚举。
  */
 const PRESENCE_STATES = Object.freeze({
   ONLINE: 'online',
@@ -37,8 +43,21 @@ const PRESENCE_STATES = Object.freeze({
 /** 枚举值列表（顺序即序列化顺序）。 */
 const PRESENCE_STATE_LIST = Object.freeze(Object.values(PRESENCE_STATES));
 
+/**
+ * legacy alias → canonical 归一映射。busy（旧契约名，与 editing 同语义「编辑中/
+ * 执行中」）由 heartbeat 在入列前归一为 editing；canonical 枚举见 PRESENCE_STATES。
+ */
+const PRESENCE_LEGACY_ALIASES = Object.freeze({
+  busy: PRESENCE_STATES.EDITING,
+});
+
 function isPresenceState(v) {
   return PRESENCE_STATE_LIST.includes(v);
+}
+
+/** 归一 legacy alias：busy → editing；其余原样返回（canonical 或非法值交由校验拒绝）。 */
+function normalizePresenceState(v) {
+  return PRESENCE_LEGACY_ALIASES[v] ?? v;
 }
 
 /* ── 内部谓词（对齐 repo contracts 风格） ───────────────────────── */
@@ -112,14 +131,15 @@ function createPresenceBus({ store } = {}) {
    */
   function heartbeat(input) {
     const { userId, canvasId, state } = isPlainObject(input) ? input : {};
-    const errors = validateHeartbeatInput({ userId, canvasId, state });
+    const normalized = normalizePresenceState(state);
+    const errors = validateHeartbeatInput({ userId, canvasId, state: normalized });
     if (errors.length > 0) return { ok: false, status: 400, errors };
 
-    if (state === PRESENCE_STATES.OFFLINE) {
+    if (normalized === PRESENCE_STATES.OFFLINE) {
       backing.remove({ userId, canvasId });
       return { ok: true, presence: null };
     }
-    const record = { userId, canvasId, state, lastSeenMs: Date.now() };
+    const record = { userId, canvasId, state: normalized, lastSeenMs: Date.now() };
     backing.upsert(record);
     return { ok: true, presence: { ...record } };
   }
@@ -166,6 +186,7 @@ module.exports = {
   createMemoryPresenceStore,
   PRESENCE_STATES,
   PRESENCE_STATE_LIST,
+  PRESENCE_LEGACY_ALIASES,
   isPresenceState,
   HEARTBEAT_TTL_MS,
 };
