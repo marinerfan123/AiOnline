@@ -50,6 +50,7 @@ import dispatcher from './dispatcher.cjs';
 import aiControlRouterMod from './modules/ai-control/routes/aiControlRoutes.cjs';
 import projectFoundationMod from './modules/project-foundation/projectFoundation.cjs';
 import assetFoundationMod from './modules/project-foundation/assetFoundation.cjs';
+import studioModelsApiMod from './modules/modelhub/studioModelsApi.cjs';
 import studioCanvasPersistenceMod from './modules/project-foundation/studioCanvasPersistence.cjs';
 import studioEpisodeApiMod from './modules/project-foundation/studioEpisodeApi.cjs';
 import studioShotApiMod from './modules/project-foundation/studioShotApi.cjs';
@@ -1475,6 +1476,17 @@ const assetFoundation = assetFoundationMod.createAssetFoundation({
   oss: ossMod,
 });
 
+// G07 — Studio Models public API (/api/studio/models + /schema + /capabilities).
+const studioModelsApi = studioModelsApiMod.createStudioModelsApi({
+  pg: {
+    query: (sql, params) => pgPool
+      ? pgPool.query(sql, params)
+      : Promise.reject(Object.assign(new Error('数据库未就绪'), { status: 503 })),
+  },
+  sessionUser: (req) => session.getUserFromCookie(req),
+  sendJSON,
+});
+
 // M05-C — V2 Studio Canvas persistence (/api/v2/projects/:id/studio/canvas).
 const studioCanvasPersistence = studioCanvasPersistenceMod.createStudioCanvasPersistence({
   pg: {
@@ -2495,6 +2507,11 @@ async function handleAPI(req, res) {
   // ── M04-S Asset Foundation（/api/v2/assets, /api/v2/projects/:id/assets）──
   if (url.startsWith('/api/v2/assets') || /\/api\/v2\/projects\/[^/]+\/assets/.test(url)) {
     if (await assetFoundation.handle(req, res, url.split('?')[0], method)) return;
+  }
+
+  // ── G07 Studio Models public API（/api/studio/models）──
+  if (url.startsWith('/api/studio/models')) {
+    if (await studioModelsApi.handle(req, res, url.split('?')[0], method)) return;
   }
 
   // ── M01-S Project / Workspace Foundation（/api/v2/workspaces, /api/v2/projects）──
