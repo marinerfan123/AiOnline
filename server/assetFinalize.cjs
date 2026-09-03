@@ -300,11 +300,16 @@ async function finalizeUrl(pgPool, opts) {
     // ossUploaded=false：没有真正上传到OSS，前端不应显示OSS角标
     ossLog('info', 'finalize', `[assetFinalize] OSS 未启用，使用 providerUrl 直接展示 ${tag}`, { taskId, userId, providerUrl: String(providerUrl).slice(0, 80), byteLength: fileSize });
     await insertMedia(pgPool, { mediaId, userId, taskId, type, prompt, model, ratio, providerUrl, thumbnail: '', ossUrl: providerUrl, ossObjectKey: '', ossUploaded: false, contentType, fileSize, status: 'success', errorMessage: '' });
+    // G08 — 生成结果版本化（OSS 未启用：storage_key 为空）
+    await recordAssetVersion(pgPool, { mediaId, taskId, model, storageKey: '', sizeBytes: fileSize });
     return { mediaId, pendingId: mediaId, ossUrl: providerUrl, thumbnail: '', ossObjectKey: '', ossUploaded: false, status: 'success', providerUrl, contentType, fileSize, type };
   }
 
   // ── 3. 写 media 表（成功/已有 OSS URL）──
   await insertMedia(pgPool, { mediaId, userId, taskId, type, prompt, model, ratio, providerUrl, thumbnail: thumbUrl, ossUrl, ossObjectKey, ossUploaded: true, contentType, fileSize, status: 'success', errorMessage: '' });
+
+  // G08 — 生成结果版本化：落 media 行后补写 asset_versions（kind='generated', status='ready'）
+  await recordAssetVersion(pgPool, { mediaId, taskId, model, storageKey: ossObjectKey, sizeBytes: fileSize });
 
   return { mediaId, pendingId: mediaId, ossUrl, thumbnail: thumbUrl, ossObjectKey, ossUploaded: true, status: 'success', providerUrl, contentType, fileSize, type };
 }
@@ -346,6 +351,57 @@ async function insertMedia(pgPool, row) {
        provider_url = EXCLUDED.provider_url`,
     params,
   );
+}
+
+// ─── G08 — 生成图/视频结果版本化（asset_versions 版本化写入）──────────────────
+// 生成结果（AI 生成图/视频）落 media 行后补写 asset_versions 版本行：
+//   - derived 类（缩略图/proxy/waveform）已由 server.js 的 storeDerived 写 kind='derived'，
+//     此处只补「生成结果」分支（kind='generated'），防重复写。
+//   - asset_versions.project_id 为 NOT NULL：仅当 media 已绑定 project（media.project_id 非空）时写入；
+//     未绑定项目的独立生成（/api/generate）跳过，避免 NOT NULL 违反。
+//   - version_id 用 rid('av') 风格（与 server.js storeDerived 一致）；ON CONFLICT DO NOTHING 幂等。
+//   - 失败不阻断资产落地（积分已扣必有产物），与 storeDerived 的 best-effort 语义一致。
+async function insertAssetVersion(pgPool, row) {
+  await pgPool.query(
+    `INSERT INTO asset_versions (version_id, media_id, project_id, kind, status, storage_key, size_bytes, generation_id, model)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+     ON CONFLICT (version_id) DO NOTHING`,
+    [
+      row.versionId,
+      row.mediaId,
+      row.projectId,
+      row.kind,
+      row.status,
+      row.storageKey || '',
+      row.sizeBytes != null ? Number(row.sizeBytes) : 0,
+      row.generationId || null,
+      row.model || '',
+    ],
+  );
+}
+
+// finalize 成功后按 media 归属项目补写 asset_versions；返回 true=已写，false=跳过（未绑定项目/失败兜底）。
+async function recordAssetVersion(pgPool, { mediaId, taskId, model, storageKey, sizeBytes }) {
+  try {
+    const meta = await pgPool.query(`SELECT project_id FROM media WHERE id = $1`, [mediaId]).catch(() => ({ rows: [] }));
+    const projectId = meta.rows && meta.rows.length ? meta.rows[0].project_id : null;
+    if (!projectId) return false;
+    await insertAssetVersion(pgPool, {
+      versionId: `av-${crypto.randomUUID()}`,
+      mediaId,
+      projectId,
+      kind: 'generated',
+      status: 'ready',
+      storageKey: storageKey || '',
+      sizeBytes: sizeBytes || 0,
+      generationId: taskId || null,
+      model: model || '',
+    });
+    return true;
+  } catch (e) {
+    try { ossMod.log && ossMod.log('warn', 'finalize', `[assetFinalize] asset_versions 写入失败 media=${mediaId} → ${e.message}`); } catch (_) {}
+    return false;
+  }
 }
 
 // 入口：批量终结化（dispatcher 任务 done 回调里调用）
@@ -416,4 +472,6 @@ module.exports = {
   buildGetUrl,
   pickActiveCfg,
   insertMedia,
+  insertAssetVersion,
+  recordAssetVersion,
 };
