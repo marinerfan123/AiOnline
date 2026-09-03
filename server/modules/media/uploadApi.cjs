@@ -99,8 +99,20 @@ function createUploadApi({ pg, sessionUser, sendJSON, parseBody, signPutUrl }) {
           }
           return sendJSON(res, 404, { ok: false, error: '上传不存在或状态不可终态化' });
         }
-        const job = await enqueueJob(pg, { assetId, kind: 'probe', createdBy: user.id });
-        return sendJSON(res, 200, { ok: true, probeJobId: job.job ? job.job.id : null });
+        // Auto-plan normalization jobs (04 §16): probe always; thumbnail for
+        // image/video; proxy for video; waveform for audio. Idempotency keys
+        // are deterministic so re-finalize/worker retries never double-queue.
+        const mimeType = String(row.rows[0].mime_type || '');
+        const planned = ['probe'];
+        if (mimeType.startsWith('image/')) planned.push('thumbnail');
+        if (mimeType.startsWith('video/')) planned.push('thumbnail', 'proxy');
+        if (mimeType.startsWith('audio/')) planned.push('waveform');
+        const jobs = [];
+        for (const kind of planned) {
+          const j = await enqueueJob(pg, { assetId, kind, idempotencyKey: `${assetId}:${kind}` });
+          jobs.push(j.job ? j.job.id : null);
+        }
+        return sendJSON(res, 200, { ok: true, probeJobId: jobs[0], plannedJobs: jobs });
       }
 
       return sendJSON(res, 404, { ok: false, error: 'Not Found' });
