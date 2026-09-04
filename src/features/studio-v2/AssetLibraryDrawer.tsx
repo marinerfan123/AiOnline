@@ -30,7 +30,9 @@ import { useQuery } from '@tanstack/react-query';
 import {
   AudioLines,
   Box,
+  ChevronDown,
   Film,
+  History,
   Image as ImageIcon,
   Images,
   Inbox,
@@ -42,6 +44,7 @@ import {
 } from 'lucide-react';
 import { v2asset } from '@/shared/api/contract/asset-client';
 import type { AssetSummary, AssetType } from '@/shared/api/contract/schemas';
+import { api } from '@/shared/api/client';
 import { Input } from '@/shared/ui/v2';
 import { cn } from '@/lib/utils';
 
@@ -110,6 +113,101 @@ function kindText(a: AssetSummary): string {
   return a.origin === 'GENERATION' ? `${base} · Generated` : base;
 }
 
+// ── G-v2.0 must#6 — asset version browsing (read-only) ──────────────────────
+// Server routes live in server/modules/media/uploadApi.cjs (added this
+// milestone, NOT yet in the generated OpenAPI contract):
+//   GET /api/v2/uploads/:assetId/versions   → { ok, versions: [...] }  (desc)
+//   GET /api/v2/uploads/versions/:versionId → { ok, version: {...} }
+// Reads therefore go straight through the shared api client with a light shape
+// guard here; a contract client can replace these once the spec is published.
+// `storageKey` is server-redacted for non-writers and is NEVER rendered by this
+// window even when the caller happens to be an owner/editor.
+
+export interface AssetVersionSummary {
+  versionId: string;
+  kind: string; // upload | generated | derived (derived covers probe/thumbnail/…)
+  status: string; // pending | ready | failed
+  sizeBytes: number;
+  createdAt: string;
+  model?: string | null;
+  provider?: string | null;
+  /** Only ever present for owner/editor callers — never displayed here. */
+  storageKey?: string;
+}
+
+/** Debounce (ms) applied before a freshly-selected asset's versions load. */
+const VERSIONS_DEBOUNCE_MS = 180;
+
+const VERSION_KIND_LABEL: Record<string, string> = {
+  upload: '上传',
+  generated: '生成',
+  derived: '派生',
+};
+
+const VERSION_STATUS_LABEL: Record<string, string> = {
+  pending: '处理中',
+  ready: '就绪',
+  failed: '失败',
+};
+
+const VERSION_STATUS_TONE: Record<string, string> = {
+  pending: 'bg-amber-400',
+  ready: 'bg-emerald-400',
+  failed: 'bg-red-400',
+};
+
+function versionKindLabel(kind: string): string {
+  return VERSION_KIND_LABEL[kind] ?? kind;
+}
+
+function versionStatusLabel(status: string): string {
+  return VERSION_STATUS_LABEL[status] ?? status;
+}
+
+function isVersionRow(x: unknown): x is AssetVersionSummary {
+  if (!x || typeof x !== 'object') return false;
+  const o = x as Record<string, unknown>;
+  return typeof o.versionId === 'string' && typeof o.createdAt === 'string';
+}
+
+/** GET /api/v2/uploads/:assetId/versions — malformed/failed → [] (silent). */
+async function listAssetVersions(assetId: string): Promise<AssetVersionSummary[]> {
+  const raw = (await api.get(`/api/v2/uploads/${encodeURIComponent(assetId)}/versions`)) as {
+    versions?: unknown;
+  };
+  if (!Array.isArray(raw?.versions)) return [];
+  return raw.versions.filter(isVersionRow);
+}
+
+/** GET /api/v2/uploads/versions/:versionId — malformed/failed → null (silent). */
+async function getAssetVersion(versionId: string): Promise<AssetVersionSummary | null> {
+  const raw = (await api.get(`/api/v2/uploads/versions/${encodeURIComponent(versionId)}`)) as {
+    version?: unknown;
+  };
+  return isVersionRow(raw?.version) ? raw.version : null;
+}
+
+function formatBytes(n: number): string {
+  if (!Number.isFinite(n) || n <= 0) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB'];
+  let i = 0;
+  let v = n;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i += 1;
+  }
+  const num = i === 0 || v >= 100 ? Math.round(v).toString() : v.toFixed(1);
+  return `${num} ${units[i]}`;
+}
+
+function formatWhen(iso: string, withSeconds = false): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '';
+  const p = (x: number) => String(x).padStart(2, '0');
+  const base = `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+  return withSeconds ? `${base}:${p(d.getSeconds())}` : base;
+}
+
 /** Read-only empty state, shared by the "whole library empty" and "filter empty" cases. */
 export function AssetLibraryEmptyState({
   libraryHasAssets,
@@ -164,6 +262,140 @@ function AssetThumb({ asset }: { asset: AssetSummary }) {
   );
 }
 
+interface AssetVersionsPanelProps {
+  assetId: string;
+  open: boolean;
+  onToggleOpen: () => void;
+  /** Loaded rows for the selected asset (undefined = not fetched yet). */
+  versions: AssetVersionSummary[] | undefined;
+  loaded: boolean;
+  attempted: boolean;
+  pending: boolean;
+  expandedVersionId: string | null;
+  onToggleVersion: (versionId: string) => void;
+  detailFor: (versionId: string) => AssetVersionSummary | undefined;
+}
+
+/**
+ * Collapsible "版本" section for the selected asset. Reads stay read-only and
+ * degrade silently: a failed or empty fetch renders a muted "暂无版本" line —
+ * never an error banner. Row click → single-version GET (race-guarded by the
+ * caller) and inline detail; storageKey is never rendered here.
+ */
+function AssetVersionsPanel({
+  assetId,
+  open,
+  onToggleOpen,
+  versions,
+  loaded,
+  attempted,
+  pending,
+  expandedVersionId,
+  onToggleVersion,
+  detailFor,
+}: AssetVersionsPanelProps) {
+  const count = versions?.length ?? 0;
+  // Server returns newest-first; browse oldest → newest so v1 = first version.
+  const rows = useMemo(() => (versions ? [...versions].reverse() : []), [versions]);
+  return (
+    <div
+      data-test={`asset-versions-${assetId}`}
+      className="ml-11 mt-1 overflow-hidden rounded-md border border-ml2-border bg-ml2-surface-2/70"
+    >
+      <button
+        type="button"
+        data-test={`asset-versions-toggle-${assetId}`}
+        onClick={onToggleOpen}
+        aria-expanded={open}
+        className="flex w-full items-center gap-1.5 px-2 py-1.5 text-left transition-colors hover:bg-ml2-surface-2"
+      >
+        <History className="size-3 shrink-0 text-ml2-text-3" />
+        <span className="text-[10px] font-semibold uppercase tracking-wide text-ml2-text-2">版本</span>
+        {loaded && count > 0 && (
+          <span
+            data-test={`asset-versions-count-${assetId}`}
+            className="rounded bg-ml2-surface-3 px-1 py-px text-[9px] leading-none text-ml2-text-3"
+          >
+            {count}
+          </span>
+        )}
+        <ChevronDown
+          className={cn('ml-auto size-3 shrink-0 text-ml2-text-3 transition-transform', open ? '' : '-rotate-90')}
+        />
+      </button>
+      {open && (
+        <div className="max-h-44 space-y-0.5 overflow-y-auto border-t border-ml2-border px-1.5 py-1">
+          {pending ? (
+            <p data-test={`asset-versions-pending-${assetId}`} className="px-1 py-0.5 text-[10px] text-ml2-text-3">
+              加载中…
+            </p>
+          ) : attempted && count === 0 ? (
+            <p data-test={`asset-versions-empty-${assetId}`} className="px-1 py-0.5 text-[10px] text-ml2-text-3">
+              暂无版本
+            </p>
+          ) : (
+            rows.map((v, i) => {
+              const ordinal = i + 1;
+              const isExpanded = expandedVersionId === v.versionId;
+              const detail = detailFor(v.versionId) ?? v;
+              return (
+                <div
+                  key={v.versionId}
+                  data-test={`asset-version-row-${v.versionId}`}
+                  className="rounded-md transition-colors hover:bg-ml2-surface-3/70"
+                >
+                  <button
+                    type="button"
+                    data-test={`asset-version-toggle-${v.versionId}`}
+                    onClick={() => onToggleVersion(v.versionId)}
+                    aria-expanded={isExpanded}
+                    className="w-full rounded px-1 py-1 text-left"
+                  >
+                    <span className="flex items-center gap-1.5">
+                      <span className="rounded bg-ml2-surface-3 px-1 py-px font-mono text-[9px] leading-none text-ml2-text-2">
+                        v{ordinal}
+                      </span>
+                      <span className="min-w-0 flex-1 truncate text-[10px] text-ml2-text-2">
+                        {versionKindLabel(v.kind)} · {versionStatusLabel(v.status)}
+                      </span>
+                      <span
+                        aria-hidden
+                        className={cn('size-1.5 shrink-0 rounded-full', VERSION_STATUS_TONE[v.status] ?? 'bg-ml2-text-3/60')}
+                      />
+                    </span>
+                    <span className="mt-0.5 flex items-center gap-1 pl-6 text-[9px] text-ml2-text-3">
+                      {formatBytes(v.sizeBytes)} · {formatWhen(v.createdAt)}
+                    </span>
+                  </button>
+                  {isExpanded && (
+                    <div
+                      data-test={`asset-version-detail-${v.versionId}`}
+                      className="mx-1 mb-1 rounded bg-ml2-surface-3/80 px-1.5 py-1 text-[10px] leading-relaxed text-ml2-text-3"
+                    >
+                      <p>
+                        {versionKindLabel(detail.kind)} · {versionStatusLabel(detail.status)} · {formatBytes(detail.sizeBytes)} ·{' '}
+                        {formatWhen(detail.createdAt, true)}
+                      </p>
+                      {(detail.model || detail.provider) && (
+                        <p className="truncate">
+                          {[detail.model && `model ${detail.model}`, detail.provider && `provider ${detail.provider}`]
+                            .filter(Boolean)
+                            .join(' · ')}
+                        </p>
+                      )}
+                      <p className="truncate font-mono text-[9px]">{v.versionId}</p>
+                    </div>
+                  )}
+                </div>
+              );
+            })
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 /**
  * Drawer body. Rendered by StudioPage as an absolutely-positioned overlay
  * inside the canvas column (sibling of the conflict panel), so it fills that
@@ -176,6 +408,18 @@ export function AssetLibraryDrawer({ projectId, onClose }: { projectId: string; 
   const [favorites, setFavorites] = useState<Record<string, boolean>>({});
   const [tagMap, setTagMap] = useState<Record<string, string[]>>({});
   const [fetched, setFetched] = useState<Set<string>>(new Set());
+
+  // G-v2.0 must#6 — selected-asset version browsing (read-only). Selection is
+  // local to this drawer; the panel expands under the selected row.
+  const [selectedAssetId, setSelectedAssetId] = useState<string | null>(null);
+  const [versionsOpen, setVersionsOpen] = useState(false);
+  const [versionLists, setVersionLists] = useState<Record<string, AssetVersionSummary[]>>({});
+  const [versionsLoaded, setVersionsLoaded] = useState<Set<string>>(new Set());
+  const [versionsAttempted, setVersionsAttempted] = useState<Set<string>>(new Set());
+  const [versionsPending, setVersionsPending] = useState<Record<string, boolean>>({});
+  const [expandedVersionId, setExpandedVersionId] = useState<string | null>(null);
+  const [versionDetails, setVersionDetails] = useState<Record<string, AssetVersionSummary>>({});
+  const [detailsLoaded, setDetailsLoaded] = useState<Set<string>>(new Set());
 
   // Close on Escape while open (drawer has no focus trap in this window).
   useEffect(() => {
@@ -264,6 +508,115 @@ export function AssetLibraryDrawer({ projectId, onClose }: { projectId: string; 
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [visibleKey, visible]);
 
+  // ── Selected-asset version load (list) ─────────────────────────────────────
+  // Mirrors the lazy-detail race pattern above: keyed on the selection, a
+  // debounce coalesces rapid asset switching and an `alive` flag drops any
+  // result that arrives after the selection moved on — only the latest selected
+  // asset's versions may land. Success is recorded in `versionsLoaded` so
+  // re-expanding the same row never refetches; failure stays unloaded (a later
+  // reselect silently retries) and is surfaced only as the muted empty state.
+  useEffect(() => {
+    const assetId = selectedAssetId;
+    if (!assetId || versionsLoaded.has(assetId)) return;
+    let alive = true;
+    const timer = window.setTimeout(() => {
+      if (!alive) return;
+      setVersionsPending((prev) => ({ ...prev, [assetId]: true }));
+      void listAssetVersions(assetId)
+        .then((rows) => {
+          if (!alive) return;
+          setVersionLists((prev) => ({ ...prev, [assetId]: rows }));
+          setVersionsLoaded((prev) => {
+            const next = new Set(prev);
+            next.add(assetId);
+            return next;
+          });
+          setVersionsAttempted((prev) => {
+            const next = new Set(prev);
+            next.add(assetId);
+            return next;
+          });
+        })
+        .catch(() => {
+          // Read-only: a failed versions read collapses to the silent empty
+          // state (never an error banner) and stays unloaded for a later retry.
+        })
+        .finally(() => {
+          if (!alive) return;
+          setVersionsAttempted((prev) => {
+            const next = new Set(prev);
+            next.add(assetId);
+            return next;
+          });
+          setVersionsPending((prev) => {
+            if (!(assetId in prev)) return prev;
+            const next = { ...prev };
+            delete next[assetId];
+            return next;
+          });
+        });
+    }, VERSIONS_DEBOUNCE_MS);
+    return () => {
+      alive = false;
+      window.clearTimeout(timer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedAssetId, versionsLoaded]);
+
+  // ── Single-version detail read (row click) ─────────────────────────────────
+  // Also race-guarded: only the row expanded at resolution time may write.
+  // The single-version response can carry storageKey for owner/editor callers,
+  // but this UI never renders it (see header note) — only displayable fields
+  // (kind/status/size/time/model/provider) are merged into the detail view.
+  useEffect(() => {
+    const versionId = expandedVersionId;
+    if (!versionId || detailsLoaded.has(versionId)) return;
+    let alive = true;
+    void getAssetVersion(versionId)
+      .then((v) => {
+        if (!alive || !v) return;
+        // Explicit pick: storageKey is redacted server-side for non-writers and
+        // is never stored/rendered even for owner/editor callers.
+        const publicFields: AssetVersionSummary = {
+          versionId: v.versionId,
+          kind: v.kind,
+          status: v.status,
+          sizeBytes: v.sizeBytes,
+          createdAt: v.createdAt,
+          model: v.model ?? null,
+          provider: v.provider ?? null,
+        };
+        setVersionDetails((prev) => ({ ...prev, [versionId]: publicFields }));
+        setDetailsLoaded((prev) => {
+          const next = new Set(prev);
+          next.add(versionId);
+          return next;
+        });
+      })
+      .catch(() => {
+        // Read-only: a failed detail read leaves the row's own summary visible.
+      });
+    return () => {
+      alive = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [expandedVersionId, detailsLoaded]);
+
+  const handleAssetClick = (assetId: string) => {
+    if (selectedAssetId === assetId) {
+      // Re-clicking the selected row collapses/expands the versions panel.
+      setVersionsOpen((v) => !v);
+      return;
+    }
+    setSelectedAssetId(assetId);
+    setVersionsOpen(true);
+    setExpandedVersionId(null);
+  };
+
+  const handleVersionClick = (versionId: string) => {
+    setExpandedVersionId((cur) => (cur === versionId ? null : versionId));
+  };
+
   const hasMore = Boolean(list.data?.pagination.hasMore);
 
   return (
@@ -346,26 +699,49 @@ export function AssetLibraryDrawer({ projectId, onClose }: { projectId: string; 
             <ul data-test="asset-library-list" className="space-y-0.5">
               {visible.map((a) => {
                 const isFav = favorites[a.assetId] === true;
+                const isSelected = selectedAssetId === a.assetId;
                 return (
-                  <li
-                    key={a.assetId}
-                    data-test={`asset-library-item-${a.assetId}`}
-                    className="flex items-center gap-2 rounded-md p-1.5 transition-colors hover:bg-ml2-surface-2/60"
-                  >
-                    <div className="h-10 w-10 shrink-0 overflow-hidden rounded-md border border-ml2-border bg-ml2-surface-3">
-                      <AssetThumb asset={a} />
-                    </div>
-                    <div className="min-w-0 flex-1">
-                      <p className="truncate text-[11px] text-ml2-text">{a.title || a.assetId}</p>
-                      <p className="truncate text-[10px] text-ml2-text-3">{kindText(a)}</p>
-                    </div>
-                    <Star
-                      aria-label={isFav ? '已收藏' : '未收藏(只读)'}
+                  <li key={a.assetId} className="rounded-md">
+                    <button
+                      type="button"
+                      data-test={`asset-library-item-${a.assetId}`}
+                      onClick={() => handleAssetClick(a.assetId)}
+                      aria-pressed={isSelected}
+                      aria-expanded={isSelected ? versionsOpen : undefined}
                       className={cn(
-                        'size-3.5 shrink-0',
-                        isFav ? 'fill-ml2-accent text-ml2-accent' : 'text-ml2-text-3/70',
+                        'flex w-full items-center gap-2 rounded-md p-1.5 text-left transition-colors hover:bg-ml2-surface-2/60',
+                        isSelected && 'bg-ml2-surface-2 ring-1 ring-inset ring-ml2-accent/40',
                       )}
-                    />
+                    >
+                      <div className="h-10 w-10 shrink-0 overflow-hidden rounded-md border border-ml2-border bg-ml2-surface-3">
+                        <AssetThumb asset={a} />
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <p className="truncate text-[11px] text-ml2-text">{a.title || a.assetId}</p>
+                        <p className="truncate text-[10px] text-ml2-text-3">{kindText(a)}</p>
+                      </div>
+                      <Star
+                        aria-label={isFav ? '已收藏' : '未收藏(只读)'}
+                        className={cn(
+                          'size-3.5 shrink-0',
+                          isFav ? 'fill-ml2-accent text-ml2-accent' : 'text-ml2-text-3/70',
+                        )}
+                      />
+                    </button>
+                    {isSelected && (
+                      <AssetVersionsPanel
+                        assetId={a.assetId}
+                        open={versionsOpen}
+                        onToggleOpen={() => setVersionsOpen((v) => !v)}
+                        versions={versionLists[a.assetId]}
+                        loaded={versionsLoaded.has(a.assetId)}
+                        attempted={versionsAttempted.has(a.assetId)}
+                        pending={versionsPending[a.assetId] === true}
+                        expandedVersionId={expandedVersionId}
+                        onToggleVersion={handleVersionClick}
+                        detailFor={(versionId) => versionDetails[versionId]}
+                      />
+                    )}
                   </li>
                 );
               })}

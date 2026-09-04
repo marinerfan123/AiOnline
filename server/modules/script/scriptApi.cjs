@@ -15,7 +15,13 @@
  *          ?scriptId=) storyboard PLAN view — read-only; computes the
  *          deterministic beats/shots plan from the project's rows (scene order)
  *          via buildStoryboardPlan. Permissions follow GET /rows (viewer can
- *          read; owner/editor not required).
+ *          read; owner/editor not required). Response adds the 0054 staleness
+ *          contract (三视图接线收口): `dirty` bool — true when this script's
+ *          PERSISTED plan (project_shots_rows) is behind script_rows, i.e.
+ *          any persisted row was markDirty'd by a rows write, OR the stored
+ *          plan fingerprint differs from the freshly computed one;
+ *          `planFingerprint` — the stored fingerprint of the script's latest
+ *          persisted generation (null when the script was never applied).
  *   POST   /api/v2/script/:scriptId/storyboard/apply  (or
  *          /api/v2/script/storyboard/apply?scriptId=) PERSIST the plan: same
  *          dual spelling, same project-bound ownership, but the write gate
@@ -40,6 +46,19 @@
  *   POST   /api/v2/script/storyboard/batches/:batchId/tasks/:taskId/retry
  *          single-task retry (only FAILED && attempt < max_attempts) →
  *          200 { ok:true, reset:1 }; non-retryable → 409; missing → 404.
+ *   POST   /api/v2/script/:scriptId/storyboard/shots/lock  (or
+ *          /api/v2/script/storyboard/shots/lock?scriptId=) lock/unlock plan
+ *          shots (0052): body { shotIds:[...], locked:bool } → lockShots batch
+ *          set on (project, script) scope → 200 { ok:true, locked }; empty /
+ *          malformed shotIds → 400; no shot matched (cross-project / never
+ *          applied / unknown shot) → 404; viewer → 403 (write gate).
+ *          unlock = same body with locked:false.
+ * 0054 接线（三视图收口）: rows 写操作（POST /rows、PATCH /rows/:id、PUT /order、
+ *          DELETE /rows/:id）成功后，把该项目全部已持久化计划 script
+ *          （project_shots_rows 中的 DISTINCT script_id）逐一 markDirty ——
+ *          计划是该项目 script_rows 的投影，任何 rows 写都使所有已 apply 计划
+ *          可报 STALE；从未 apply（无计划行）则无事可做。标注为 best-effort，
+ *          失败不影响已成功的 rows 写。GET …/storyboard 据此 + 指纹比较报 dirty。
  *   Batch rows (0051) carry no project_id — project isolation of batch
  *   resource routes rests on the same requireProject membership gate every
  *   sibling route uses (batchId is an unguessable bt-UUID minted only for the
@@ -50,7 +69,12 @@
 const crypto = require('crypto');
 const { validateScriptRow, buildSceneRows, normalizeContinuityNotes } = require('./scriptModel.cjs');
 const { buildStoryboardPlan } = require('./storyboardPlan.cjs');
-const { persistStoryboardShots } = require('./storyboardShots.cjs');
+const {
+  persistStoryboardShots,
+  markDirty,
+  lockShots,
+  computePlanFingerprint,
+} = require('./storyboardShots.cjs');
 const { storyboardBatchPlan } = require('./storyboardBatchPlan.cjs');
 const { createBatchTaskStore } = require('./batchTaskStore.cjs');
 
@@ -67,7 +91,8 @@ const { createBatchTaskStore } = require('./batchTaskStore.cjs');
  *   { kind, method, scriptId?, batchId?, taskId? } where kind ∈
  *   'plan' (GET plan view), 'apply' (POST persist), 'createBatch'
  *   (POST enqueue), 'listBatch' (GET), 'retryBatch' (POST),
- *   'retryTask' (POST). scriptId may be null when spelling B omits it (the
+ *   'retryTask' (POST), 'lock' (POST shots/lock; unlock same route with
+ *   locked:false). scriptId may be null when spelling B omits it (the
  *   handler then 400s). The 'rows' / 'order' prefixes are reserved by the CRUD
  *   routes, so /api/v2/script/rows/storyboard… stays a rows route, never a
  *   storyboard view/action.
@@ -93,6 +118,10 @@ function matchStoryboardRoute(urlPath, params) {
   if (urlPath === '/api/v2/script/storyboard/batch') {
     return { kind: 'createBatch', method: 'POST', scriptId: sidParam };
   }
+  // B) query-form lock/unlock — shots/lock under the storyboard subtree.
+  if (urlPath === '/api/v2/script/storyboard/shots/lock') {
+    return { kind: 'lock', method: 'POST', scriptId: sidParam };
+  }
   // A) path-form plan view / apply / batch create — :scriptId segment in path.
   const pm = /^\/api\/v2\/script\/([^/]+)\/storyboard(?:\/(apply|batch))?$/.exec(urlPath);
   if (pm && pm[1] !== 'rows' && pm[1] !== 'order') {
@@ -101,6 +130,11 @@ function matchStoryboardRoute(urlPath, params) {
     if (verb === 'apply') return { kind: 'apply', method: 'POST', scriptId: sid };
     if (verb === 'batch') return { kind: 'createBatch', method: 'POST', scriptId: sid };
     return { kind: 'plan', method: 'GET', scriptId: sid };
+  }
+  // A) path-form shots lock/unlock — :scriptId/storyboard/shots/lock.
+  const lockM = /^\/api\/v2\/script\/([^/]+)\/storyboard\/shots\/lock$/.exec(urlPath);
+  if (lockM && lockM[1] !== 'rows' && lockM[1] !== 'order') {
+    return { kind: 'lock', method: 'POST', scriptId: decodeSegment(lockM[1]) };
   }
   // C) batch resource subtree (0051 storyboard_batch_tasks).
   const listM = /^\/api\/v2\/script\/storyboard\/batches\/([^/]+)$/.exec(urlPath);
@@ -137,6 +171,23 @@ UPDATE storyboard_batch_tasks
 const READ_TASK_SQL = `
 SELECT status, attempt, max_attempts FROM storyboard_batch_tasks
  WHERE batch_id = $1 AND task_id = $2`;
+
+// ── 0054 三视图收口 ─────────────────────────────────────────────────────
+// rows 写后把该项目所有已 apply 计划 script 标 dirty 用：先取 DISTINCT script_id
+// （计划 = 该项目 script_rows 的投影，rows 一变全体落后），再逐 script markDirty。
+const PERSISTED_SCRIPT_IDS_SQL =
+  'SELECT DISTINCT script_id FROM project_shots_rows WHERE project_id = $1';
+// GET …/storyboard 读侧：某 script「当前持久化计划代」的汇总 —— dirty = 最新
+// version 各行是否存在脏标记（旧代 locked 行属钉住的例外，不计入活动代）；
+// fingerprint = 最新代共享的计划指纹（同一次 apply 各行同值，MAX 等价取该值），
+// 无任何行（从未 apply / 他 script）→ 空结果 → dirty=false、fingerprint=null。
+const PERSISTED_PLAN_SUMMARY_SQL = `
+SELECT COALESCE(bool_or(dirty), false) AS dirty,
+       MAX(plan_fingerprint) AS fingerprint
+  FROM project_shots_rows
+ WHERE project_id = $1 AND script_id = $2
+   AND version = (SELECT MAX(version) FROM project_shots_rows
+                   WHERE project_id = $1 AND script_id = $2)`;
 
 function createScriptApi({ pg, sessionUser, sendJSON, parseBody }) {
   // Batch store (0051): one instance per API — createBatch/listTasks/markTask/
@@ -192,6 +243,25 @@ function createScriptApi({ pg, sessionUser, sendJSON, parseBody }) {
       return null;
     }
     return tasks;
+  }
+
+  // rows 写（POST/PATCH/PUT order/DELETE）成功后调用（0054 三视图收口）：
+  // 计划 = 该项目 script_rows 的投影（storyboardShots 属主模型：script 的内容
+  // 载体即该项目 script_rows），任何 rows 写都让该项目全部已 apply 的持久化
+  // 计划落后 —— 逐一 markDirty，使 GET …/storyboard 可报 dirty=true（STALE）。
+  // 从未 apply（project_shots_rows 无该项目计划行）→ 无事可做。全程 best-effort：
+  // 标注失败/0 行（markDirty 404）绝不影响已成功的 rows 写。
+  async function markPersistedScriptsDirty(pid) {
+    let scripts = [];
+    try {
+      const r = await pg.query(PERSISTED_SCRIPT_IDS_SQL, [pid]);
+      scripts = (r.rows || [])
+        .map((x) => x && x.script_id)
+        .filter((s) => typeof s === 'string' && s.length > 0);
+    } catch (_) { return; }
+    for (const scriptId of scripts) {
+      try { await markDirty({ pg, projectId: pid, scriptId }); } catch (_) { /* best-effort */ }
+    }
   }
 
   // POST …/batches/:batchId/tasks/:taskId/retry — single-task partial retry.
@@ -324,6 +394,32 @@ function createScriptApi({ pg, sessionUser, sendJSON, parseBody }) {
         });
       }
       const scriptId = storyboard.scriptId;
+      // ── POST …/storyboard/shots/lock — batch lock/unlock (0052). No rows
+      // context needed: target = persisted plan rows only. 200 {ok,locked} on
+      // ≥1 hit; no hit (cross-project / never applied / unknown shot) → 404;
+      // malformed body → 400; viewer is blocked earlier by the write gate.
+      if (storyboard.kind === 'lock') {
+        if (!scriptId) return sendJSON(res, 400, { ok: false, error: 'scriptId 必填' });
+        const body = (await parseBody(req)) || {};
+        const shotIds = body.shotIds;
+        const locked = body.locked;
+        if (!Array.isArray(shotIds) || shotIds.length === 0
+          || shotIds.some((s) => typeof s !== 'string' || s.trim().length === 0)) {
+          return sendJSON(res, 400, { ok: false, error: 'shotIds 必填非空字符串数组' });
+        }
+        if (typeof locked !== 'boolean') {
+          return sendJSON(res, 400, { ok: false, error: 'locked 必填布尔' });
+        }
+        const r = await lockShots({ pg, projectId, scriptId, shotIds, locked });
+        if (!r || r.ok !== true) {
+          const e = r && r.errors && r.errors[0] ? r.errors[0] : (r && r.error ? r.error : '锁定失败');
+          return sendJSON(res, Number.isInteger(r && r.status) ? r.status : 400, { ok: false, error: e });
+        }
+        if (!Array.isArray(r.updated) || r.updated.length === 0) {
+          return sendJSON(res, 404, { ok: false, error: 'shot 不存在或不属于该项目' });
+        }
+        return sendJSON(res, 200, { ok: true, locked });
+      }
       if (!scriptId) return sendJSON(res, 400, { ok: false, error: 'scriptId 必填' });
       const ctx = await loadStoryboardContext(res, projectId);
       if (!ctx || !ctx.rows) return true; // 400 already sent (empty rows / read error)
@@ -388,7 +484,26 @@ function createScriptApi({ pg, sessionUser, sendJSON, parseBody }) {
           },
         });
       }
-      return sendJSON(res, 200, { ok: true, plan: { beats: plan.beats, totalShots: plan.totalShots } });
+      // GET …/storyboard plan view（0054 三视图收口）—— dirty/planFingerprint：
+      // dirty = 持久化计划落后于 script_rows —— 该 script 最新代存在 markDirty
+      // 脏行（rows 写后置位，apply 落新行即清），或存储指纹 ≠ 本次现算指纹
+      // （rows 结构变化而未被 flag 覆盖的兜底）；planFingerprint = 存储的
+      // 最新代计划指纹（客户端可自行与现算比较），从未 apply → null。
+      const freshFingerprint = computePlanFingerprint(plan);
+      const sum = await pg.query(PERSISTED_PLAN_SUMMARY_SQL, [projectId, scriptId]);
+      const persistedRow = sum && sum.rows && sum.rows[0] ? sum.rows[0] : null;
+      const storedFingerprint = persistedRow && persistedRow.fingerprint != null
+        ? String(persistedRow.fingerprint)
+        : null;
+      const persistedDirty = persistedRow ? !!persistedRow.dirty : false;
+      const dirty = persistedDirty
+        || (storedFingerprint !== null && storedFingerprint !== freshFingerprint);
+      return sendJSON(res, 200, {
+        ok: true,
+        plan: { beats: plan.beats, totalShots: plan.totalShots },
+        dirty,
+        planFingerprint: storedFingerprint,
+      });
     }
 
     const id = m && m[1] ? decodeURIComponent(m[1]) : null;
@@ -413,6 +528,8 @@ function createScriptApi({ pg, sessionUser, sendJSON, parseBody }) {
           );
         }
         if (client) await client.query('COMMIT');
+        // 0054: rows 写后标脏（best-effort，不阻断已成功的重排）。
+        await markPersistedScriptsDirty(projectId);
         return sendJSON(res, 200, { ok: true, reordered: rowIds.length });
       } catch (e) {
         if (client) await client.query('ROLLBACK').catch(() => {});
@@ -449,12 +566,18 @@ function createScriptApi({ pg, sessionUser, sendJSON, parseBody }) {
         [id, projectId, ...vals],
       );
       if (!r.rows.length) return sendJSON(res, 409, { ok: false, error: '并发修改，请重试' });
+      // 0054: rows 写后标脏（best-effort，不阻断已成功的 PATCH）。
+      await markPersistedScriptsDirty(projectId);
       return sendJSON(res, 200, { ok: true, id });
     }
 
     // DELETE /rows/:id
     if (method === 'DELETE' && id) {
       const r = await pg.query(`DELETE FROM script_rows WHERE id = $1 AND project_id = $2`, [id, projectId]);
+      if (r.rowCount) {
+        // 0054: rows 写后标脏（best-effort，不阻断已成功的 DELETE）。
+        await markPersistedScriptsDirty(projectId);
+      }
       return sendJSON(res, r.rowCount ? 200 : 404, { ok: r.rowCount ? true : false, error: r.rowCount ? undefined : 'row 不存在' });
     }
 
@@ -491,6 +614,10 @@ function createScriptApi({ pg, sessionUser, sendJSON, parseBody }) {
           [row.id, row.project_id, row.episode_id, row.scene_index, row.row_index, row.kind, row.speaker, row.text, row.beat, row.timing_ms, JSON.stringify(row.continuity_notes)],
         );
         out.push(row);
+      }
+      if (out.length > 0) {
+        // 0054: rows 写后标脏（best-effort；至少 1 行真实落库才标）。
+        await markPersistedScriptsDirty(projectId);
       }
       return sendJSON(res, errors.length ? 207 : 201, { ok: true, inserted: out, errors });
     }

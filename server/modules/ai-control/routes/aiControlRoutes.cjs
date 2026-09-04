@@ -32,11 +32,32 @@
  * 404/409 semantics stay identical. Unrecognized write SQL is refused with a
  * 500 (fail closed — a dry-run must never touch the DB). dryRun defaults to
  * false: existing behavior is byte-for-byte unchanged.
+ *
+ * G19 (approval 门接线) — approvalGate 决策接入 5 个高危写 kind 的真实执行路径：
+ *   POST /providers → provider.create；POST …/enable → provider.enable；
+ *   POST …/keys → provider.key.create；DELETE …/keys/:keyId → provider.key.delete；
+ *   POST …/keys/:keyId/cooldown → provider.cooldown。
+ *   dryRun 恒定放行（只校验不落库，无审批语义）。decision 'deny' → 403
+ *   APPROVAL_DENIED（无审批路径，allowlist 不可覆盖）；'required' 且
+ *   requiresApproval && !shouldAutoApprove → 402 APPROVAL_REQUIRED 不执行
+ *   （无 pending 表：响应 message 指引客户端走人工确认；TODO(pending_actions)
+ *   落地后应建待批记录并回 pendingId）。'auto' / allowlist 预授权 → 放行。
+ *   PATCH 类元数据写（provider 字段 / key 元数据）不在 APPROVAL_REQUIRED_KINDS
+ *   → 不入门，行为维持现状。
+ *
+ * 角色来源（写路径在 admin 门后）：guard() 放行的会话用户（cookie sid）是唯一
+ * 可达写面的身份。users.role 只有 'admin'|'user'（注册/登录签发）；API_TOKEN 的
+ * role:'system'（appGateway）无会话 cookie，在 handle() 顶部 401，到不了写面；
+ * 'agent' 在本应用无任何签发路径。故当前实际恒为 admin（DEFAULT_POLICY 全
+ * auto）→ 本门零行为改变；agent/system 单元在「未来 agent/system 内部调用面」
+ * 接入时才真正约束（策略见 approvalGate.cjs DEFAULT_POLICY）。词表外角色
+ * fail-closed 视同 deny(403)，绝不静默放行。
  */
 
 const service = require('../services/providerService.cjs');
 const catalogService = require('../services/aiControlService.cjs');
 const keypool = require('../domain/keypool.cjs');
+const approvalGate = require('../approvalGate.cjs');
 
 const PREFIX = '/api/v2/ai-control';
 
@@ -157,6 +178,45 @@ function createAiControlRouter(deps) {
     return user;
   }
 
+  /**
+   * G19 — approval 门裁决（真实写执行前；dryRun 路径不调用本函数）。
+   * 角色枚举映射（见文件头「角色来源」）：写面可达身份 = 会话用户 role
+   * ∈ {admin, user}；admin → DEFAULT_POLICY 全 auto（放行）；user → 全 deny；
+   * agent/system 为未来内部调用面。词表外角色 fail-closed deny。
+   * @returns {{allow:true}|{allow:false, code:402|403, error:string, kind:string}}
+   */
+  function approvalVerdict(kind, user) {
+    if (!user || !approvalGate.ACTOR_ROLES.includes(user.role)) {
+      return { allow: false, code: 403, error: 'APPROVAL_DENIED', kind };
+    }
+    const ctx = { kind, actorRole: user.role, actorId: user.id };
+    const d = approvalGate.decisionFor(ctx);
+    if (d === 'deny') return { allow: false, code: 403, error: 'APPROVAL_DENIED', kind };
+    if (d === 'required'
+        && approvalGate.requiresApproval(ctx)
+        && !approvalGate.shouldAutoApprove({ kind, actorRole: user.role })) {
+      // TODO(pending_actions)：接入 pending 表后此处应创建待批记录并回 pendingId，
+      // 人工批准后再执行；当前无表 → 402 拒绝并指引客户端走人工确认流程。
+      return { allow: false, code: 402, error: 'APPROVAL_REQUIRED', kind };
+    }
+    return { allow: true }; // auto；或 required 但被 allowlist 预授权
+  }
+
+  /** G19 — 门不通过则 sendJSON 拒绝并返回 false（调用方直接 return true）。 */
+  function gateWrite(res, kind, user) {
+    const v = approvalVerdict(kind, user);
+    if (v.allow) return true;
+    sendJSON(res, v.code, {
+      ok: false,
+      error: v.error,
+      kind: v.kind,
+      message: v.code === 402
+        ? '高危写操作需人工审批：当前服务端未接入待批队列（pending_actions 未落地），请客户端走人工确认流程、经人工批准后重放本请求。'
+        : '该身份无此写操作权限（deny，无审批路径）。',
+    });
+    return false;
+  }
+
   async function handle(req, res, urlPath, method) {
     if (!urlPath.startsWith(PREFIX)) return false;
     if (method === 'OPTIONS') return true;
@@ -207,6 +267,7 @@ function createAiControlRouter(deps) {
             },
           });
         }
+        if (!gateWrite(res, 'provider.create', user)) return true;
         const out = await service.createProvider(pg, body, body.apiKey, user.id);
         return finish(res, 201, out);
       }
@@ -252,6 +313,7 @@ function createAiControlRouter(deps) {
             },
           });
         }
+        if (!gateWrite(res, 'provider.enable', user)) return true;
         const out = await service.setProviderEnabled(pg, m[1], enabled, cur.revision);
         return finish(res, 200, out);
       }
@@ -278,6 +340,7 @@ function createAiControlRouter(deps) {
           const would = await dryRunAddKeysDigest(pg, m[1], keys);
           return finish(res, 201, { ok: true, dryRun: true, would });
         }
+        if (!gateWrite(res, 'provider.key.create', user)) return true;
         const out = await service.addKeysBatch(pg, m[1], keys, sync);
         return finish(res, 201, out);
       }
@@ -310,6 +373,7 @@ function createAiControlRouter(deps) {
             would: { action: 'deleteKey', provider_id: m[1], key_id: m[2] },
           });
         }
+        if (!gateWrite(res, 'provider.key.delete', user)) return true;
         const out = await service.deleteKey(pg, m[1], m[2], sync);
         return finish(res, 200, out);
       }
@@ -330,6 +394,7 @@ function createAiControlRouter(deps) {
             },
           });
         }
+        if (!gateWrite(res, 'provider.cooldown', user)) return true;
         const out = await service.setKeyCooldown(pg, m[1], m[2], body.cooldownMs, sync);
         return finish(res, 200, out);
       }

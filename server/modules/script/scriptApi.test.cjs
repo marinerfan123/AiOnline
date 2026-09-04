@@ -38,6 +38,7 @@ function makeHarness({ memberFor = ['p-1'], role = 'editor', characters = [], lo
           shot_index: params[6], kind: params[7], intent: params[8],
           subject_refs: JSON.parse(params[9]), duration_ms: params[10],
           ordering: params[11], version: params[12],
+          locked: params[13], plan_fingerprint: params[15], dirty: params[16],
         });
         return { rows: [], rowCount: 1 };
       }
@@ -59,6 +60,44 @@ function makeHarness({ memberFor = ['p-1'], role = 'editor', characters = [], lo
         const before = state.shots.length;
         state.shots = state.shots.filter((s) => !(s.script_id === params[0] && s.project_id === params[1]));
         return { rowCount: before - state.shots.length };
+      }
+      // ── 0054 三视图收口 emulation（scriptApi rows 写标脏 + GET dirty/fp）──
+      if (/SELECT DISTINCT script_id FROM project_shots_rows/.test(sql)) {
+        const scripts = [...new Set(
+          state.shots.filter((s) => s.project_id === params[0]).map((s) => s.script_id),
+        )];
+        return { rows: scripts.map((script_id) => ({ script_id })) };
+      }
+      if (/UPDATE project_shots_rows SET dirty/.test(sql)) {
+        // MARK_DIRTY_SQL: script_id=$1, project_id=$2 → 全部计划行 dirty=true
+        let n = 0;
+        for (const s of state.shots) {
+          if (s.script_id === params[0] && s.project_id === params[1]) { s.dirty = true; n += 1; }
+        }
+        return { rowCount: n };
+      }
+      if (/UPDATE project_shots_rows SET locked/.test(sql) && /ANY\(\$3::text\[\]\)/.test(sql)) {
+        // SET_LOCKED_BATCH_SQL: script_id=$1, project_id=$2, shot_ids=$3, locked=$4
+        const ids = params[2];
+        const updated = [];
+        for (const s of state.shots) {
+          if (s.script_id === params[0] && s.project_id === params[1] && ids.includes(s.shot_id)) {
+            s.locked = params[3];
+            updated.push({ shot_id: s.shot_id });
+          }
+        }
+        return { rows: updated };
+      }
+      if (/bool_or\(dirty\)/.test(sql)) {
+        // PERSISTED_PLAN_SUMMARY_SQL: 最新代 dirty 汇总 + 计划指纹（无行 → null/false）
+        const ofScript = state.shots.filter((s) => s.project_id === params[0] && s.script_id === params[1]);
+        const maxV = ofScript.reduce((m, s) => Math.max(m, s.version || 0), 0);
+        const latest = ofScript.filter((s) => (s.version || 0) === maxV);
+        const dirty = latest.some((s) => s.dirty === true);
+        const fingerprint = latest.length && latest[0].plan_fingerprint != null
+          ? latest[0].plan_fingerprint
+          : null;
+        return { rows: [{ dirty, fingerprint }] };
       }
       if (/FROM script_rows/.test(sql)) {
         const sc = params.length > 1 ? params[1] : null;
@@ -853,4 +892,199 @@ test('V2.0#4: batch endpoints unauthenticated → 401', async () => {
     await anon.handle({ params: { projectId: 'p-1' } }, res, path, method);
     assert.equal(res.status, 401, `${method} ${path}`);
   }
+});
+
+// ══ 三视图接线收口 — rows 写标脏(0054) + GET dirty/planFingerprint + lock 路由 ══
+// Body-carrying POST to a storyboard route with arbitrary params (lock route
+// needs {shotIds,locked} in the body AND scriptId/projectId in params/URL).
+const callBody = (api, method, body, path, params) => {
+  const res = {};
+  return api.handle(h(body, params), res, path, method).then(() => res);
+};
+
+test('0054: GET storyboard before any apply → dirty=false, planFingerprint=null (计划视图仍 200)', async () => {
+  const { api, state } = makeHarness();
+  state.rows.push(seedRow('sr-1', { kind: 'action', text: 'Door opens.' }));
+  const res = await callParams(api, 'GET', '/api/v2/script/s-1/storyboard', { projectId: 'p-1' });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.ok, true);
+  assert.equal(res.body.dirty, false);
+  assert.equal(res.body.planFingerprint, null);
+  assert.deepEqual(Object.keys(res.body.plan).sort(), ['beats', 'totalShots']);
+  assert.equal(state.shots.length, 0);
+});
+
+test('0054: rows 写（POST/PATCH/PUT order/DELETE）后计划 dirty=true → apply 后 false', async () => {
+  const { api, state } = makeHarness();
+  state.rows.push(
+    seedRow('sr-a', { scene_index: 0, row_index: 0, kind: 'action', text: 'A enters.' }),
+    seedRow('sr-b', { scene_index: 0, row_index: 1, kind: 'action', text: 'B follows.' }),
+  );
+  const apply = () => callParams(api, 'POST', '/api/v2/script/s-1/storyboard/apply', { projectId: 'p-1' });
+  const planView = () => callParams(api, 'GET', '/api/v2/script/s-1/storyboard', { projectId: 'p-1' });
+  // 一轮「rows 写 → dirty=true → apply → dirty=false」的公共断言
+  const assertCycle = async () => {
+    const stale = await planView();
+    assert.equal(stale.status, 200);
+    assert.equal(stale.body.dirty, true, 'rows 写后计划视图应报 STALE');
+    assert.equal(typeof stale.body.planFingerprint, 'string');
+    const applied = await apply();
+    assert.equal(applied.status, 200);
+    const clean = await planView();
+    assert.equal(clean.status, 200);
+    assert.equal(clean.body.dirty, false, 'apply 落新行后 dirty 复位 false');
+    // planFingerprint = 本次持久化（最新代）指纹，与落库行冗余值一致
+    assert.equal(clean.body.planFingerprint, state.shots[0].plan_fingerprint);
+    assert.ok(/^[0-9a-f]{16}$/.test(clean.body.planFingerprint));
+  };
+
+  await apply();
+  assert.equal((await planView()).body.dirty, false);
+
+  // POST /rows 批量新增 → 脏
+  const post = await call(api, 'POST', { rows: [{ kind: 'action', text: 'C joins.', scene_index: 0 }] }, '/api/v2/script/rows', 'p-1');
+  assert.equal(post.status, 201);
+  await assertCycle();
+  // PATCH /rows/:id → 脏
+  const patch = await call(api, 'PATCH', { text: 'A hesitates.' }, '/api/v2/script/rows/sr-a', 'p-1');
+  assert.equal(patch.status, 200);
+  await assertCycle();
+  // PUT /order 重排 → 脏
+  const order = await call(api, 'PUT', { sceneIndex: 0, rowIds: ['sr-b', 'sr-a', 'sr-c'] }, '/api/v2/script/order', 'p-1');
+  assert.equal(order.status, 200);
+  await assertCycle();
+  // DELETE /rows/:id → 脏
+  const del = await call(api, 'DELETE', {}, '/api/v2/script/rows/sr-b', 'p-1');
+  assert.equal(del.status, 200);
+  await assertCycle();
+});
+
+test('0054: rows 写标脏覆盖该项目全部已 apply script；apply 只清本 script', async () => {
+  const { api, state } = makeHarness();
+  state.rows.push(seedRow('sr-1', { kind: 'action', text: 'v1' }));
+  await callParams(api, 'POST', '/api/v2/script/s-1/storyboard/apply', { projectId: 'p-1' });
+  await callParams(api, 'POST', '/api/v2/script/s-2/storyboard/apply', { projectId: 'p-1' });
+  // 纯文本 PATCH（不改计划结构 → 指纹不变）：dirty 只能由 markDirty 置位
+  const patch = await call(api, 'PATCH', { text: 'v2' }, '/api/v2/script/rows/sr-1', 'p-1');
+  assert.equal(patch.status, 200);
+  const g1 = await callParams(api, 'GET', '/api/v2/script/s-1/storyboard', { projectId: 'p-1' });
+  const g2 = await callParams(api, 'GET', '/api/v2/script/s-2/storyboard', { projectId: 'p-1' });
+  assert.equal(g1.body.dirty, true);
+  assert.equal(g2.body.dirty, true, '同项目另一已 apply script 也应被标脏');
+  // 只 apply s-1 → s-1 复位 false，s-2 保持 true（per-script 作用域）
+  await callParams(api, 'POST', '/api/v2/script/s-1/storyboard/apply', { projectId: 'p-1' });
+  const h1 = await callParams(api, 'GET', '/api/v2/script/s-1/storyboard', { projectId: 'p-1' });
+  const h2 = await callParams(api, 'GET', '/api/v2/script/s-2/storyboard', { projectId: 'p-1' });
+  assert.equal(h1.body.dirty, false);
+  assert.equal(h2.body.dirty, true);
+  assert.ok(state.shots.filter((s) => s.script_id === 's-1').every((s) => s.dirty === false));
+  assert.ok(state.shots.filter((s) => s.script_id === 's-2').every((s) => s.dirty === true));
+});
+
+test('0054: dirty=true 也由指纹比较触发 —— 存储指纹 ≠ 现算指纹且无脏行', async () => {
+  const { api, state } = makeHarness();
+  state.rows.push(seedRow('sr-1', { kind: 'action', text: 'Current rows.' }));
+  // 模拟早前一次 apply：行 clean（从未 markDirty），但存储指纹 ≠ 现算指纹
+  // （例如 rows 被绕过 API 直改 / 旧代遗留）→ 计划视图须能仅凭指纹比较报 STALE。
+  state.shots.push(
+    { project_id: 'p-1', script_id: 's-1', shot_id: 's0:b0:k0', version: 1, locked: false, dirty: false, plan_fingerprint: 'ffffffffffffffff' },
+    { project_id: 'p-1', script_id: 's-1', shot_id: 's0:b0:k1', version: 1, locked: false, dirty: false, plan_fingerprint: 'ffffffffffffffff' },
+  );
+  const res = await callParams(api, 'GET', '/api/v2/script/s-1/storyboard', { projectId: 'p-1' });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.dirty, true);
+  assert.equal(res.body.planFingerprint, 'ffffffffffffffff');
+});
+
+test('0052: POST …/storyboard/shots/lock 批量 lock/unlock → 200 {ok,locked}（path + query 拼写）', async () => {
+  const { api, state } = makeHarness();
+  state.rows.push(
+    seedRow('sr-a', { scene_index: 0, row_index: 0, kind: 'action', text: 'A enters.' }),
+    seedRow('sr-b', { scene_index: 0, row_index: 1, kind: 'action', text: 'B follows.' }),
+  );
+  const applied = await callParams(api, 'POST', '/api/v2/script/s-1/storyboard/apply', { projectId: 'p-1' });
+  assert.equal(applied.status, 200);
+  const ids = ['s0:b0:k0', 's0:b0:k1'];
+  // path form 批量 lock
+  const lock = await callBody(api, 'POST', { shotIds: ids, locked: true }, '/api/v2/script/s-1/storyboard/shots/lock', { projectId: 'p-1' });
+  assert.equal(lock.status, 200);
+  assert.deepEqual(lock.body, { ok: true, locked: true });
+  assert.ok(state.shots.every((s) => s.locked === true));
+  // query form (?scriptId=) 批量 unlock
+  const unlock = await callBody(api, 'POST', { shotIds: ids, locked: false }, '/api/v2/script/storyboard/shots/lock', { projectId: 'p-1', scriptId: 's-1' });
+  assert.equal(unlock.status, 200);
+  assert.deepEqual(unlock.body, { ok: true, locked: false });
+  assert.ok(state.shots.every((s) => s.locked === false));
+  // lock 路由只答 POST；GET 落入外层（false）
+  const resGet = {};
+  const handled = await api.handle(h({}, { projectId: 'p-1' }), resGet, '/api/v2/script/s-1/storyboard/shots/lock', 'GET');
+  assert.equal(handled, false);
+  assert.equal(resGet.status, undefined);
+});
+
+test('0052: lock guards — 空/畸形 shotIds 400、locked 非布尔 400、未命中 404、跨项目 404', async () => {
+  const { api, state } = makeHarness();
+  state.rows.push(seedRow('sr-1', { kind: 'action', text: 'x' }));
+  await callParams(api, 'POST', '/api/v2/script/s-1/storyboard/apply', { projectId: 'p-1' });
+  assert.equal(state.shots.length, 2);
+  const lock = (body, params = { projectId: 'p-1' }, path = '/api/v2/script/s-1/storyboard/shots/lock') =>
+    callBody(api, 'POST', body, path, params);
+  // 空数组 / 缺 shotIds / 非字符串元素 → 400
+  const empty = await lock({ shotIds: [], locked: true });
+  assert.equal(empty.status, 400);
+  const missing = await lock({ locked: true });
+  assert.equal(missing.status, 400);
+  const badElem = await lock({ shotIds: ['s0:b0:k0', 42], locked: true });
+  assert.equal(badElem.status, 400);
+  // locked 非布尔 → 400
+  const badBool = await lock({ shotIds: ['s0:b0:k0'], locked: 'yes' });
+  assert.equal(badBool.status, 400);
+  // 未命中（该 script 无此 shot / 他项目 shot）→ 404，无任何行被改
+  const miss = await lock({ shotIds: ['s0:b0:k9'], locked: true });
+  assert.equal(miss.status, 404);
+  assert.ok(miss.body.error.includes('shot'));
+  assert.ok(state.shots.every((s) => s.locked === false));
+  // script 从未 apply（合法项目内但无计划行）→ 404
+  const neverApplied = await lock({ shotIds: ['s0:b0:k0'], locked: true }, { projectId: 'p-1' }, '/api/v2/script/s-9/storyboard/shots/lock');
+  assert.equal(neverApplied.status, 404);
+  // 跨项目（未知项目）→ 404（requireProject 同款门）
+  const cross = await lock({ shotIds: ['s0:b0:k0'], locked: true }, { projectId: 'ghost' });
+  assert.equal(cross.status, 404);
+  assert.equal(cross.body.error, '项目不存在');
+  // query 拼写缺 scriptId → 400
+  const noScript = await callBody(api, 'POST', { shotIds: ['s0:b0:k0'], locked: true }, '/api/v2/script/storyboard/shots/lock', { projectId: 'p-1' });
+  assert.equal(noScript.status, 400);
+  assert.ok(noScript.body.error.includes('scriptId'));
+});
+
+test('0052: lock 路由 viewer → 403（写门 owner/editor），不改任何行', async () => {
+  // viewer 不能 apply（403）→ 先在 editor harness 真实 apply，再把持久化计划行
+  // 注入 viewer harness（等价「editor 曾 apply，viewer 后加入」）。
+  const editor = makeHarness();
+  editor.state.rows.push(seedRow('sr-1', { kind: 'action', text: 'x' }));
+  await callParams(editor.api, 'POST', '/api/v2/script/s-1/storyboard/apply', { projectId: 'p-1' });
+  assert.equal(editor.state.shots.length, 2);
+  const { api, state } = makeHarness({ role: 'viewer' });
+  state.rows.push(seedRow('sr-1', { kind: 'action', text: 'x' }));
+  state.shots.push(...editor.state.shots.map((s) => ({ ...s })));
+  const lock = await callBody(api, 'POST', { shotIds: ['s0:b0:k0', 's0:b0:k1'], locked: true }, '/api/v2/script/s-1/storyboard/shots/lock', { projectId: 'p-1' });
+  assert.equal(lock.status, 403);
+  assert.ok(lock.body.error.includes('只读成员'));
+  assert.ok(state.shots.every((s) => s.locked === false), '403 锁定尝试不得改动任何行');
+  // viewer 仍可读计划视图（只读 parity 不变），响应带 dirty/fp 字段且不误报
+  const view = await callParams(api, 'GET', '/api/v2/script/s-1/storyboard', { projectId: 'p-1' });
+  assert.equal(view.status, 200);
+  assert.equal(view.body.dirty, false);
+  assert.equal(view.body.planFingerprint, state.shots[0].plan_fingerprint);
+});
+
+test('0054: GET storyboard 未登录 → 401 且不触达 dirty/fp（沿用既有鉴权）', async () => {
+  const anon = createScriptApi({
+    pg: { query: async () => ({ rows: [] }) }, sessionUser: () => null,
+    sendJSON: (r, code, body) => { r.status = code; r.body = body; },
+    parseBody: async () => ({}),
+  });
+  const res = {};
+  await anon.handle({ params: { projectId: 'p-1' } }, res, '/api/v2/script/s-1/storyboard', 'GET');
+  assert.equal(res.status, 401);
 });

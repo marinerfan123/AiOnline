@@ -14,7 +14,12 @@
  *   3. Regression: real path (dryRun absent / false) persists exactly as
  *      before — write SQL reaches pg, dispatcher sync fires, payload shape
  *      unchanged.
- * No real DB is used.
+ *   4. G19 approval 门（写路径接线）：agent 身份（= 未来 agent/system 内部调用
+ *      面；本 harness 放行 admin 门以直接测 gate 决策单元）真实写 4 个 required
+ *      kind → 402 APPROVAL_REQUIRED 不执行；agent cooldown(auto) 与 admin 全
+ *      kind 放行执行；user/词表外身份 → 403 APPROVAL_DENIED；dryRun 恒定放行
+ *      （agent required kind 亦放行）；PATCH 元数据写（不在 APPROVAL_REQUIRED_
+ *      KINDS）不入门 → 维持现状。No real DB is used.
  */
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -193,13 +198,13 @@ function fakePg() {
 }
 
 // ── router harness ─────────────────────────────────────────────────────────
-function harness({ authed = true, admin = true } = {}) {
+function harness({ authed = true, admin = true, role = 'admin', id = 'admin-1' } = {}) {
   const db = fakePg();
   let last = null;
   const router = createAiControlRouter({
     pg: db,
     adminRequire: () => admin,
-    sessionUser: () => (authed ? { id: 'admin-1', role: 'admin' } : null),
+    sessionUser: () => (authed ? { id, role } : null),
     onPoolChanged: async () => { db.fired.push('onPoolChanged'); },
     sendJSON: (_res, code, data) => { last = { code, data }; },
     parseBody: async (req) => (req.__hasBody ? req.__body : null),
@@ -585,4 +590,127 @@ test('real GET /providers still lists (reads untouched)', async () => {
   assert.equal(r.code, 200);
   assert.ok(Array.isArray(r.data.providers));
   assert.equal(h.writeKinds().length, 0);
+});
+
+// ── 4) G19 approval 门（写路径接线）─────────────────────────────────────
+// 说明：真实服务里 ai-control 写面在 admin.requireAdmin 之后（admin/system 才
+// 可达），agent 角色当前无签发路径。下面用 harness({role:'agent'}) 绕过 admin
+// 门，直接测 approvalGate 决策单元在写路径上的接线 —— 等价于未来 agent/system
+// 内部调用面接入后的行为。
+const AGENT = { role: 'agent', id: 'agent-1' };
+
+function assertApprovalRefused(r, kind, code) {
+  assert.equal(r.code, code);
+  assert.equal(r.data.ok, false);
+  assert.equal(r.data.error, code === 402 ? 'APPROVAL_REQUIRED' : 'APPROVAL_DENIED');
+  assert.equal(r.data.kind, kind);
+  assert.equal(typeof r.data.message, 'string', '拒绝响应须带人工指引 message');
+}
+
+test('agent real POST /providers → 402 APPROVAL_REQUIRED (provider.create), nothing executed', async () => {
+  const h = harness({ role: AGENT.role, id: AGENT.id });
+  const r = await h.call('POST', `${U}/providers`, {
+    body: { id: 'p-agent', name: 'Agent Prov', apiKey: '«redacted:sk-…»' },
+  });
+  assertApprovalRefused(r, 'provider.create', 402);
+  assert.equal(h.writeKinds().length, 0, 'must not execute');
+  assert.equal(h.poolFired(), 0);
+  assert.equal(h.db.providers.some((p) => p.id === 'p-agent'), false);
+});
+
+test('agent real POST /providers/:id/enable → 402 (provider.enable), nothing executed', async () => {
+  const h = harness({ role: AGENT.role, id: AGENT.id });
+  const r = await h.call('POST', `${U}/providers/p1/enable`, { body: { enabled: false } });
+  assertApprovalRefused(r, 'provider.enable', 402);
+  assert.equal(h.writeKinds().length, 0);
+  assert.equal(h.poolFired(), 0);
+  assert.equal(h.db.providers.find((p) => p.id === 'p1').enabled, true, 'must stay enabled');
+});
+
+test('agent real POST /providers/:id/keys → 402 (provider.key.create), nothing executed', async () => {
+  const h = harness({ role: AGENT.role, id: AGENT.id });
+  const r = await h.call('POST', `${U}/providers/p1/keys`, {
+    body: { apiKeys: ['«redacted:sk-…»'] },
+  });
+  assertApprovalRefused(r, 'provider.key.create', 402);
+  assert.equal(h.writeKinds().length, 0);
+  assert.equal(h.poolFired(), 0);
+  assert.equal(h.db.apiKeys.length, 2);
+});
+
+test('agent real DELETE /providers/:id/keys/:keyId → 402 (provider.key.delete), nothing executed', async () => {
+  const h = harness({ role: AGENT.role, id: AGENT.id });
+  const r = await h.call('DELETE', `${U}/providers/p1/keys/k2`, {});
+  assertApprovalRefused(r, 'provider.key.delete', 402);
+  assert.equal(h.writeKinds().length, 0);
+  assert.equal(h.poolFired(), 0);
+  assert.equal(h.db.apiKeys.some((k) => k.id === 'k2'), true, 'key must survive');
+});
+
+test('agent real cooldown (auto per DEFAULT_POLICY) executes → auto-approve bypass', async () => {
+  const h = harness({ role: AGENT.role, id: AGENT.id });
+  const r = await h.call('POST', `${U}/providers/p1/keys/k1/cooldown`, { body: { cooldownMs: 5000 } });
+  assert.equal(r.code, 200);
+  assert.equal(r.data.ok, true);
+  assert.ok(r.data.cooldown_until, 'cooldown must persist under auto');
+  assert.ok(h.writeKinds().includes('UPDATE'));
+  assert.equal(h.poolFired(), 1);
+  assert.ok(h.db.apiKeys.find((k) => k.id === 'k1').cooldown_until);
+});
+
+test('user role real write → 403 APPROVAL_DENIED (user deny, no approval path)', async () => {
+  const h = harness({ role: 'user', id: 'user-1' });
+  const r = await h.call('POST', `${U}/providers`, {
+    body: { id: 'p-user', name: 'U', apiKey: '«redacted:sk-…»' },
+  });
+  assertApprovalRefused(r, 'provider.create', 403);
+  assert.equal(h.writeKinds().length, 0);
+});
+
+test('out-of-vocabulary actor role → 403 APPROVAL_DENIED (fail closed)', async () => {
+  const h = harness({ role: 'staff', id: 's-1' });
+  const r = await h.call('POST', `${U}/providers/p1/keys`, { body: { apiKeys: ['«redacted:sk-…»'] } });
+  assertApprovalRefused(r, 'provider.key.create', 403);
+  assert.equal(h.writeKinds().length, 0);
+});
+
+test('dryRun overrides the gate: agent dryRun create → 201 summary, nothing persisted', async () => {
+  const h = harness({ role: AGENT.role, id: AGENT.id });
+  const r = await h.call('POST', `${U}/providers`, {
+    body: { id: 'p-gdr', name: 'Dry Agent', apiKey: '«redacted:sk-…»', dryRun: true },
+  });
+  assert.equal(r.code, 201);
+  assert.equal(r.data.ok, true);
+  assert.equal(r.data.dryRun, true);
+  assert.equal(r.data.would.action, 'createProvider');
+  assert.equal(h.writeKinds().length, 0, 'dry-run never writes, gate or not');
+});
+
+test('dryRun overrides the gate: agent dryRun DELETE key (query) → 200 summary, nothing persisted', async () => {
+  const h = harness({ role: AGENT.role, id: AGENT.id });
+  const r = await h.call('DELETE', `${U}/providers/p1/keys/k2`, { query: { dryRun: 'true' } });
+  assert.equal(r.code, 200);
+  assert.equal(r.data.dryRun, true);
+  assert.equal(r.data.would.action, 'deleteKey');
+  assert.equal(h.writeKinds().length, 0);
+  assert.equal(h.db.apiKeys.length, 2);
+});
+
+test('unknown kind stays status quo: agent real PATCH /providers/:id is not gated → executes', async () => {
+  const h = harness({ role: AGENT.role, id: AGENT.id });
+  const r = await h.call('PATCH', `${U}/providers/p1`, { body: { revision: 3, name: 'AgentRenamed' } });
+  assert.equal(r.code, 200);
+  assert.equal(r.data.ok, true);
+  assert.equal(r.data.revision, 4);
+  assert.ok(h.writeKinds().includes('UPDATE'));
+  assert.equal(h.db.providers.find((p) => p.id === 'p1').name, 'AgentRenamed');
+});
+
+test('unknown kind stays status quo: agent real PATCH key metadata is not gated → executes', async () => {
+  const h = harness({ role: AGENT.role, id: AGENT.id });
+  const r = await h.call('PATCH', `${U}/providers/p1/keys/k1`, { body: { label: 'agent-edited' } });
+  assert.equal(r.code, 200);
+  assert.equal(r.data.ok, true);
+  assert.equal(h.db.apiKeys.find((k) => k.id === 'k1').label, 'agent-edited');
+  assert.ok(h.writeKinds().includes('UPDATE'));
 });
