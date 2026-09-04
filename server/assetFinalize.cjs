@@ -169,7 +169,14 @@ async function putObject(cfg, objectKey, fetched, contentType) {
   // local-disk provider（测试/离线真链后端）：写本地存储，无签名。
   if (String(cfg.providerType || cfg.provider || cfg.type || '') === 'local-disk') {
     const store = ossMod.localStoreFor(cfg);
-    const body = fetched && fetched.buffer !== undefined ? fetched.buffer : Buffer.from('');
+    let body = fetched && fetched.buffer !== undefined ? fetched.buffer : null;
+    if (!body && fetched && fetched.stream) {
+      const chunks = [];
+      for await (const c of fetched.stream) chunks.push(c);
+      body = Buffer.concat(chunks);
+    }
+    if (!body) body = Buffer.from('');
+    if (body.length === 0) throw new Error('local-disk 空 body（拉取为空）');
     const r = await store.put({ objectKey, body });
     if (!r || !r.ok) throw new Error('local-disk 写入失败');
     return store.urlFor(r.key);
