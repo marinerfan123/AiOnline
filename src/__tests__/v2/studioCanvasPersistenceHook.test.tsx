@@ -220,3 +220,40 @@ describe('M05-C persistence hook — G22 conflict-shape extension (client)', () 
     expect(v2studio.getCanvas as unknown as ReturnType<typeof vi.fn>).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('M05-C persistence hook — reload safety (no silent dirty-discard)', () => {
+  it('a failed reload keeps the retained buffer + conflict state (edits survive for retry)', async () => {
+    const patchCanvas = v2studio.patchCanvas as unknown as ReturnType<typeof vi.fn>;
+    patchCanvas
+      .mockRejectedValueOnce(new StudioCanvasApiError(409, 'CONFLICT', { serverRevision: 5, canvasId: 'c1' }))
+      .mockRejectedValueOnce(new StudioCanvasApiError(409, 'CONFLICT', { serverRevision: 9, canvasId: 'c1' }));
+
+    const { result } = renderHook(() => useStudioCanvasPersistence('p1'));
+    await drain();
+
+    let addedId: string | null = null;
+    act(() => { addedId = useStudioStore.getState().addNode('prompt', { x: 10, y: 20 }); });
+    act(() => { result.current.retry(); });
+    await drain();
+    expect(result.current.status).toBe('Conflict');
+    expect(result.current.conflict).not.toBeNull();
+
+    // Reload fails (network down): must NOT drop the buffer or clear conflict.
+    (v2studio.getCanvas as unknown as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error('network down'));
+    await act(async () => { await result.current.reloadFromServer(); });
+    await drain();
+
+    expect(result.current.status).toBe('Save failed'); // never stuck in 'Loading'
+    expect(result.current.conflict).not.toBeNull(); // banner survives
+
+    // The retained edit survived: retry replays it on the server revision.
+    patchCanvas.mockResolvedValueOnce({ canvas: { revision: 10 }, nodes: [], edges: [], viewport: null });
+    act(() => { result.current.retry(); });
+    await drain();
+    expect(result.current.status).toBe('Saved');
+    expect(patchCanvas).toHaveBeenCalledTimes(3);
+    const thirdPatch = patchCanvas.mock.calls[2][1];
+    expect(thirdPatch.upsertNodes).toHaveLength(1);
+    expect(thirdPatch.upsertNodes[0].nodeId).toBe(addedId);
+  });
+});

@@ -403,3 +403,13 @@ test('G24-EXP: pure read — SELECT-only and ≤8 queries in every scenario', as
     for (const c of h.calls) assert.ok(/^\s*SELECT/i.test(c.sql.trim()));
   }
 });
+
+test('G24-EXP: BIGINT > 2^53 rejected → ok:false PROJECT_EXPORT_ERROR (no silent rounding)', async () => {
+  const d = baseData();
+  d.clips[0] = { ...d.clips[0], start_ms: '9007199254740993' }; // 2^53 + 1 → rounds
+  const { exportProject } = makeHarness(d);
+  const res = await exportProject({ projectId: 'p-1' });
+  assert.equal(res.ok, false);
+  assert.match(res.error, /PROJECT_EXPORT_ERROR/);
+  assert.match(res.error, /超出安全整数范围/);
+});

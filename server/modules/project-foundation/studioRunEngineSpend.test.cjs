@@ -18,7 +18,10 @@
  *   - node already terminal (idempotent replay) → zero recordSpend calls;
  *   - no budgetSpentStore injected → zero spend activity (no project_budget SQL);
  *   - recordSpend throws → completeRunNode still succeeds (run never disturbed);
- *   - recordSpend returns {ok:false} → run still succeeds, warn logged.
+ *   - recordSpend returns {ok:false} → run still succeeds, warn logged;
+ *   - recordSpend rejected/throwing with a relay injected → a durable
+ *     studio.run_node.spend_rejected / spend_failed event is relayed with
+ *     runId + run_node_id (budget-defence failure is never silent).
  */
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
@@ -98,12 +101,25 @@ function makeFakeStore(opts = {}) {
   };
 }
 
-function makeEngine(pg, { budgetSpentStore } = {}) {
+/** Fake relay: records relayRunEvent calls (no DB). */
+function makeFakeRelay() {
+  const events = [];
+  return {
+    events,
+    async relayRunEvent(evt) {
+      events.push(evt);
+      return { ok: true, seq: events.length };
+    },
+  };
+}
+
+function makeEngine(pg, { budgetSpentStore, relay } = {}) {
   const logs = [];
   const engine = createStudioRunEngine({
     pg,
     workerId: 'w-spend-unit',
     budgetSpentStore,
+    relay,
     onLog: (tag, payload) => logs.push({ tag, payload }),
   });
   return { engine, logs };
@@ -189,4 +205,52 @@ test('recordSpend returns {ok:false} (over remaining / no budget) → run still 
   assert.equal(store.calls.length, 1);
   assert.ok(logs.some((l) => l.tag === 'run.node.spend_not_recorded' && l.payload.code === 'SPEND_OVER_REMAINING'),
     'rejected spend is logged, run unaffected');
+});
+
+test('recordSpend rejected (over remaining) + relay → durable spend_rejected event with runId + run_node_id', async () => {
+  const m = makeMockPg();
+  const store = makeFakeStore({ result: { ok: false, error: { code: 'SPEND_OVER_REMAINING' } } });
+  const relay = makeFakeRelay();
+  const { engine } = makeEngine(m.pg, { budgetSpentStore: store, relay });
+
+  const r = await engine.completeRunNode('srn-1', { owner: 'w-A', token: 'tok', result: { text: 'hi', cost: 7 } });
+
+  assert.equal(r.ok, true);
+  const warns = relay.events.filter((e) => e.type === 'studio.run_node.spend_rejected');
+  assert.equal(warns.length, 1, 'one durable spend_rejected warning relayed (normal engine events are also relayed)');
+  assert.deepEqual(warns[0], {
+    runId: 'run-1',
+    type: 'studio.run_node.spend_rejected',
+    payload: { run_node_id: 'srn-1', projectId: 'proj-1', code: 'SPEND_OVER_REMAINING' },
+  });
+});
+
+test('recordSpend throws + relay → durable spend_failed event, run unaffected', async () => {
+  const m = makeMockPg();
+  const store = makeFakeStore({ throwError: 'store down' });
+  const relay = makeFakeRelay();
+  const { engine } = makeEngine(m.pg, { budgetSpentStore: store, relay });
+
+  const r = await engine.completeRunNode('srn-1', { owner: 'w-A', token: 'tok', result: { text: 'hi', cost: 4 } });
+
+  assert.equal(r.ok, true, 'spend failure must not fail the run');
+  const warns = relay.events.filter((e) => e.type === 'studio.run_node.spend_failed');
+  assert.equal(warns.length, 1);
+  assert.equal(warns[0].runId, 'run-1');
+  assert.equal(warns[0].payload.run_node_id, 'srn-1');
+  assert.equal(warns[0].payload.projectId, 'proj-1');
+  assert.equal(warns[0].payload.error, 'store down');
+});
+
+test('recordSpend succeeded + relay → no spend warning event (only failure/rejection are warned)', async () => {
+  const m = makeMockPg();
+  const store = makeFakeStore(); // returns { ok: true, recorded: true }
+  const relay = makeFakeRelay();
+  const { engine } = makeEngine(m.pg, { budgetSpentStore: store, relay });
+
+  const r = await engine.completeRunNode('srn-1', { owner: 'w-A', token: 'tok', result: { text: 'hi', cost: 3 } });
+
+  assert.equal(r.ok, true);
+  const warns = relay.events.filter((e) => typeof e.type === 'string' && e.type.startsWith('studio.run_node.spend_'));
+  assert.equal(warns.length, 0, 'successful spend emits no warning event');
 });

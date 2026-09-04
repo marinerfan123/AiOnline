@@ -212,3 +212,36 @@ test('G24: pure read — SELECT only, exactly 4 queries (3 without shot bindings
   assert.equal(calls2.length, 3);
   for (const c of calls2) assert.ok(/^\s*SELECT/i.test(c.sql.trim()));
 });
+
+test('G24: BIGINT > 2^53 rejected — no silent Number rounding (audit 越界)', async () => {
+  const d = baseData();
+  d.clips[0] = { ...d.clips[0], start_ms: '9007199254740993' }; // 2^53 + 1 → rounds
+  const { exportTimeline } = makeHarness(d);
+  await assert.rejects(
+    () => exportTimeline({ projectId: 'p-1', timelineId: 'tl-1' }),
+    /超出安全整数范围/,
+  );
+});
+
+test('G24: Q4 plan-row query carries a deterministic id tiebreaker (ORDER BY ordering, shot_id, id)', async () => {
+  const { exportTimeline, calls } = makeHarness();
+  await exportTimeline({ projectId: 'p-1', timelineId: 'tl-1' });
+  const psrCall = calls.find((c) => c.sql.includes('FROM project_shots_rows'));
+  assert.ok(psrCall);
+  assert.match(psrCall.sql, /ORDER BY ordering, shot_id, id/);
+});
+
+test('G24: duplicate clip shot_ids deduped before the ANY intersection query', async () => {
+  const d = baseData();
+  // A second clip binding the SAME shot as cl-1 → shotIds must carry it once.
+  d.clips.push({
+    id: 'cl-dup', track_id: 'tr-video', shot_id: 's1:b1:k1', asset_version_id: null,
+    order_index: '3', start_ms: '6500', duration_ms: '1000', mime_type: null,
+  });
+  const { exportTimeline, calls } = makeHarness(d);
+  await exportTimeline({ projectId: 'p-1', timelineId: 'tl-1' });
+  const psrCall = calls.find((c) => c.sql.includes('FROM project_shots_rows'));
+  const shotIds = psrCall.params[1];
+  assert.equal(shotIds.length, new Set(shotIds).size); // no duplicate entries
+  assert.ok(shotIds.includes('s1:b1:k1'));
+});

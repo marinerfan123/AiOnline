@@ -154,24 +154,35 @@ export function useStudioCanvasPersistence(projectId: string, enabled = true) {
   const reloadFromServer = async () => {
     if (!projectId) return;
     setStatus('Loading');
-    blockedRef.current = false;
-    conflictRef.current = null;
-    setConflict(null);
-    // Reload discards any uncommitted local edits (explicit user action).
-    bufferRef.current.clear();
-    const res = await v2studio.getCanvas(projectId);
-    const data = res.canvas ? res : await v2studio.createCanvas(projectId, { name: 'Primary Canvas' });
-    const nodes = data.nodes.map(deserializeStudioNode);
-    const edges = data.edges.map(deserializeStudioEdge);
-    suppressRef.current = true;
-    useStudioStore.getState().loadGraph(nodes, edges, data.viewport ?? { x: 0, y: 0, zoom: 1 });
-    suppressRef.current = false;
-    const rev = data.canvas?.revision ?? 1;
-    revisionRef.current = rev;
-    setRevision(rev);
-    setLastSavedAt(data.canvas?.updatedAt ?? null);
-    markClean(nodes, edges, data.viewport ?? { x: 0, y: 0, zoom: 1 });
-    setStatus('Saved');
+    try {
+      const res = await v2studio.getCanvas(projectId);
+      const data = res.canvas ? res : await v2studio.createCanvas(projectId, { name: 'Primary Canvas' });
+      const nodes = data.nodes.map(deserializeStudioNode);
+      const edges = data.edges.map(deserializeStudioEdge);
+      // Adopt the server graph BEFORE discarding the retained local buffer. The
+      // reject409 banner promises "本地工作副本已保留"; only a SUCCESSFUL fetch
+      // may drop the uncommitted edits (an explicit whole-canvas reload). A
+      // failed fetch must leave the buffer + conflict state intact so the user
+      // can retry instead of silently losing their work.
+      bufferRef.current.clear();
+      blockedRef.current = false;
+      conflictRef.current = null;
+      setConflict(null);
+      suppressRef.current = true;
+      useStudioStore.getState().loadGraph(nodes, edges, data.viewport ?? { x: 0, y: 0, zoom: 1 });
+      suppressRef.current = false;
+      const rev = data.canvas?.revision ?? 1;
+      revisionRef.current = rev;
+      setRevision(rev);
+      setLastSavedAt(data.canvas?.updatedAt ?? null);
+      markClean(nodes, edges, data.viewport ?? { x: 0, y: 0, zoom: 1 });
+      setStatus('Saved');
+    } catch {
+      // Reload failed: keep the retained buffer and conflict state intact and
+      // reflect the failure in the save status — never leave the UI stuck in
+      // 'Loading' with the edits already thrown away.
+      setStatus(navigator.onLine === false ? 'Offline' : 'Save failed');
+    }
   };
 
   useEffect(() => {

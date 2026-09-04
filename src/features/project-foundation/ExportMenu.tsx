@@ -49,7 +49,10 @@ function timelineUrl(projectId: string, timelineId: string) {
 
 /** Fetch a JSON bundle and trigger a browser download as <filename>. */
 async function downloadBundle(url: string, filename: string): Promise<void> {
-  const res = await fetch(url);
+  // Same-origin cookie session (matches ApiClient's `credentials: 'include'`
+  // convention) so the membership-gated export carries the `sid` cookie even if
+  // the API base ever becomes cross-origin.
+  const res = await fetch(url, { credentials: 'include' });
   if (!res.ok) {
     let message = `HTTP ${res.status}`;
     try {

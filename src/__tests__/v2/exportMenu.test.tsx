@@ -80,7 +80,7 @@ describe('ExportMenu — structure', () => {
 
 describe('ExportMenu — whole-project export', () => {
   it('fetches /api/v2/projects/:id/export and downloads the JSON blob as project-<id>.json', async () => {
-    const fetchMock = vi.fn(async (_url: RequestInfo | URL) =>
+    const fetchMock = vi.fn(async (_url: RequestInfo | URL, _init?: RequestInit) =>
       new Response(new Blob(['{"exported":true}'], { type: 'application/json' }), { status: 200 }),
     );
     vi.stubGlobal('fetch', fetchMock);
@@ -90,6 +90,7 @@ describe('ExportMenu — whole-project export', () => {
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
     expect(fetchMock.mock.calls[0][0]).toBe('/api/v2/projects/proj-7/export');
+    expect(fetchMock.mock.calls[0][1]).toEqual({ credentials: 'include' });
 
     await waitFor(() => expect(createObjectUrlSpy).toHaveBeenCalledTimes(1));
     await waitFor(() => expect(clickSpy).toHaveBeenCalledTimes(1));

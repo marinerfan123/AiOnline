@@ -1546,7 +1546,7 @@ const runEventsApi = runEventsApiMod.createRunEventsApi({
     query: (sql, params) => pgPool ? pgPool.query(sql, params) : Promise.reject(Object.assign(new Error('数据库未就绪'), { status: 503 })),
   },
   sessionUser: (req) => session.getUserFromCookie(req),
-  authProject: async (req, projectId) => projectMembershipOk(projectId, session.getUserFromCookie(req)),
+  authProject: async (ctx) => projectMembershipOk(ctx.projectId, ctx.user),
   sendJSON,
 });
 const projectExport = projectExportMod.createProjectExport({
@@ -2800,8 +2800,10 @@ async function handleAPI(req, res) {
       ).catch(() => ({ rows: [] }));
       if (!auth.rows.length) return sendJSON(res, 404, { ok: false, error: '项目不存在' });
       const out = await projectExport.exportProject({ projectId });
-      if (!out.ok) return sendJSON(res, 404, { ok: false, error: out.error || '项目不存在' });
-      return sendJSON(res, 200, out.bundle);
+      if (out.error === '项目不存在') return sendJSON(res, 404, { ok: false, error: out.error });
+      if (out.error && String(out.error).startsWith('PROJECT_EXPORT_ERROR')) return sendJSON(res, 500, { ok: false, error: out.error });
+      // degraded (ok:false + partial bundle, e.g. schema-evolution gap) → 200 + partial bundle
+      return sendJSON(res, 200, out.bundle || { ok: false, error: out.error || '导出失败' });
     }
   }
 

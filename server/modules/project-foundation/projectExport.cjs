@@ -75,6 +75,9 @@ function intMs(v, what) {
   if (v === null || v === undefined) return undefined;
   const n = typeof v === 'string' ? Number(v) : v;
   if (!Number.isInteger(n)) throw new Error(`projectExport: ${what} 必须为整数毫秒 (got ${v})`);
+  // BIGINT (int8) can exceed 2^53; Number() silently rounds, so reject instead of
+  // exporting a corrupted value (audit: BIGINT→Number 越界 → 静默失真).
+  if (!Number.isSafeInteger(n)) throw new Error(`projectExport: ${what} 超出安全整数范围 (got ${v})`);
   return n;
 }
 
@@ -82,6 +85,7 @@ function intOr(v, what) {
   if (v === null || v === undefined) return undefined;
   const n = typeof v === 'string' ? Number(v) : v;
   if (!Number.isInteger(n)) throw new Error(`projectExport: ${what} 必须为整数 (got ${v})`);
+  if (!Number.isSafeInteger(n)) throw new Error(`projectExport: ${what} 超出安全整数范围 (got ${v})`);
   return n;
 }
 

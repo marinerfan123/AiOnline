@@ -32,21 +32,32 @@
  *   400 { ok:false, error:'INVALID_AFTER_SEQ' } — afterSeq not a ≥0 safe int
  *   500 { ok:false, error:'服务内部错误' }
  *
- * AUTH — double-hook convention (canvasCommandLogApi contract): the factory
- * takes two OPTIONAL hooks; when either is omitted the request is ALLOWED
- * (缺省放行) and the missing scope is not enforced:
+ * AUTH — double-hook convention. NOTE the hook signature DIFFERS from
+ * canvasCommandLogApi: that leaf takes authProject(req, projectId) (two args,
+ * { ok:false } deny shape); THIS leaf takes authProject(ctx) (one context
+ * object, { allowed:false } deny shape). The factory takes two OPTIONAL hooks;
+ * when either is omitted the request is ALLOWED (缺省放行) and the missing
+ * scope is not enforced:
  *   sessionUser(req) → user|null        identity hook. When provided, a request
  *     without a session is answered 401 BEFORE any read. When omitted, no
  *     identity is required (user passed to authProject is null).
  *   authProject(ctx) → allow/deny       project-scope hook. ctx =
  *     { projectId, runId, user, req }. May be async. Resolutions:
  *       null / undefined / true  / { allowed:true  }  → allow
- *       false / { allowed:false }                     → 403 '无项目权限'
+ *       false / { allowed:false } / { ok:false }       → deny (403; { ok:false }
+ *                                                        accepted defensively,
+ *                                                        fail-closed)
  *       { allowed:false, status, error }              → deny with given status/error
  *     When omitted, project scope is NOT gated (缺省放行 — dev/test default).
  *     ⚠️ A production mount MUST inject a membership gate here (mirror the
  *     G24 /export pattern: project + workspace_members, foreign → 404 no leak)
  *     or the API reads any project's run events.
+ *     ⚠️ Wiring hazard (audit 2026-09-04, CRITICAL): authProject is invoked with
+ *     ONE argument (ctx). A mount that wires it with the canvasCommandLogApi
+ *     two-arg shape `(req, projectId) => …` receives the ctx object as `req`
+ *     and `undefined` as `projectId` — the membership gate then fails every
+ *     request (500/403). server.js must pass `(ctx) => membership(ctx.projectId,
+ *     ctx.user)`, NOT the `(req, projectId)` shape.
  *
  * RUN-OWNERSHIP 404 is structural and ALWAYS enforced (never hooked): the run
  * must exist in studio_runs AND its project_id must equal :projectId, so an
@@ -198,9 +209,12 @@ function createRunEventsApi({ pg, sessionUser, authProject, sendJSON } = {}) {
     const d = await authProject(ctx);
     if (d === null || d === undefined || d === true) return { allowed: true };
     if (d === false) return { allowed: false, status: 403, error: '无项目权限' };
-    if (d && typeof d === 'object' && d.allowed === false) {
+    if (d && typeof d === 'object' && (d.allowed === false || d.ok === false)) {
       const status = Number.isInteger(d.status) && d.status >= 400 ? d.status : 403;
-      return { allowed: false, status, error: d.error || '无项目权限' };
+      const error = typeof d.error === 'string' && d.error.length > 0
+        ? d.error
+        : (d.ok === false ? 'FORBIDDEN' : '无项目权限');
+      return { allowed: false, status, error };
     }
     return { allowed: true };
   }

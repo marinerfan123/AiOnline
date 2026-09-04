@@ -51,7 +51,8 @@ function createCanvasDb(seed = {}) {
   const membershipsAll = seed.memberships || memberships;
   let nodesByCanvas = new Map();   // canvasId -> Map<node_id, row>
   let edgesByCanvas = new Map();   // canvasId -> Map<edge_id, row>
-  let mutations = [];              // studio_canvas_mutations rows
+  let mutations = [];              // studio_canvas_mutations rows(本事务写入, 随 BEGIN/ROLLBACK 快照)
+  let externalMutations = [];      // 模拟「并发请求已提交」的 mutation 行(不随本事务回滚)
   let logByCanvas = new Map();     // canvasId -> Map<command_id, row>
   let logSeq = 0;                    // canvas_command_log 全局序列(BIGSERIAL)
   let insertAttempts = 0;            // INSERT INTO canvas_command_log 尝试次数
@@ -168,11 +169,20 @@ function createCanvasDb(seed = {}) {
     /* ── studio_canvas_mutations(CAS 幂等表) ───────────────────── */
     if (sql.includes('FROM studio_canvas_mutations WHERE canvas_id=$1 AND client_mutation_id=$2')) {
       const [cid, cmid] = p;
-      const row = mutations.find((m) => m.canvas_id === cid && m.client_mutation_id === cmid) || null;
+      const row = mutations.find((m) => m.canvas_id === cid && m.client_mutation_id === cmid)
+        || externalMutations.find((m) => m.canvas_id === cid && m.client_mutation_id === cmid) || null;
       return { rows: row ? [row] : [], rowCount: row ? 1 : 0 };
     }
     if (sql.includes('INSERT INTO studio_canvas_mutations')) {
       const [cid, cmid, baseRev, resultingRev, responseJson, createdBy] = p;
+      if (seed.raceMutationAtInsert) {
+        const raced = seed.raceMutationAtInsert({ canvasId: cid, clientMutationId: cmid });
+        if (raced) { externalMutations.push(raced); return { rows: [], rowCount: 0 }; } // 并发同 cmid 已提交 → UNIQUE 冲突 → DO NOTHING
+      }
+      if (mutations.some((m) => m.canvas_id === cid && m.client_mutation_id === cmid)
+        || externalMutations.some((m) => m.canvas_id === cid && m.client_mutation_id === cmid)) {
+        return { rows: [], rowCount: 0 }; // UNIQUE (canvas_id, client_mutation_id) 冲突 → DO NOTHING
+      }
       mutations.push({ canvas_id: cid, client_mutation_id: cmid, base_revision: baseRev,
         resulting_revision: resultingRev, response_json: JSON.parse(responseJson), created_by: createdBy });
       return { rows: [{ client_mutation_id: cmid }], rowCount: 1 };
@@ -247,7 +257,7 @@ function createCanvasDb(seed = {}) {
   return {
     pg,
     canvasRow,
-    mutationRows: () => [...mutations],
+    mutationRows: () => [...mutations, ...externalMutations],
     /** 已存节点行(canvasId → 按 node_id 升序; data_json 已解析)。 */
     nodesOf: (canvasId = 'canvas-1') =>
       [...(nodeMap(canvasId).values())].sort((a, b) => (a.node_id < b.node_id ? -1 : 1)),
@@ -900,6 +910,117 @@ test('G22-Phase3 env OFF: merge/lww 全走整画布 CAS(零变化回归)', async
     assert.equal(r.body.mode, undefined, 'env-off 响应无 mode 标记');
     assert.equal(db.canvasRow().revision, 3, 'env-off 全量 CAS 推进 revision');
     assert.equal(r.body.edges.length, 1);
+  } finally {
+    delete process.env.STUDIO_CANVAS_KIND_SCOPED;
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────── */
+/* G22 v4-pro 审计修复① — kind-scoped LWW 直写不可绕过权威绑定守卫(W2-06)。 */
+/* 修复: applyKindScopedLww 在 UPDATE 前对全部待更新节点跑 assertBindingsValid。 */
+/* 修复② — 并发同 clientMutationId 双写 → ON CONFLICT DO NOTHING 幂等(非 23505→500)。 */
+/* ─────────────────────────────────────────────────────────────── */
+
+test('G22-audit env ON: LWW data-only update 改写 shotId 为非法值 → 409 BINDING_INVALID(绑定守卫不被 LWW 直写绕过)', async () => {
+  process.env.STUDIO_CANVAS_KIND_SCOPED = '1';
+  try {
+    const db = createCanvasDb({ shotIds: ['shot-1'] });
+    const p = makePersistence(db);
+    // seed: 合法绑定节点 n1(shot-1)→ node.create → 整画布 CAS(revision 1→2)
+    await doPatch(p, { clientMutationId: 'm-seed', baseRevision: 1, upsertNodes: [mkBoundNode('n1', { shotId: 'shot-1' })], upsertEdges: [], deleteNodeIds: [], deleteEdgeIds: [] });
+    assert.equal(db.canvasRow().revision, 2);
+    assert.equal(db.nodesOf()[0].data_json.shotId, 'shot-1');
+
+    // data-only update: 仅改 data.shotId → shot-bogus(非法)。position/size 不变 → LWW 桶。
+    const r = await doPatch(p, { clientMutationId: 'm-lww-bad', baseRevision: 2, upsertNodes: [mkBoundNode('n1', { shotId: 'shot-bogus' })], upsertEdges: [], deleteNodeIds: [], deleteEdgeIds: [] });
+    assert.equal(r.status, 409, 'LWW 直写也拦截非法绑定');
+    assert.equal(r.body.error, 'BINDING_INVALID');
+    assert.ok(Array.isArray(r.body.errors) && r.body.errors.length >= 1);
+    assert.ok(r.body.errors[0].includes('node.n1') && r.body.errors[0].includes('shot-bogus'), `明细=${r.body.errors[0]}`);
+    assert.equal(r.body.canvasId, 'canvas-1');
+    assert.equal(db.canvasRow().revision, 2, '409 不推进 revision');
+    assert.equal(db.nodesOf()[0].data_json.shotId, 'shot-1', '非法绑定未落库(整事务回滚)');
+    assert.equal(db.mutationRows().length, 1, '仅 seed 一行 mutation');
+    assert.equal(db.logRows().filter((x) => x.command_id === 'm-lww-bad').length, 0, '非法 LWW 零命令日志');
+  } finally {
+    delete process.env.STUDIO_CANVAS_KIND_SCOPED;
+  }
+});
+
+test('G22-audit env ON: LWW data-only update 合法绑定照常直写(守卫不误伤)', async () => {
+  process.env.STUDIO_CANVAS_KIND_SCOPED = '1';
+  try {
+    const db = createCanvasDb({ shotIds: ['shot-1', 'shot-2'] });
+    const p = makePersistence(db);
+    await doPatch(p, { clientMutationId: 'm-seed', baseRevision: 1, upsertNodes: [mkBoundNode('n1', { shotId: 'shot-1' })], upsertEdges: [], deleteNodeIds: [], deleteEdgeIds: [] });
+    assert.equal(db.canvasRow().revision, 2);
+
+    // 合法: 仅 data 变(shotId shot-1 → shot-2, 均在权威集)→ LWW 直写放行
+    const r = await doPatch(p, { clientMutationId: 'm-lww-ok', baseRevision: 2, upsertNodes: [mkBoundNode('n1', { shotId: 'shot-2' })], upsertEdges: [], deleteNodeIds: [], deleteEdgeIds: [] });
+    assert.equal(r.status, 200, '合法绑定 LWW 直写放行');
+    assert.equal(r.body.mode, 'kind-scoped-lww');
+    assert.equal(db.canvasRow().revision, 2, 'LWW 不改 revision');
+    assert.equal(db.nodesOf()[0].data_json.shotId, 'shot-2', '合法绑定已持久化');
+  } finally {
+    delete process.env.STUDIO_CANVAS_KIND_SCOPED;
+  }
+});
+
+test('G22-audit env ON: 并发同 clientMutationId LWW 双写 → idempotent 200(非 500), 数据不双写', async () => {
+  process.env.STUDIO_CANVAS_KIND_SCOPED = '1';
+  try {
+    const db = createCanvasDb({
+      raceMutationAtInsert: ({ clientMutationId }) => {
+        if (clientMutationId !== 'm-race') return null;
+        // 模拟并发请求已提交同 cmid 的 mutation(在 prior-check 之后、本请求 INSERT 之前落地)
+        return { canvas_id: 'canvas-1', client_mutation_id: 'm-race', base_revision: 2, resulting_revision: 2,
+          response_json: { ok: true, applied: true, clientMutationId: 'm-race', mode: 'kind-scoped-lww', revision: 2,
+            canvas: { id: 'canvas-1', revision: 2 }, nodes: [], edges: [] }, created_by: USER.id };
+      },
+    });
+    const p = makePersistence(db);
+    await doPatch(p, { clientMutationId: 'm-seed', baseRevision: 1, upsertNodes: [mkNode('n1')], upsertEdges: [], deleteNodeIds: [], deleteEdgeIds: [] });
+    assert.equal(db.canvasRow().revision, 2);
+
+    const updated = { ...mkNode('n1'), data: { nodeKind: 'prompt', schemaVersion: 1, title: 'T-n1-race', status: 'IDLE', parameters: {} } };
+    const r = await doPatch(p, { clientMutationId: 'm-race', baseRevision: 2, upsertNodes: [updated], upsertEdges: [], deleteNodeIds: [], deleteEdgeIds: [] });
+    assert.equal(r.status, 200, '并发同 cmid 不 500');
+    assert.equal(r.body.idempotent, true, '返回 idempotent:true');
+    assert.equal(r.body.mode, 'kind-scoped-lww', '回放已提交响应');
+    assert.equal(db.canvasRow().revision, 2, 'revision 不被双写推进');
+    assert.equal(db.mutationRows().filter((m) => m.client_mutation_id === 'm-race').length, 1, 'm-race mutation 仅一行(并发提交的那行)');
+    assert.equal(db.logRows().filter((x) => x.command_id === 'm-race').length, 0, '回放不写命令日志');
+    assert.equal(db.nodesOf()[0].data_json.title, 'T-n1', '本请求 LWW 写入已回滚(对方已提交同 cmid)');
+  } finally {
+    delete process.env.STUDIO_CANVAS_KIND_SCOPED;
+  }
+});
+
+test('G22-audit env ON: 并发同 clientMutationId merge 双写 → idempotent 200(非 500)', async () => {
+  process.env.STUDIO_CANVAS_KIND_SCOPED = '1';
+  try {
+    const db = createCanvasDb({
+      raceMutationAtInsert: ({ clientMutationId }) => {
+        if (clientMutationId !== 'm-race-edge') return null;
+        return { canvas_id: 'canvas-1', client_mutation_id: 'm-race-edge', base_revision: 2, resulting_revision: 2,
+          response_json: { ok: true, applied: true, clientMutationId: 'm-race-edge', mode: 'kind-scoped-merge', revision: 2,
+            canvas: { id: 'canvas-1', revision: 2 }, nodes: [], edges: [] }, created_by: USER.id };
+      },
+    });
+    const p = makePersistence(db);
+    await doPatch(p, { clientMutationId: 'm-seed', baseRevision: 1, upsertNodes: [mkNode('n1'), mkNode('n2')], upsertEdges: [], deleteNodeIds: [], deleteEdgeIds: [] });
+    assert.equal(db.canvasRow().revision, 2);
+
+    const r = await doPatch(p, { clientMutationId: 'm-race-edge', baseRevision: 2, upsertNodes: [], upsertEdges: [mkEdge('e1', 'n1', 'n2')], deleteNodeIds: [], deleteEdgeIds: [] });
+    assert.equal(r.status, 200, 'merge 并发同 cmid 不 500');
+    assert.equal(r.body.idempotent, true);
+    assert.equal(r.body.mode, 'kind-scoped-merge');
+    assert.equal(db.canvasRow().revision, 2);
+    assert.equal(db.mutationRows().filter((m) => m.client_mutation_id === 'm-race-edge').length, 1);
+    assert.equal(db.logRows().filter((x) => x.command_id === 'm-race-edge').length, 0);
+    // 本请求的边写入被回滚(不存在 e1)
+    assert.equal((await db.replay()).commands.filter((c) => c.commandId === 'm-race-edge').length, 0, '命令日志未落 m-race-edge');
+    assert.equal(r.body.edges.length, 0, '回放已提交响应(边未写入)');
   } finally {
     delete process.env.STUDIO_CANVAS_KIND_SCOPED;
   }

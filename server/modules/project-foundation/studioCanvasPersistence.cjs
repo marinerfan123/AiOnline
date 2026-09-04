@@ -124,6 +124,49 @@ function bulkInsertEdges(client, canvasId, rawEdges) {
     )`, [canvasId, JSON.stringify(rows)]);
 }
 
+// G22 Phase-3 — 权威绑定校验(与整画布 CAS 路径同源)。kind-scoped LWW 直写路径同样
+// 必须校验 data 内 shotId/structureNodeId: data-only node.update 也可能改写绑定串,
+// 否则 env 开时绑定守卫被 LWW 直写绕过(与 W2-06 三视图守卫语义背离)。非法 → 抛
+// BINDING_INVALID(带 bindingErrors/canvasId), 由 handlePatch 统一 409。
+async function assertBindingsValid(client, projectId, canvasId, nodes) {
+  const boundNodes = (nodes || []).filter((n) => {
+    const d = n && n.data ? n.data : {};
+    return (typeof d.shotId === 'string' && d.shotId.trim() !== '')
+      || (typeof d.structureNodeId === 'string' && d.structureNodeId.trim() !== '');
+  });
+  if (!boundNodes.length) return;
+  const [shotRows, structRows] = await Promise.all([
+    client.query('SELECT id FROM shots WHERE episode_id IN (SELECT id FROM episodes WHERE project_id=$1)', [projectId]),
+    client.query('SELECT id FROM project_structure_nodes WHERE project_id=$1', [projectId]),
+  ]);
+  const chk = validateAuthoritativeBindings(boundNodes, {
+    shotIds: shotRows.rows.map((r) => r.id),
+    structureNodeIds: structRows.rows.map((r) => r.id),
+  });
+  if (!chk.ok) throw Object.assign(new Error('BINDING_INVALID'), { bindingErrors: chk.errors, canvasId });
+}
+
+// G22 Phase-3 — 幂等 mutation 落表(ON CONFLICT DO NOTHING)。kind-scoped LWW/merge 直写
+// 无整画布 CAS 门, 同 clientMutationId 并发双请求会在「prior SELECT(空) → 各自写入」
+// 的 TOCTOU 窗口内撞 (canvas_id,client_mutation_id) UNIQUE → 23505 → 500。此处把 INSERT
+// 幂等化: 冲突(0 行)即回读已提交响应返回 { ...response_json, idempotent:true };
+// 正常插入(1 行)返回 null(调用方照常 COMMIT)。
+async function insertMutation(client, { canvasId, cmid, baseRevision, resultingRevision, responseJson, userId }) {
+  const ins = await client.query(
+    `INSERT INTO studio_canvas_mutations (canvas_id,client_mutation_id,base_revision,resulting_revision,response_json,created_by)
+     VALUES ($1,$2,$3,$4,$5,$6)
+     ON CONFLICT (canvas_id, client_mutation_id) DO NOTHING
+     RETURNING client_mutation_id`,
+    [canvasId, cmid, baseRevision, resultingRevision, JSON.stringify(responseJson), userId]
+  );
+  if (ins.rows && ins.rows.length) return null;
+  const prior = await client.query(
+    'SELECT response_json FROM studio_canvas_mutations WHERE canvas_id=$1 AND client_mutation_id=$2',
+    [canvasId, cmid]
+  );
+  return prior.rows[0] ? prior.rows[0].response_json : null;
+}
+
 function createStudioCanvasPersistence(deps) {
   const { pg, sessionUser, sendJSON, parseBody, logEvent } = deps;
   function requireUser(req, res) { const user = sessionUser(req); if (!user) { sendJSON(res, 401, { ok: false, error: '未登录' }); return null; } return user; }
@@ -187,12 +230,19 @@ function createStudioCanvasPersistence(deps) {
   async function applyKindScopedLww(client, res, access, user, canvas, body, base, cmid, lwwUpdateOps) {
     const byId = new Map();
     for (const raw of body.upsertNodes) byId.set(String((raw && raw.nodeId) || (raw && raw.id) || '').trim(), raw);
-    let affected = 0;
-    const applied = [];
+    // 归一化全部待更新节点 + 权威绑定校验(与整画布 CAS 路径同源): data-only
+    // node.update 同样可能改写 data.shotId / data.structureNodeId, 不可绕过绑定守卫。
+    const normNodes = [];
     for (const op of lwwUpdateOps) {
       const raw = byId.get(op.nodeId);
       if (!raw) { await client.query('ROLLBACK'); sendErr(sendJSON, res, 400, 'INVALID_NODE'); return true; }
-      const data = durableNodeData(raw.data || raw);
+      normNodes.push({ nodeId: op.nodeId, data: durableNodeData(raw.data || raw) });
+    }
+    await assertBindingsValid(client, access.project.id, canvas.id, normNodes);
+    let affected = 0;
+    const applied = [];
+    for (const op of lwwUpdateOps) {
+      const data = normNodes.find((n) => n.nodeId === op.nodeId).data;
       const ur = await client.query('UPDATE studio_canvas_nodes SET data_json=$2, updated_at=NOW() WHERE canvas_id=$1 AND node_id=$3', [canvas.id, JSON.stringify(data), op.nodeId]);
       affected += (ur && ur.rowCount) || 0;
       applied.push({ op, data });
@@ -201,7 +251,8 @@ function createStudioCanvasPersistence(deps) {
     const graph = await loadGraph(client, canvas.id);
     const fresh = (await client.query('SELECT * FROM studio_canvases WHERE id=$1', [canvas.id])).rows[0];
     const resp = { ...response(fresh, graph, fresh.viewport_json, { permissions: access.permissions, extra: { applied: true, clientMutationId: cmid } }), ok: true, mode: 'kind-scoped-lww', revision: fresh.revision };
-    await client.query('INSERT INTO studio_canvas_mutations (canvas_id,client_mutation_id,base_revision,resulting_revision,response_json,created_by) VALUES ($1,$2,$3,$4,$5,$6)', [canvas.id, cmid, base, fresh.revision, JSON.stringify(resp), user.id]);
+    const raced = await insertMutation(client, { canvasId: canvas.id, cmid, baseRevision: base, resultingRevision: fresh.revision, responseJson: resp, userId: user.id });
+    if (raced) { await client.query('ROLLBACK'); sendJSON(res, 200, { ...raced, idempotent: true }); return true; }
     await client.query('COMMIT');
     const logged = await recordCanvasPatch({ canvasId: canvas.id, commandId: cmid, actorId: user.id, baseRevision: base, mode: 'kind-scoped-lww', ops: applied.map(({ op, data }) => ({ op: op.op, kind: op.kind, nodeId: op.nodeId, fields: op.fields, reason: op.reason, data })) });
     if (logged && logged.ok !== false && logged.idempotent === false && logged.seq != null) resp.commandSeq = logged.seq;
@@ -241,7 +292,8 @@ function createStudioCanvasPersistence(deps) {
     const graph = await loadGraph(client, canvas.id);
     const fresh = (await client.query('SELECT * FROM studio_canvases WHERE id=$1', [canvas.id])).rows[0];
     const resp = { ...response(fresh, graph, fresh.viewport_json, { permissions: access.permissions, extra: { applied: true, clientMutationId: cmid } }), ok: true, mode: 'kind-scoped-merge', revision: fresh.revision };
-    await client.query('INSERT INTO studio_canvas_mutations (canvas_id,client_mutation_id,base_revision,resulting_revision,response_json,created_by) VALUES ($1,$2,$3,$4,$5,$6)', [canvas.id, cmid, base, fresh.revision, JSON.stringify(resp), user.id]);
+    const raced = await insertMutation(client, { canvasId: canvas.id, cmid, baseRevision: base, resultingRevision: fresh.revision, responseJson: resp, userId: user.id });
+    if (raced) { await client.query('ROLLBACK'); sendJSON(res, 200, { ...raced, idempotent: true }); return true; }
     await client.query('COMMIT');
     const logged = await recordCanvasPatch({ canvasId: canvas.id, commandId: cmid, actorId: user.id, baseRevision: base, mode: 'kind-scoped-merge', ops: fullOps });
     if (logged && logged.ok !== false && logged.idempotent === false && logged.seq != null) resp.commandSeq = logged.seq;
@@ -314,25 +366,14 @@ function createStudioCanvasPersistence(deps) {
       //   计划空间 id 在统一前会被 409 拒 —— canvas data.shotId 语义锁定 = 执行 shot。
       //   空串/纯空白视为"未绑定"(FE storyboard 默认 shotId:'' 占位), 不参与校验。
       const normNodes = upsertNodes.map(normalizeNode);
-      const boundNodes = normNodes.filter((n) => {
-        const d = n.data || {};
-        return (typeof d.shotId === 'string' && d.shotId.trim() !== '')
-          || (typeof d.structureNodeId === 'string' && d.structureNodeId.trim() !== '');
-      });
-      if (boundNodes.length) {
-        const [shotRows, structRows] = await Promise.all([
-          client.query('SELECT id FROM shots WHERE episode_id IN (SELECT id FROM episodes WHERE project_id=$1)', [access.project.id]),
-          client.query('SELECT id FROM project_structure_nodes WHERE project_id=$1', [access.project.id]),
-        ]);
-        const chk = validateAuthoritativeBindings(boundNodes, { shotIds: shotRows.rows.map((r) => r.id), structureNodeIds: structRows.rows.map((r) => r.id) });
-        if (!chk.ok) throw Object.assign(new Error('BINDING_INVALID'), { bindingErrors: chk.errors, canvasId: canvas.id });
-      }
+      await assertBindingsValid(client, access.project.id, canvas.id, normNodes);
       if (deleteEdgeIds.length) await client.query('DELETE FROM studio_canvas_edges WHERE canvas_id=$1 AND edge_id = ANY($2::text[])', [canvas.id, deleteEdgeIds]);
       if (deleteNodeIds.length) await client.query('DELETE FROM studio_canvas_nodes WHERE canvas_id=$1 AND node_id = ANY($2::text[])', [canvas.id, deleteNodeIds]);
       for (const n of normNodes) { await client.query(`INSERT INTO studio_canvas_nodes (canvas_id,node_id,node_type,node_schema_version,position_x,position_y,width,height,z_index,data_json,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW(),NOW()) ON CONFLICT (canvas_id,node_id) DO UPDATE SET node_type=EXCLUDED.node_type,node_schema_version=EXCLUDED.node_schema_version,position_x=EXCLUDED.position_x,position_y=EXCLUDED.position_y,width=EXCLUDED.width,height=EXCLUDED.height,z_index=EXCLUDED.z_index,data_json=EXCLUDED.data_json,updated_at=NOW()`, [canvas.id,n.nodeId,n.nodeType,n.nodeSchemaVersion,n.positionX,n.positionY,n.width,n.height,n.zIndex,JSON.stringify(n.data)]); }
       for (const raw of upsertEdges) { const e = normalizeEdge(raw); await client.query(`INSERT INTO studio_canvas_edges (canvas_id,edge_id,source_node_id,source_handle,target_node_id,target_handle,edge_type,data_json,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW(),NOW()) ON CONFLICT (canvas_id,edge_id) DO UPDATE SET source_node_id=EXCLUDED.source_node_id,source_handle=EXCLUDED.source_handle,target_node_id=EXCLUDED.target_node_id,target_handle=EXCLUDED.target_handle,edge_type=EXCLUDED.edge_type,data_json=EXCLUDED.data_json,updated_at=NOW()`, [canvas.id,e.edgeId,e.sourceNodeId,e.sourceHandle,e.targetNodeId,e.targetHandle,e.edgeType,JSON.stringify(e.data)]); }
       const graph = await loadGraph(client, canvas.id); const fresh = (await client.query('SELECT * FROM studio_canvases WHERE id=$1', [canvas.id])).rows[0]; const extra = { applied: true, clientMutationId: cmid }; if (kindScopedEnabled()) extra.mode = 'canvas-cas'; const resp = response(fresh, graph, fresh.viewport_json, { permissions: access.permissions, extra });
-      await client.query('INSERT INTO studio_canvas_mutations (canvas_id,client_mutation_id,base_revision,resulting_revision,response_json,created_by) VALUES ($1,$2,$3,$4,$5,$6)', [canvas.id, cmid, base, fresh.revision, JSON.stringify(resp), user.id]);
+      const raced = await insertMutation(client, { canvasId: canvas.id, cmid, baseRevision: base, resultingRevision: fresh.revision, responseJson: resp, userId: user.id });
+      if (raced) { await client.query('ROLLBACK'); return sendJSON(res, 200, { ...raced, idempotent: true }); }
       await client.query('COMMIT');
       // G22 — mutation 已提交(CAS 通过)后写 canvas.patch 命令日志。commandId=clientMutationId,
       // 幂等由 (canvas_id,command_id) 保证 → 同 mutationId 重放安全。失败路径仅在成功分支后

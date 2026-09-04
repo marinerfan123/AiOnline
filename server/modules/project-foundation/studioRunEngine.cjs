@@ -138,8 +138,32 @@ function createStudioRunEngine(deps) {
    *
    * Best-effort ONLY: any throw (store down, pg down) is logged and swallowed —
    * a spend failure can never fail or roll back an already-committed run.
+   *
+   * Observability (audit 2026-09-04): a non-recorded spend is a BUDGET-DEFENCE
+   * failure — the node already ran and was billed at L5, but the guarded ledger
+   * rejected it (SPEND_OVER_REMAINING = overspend leaked past the gate;
+   * SPEND_NO_BUDGET = no budget row at all) or the store threw (permanent 漏计).
+   * That must never be silent: alongside the structured `log()` it is ALSO
+   * relayed as a durable run_events row (SSE-visible) so the overspend surface
+   * is recoverable. The relay warning is best-effort and never thrown.
    */
-  async function recordNodeSpend(runNodeId, projectId, result) {
+  async function relaySpendWarning(runId, runNodeId, type, detail) {
+    if (!relay || !runId) return;
+    try {
+      const r = await relay.relayRunEvent({
+        runId,
+        type,
+        payload: runNodeId ? { run_node_id: runNodeId, ...(detail || {}) } : (detail || {}),
+      });
+      if (!r || r.ok !== true) {
+        log('event.spend_warning_relay_failed', { runId, type, error: (r && r.errors) || 'relayRunEvent returned a non-ok result' });
+      }
+    } catch (e) {
+      log('event.spend_warning_relay_failed', { runId, type, error: e && e.message ? e.message : String(e) });
+    }
+  }
+
+  async function recordNodeSpend(runNodeId, runId, projectId, result) {
     if (!budgetSpentStore || typeof budgetSpentStore.recordSpend !== 'function') return;
     const amount = pricedNodeCost(result);
     if (amount == null) return; // unpriced → nothing to record
@@ -150,10 +174,14 @@ function createStudioRunEngine(deps) {
         idempotencyKey: String(runNodeId),
       });
       if (!r || r.ok !== true) {
-        log('run.node.spend_not_recorded', { runNodeId, projectId, code: r && r.error && r.error.code });
+        const code = r && r.error && r.error.code;
+        log('run.node.spend_not_recorded', { runNodeId, projectId, code });
+        await relaySpendWarning(runId, runNodeId, 'studio.run_node.spend_rejected', { projectId, code });
       }
     } catch (e) {
-      log('run.node.spend_failed', { runNodeId, projectId, error: e && e.message ? e.message : String(e) });
+      const msg = e && e.message ? e.message : String(e);
+      log('run.node.spend_failed', { runNodeId, projectId, error: msg });
+      await relaySpendWarning(runId, runNodeId, 'studio.run_node.spend_failed', { projectId, error: msg });
     }
   }
 
@@ -811,7 +839,7 @@ function createStudioRunEngine(deps) {
       // maxed-out pool. The spend is best-effort and runs after the run is
       // durably committed; it can never throw or roll back the run.
       releaseOnce();
-      await recordNodeSpend(runNodeId, node.run_project_id, result);
+      await recordNodeSpend(runNodeId, node.run_id, node.run_project_id, result);
       log('run.node.succeeded', { runId: node.run_id, studioNodeId: node.studio_node_id, attempt: node.attempt, unlocked: unlockedRows.map((r) => r.studio_node_id), workerId: owner });
       return { ok: true, runId: node.run_id, unlocked: unlockedRows.map((r) => r.studio_node_id) };
     } catch (e) {

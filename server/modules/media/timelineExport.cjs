@@ -40,6 +40,9 @@ function intMs(v, what) {
   if (v === null || v === undefined) return undefined;
   const n = typeof v === 'string' ? Number(v) : v;
   if (!Number.isInteger(n)) throw new Error(`timelineExport: ${what} 必须为整数毫秒 (got ${v})`);
+  // BIGINT (int8) can exceed 2^53; Number() silently rounds, so reject instead of
+  // exporting a corrupted value (audit: BIGINT→Number 越界 → 静默失真).
+  if (!Number.isSafeInteger(n)) throw new Error(`timelineExport: ${what} 超出安全整数范围 (got ${v})`);
   return n;
 }
 
@@ -47,6 +50,7 @@ function intOr(v, what) {
   if (v === null || v === undefined) return undefined;
   const n = typeof v === 'string' ? Number(v) : v;
   if (!Number.isInteger(n)) throw new Error(`timelineExport: ${what} 必须为整数 (got ${v})`);
+  if (!Number.isSafeInteger(n)) throw new Error(`timelineExport: ${what} 超出安全整数范围 (got ${v})`);
   return n;
 }
 
@@ -143,10 +147,12 @@ function createTimelineExport({ pg }) {
     }
 
     // Q4 — script-bound plan rows for the timeline's shots (only if any shot_id).
-    const shotIds = [...clipsByTrack.values()]
-      .flat()
-      .map((c) => c.shotId)
-      .filter((s) => s !== undefined);
+    const shotIds = [...new Set(
+      [...clipsByTrack.values()]
+        .flat()
+        .map((c) => c.shotId)
+        .filter((s) => s !== undefined),
+    )];
     let scriptRows;
     if (shotIds.length) {
       const psr = await pg.query(
@@ -154,7 +160,7 @@ function createTimelineExport({ pg }) {
                 kind, intent, subject_refs, duration_ms, ordering, version
            FROM project_shots_rows
           WHERE project_id = $1 AND shot_id = ANY($2::text[])
-          ORDER BY ordering, shot_id`,
+          ORDER BY ordering, shot_id, id`,
         [projectId, shotIds],
       );
       const rows = (psr.rows || []).map(buildScriptRow);

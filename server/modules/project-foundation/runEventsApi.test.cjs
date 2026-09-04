@@ -410,6 +410,26 @@ test('authProject hook deny: false → 403 default; object carries status/error;
   assert.equal(m.countBy(/FROM run_events/), 0, 'denied requests never read events');
 });
 
+test('authProject hook {ok:false} (canvasCommandLogApi deny shape) → deny, fail-closed not allow', async () => {
+  const m = createMockPg();
+  m.addRun('run-1', 'p-1');
+  m.fill('run-1', 2);
+
+  const denyOk = makeApi(m, { authProject: async () => ({ ok: false, status: 403, error: 'FORBIDDEN' }) });
+  const r1 = await call(denyOk, { path: eventsUrl('p-1', 'run-1') });
+  assert.equal(r1.res.status, 403);
+  assert.deepEqual(r1.res.body, { ok: false, error: 'FORBIDDEN' });
+
+  // bare { ok:false } (no status/error) → 403 with canvas-default error 'FORBIDDEN'
+  const denyBare = makeApi(m, { authProject: async () => ({ ok: false }) });
+  const r2 = await call(denyBare, { path: latestUrl('p-1', 'run-1') });
+  assert.equal(r2.res.status, 403);
+  assert.deepEqual(r2.res.body, { ok: false, error: 'FORBIDDEN' });
+
+  assert.equal(m.countBy(/FROM studio_runs/), 0, 'denied requests never touch run ownership SQL');
+  assert.equal(m.countBy(/FROM run_events/), 0, 'denied requests never read events');
+});
+
 test('authProject hook allow (true / null / {allowed:true}) proceeds; ctx receives projectId/runId/user/req', async () => {
   const m = createMockPg();
   m.addRun('run-1', 'p-1');
