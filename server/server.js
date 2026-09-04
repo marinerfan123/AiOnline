@@ -1658,6 +1658,9 @@ async function ossSignedGetUrl(objectKey) {
   return (r && r.getUrl) || null;
 }
 
+// local-disk 媒体读取面：GET /local-media/<objectKey>（key 每段 encode；生产走 OSS，本面仅测试/离线链）。
+const localMediaRead = ossMod.createLocalMediaStore({});
+
 const uploadApi = uploadApiMod.createUploadApi({
   pg: {
     query: (sql, params) => pgPool
@@ -2843,6 +2846,22 @@ async function handleAPI(req, res) {
   if (payments.handlePayments(req, res, url, method)) return;
 
   const realUser = session.getUserFromCookie(req); // 真实用户身份（用于计费/owner）
+
+  // ── local-disk 媒体读取（GET /local-media/<key>，key 段编码；404/空 buffer 语义）──
+  if (url.startsWith('/local-media/') && method === 'GET') {
+    const rawKey = decodeURIComponent(url.slice('/local-media/'.length).split('?')[0]);
+    const key = ossMod.decodeUrlKey(rawKey);
+    if (!key) return sendJSON(res, 400, { ok: false, error: 'INVALID_KEY' });
+    try {
+      const buf = await localMediaRead.get({ objectKey: key });
+      if (ossMod.isMediaNotFound(buf)) return sendJSON(res, 404, { ok: false, error: 'NOT_FOUND' });
+      const ext = key.split('.').pop() || 'bin';
+      const mime = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', webp: 'image/webp', mp4: 'video/mp4', gif: 'image/gif', json: 'application/json', bin: 'application/octet-stream' }[ext.toLowerCase()] || 'application/octet-stream';
+      res.writeHead(200, { 'content-type': mime, 'cache-control': 'public, max-age=86400' });
+      res.end(buf);
+      return;
+    } catch (e) { return sendJSON(res, 500, { ok: false, error: e.message }); }
+  }
 
   // ── 用户反馈（前端「发送应用反馈」表单落库）── 需登录（appGateway 已全局鉴权）
   if (url === '/api/feedback' && method === 'POST') {

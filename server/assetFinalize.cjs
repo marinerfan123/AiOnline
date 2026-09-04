@@ -119,7 +119,8 @@ async function pickActiveCfg(pgPool, ossLog) {
   if (!enabled) return null;
   const active = list.find((c) => c.id === activeId);
   if (!active || !active.enabled) return null;
-  if (!active.accessKeyId || !active.accessKeySecret || !active.bucket) return null;
+  const local = String(active.providerType || active.provider || active.type || '') === 'local-disk';
+  if (!local && (!active.accessKeyId || !active.accessKeySecret || !active.bucket)) return null;
   return active;
 }
 
@@ -165,6 +166,14 @@ async function streamToPassThroughWithMd5(webStream) {
 //   - 阿里云：两段式算 MD5 后流式发出
 //   - 无 stream（data: URI / chunked 无 content-length）：退回整图 buffer 旧路径，双兼容
 async function putObject(cfg, objectKey, fetched, contentType) {
+  // local-disk provider（测试/离线真链后端）：写本地存储，无签名。
+  if (String(cfg.providerType || cfg.provider || cfg.type || '') === 'local-disk') {
+    const store = ossMod.localStoreFor(cfg);
+    const body = fetched && fetched.buffer !== undefined ? fetched.buffer : Buffer.from('');
+    const r = await store.put({ objectKey, body });
+    if (!r || !r.ok) throw new Error('local-disk 写入失败');
+    return store.urlFor(r.key);
+  }
   const canStream = fetched.isStream && fetched.contentLength > 0 && fetched.stream;
   let putUrl, headers, body;
   if (cfg.providerType === 'tencent-cos') {
