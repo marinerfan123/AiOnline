@@ -24,6 +24,115 @@ const videoRouter = require('../../providers/video/index.cjs');
 
 const HTTP_TIMEOUT_MS = 30_000;
 
+// ─── Poll Policy (§63-65, L21) ─────────────────────────────────────────
+// Provider-specific poll policy：每 provider 可配 poll_interval / deadline 类型 /
+// deadline 时长 / max_polls / retry_after 上限。表 0063（provider_poll_policies）。
+//
+// 4 类 deadline（§64 Poll ≠ Job Deadline 的落地命名）：
+//   no_deadline    — 无 deadline，无限轮询（默认）
+//   fixed_window   — 从「本次轮询窗口」开始计时，窗口耗时 ≥ deadline_ms 停
+//   attempt_ttl    — 单次 attempt（本次一 shot 查询）耗时 ≥ deadline_ms 停
+//   job_ttl        — 从 job 提交起（job 年龄）≥ deadline_ms 停
+//
+// 等待≠取消（§65）：deadline 到期只「停止 poll」，绝不 cancel provider task；
+// 状态转 reconcile_wait 待 watchdog（reconciler 后台对账到真实终态）。
+const VALID_DEADLINE_KINDS = new Set(['no_deadline', 'fixed_window', 'attempt_ttl', 'job_ttl']);
+
+const DEFAULT_POLL_POLICY = Object.freeze({
+  poll_interval_ms: 15000,
+  deadline_kind: 'no_deadline',
+  deadline_ms: null,
+  max_polls: null,
+  retry_after_cap_ms: 30000,
+});
+
+// 停 poll 后（deadline/max_polls 到期）把 next_attempt_at 推到远端，使 reconciler 的
+// `next_attempt_at <= NOW()` 谓词不再命中 → 暂停轮询；但 status 仍是 reconcile_wait
+// （非终态、非 cancel），watchdog/管理面可随时复位恢复对账。
+const POLL_STOPPED_DEFER_MS = 7 * 24 * 60 * 60 * 1000; // 7 天兜底重查窗口
+
+function toNumOrNull(v) {
+  if (v === null || v === undefined || v === '') return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+// 把 DB 行/入参归一化为完整 policy（缺字段回退默认常量）。入参可能是 pg 行（字符串/数字）。
+// 归一化结果与 DEFAULT_POLL_POLICY 同形：retry_after_cap_ms 缺省回退 30000（= 基础退避，
+// 即无额外封顶）；deadline_ms/max_polls 缺省回退 null（= 无 deadline / 不限次数）。
+function normalizePolicy(policy) {
+  const p = (policy && typeof policy === 'object') ? policy : {};
+  const interval = toNumOrNull(p.poll_interval_ms);
+  const cap = toNumOrNull(p.retry_after_cap_ms);
+  return {
+    poll_interval_ms: interval == null ? DEFAULT_POLL_POLICY.poll_interval_ms : interval,
+    deadline_kind: (typeof p.deadline_kind === 'string' && VALID_DEADLINE_KINDS.has(p.deadline_kind))
+      ? p.deadline_kind : DEFAULT_POLL_POLICY.deadline_kind,
+    deadline_ms: toNumOrNull(p.deadline_ms),
+    max_polls: toNumOrNull(p.max_polls),
+    retry_after_cap_ms: cap == null ? DEFAULT_POLL_POLICY.retry_after_cap_ms : cap,
+  };
+}
+
+// 轮询判定（纯函数，无 I/O）：给定 policy + timing，返回是否继续 poll 及下次间隔。
+// timing: { attemptCount, windowElapsedMs, attemptElapsedMs, jobElapsedMs }
+//   返回 { continue:boolean, reason:string|null, nextInMs:number }
+function evaluatePollDeadline(policy, timing) {
+  const p = normalizePolicy(policy);
+  const t = (timing && typeof timing === 'object') ? timing : {};
+
+  // max_polls：已完成/含本次的轮询次数达到上限 → 停（等待≠取消）。
+  if (p.max_polls != null) {
+    const count = toNumOrNull(t.attemptCount);
+    if (count != null && count >= p.max_polls) {
+      return { continue: false, reason: 'max_polls_reached', nextInMs: p.poll_interval_ms };
+    }
+  }
+
+  let elapsed = null;
+  let reason = null;
+  switch (p.deadline_kind) {
+    case 'fixed_window':
+      elapsed = toNumOrNull(t.windowElapsedMs);
+      reason = 'fixed_window_exceeded';
+      break;
+    case 'attempt_ttl':
+      elapsed = toNumOrNull(t.attemptElapsedMs);
+      reason = 'attempt_ttl_exceeded';
+      break;
+    case 'job_ttl':
+      elapsed = toNumOrNull(t.jobElapsedMs);
+      reason = 'job_ttl_exceeded';
+      break;
+    case 'no_deadline':
+    default:
+      // no_deadline 或未知 kind（未知视为 no_deadline，安全：继续 poll，不误停/不误取消）
+      break;
+  }
+
+  if (elapsed != null && p.deadline_ms != null && elapsed >= p.deadline_ms) {
+    return { continue: false, reason, nextInMs: p.poll_interval_ms };
+  }
+  return { continue: true, reason: null, nextInMs: p.poll_interval_ms };
+}
+
+// 读 0063 provider_poll_policies；无行/未建表/无 pg → 回退默认常量（缺省配置）。
+async function pollPolicyFor(pg, providerId) {
+  if (!providerId || !pg || typeof pg.query !== 'function') return { ...DEFAULT_POLL_POLICY };
+  try {
+    const r = await pg.query(
+      `SELECT poll_interval_ms, deadline_kind, deadline_ms, max_polls, retry_after_cap_ms
+         FROM provider_poll_policies WHERE provider_id = $1`,
+      [providerId],
+    );
+    if (!r.rows || !r.rows.length) return { ...DEFAULT_POLL_POLICY };
+    return normalizePolicy(r.rows[0]);
+  } catch (_) {
+    // 表未建（迁移未跑/旧库）→ 回退默认，不抛错，轮询继续用默认策略。
+    return { ...DEFAULT_POLL_POLICY };
+  }
+}
+
 // ─── Load provider config from DB ───
 async function loadProviderById(pg, providerId) {
   if (!providerId) return null;
@@ -326,10 +435,13 @@ const REDUCIBLE_FROM = new Set(['reconciling', 'generating']);
 
 // 归一化状态 → 单调状态机决策（纯函数，无 I/O）。from 收敛于 reconciling；
 // 仅「早期 webhook」落在 generating 时允许 generating>generated 直边。
-function reduceDecision(item, normalizedStatus) {
+// pollPolicy/pollTiming（L21）：pending 分支用 provider-specific poll 策略驱动下次
+// poll 间隔与 deadline 判定；未传时回退 DEFAULT_POLL_POLICY（no_deadline）。
+function reduceDecision(item, normalizedStatus, pollPolicy, pollTiming) {
   const from = item.status || 'reconciling';
   const st = (normalizedStatus && normalizedStatus.status) || 'unknown';
   const now = Date.now();
+  const policy = normalizePolicy(pollPolicy);
   if (st === 'success' && normalizedStatus.providerUrl) {
     return {
       from, to: 'generated',
@@ -341,23 +453,42 @@ function reduceDecision(item, normalizedStatus) {
     };
   }
   if (st === 'failed') {
+    // retry_after_cap_ms：封顶 failed 后的重试退避（Retry-After cap）。
+    const backoffMs = 30000;
+    const cap = policy.retry_after_cap_ms;
+    const waitMs = (cap != null && cap >= 0) ? Math.min(backoffMs, cap) : backoffMs;
     return {
       from: 'reconciling', to: 'retry_wait',
       patch: {
         last_error_code: 'PROVIDER_FAILED',
         last_error: normalizedStatus.errorMessage || 'provider reported failure',
-        next_attempt_at: new Date(now + 30000),
+        next_attempt_at: new Date(now + waitMs),
         lease_expires_at: null,
       },
     };
   }
   if (st === 'pending') {
+    const poll = evaluatePollDeadline(policy, pollTiming);
+    if (!poll.continue) {
+      // 等待≠取消（§65）：deadline / max_polls 到期 → 只停 poll，绝不 cancel
+      // provider task；转 reconcile_wait 待 watchdog 后台对账到真实终态。
+      // next_attempt_at 推到远端（POLL_STOPPED_DEFER_MS）使 poll 谓词不再命中。
+      return {
+        from: 'reconciling', to: 'reconcile_wait',
+        patch: {
+          last_error_code: 'POLL_STOPPED',
+          last_error: `poll stopped (${poll.reason}); provider task NOT cancelled — awaiting watchdog reconcile`,
+          next_attempt_at: new Date(now + POLL_STOPPED_DEFER_MS),
+          lease_expires_at: null,
+        },
+      };
+    }
     return {
       from: 'reconciling', to: 'reconcile_wait',
       patch: {
         last_error_code: 'PROVIDER_PENDING',
         last_error: 'still processing; reconciliation only',
-        next_attempt_at: new Date(now + 15000),
+        next_attempt_at: new Date(now + poll.nextInMs),
         lease_expires_at: null,
       },
     };
@@ -383,10 +514,13 @@ function reduceDecision(item, normalizedStatus) {
  * @param {object} opts.event            inbox 行（含 id/signature_state/status/provider_id/payload）；poll 路径为虚拟事件
  * @param {object} opts.normalizedStatus 与 queryProviderStatus 返回值同形
  * @param {string} [opts.providerRequestId] 提供方任务 ID（未传时回退 event.payload.provider_request_id）
+ * @param {object} [opts.pollPolicy]     provider-specific poll 策略（pollPolicyFor 的返回值；未传回退 DEFAULT_POLL_POLICY）
+ * @param {object} [opts.pollTiming]     轮询计时 { attemptCount, windowElapsedMs, attemptElapsedMs, jobElapsedMs }
+ *   （L21：pending 分支用它做 4 类 deadline 判定；等待≠取消，deadline 过只停 poll 不 cancel）
  * @returns {{outcome:string, to?:string, reason?:string, itemStatus?:string}}
  *   outcome ∈ reduced | duplicate | out_of_order | rejected | concurrent_noop
  */
-async function applyProviderEvent({ store, inbox, event, normalizedStatus, providerRequestId } = {}) {
+async function applyProviderEvent({ store, inbox, event, normalizedStatus, providerRequestId, pollPolicy, pollTiming } = {}) {
   if (!store || typeof store.transitionItem !== 'function' || typeof store.findItemByProviderRequestId !== 'function') {
     throw new TypeError('applyProviderEvent: store.transitionItem and store.findItemByProviderRequestId required');
   }
@@ -432,7 +566,7 @@ async function applyProviderEvent({ store, inbox, event, normalizedStatus, provi
   }
 
   // 唯一 reduce：CAS 单写（store.transitionItem 内部 status+lease_version 双 CAS）。
-  const decision = reduceDecision(item, normalizedStatus);
+  const decision = reduceDecision(item, normalizedStatus, pollPolicy, pollTiming);
   const row = await store.transitionItem({
     itemId: item.item_id,
     leaseVersion: Number(item.lease_version),
@@ -480,4 +614,11 @@ module.exports = {
   queryVolcanoStatus,
   queryGenericVideoStatus,
   sanitizeErrorMessage,
+  // L21 — Poll Policy (§63-65)
+  pollPolicyFor,
+  evaluatePollDeadline,
+  normalizePolicy,
+  DEFAULT_POLL_POLICY,
+  VALID_DEADLINE_KINDS,
+  POLL_STOPPED_DEFER_MS,
 };

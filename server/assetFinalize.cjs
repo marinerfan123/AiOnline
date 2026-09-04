@@ -481,6 +481,185 @@ async function finalizeTask(pgPool, ctx, providerImages, providerVideoUrl) {
   return out;
 }
 
+// ─── L27 — OutputManifest：provider 原样快照 + 归一 artifacts → 逐件拉取落库（§78-80）──────────
+// 墨渊 V2.0 L27（0065 迁移段）。语义：
+//   §78 Provider 返回 OutputManifest `{artifacts:[{role, media_type, source}], provider_metadata}`，
+//       不再返回单一 video_url。此处把 provider manifest 原样快照落 generation_output_manifests，
+//       并把 artifacts 归一为 [{url, kind, mimeType, sizeBytes, checksum?}] 再逐件拉取落 media。
+//   §79 Provider Success ≠ Job Success：快照行的存在 = provider 已成功产出 manifest（仅入快照）；
+//       只有当所有 artifacts 拉取落库 + media_ids 齐（无 NULL）时，Job 才成功（finalized_at 置值）。
+//   §80 Finalize 独立重试：快照先于任何拉取；拉取部分失败时快照保留已落 media_ids，
+//       重试从快照重放（不重新生成、不重新归一），只补拉未落库的 artifact。
+
+// 归一：provider artifact → { url, kind, mimeType, sizeBytes, checksum }。
+// 宽容映射（不同 provider 字段名不一）：source|url → url；role|kind → kind；media_type|mimeType|contentType → mimeType。
+function normalizeOutputArtifact(a) {
+  if (!a || typeof a !== 'object') return null;
+  const url = a.source || a.url || a.oss_url || a.media_url || a.href || null;
+  const kind = a.role || a.kind || a.type || 'artifact';
+  const mimeType = a.media_type || a.mimeType || a.mime_type || a.contentType || a.content_type || null;
+  const sizeBytes = a.size_bytes != null ? Number(a.size_bytes)
+    : (a.sizeBytes != null ? Number(a.sizeBytes)
+      : (a.byte_length != null ? Number(a.byte_length) : (a.size != null ? Number(a.size) : null)));
+  const checksum = a.checksum || a.sha256 || a.md5 || a.etag || null;
+  if (!url) return null; // 无来源地址的 artifact 无法拉取，跳过（保留在 provider_manifest 原样里）
+  const norm = { url, kind: String(kind), mimeType: mimeType ? String(mimeType) : null, sizeBytes: Number.isFinite(sizeBytes) ? sizeBytes : null };
+  if (checksum) norm.checksum = String(checksum);
+  return norm;
+}
+
+// 从 provider OutputManifest 归一 artifacts 列表；返回数组（含 null 表示无法归一，调用方忽略）。
+function normalizeOutputArtifacts(providerManifest) {
+  if (!providerManifest || typeof providerManifest !== 'object') return [];
+  const raw = Array.isArray(providerManifest.artifacts) ? providerManifest.artifacts : [];
+  return raw.map(normalizeOutputArtifact);
+}
+
+// artifact kind/mimeType → media.type（media.type 为开放 TEXT；video/* → video，其余按 image 落库，
+// audio/metadata 等特殊 kind 由 manifest 的 kind 字段承载，L29 Media Metadata 再细分）。
+function deriveArtifactMediaType(kind, mimeType) {
+  if (/video/i.test(String(kind || ''))) return 'video';
+  if (mimeType && /^video\//i.test(String(mimeType))) return 'video';
+  return 'image';
+}
+
+// 落库/重放 provider 快照（先于任何拉取，§80）。返回重放后的快照行 + 既有 media_ids。
+// opts: { jobId, attemptId, providerManifest?, artifacts? }
+//   - 首次：providerManifest 必填（否则抛错）；artifacts 缺省时由 manifest 归一。
+//   - 重试（同 attempt）：providerManifest 可省略 → 从既有行重放（不重新生成、不重新归一）；
+//     retry_count+1，保留已落库 media_ids。
+//   - 新 attempt（attempt_id 变化）：重置 retry_count=0、media_ids 清空，覆盖 manifest/artifacts。
+async function snapshotOutputManifest(pgPool, opts) {
+  if (!pgPool) throw new Error('数据库不可用，无法落 OutputManifest 快照');
+  const { jobId, attemptId, providerManifest, artifacts: artifactsIn } = opts || {};
+  if (!jobId) throw new Error('jobId 缺失');
+  if (!attemptId) throw new Error('attemptId 缺失');
+
+  const existing = await pgPool.query(
+    `SELECT attempt_id, provider_manifest, artifacts, media_ids, retry_count
+     FROM generation_output_manifests WHERE job_id = $1`,
+    [jobId],
+  ).then((r) => (r && r.rows && r.rows[0]) || null).catch(() => null);
+
+  const isRetry = !!(existing && existing.attempt_id === attemptId);
+  const isNewAttempt = !!(existing && existing.attempt_id !== attemptId);
+
+  let manifest = providerManifest;
+  if (manifest == null) {
+    if (existing) manifest = existing.provider_manifest;
+    else throw new Error('providerManifest 缺失且无既有快照可重放（首次必须提供原样 manifest）');
+  }
+
+  let artifacts = Array.isArray(artifactsIn) ? artifactsIn : null;
+  if (!Array.isArray(artifacts) || !artifacts.length) {
+    if (existing) artifacts = Array.isArray(existing.artifacts) ? existing.artifacts : [];
+    else artifacts = normalizeOutputArtifacts(manifest);
+  }
+  artifacts = artifacts.filter(Boolean).map((a) => normalizeOutputArtifact(a) || a);
+
+  let mediaIds = Array.isArray(existing && existing.media_ids) ? existing.media_ids.slice() : [];
+  let retryCount = existing ? Number(existing.retry_count || 0) : 0;
+  if (isRetry) {
+    retryCount += 1;
+  } else if (isNewAttempt) {
+    retryCount = 0;
+    mediaIds = [];
+  }
+  // media_ids 与 artifacts 下标对齐，未落库项 null
+  mediaIds = artifacts.map((_, i) => (mediaIds[i] != null ? mediaIds[i] : null));
+
+  await pgPool.query(
+    `INSERT INTO generation_output_manifests
+       (job_id, attempt_id, provider_manifest, artifacts, media_ids, retry_count)
+     VALUES ($1,$2,$3,$4,$5,$6)
+     ON CONFLICT (job_id) DO UPDATE SET
+       attempt_id = EXCLUDED.attempt_id,
+       provider_manifest = EXCLUDED.provider_manifest,
+       artifacts = EXCLUDED.artifacts,
+       media_ids = EXCLUDED.media_ids,
+       retry_count = EXCLUDED.retry_count,
+       updated_at = NOW()`,
+    [jobId, attemptId, JSON.stringify(manifest), JSON.stringify(artifacts), mediaIds, retryCount],
+  );
+
+  return {
+    jobId, attemptId,
+    providerManifest: manifest,
+    artifacts, mediaIds, retryCount,
+    isRetry,
+    replayedFromSnapshot: !providerManifest && !!existing,
+  };
+}
+
+// 终态后编排：先存快照（§80 先于拉取）→ 逐件拉取落库 → 回填 media_ids/artifacts/finalized_at。
+// opts: { jobId, attemptId, providerManifest?, userId, prompt?, model?, ratio?, pendingIds? }
+// 返回 { jobId, attemptId, providerSuccess, jobSuccess, artifacts, mediaIds, finalizedAt, results }。
+//   - providerSuccess = true（快照已落 = provider 成功产出 manifest）。
+//   - jobSuccess = true 仅当所有 artifacts 拉取落库成功 + media_ids 齐（无 NULL）；否则 false（仍 retry 域，§79）。
+//   - 重试（同 attempt）可省略 providerManifest：从快照重放，只补拉未落库 artifact（§80 绝不重新生成）。
+async function finalizeOutputManifest(pgPool, opts) {
+  const { jobId, attemptId, providerManifest, userId, prompt = '', model = '', ratio = '1:1', pendingIds } = opts || {};
+  if (!userId) throw new Error('userId 缺失');
+
+  // 1. 快照先于拉取（§80）：写入/重放 generation_output_manifests，拿到归一 artifacts + 既有 media_ids
+  const snap = await snapshotOutputManifest(pgPool, { jobId, attemptId, providerManifest });
+
+  const artifacts = snap.artifacts.slice();
+  const mediaIds = snap.mediaIds.slice();
+  const results = new Array(artifacts.length);
+  let allLanded = true;
+
+  // 2. 逐件拉取落库：已落库（mediaIds[i] 非 null）跳过（快照重放），只补拉缺失项
+  for (let i = 0; i < artifacts.length; i++) {
+    const a = artifacts[i];
+    if (mediaIds[i] != null) {
+      results[i] = { ...a, mediaId: mediaIds[i], landed: true, replayed: true, status: 'success' };
+      continue;
+    }
+    const type = deriveArtifactMediaType(a.kind, a.mimeType);
+    const pendingId = Array.isArray(pendingIds) ? pendingIds[i] : undefined;
+    try {
+      const r = await finalizeUrl(pgPool, {
+        userId, taskId: jobId, idx: i, providerUrl: a.url, type,
+        prompt, model, ratio, pendingId,
+      });
+      if (r && r.status === 'success') {
+        mediaIds[i] = r.mediaId;
+        a.mimeType = r.contentType || a.mimeType;
+        a.sizeBytes = r.fileSize != null ? r.fileSize : a.sizeBytes;
+        results[i] = { ...a, mediaId: r.mediaId, ossUrl: r.ossUrl, landed: true, replayed: false, status: 'success' };
+      } else {
+        // 拉取/落库失败：media_ids 保持 null（未落库），Job 未成功，仍处 retry 域（§79）
+        allLanded = false;
+        results[i] = { ...a, mediaId: r && r.mediaId ? r.mediaId : null, landed: false, replayed: false, status: (r && r.status) || 'failed' };
+      }
+    } catch (e) {
+      allLanded = false;
+      results[i] = { ...a, mediaId: null, landed: false, replayed: false, status: 'failed', error: e && e.message ? e.message : String(e) };
+    }
+  }
+
+  // 3. 回填 artifacts（sizeBytes/mimeType 已拉取成功者更新）+ media_ids + finalized_at（全落才置值）
+  const finalizedAt = allLanded ? new Date().toISOString() : null;
+  await pgPool.query(
+    `UPDATE generation_output_manifests
+     SET artifacts = $2, media_ids = $3, finalized_at = $4, updated_at = NOW()
+     WHERE job_id = $1`,
+    [jobId, JSON.stringify(artifacts), mediaIds, finalizedAt ? finalizedAt : null],
+  ).catch(() => ({ rows: [] }));
+
+  const mediaIdsComplete = artifacts.length > 0 && mediaIds.every((m) => m != null);
+  return {
+    jobId, attemptId,
+    providerSuccess: true, // 快照已落 = provider 成功产出 manifest（§79 与 Job Success 严格区分）
+    jobSuccess: allLanded && mediaIdsComplete,
+    artifacts, mediaIds,
+    finalizedAt,
+    retryCount: snap.retryCount,
+    results,
+  };
+}
+
 module.exports = {
   finalizeUrl,
   finalizeTask,
@@ -494,4 +673,10 @@ module.exports = {
   insertMedia,
   insertAssetVersion,
   recordAssetVersion,
+  // L27 OutputManifest（§78-80）
+  normalizeOutputArtifact,
+  normalizeOutputArtifacts,
+  deriveArtifactMediaType,
+  snapshotOutputManifest,
+  finalizeOutputManifest,
 };

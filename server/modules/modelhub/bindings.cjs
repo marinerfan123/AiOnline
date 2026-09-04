@@ -11,6 +11,11 @@
  *   2. 若某 model_id 在 bindings 中没有任何绑定（迁移中途 / 旧数据未回填 / 新模型尚未配绑定），
  *      回退到旧 models.provider_id 单绑定，upstream_model_name 取 model_id（= 现状行为）。
  *
+ * 0067 扩展（L34+L36 联读）：绑定行可带 quota_scope_id / cert_id 引用（可空），本模块
+ *   顺带联读 provider_quota_scopes / provider_certifications，把 pair.quotaScope / pair.cert
+ *   透传给调度方（admission L35 消费）；无引用（旧绑定 / legacy fallback）时 quotaScopeId/
+ *   certId 为空串、quotaScope/cert 为 null，原路径行为不变。
+ *
  * 重要约束（来自迁移铁律 + Phase 1 禁令）：
  *   - 绝不 DROP / 改 models 旧列；旧 models.provider_id 仍被本模块的 fallback 与崩溃恢复链路读取。
  *   - 不改变路由算法（round-robin 由 dispatcher 负责）；本模块只产出 pairs，不排序（priority/weight 仅透传供 Phase 3）。
@@ -23,14 +28,15 @@
  * @param {object} pgPool      PG 连接池
  * @param {string[]} modelIds  已归一化的 canonical model_id 数组（来自 resolver）
  * @param {string} [contentType] 'image' | 'video' | undefined（预留，当前不影响配对）
- * @returns {Promise<Array<{model:object, provider:object, bindingId:string}>>}  bindingId = provider_model_bindings.id（线路主键；legacy fallback 为空串）
+ * @returns {Promise<Array<{model:object, provider:object, bindingId:string, quotaScopeId:string, quotaScope:object|null, certId:string, cert:object|null}>>}  bindingId = provider_model_bindings.id（线路主键；legacy fallback 为空串）；quotaScope/cert 为 0067 联读结果（无引用时为 null）
  */
 async function loadDispatchPairs(pgPool, modelIds, contentType) {
   if (!pgPool || !Array.isArray(modelIds) || modelIds.length === 0) return [];
   try {
-  // 1) 读取这批 model_id 的绑定（仅启用）
+  // 1) 读取这批 model_id 的绑定（仅启用）+ 可选的 quota_scope_id / cert_id 引用（0067，可空）
   const bRes = await pgPool.query(
-    `SELECT id, model_id, provider_id, upstream_model_name, enabled, priority, weight
+    `SELECT id, model_id, provider_id, upstream_model_name, enabled, priority, weight,
+            quota_scope_id, cert_id
        FROM provider_model_bindings
       WHERE model_id = ANY($1) AND enabled = true`,
     [modelIds],
@@ -51,6 +57,8 @@ async function loadDispatchPairs(pgPool, modelIds, contentType) {
       : b.model_id, // 上游名为空时回退 model_id（等价现状）
     priority: b.priority || 0,
     weight: b.weight || 0,
+    quota_scope_id: b.quota_scope_id || null, // 0067：绑定可带的 quota scope 引用（可空）
+    cert_id: b.cert_id || null,               // 0067：绑定可带的 cert 引用（可空）
   }));
 
   if (fallbackModelIds.length) {
@@ -113,7 +121,27 @@ async function loadDispatchPairs(pgPool, modelIds, contentType) {
     providerById.set(pr.id, pr);
   }
 
-  // 5) 组装 pairs（过滤：服务商启用 + 有可用 key）
+  // 5) 加载绑定行携带的 quota scope / cert 引用（0067，联读；可空 → 仅读非空引用）
+  const quotaScopeIds = [...new Set(targets.map((t) => t.quota_scope_id).filter(Boolean))];
+  const certIds = [...new Set(targets.map((t) => t.cert_id).filter(Boolean))];
+  const quotaScopeById = new Map();
+  const certById = new Map();
+  if (quotaScopeIds.length) {
+    const qRes = await pgPool.query(
+      `SELECT * FROM provider_quota_scopes WHERE scope_id = ANY($1)`,
+      [quotaScopeIds],
+    );
+    for (const q of qRes.rows || []) quotaScopeById.set(q.scope_id, q);
+  }
+  if (certIds.length) {
+    const cRes = await pgPool.query(
+      `SELECT * FROM provider_certifications WHERE cert_id = ANY($1)`,
+      [certIds],
+    );
+    for (const c of cRes.rows || []) certById.set(c.cert_id, c);
+  }
+
+  // 6) 组装 pairs（过滤：服务商启用 + 有可用 key）
   //    可用 key = 老列 providers.api_key（legacy fallback） OR 池中至少一把 active 且长度≥6 的 key
   const pairs = [];
   for (const t of targets) {
@@ -132,7 +160,15 @@ async function loadDispatchPairs(pgPool, modelIds, contentType) {
       bindingPriority: t.priority,
       bindingWeight: t.weight,
     };
-    pairs.push({ model, provider: pr, bindingId: t.bindingId || '' });
+    pairs.push({
+      model,
+      provider: pr,
+      bindingId: t.bindingId || '',
+      quotaScopeId: t.quota_scope_id || '',
+      quotaScope: t.quota_scope_id ? quotaScopeById.get(t.quota_scope_id) || null : null,
+      certId: t.cert_id || '',
+      cert: t.cert_id ? certById.get(t.cert_id) || null : null,
+    });
   }
 
   return pairs;

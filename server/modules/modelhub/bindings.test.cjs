@@ -150,3 +150,67 @@ test('loadDispatchPairs：绑定到非模型主 provider（多 provider 线路�
   assert.strictEqual(pairs[0].model.upstreamModelName, 'gpt-image-1'); // wire name 来自 binding
   assert.strictEqual(pairs[0].model.model_id, 'foo');                  // canonical model_id 保留
 });
+
+// ── 0067 扩展：绑定行可带 quota_scope_id / cert_id 引用，联读透传 pair.quotaScope / pair.cert ──
+test('loadDispatchPairs：绑定带 quota_scope_id + cert_id → 联读透传 quotaScope/cert', async () => {
+  const quotaScope = { scope_id: 'qs-1', provider_id: 'p1', scope_code: 'acct-1000', kind: 'model', capacity: { limit_type: 'DAILY_REQUESTS', limit_value: 1000 } };
+  const cert = { cert_id: 'cert-1', provider_id: 'p1', model_code: 'veo3.1', fidelity_class: 'EXACT', cert_status: 'certified' };
+  const pool = {
+    async query(text, params = []) {
+      const T = text.toUpperCase();
+      if (T.includes('PROVIDER_MODEL_BINDINGS')) {
+        return { rows: [{ id: 'b1', model_id: 'm', provider_id: 'p1', upstream_model_name: 'u1', enabled: true, priority: 0, weight: 0, quota_scope_id: 'qs-1', cert_id: 'cert-1' }] };
+      }
+      if (T.includes('FROM MODELS')) return { rows: [{ model_id: 'm', provider_id: 'p1', enabled: true }] };
+      if (T.includes('FROM PROVIDERS')) return { rows: [{ id: 'p1', enabled: true, api_key: 'sk-111111' }] };
+      if (T.includes('FROM API_KEYS')) return { rows: [] };
+      if (T.includes('PROVIDER_QUOTA_SCOPES')) return { rows: [quotaScope] };
+      if (T.includes('PROVIDER_CERTIFICATIONS')) return { rows: [cert] };
+      return { rows: [] };
+    },
+  };
+  const pairs = await loadDispatchPairs(pool, ['m']);
+  assert.strictEqual(pairs.length, 1);
+  assert.strictEqual(pairs[0].quotaScopeId, 'qs-1');
+  assert.deepStrictEqual(pairs[0].quotaScope, quotaScope);
+  assert.strictEqual(pairs[0].certId, 'cert-1');
+  assert.deepStrictEqual(pairs[0].cert, cert);
+  assert.strictEqual(pairs[0].cert.fidelity_class, 'EXACT'); // §20 消费方可见 fidelity_class
+});
+
+test('loadDispatchPairs：绑定无 quota/cert 引用 → quotaScope/cert 为 null、id 为空串', async () => {
+  const pairs = await loadDispatchPairs(makePool(), ['flux-1']);
+  assert.strictEqual(pairs.length, 1);
+  assert.strictEqual(pairs[0].quotaScopeId, '');
+  assert.strictEqual(pairs[0].quotaScope, null);
+  assert.strictEqual(pairs[0].certId, '');
+  assert.strictEqual(pairs[0].cert, null);
+});
+
+test('loadDispatchPairs：legacy fallback 路径不联读 → quotaScope/cert 为 null', async () => {
+  const pool = makePool({ bindings: [], models: [{ model_id: 'legacy-1', provider_id: 'provider-a', enabled: true }] });
+  const pairs = await loadDispatchPairs(pool, ['legacy-1']);
+  assert.strictEqual(pairs.length, 1);
+  assert.strictEqual(pairs[0].quotaScope, null);
+  assert.strictEqual(pairs[0].cert, null);
+});
+
+test('loadDispatchPairs：quota_scope_id 指向不存在的 scope → 优雅降级 quotaScope=null（不丢 pair）', async () => {
+  const pool = {
+    async query(text, params = []) {
+      const T = text.toUpperCase();
+      if (T.includes('PROVIDER_MODEL_BINDINGS')) {
+        return { rows: [{ id: 'b1', model_id: 'm', provider_id: 'p1', upstream_model_name: 'u1', enabled: true, priority: 0, weight: 0, quota_scope_id: 'qs-missing' }] };
+      }
+      if (T.includes('FROM MODELS')) return { rows: [{ model_id: 'm', provider_id: 'p1', enabled: true }] };
+      if (T.includes('FROM PROVIDERS')) return { rows: [{ id: 'p1', enabled: true, api_key: 'sk-111111' }] };
+      if (T.includes('FROM API_KEYS')) return { rows: [] };
+      if (T.includes('PROVIDER_QUOTA_SCOPES')) return { rows: [] }; // 引用悬空
+      return { rows: [] };
+    },
+  };
+  const pairs = await loadDispatchPairs(pool, ['m']);
+  assert.strictEqual(pairs.length, 1);          // pair 不因悬空引用被丢弃
+  assert.strictEqual(pairs[0].quotaScopeId, 'qs-missing');
+  assert.strictEqual(pairs[0].quotaScope, null);
+});
