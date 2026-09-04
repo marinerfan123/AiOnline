@@ -17,8 +17,11 @@
  *   Ownership is verified INSIDE the SSE handler (404/403) because a streaming
  *   endpoint has no dispatcher role gate — see createRunEventsSse below.
  */
-const { LIMITS: GRAPH_LIMITS } = require('./studioRunGraph.cjs');
+const { LIMITS: GRAPH_LIMITS, compileStudioGraph } = require('./studioRunGraph.cjs');
 const { createRunEventStore } = require('./runEventStore.cjs');
+// V2.0 must#2 — 预算前置门（纯估算核心 + project_budgets 读模型）。
+const { estimateRun, creditsToUnits } = require('../budget/budgetEstimate.cjs');
+const { getBudgetSpent } = require('./budgetSpentStore.cjs');
 
 const RUNS_RE = /^\/api\/v2\/projects\/([^/]+)\/studio\/runs(?:\/([^/]+)(?:\/([^/]+))?)?$/;
 
@@ -46,6 +49,80 @@ const FORMAT_RUN = (row) => ({
 });
 
 function toIso(v) { return v ? new Date(v).toISOString() : null; }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// V2.0 must#2 — run 预算前置门 / 估算（估算侧与引擎共用同一纯编译函数）。
+//
+// 策略注（诚实边界）：
+//  - 价格真源：models.credit_cost（每逻辑模型单任务价，N(18,4)）。金额语义与
+//    server.js 的 L5 计费一致：image 节点按件（画布 image-generation 节点无
+//    count 字段 → 每节点 1 件）、video 节点固定 1 任务（duration 不放大价格，
+//    server.js billingCount = 1）。故 unitPrices 注入纯数字（每任务价），
+//    不做 per-second/per-image 加权 —— budgetEstimate 支持该形状。
+//  - 无 models 行/无 credit_cost 的模型 → 按 L5 双读链兜底 0 credit 计（不计
+//    入 totalUnits，但标 unpriced，前端可见）。
+//  - 预算不存在（无 project_budgets 行）→ 放行（NO_BUDGET 策略，不设门）。
+//  - 本 API 只读估算 + 门；预算的持久扣减仍归 budgetSpentStore.recordSpend
+//    （带守卫的 UPDATE，真正的并发防线）。门是保守的事前拦截，非结算。
+//  - 引擎不暴露 compile-only 入口；但 compileStudioGraph（studioRunGraph.cjs
+//    导出的纯函数，引擎 createRunFromCanvas 内部调用的是同一函数）可被本模块
+//    只读复用：先编译闭包再估算，闭包语义（ALL/SELECTED/FROM_NODE）与引擎
+//    一致。真正的 create 仍走引擎锁定事务，估算与 create 之间 revision 前进时
+//    引擎照旧抛 CANVAS_REVISION_STALE（不建 run），估算永不越权建 run。
+//  - 快照不可解析（canvas 不存在/revision 不一致/编译失败）→ 门 DEFER 给引擎
+//    （引擎的 404/409/400 错误照旧，且不建 run），门本身不臆造 4xx。
+// ─────────────────────────────────────────────────────────────────────────────
+
+const UNITS_PER_CREDIT = 10000; // budgetEstimate 单位语义：1 credit = 10000 units（N(14,4)）
+const GENERATION_IMAGE_TYPES = new Set(['image-generation']);
+const GENERATION_VIDEO_TYPES = new Set(['image-to-video', 'text-to-video']);
+
+const CANVAS_BY_PROJECT_SQL = 'SELECT id, revision, schema_version FROM studio_canvases WHERE project_id=$1 AND is_primary=TRUE AND archived_at IS NULL LIMIT 1';
+const CANVAS_NODES_SQL = 'SELECT node_id, node_type, node_schema_version, data_json FROM studio_canvas_nodes WHERE canvas_id=$1';
+const CANVAS_EDGES_SQL = 'SELECT edge_id, source_node_id, source_handle, target_node_id, target_handle, edge_type FROM studio_canvas_edges WHERE canvas_id=$1';
+const MODELS_PRICE_SQL = 'SELECT model_id, credit_cost FROM models WHERE model_id = ANY($1::text[])';
+const RUN_BY_CANVAS_KEY_SQL = 'SELECT id FROM studio_runs WHERE canvas_id=$1 AND idempotency_key=$2';
+
+/**
+ * 编译图 → 计费 shots（纯函数）。只把 GENERATION 节点视为可计费任务：
+ *   image-generation       → { kind:'image', count:1 }（无 count 字段 → 1 件）
+ *   image-to-video/text-to-video → { kind:'video', seconds:duration }
+ *                              （duration 缺省取 registry 默认 5；平坦任务价下
+ *                                seconds 不参与计价，仅作诚实语义保留）
+ * 未来未知 GENERATION 节点类型 → 不计 shot（unmappedGenerationNodes 上报）。
+ */
+function deriveGenerationShots(graph) {
+  const shots = [];
+  let generationNodeCount = 0;
+  let unmappedGenerationNodes = 0;
+  const nodes = (graph && Array.isArray(graph.nodes)) ? graph.nodes : [];
+  for (const n of nodes) {
+    if (!n || n.executionKind !== 'GENERATION') continue;
+    generationNodeCount += 1;
+    const params = (n.input && n.input.parameters && typeof n.input.parameters === 'object') ? n.input.parameters : {};
+    const model = params.logicalModelId != null ? String(params.logicalModelId).trim() : '';
+    if (GENERATION_IMAGE_TYPES.has(n.nodeType)) {
+      shots.push({ shotId: n.nodeId, kind: 'image', model, count: 1 });
+    } else if (GENERATION_VIDEO_TYPES.has(n.nodeType)) {
+      const d = params.duration;
+      const seconds = (Number.isInteger(d) && d > 0) ? d : 5; // registry UI 默认 5s
+      shots.push({ shotId: n.nodeId, kind: 'video', model, seconds });
+    } else {
+      unmappedGenerationNodes += 1;
+    }
+  }
+  return { shots, generationNodeCount, unmappedGenerationNodes };
+}
+
+/** models 行 → modelId → credit_cost 数字（每任务价；缺价模型不在表内 → unpriced）。 */
+function rowsToUnitPrices(rows) {
+  const prices = {};
+  for (const row of (Array.isArray(rows) ? rows : [])) {
+    const cc = Number(row && row.credit_cost);
+    if (row && row.model_id != null && Number.isFinite(cc)) prices[row.model_id] = cc;
+  }
+  return prices;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // G21 — run events SSE read side.
@@ -409,6 +486,87 @@ function createStudioRunApi(deps) {
     try { await logEvent(pg, { aggregate: 'studio_run', eventType, payload }); } catch (_) {}
   }
 
+  // ── V2.0 must#2 — run 闭包估算 + 预算门 ──────────────────────────────
+
+  /**
+   * 只读解析项目主 canvas 的指定 revision，编译 run 闭包并估算计费 units。
+   * 与引擎 createRunFromCanvas 共用 compileStudioGraph 纯函数（引擎不暴露
+   * compile-only），闭包语义（ALL/SELECTED/FROM_NODE）逐字节一致。本函数
+   * 只读、不加锁 —— 真正的 create 仍在引擎锁定事务内，revision 竞态由引擎
+   * 的 CANVAS_REVISION_STALE 兜底（不建 run）。
+   *
+   * @returns {Promise<{ok:true, canvas, runMode, selectedNodeIds, nodeCount,
+   *   generationNodeCount, unmappedGenerationNodes, shotCount, estimate, shots}
+   *   | {ok:false, error:{code, ...}}>}
+   *   estimate 为 estimateRun 的返回（totalUnits 单位 = budgetEstimate units，
+   *   1 credit = 10000 units）。
+   */
+  async function estimateProjectRunClosure({ projectId, requestedCanvasRevision, runMode = 'ALL', selectedNodeIds = [] }) {
+    const cr = await pg.query(CANVAS_BY_PROJECT_SQL, [projectId]);
+    const canvas = cr && cr.rows && cr.rows[0];
+    if (!canvas) return { ok: false, error: { code: 'CANVAS_NOT_FOUND' } };
+    const canvasRevision = Number(canvas.revision);
+    if (requestedCanvasRevision != null && requestedCanvasRevision !== canvasRevision) {
+      return { ok: false, error: { code: 'CANVAS_REVISION_STALE', canvasId: canvas.id, currentRevision: canvasRevision } };
+    }
+    const [nr, er] = await Promise.all([
+      pg.query(CANVAS_NODES_SQL, [canvas.id]),
+      pg.query(CANVAS_EDGES_SQL, [canvas.id]),
+    ]);
+    const nodes = ((nr && nr.rows) || []).map((r) => ({
+      nodeId: r.node_id, nodeType: r.node_type, nodeSchemaVersion: r.node_schema_version,
+      data: (r.data_json && typeof r.data_json === 'object') ? r.data_json : {},
+    }));
+    const edges = ((er && er.rows) || []).map((r) => ({
+      edgeId: r.edge_id, sourceNodeId: r.source_node_id, sourceHandle: r.source_handle,
+      targetNodeId: r.target_node_id, targetHandle: r.target_handle, edgeType: r.edge_type,
+    }));
+    const compiled = compileStudioGraph({
+      canvasId: canvas.id, canvasRevision, canvasSchemaVersion: Number(canvas.schema_version) || 1,
+      runMode, selectedNodeIds, nodes, edges, maxAttempts: 3,
+    });
+    if (!compiled.ok) return { ok: false, error: { code: compiled.error.code, nodeIds: compiled.error.nodeIds || [] } };
+    const { shots, generationNodeCount, unmappedGenerationNodes } = deriveGenerationShots(compiled.graph);
+    const modelIds = Array.from(new Set(shots.map((s) => s.model).filter(Boolean)));
+    const priceRes = modelIds.length ? await pg.query(MODELS_PRICE_SQL, [modelIds]) : null;
+    const unitPrices = rowsToUnitPrices(priceRes && priceRes.rows);
+    const estimate = estimateRun({ shots, unitPrices, unitsPerCredit: UNITS_PER_CREDIT });
+    return {
+      ok: true,
+      canvas: { id: canvas.id, revision: canvasRevision },
+      runMode,
+      selectedNodeIds,
+      nodeCount: compiled.graph.nodeCount,
+      generationNodeCount,
+      unmappedGenerationNodes,
+      shotCount: shots.length,
+      estimate,
+      shots,
+    };
+  }
+
+  /**
+   * POST create 预算门。返回：
+   *   { policy:'NO_BUDGET' }                         无 project_budgets 行 → 放行
+   *   { policy:'BUDGETED', reason:'IDEMPOTENT_REPLAY' } 同 (canvas,key) 已有 run → 放行（引擎回放）
+   *   { policy:'BUDGETED', reason:'DEFER_ENGINE', deferCode }  快照不可解析/编译失败 → 放行给引擎报错
+   *   { policy:'BUDGETED', blocked:false, estimateUnits, remainingUnits }
+   *   { policy:'BUDGETED', blocked:true,  estimateUnits, remainingUnits }  → 409
+   */
+  async function runBudgetGate({ projectId, canvasId, idempotencyKey, requestedCanvasRevision, runMode, selectedNodeIds }) {
+    const budget = await getBudgetSpent(pg, projectId);
+    if (!budget) return { policy: 'NO_BUDGET' }; // 策略：无预算行 → 不设预算门
+    // 幂等重放：同 (canvas, key) 已建 run 时引擎回放旧 run（不新执行），不拦。
+    const prior = await pg.query(RUN_BY_CANVAS_KEY_SQL, [canvasId, idempotencyKey]);
+    if (prior && prior.rows && prior.rows.length) return { policy: 'BUDGETED', reason: 'IDEMPOTENT_REPLAY' };
+    const est = await estimateProjectRunClosure({ projectId, requestedCanvasRevision, runMode, selectedNodeIds });
+    if (!est.ok) return { policy: 'BUDGETED', reason: 'DEFER_ENGINE', deferCode: est.error.code }; // 引擎 404/409/400，不建 run
+    const remainingUnits = creditsToUnits(budget.remaining, UNITS_PER_CREDIT);
+    const estimateUnits = est.estimate.totalUnits;
+    if (estimateUnits > remainingUnits) return { policy: 'BUDGETED', blocked: true, estimateUnits, remainingUnits };
+    return { policy: 'BUDGETED', blocked: false, estimateUnits, remainingUnits };
+  }
+
   async function handleCreate(req, res, user, projectId) {
     const body = (await parseBody(req)) || {};
     const idempotencyKey = String(body.idempotencyKey || '').trim();
@@ -438,6 +596,29 @@ function createStudioRunApi(deps) {
       canvasId = cr.rows[0] ? cr.rows[0].id : null;
     } finally { client.release(); }
     if (!canvasId) return sendErr(sendJSON, res, 404, 'CANVAS_NOT_FOUND');
+
+    // ── V2.0 must#2 预算前置门 ─────────────────────────────────────────
+    // 项目有 project_budgets 行时：依 run 闭包 GENERATION 节点估算（models
+    // credit_cost 每任务价，单位换算见预算区块头注）→ 估算 > 剩余则 409 且不建
+    // run。无预算行 → NO_BUDGET 放行；快照不可解析/编译失败 → DEFER 引擎报错
+    // （引擎 404/409/400 且不建 run）。预算读取自身故障 → fail-open 放行并告警：
+    // 门是叠加护栏，持久扣减防线仍在 budgetSpentStore.recordSpend，绝不让预算
+    // 读故障把 studio 运行整体打挂。
+    let gate = null;
+    try {
+      gate = await runBudgetGate({
+        projectId, canvasId, idempotencyKey, requestedCanvasRevision,
+        runMode, selectedNodeIds: runMode !== 'ALL' ? selectedNodeIds : [],
+      });
+    } catch (e) {
+      console.error('[studio-runs] budget gate read failed — fail-open create:', e && e.stack);
+    }
+    if (gate && gate.blocked) {
+      return sendErr(sendJSON, res, 409, 'BUDGET_INSUFFICIENT', {
+        estimateUnits: gate.estimateUnits,
+        remainingUnits: gate.remainingUnits,
+      });
+    }
 
     let created;
     try {
@@ -527,6 +708,116 @@ function createStudioRunApi(deps) {
   }
 
   /**
+   * V2.0 must#2 — GET /api/v2/projects/:projectId/studio/runs/estimate
+   * （估算端点，与 create 同鉴权但只读：requireProject 通过即可，无需 owner）。
+   *
+   * 入参（GET，body 或 query 均可，body 优先）：{ runMode?, canvasRevision?,
+   * selectedNodeIds? }。缺省 runMode='ALL'；canvasRevision 缺省用主 canvas
+   * 当前 revision。
+   *
+   * 服务端按闭包真实编译（compileStudioGraph 纯函数，同引擎）估算，不是让前端
+   * 自己算：ALL/SELECTED/FROM_NODE 的闭包语义在服务端逐字节与 create 一致。
+   *
+   * 200 形状：
+   *   { ok, canvas:{id,revision}, run:{runMode,selectedNodeIds,nodeCount,
+   *       generationNodeCount}, estimate:{shotCount,totalUnits,perKind,
+   *       hasUnpriced,unpricedModelIds,breakdown,thresholdUnits,
+   *       needsConfirmation},
+   *     budget:{exists, policy:'BUDGETED'|'NO_BUDGET', budgetUnits,
+   *       spentUnits, remainingUnits, blocked} }
+   *   有预算时 blocked = estimate.totalUnits > remainingUnits（与 create 门同判据）。
+   */
+  async function handleEstimate(req, res, user, projectId) {
+    const body = (await parseBody(req)) || {};
+    const q = (req && req.query) || {};
+    const runMode = String(body.runMode || q.runMode || 'ALL');
+    let requestedCanvasRevision = null;
+    const brv = body.canvasRevision != null ? body.canvasRevision : q.canvasRevision;
+    if (brv != null && brv !== '') requestedCanvasRevision = Number(brv);
+    const rawSelection = Array.isArray(body.selectedNodeIds) ? body.selectedNodeIds : [];
+    const selectedNodeIds = rawSelection.map((s) => String(s).trim()).filter(Boolean).slice(0, runLimits.maxSelectedIds);
+
+    if (!['ALL', 'SELECTED', 'FROM_NODE'].includes(runMode)) return sendErr(sendJSON, res, 400, 'INVALID_RUN_MODE');
+    if (requestedCanvasRevision != null && (!Number.isInteger(requestedCanvasRevision) || requestedCanvasRevision < 1)) {
+      return sendErr(sendJSON, res, 400, 'INVALID_CANVAS_REVISION');
+    }
+    if (runMode !== 'ALL' && !selectedNodeIds.length) return sendErr(sendJSON, res, 400, 'INVALID_SELECTION');
+
+    const client = await pg.connect();
+    let access = null;
+    try {
+      access = await requireProject(client, res, user, projectId);
+      if (!access) return;
+    } finally { client.release(); }
+
+    let est;
+    try {
+      est = await estimateProjectRunClosure({ projectId, requestedCanvasRevision, runMode, selectedNodeIds });
+    } catch (e) {
+      console.error('[studio-runs] estimate failed:', e && e.stack);
+      throw e; // 兜底 500（handle 顶层）
+    }
+    if (!est.ok) {
+      if (est.error.code === 'CANVAS_NOT_FOUND') return sendErr(sendJSON, res, 404, 'CANVAS_NOT_FOUND');
+      if (est.error.code === 'CANVAS_REVISION_STALE') {
+        return sendErr(sendJSON, res, 409, 'CANVAS_REVISION_STALE', {
+          canvasId: est.error.canvasId, serverRevision: est.error.currentRevision, requestedRevision: requestedCanvasRevision,
+        });
+      }
+      return sendErr(sendJSON, res, 400, est.error.code, { nodeIds: est.error.nodeIds || [] });
+    }
+
+    const budget = await getBudgetSpent(pg, projectId);
+    const unpricedModelIds = [];
+    est.estimate.breakdown.forEach((b, i) => { if (b.unpriced) unpricedModelIds.push(est.shots[i] && est.shots[i].model); });
+    const breakdown = est.estimate.breakdown.map((b, i) => {
+      const s = est.shots[i] || {};
+      const out = { ...b };
+      if (s.seconds != null) out.seconds = s.seconds;
+      if (s.count != null) out.count = s.count;
+      return out;
+    });
+
+    const estimate = {
+      shotCount: est.shotCount,
+      totalUnits: est.estimate.totalUnits,
+      perKind: est.estimate.perKind,
+      hasUnpriced: est.estimate.hasUnpriced,
+      unpricedModelIds: Array.from(new Set(unpricedModelIds.filter(Boolean))),
+      breakdown,
+      thresholdUnits: est.estimate.thresholdUnits,
+      needsConfirmation: est.estimate.needsConfirmation,
+    };
+
+    if (!budget) {
+      return sendJSON(res, 200, {
+        ok: true,
+        canvas: est.canvas,
+        run: { runMode, selectedNodeIds, nodeCount: est.nodeCount, generationNodeCount: est.generationNodeCount },
+        estimate,
+        budget: { exists: false, policy: 'NO_BUDGET' },
+      });
+    }
+    const budgetUnits = creditsToUnits(budget.budget, UNITS_PER_CREDIT);
+    const spentUnits = creditsToUnits(budget.spent, UNITS_PER_CREDIT);
+    const remainingUnits = creditsToUnits(budget.remaining, UNITS_PER_CREDIT);
+    return sendJSON(res, 200, {
+      ok: true,
+      canvas: est.canvas,
+      run: { runMode, selectedNodeIds, nodeCount: est.nodeCount, generationNodeCount: est.generationNodeCount },
+      estimate,
+      budget: {
+        exists: true,
+        policy: 'BUDGETED',
+        budgetUnits,
+        spentUnits,
+        remainingUnits,
+        blocked: est.estimate.totalUnits > remainingUnits,
+      },
+    });
+  }
+
+  /**
    * G21 — run events SSE. Mount point is wired by server.js/dispatcher; this is
    * the handler that owns authorization (no dispatcher role gate for SSE).
    * `user` may be pre-resolved by the caller; otherwise resolved from the
@@ -558,6 +849,7 @@ function createStudioRunApi(deps) {
         await handleRunEventsSse(req, res, { runId, user });
         return true;
       }
+      if (runId && !seg2 && method === 'GET' && runId === 'estimate') return await handleEstimate(req, res, user, projectId), true;
       if (runId && !seg2 && method === 'GET') return await handleGet(req, res, user, projectId, runId), true;
       if (runId && seg2 === 'cancel' && method === 'POST') return await handleCancel(req, res, user, projectId, runId), true;
       return sendJSON(res, 404, { ok: false, error: 'Not Found' }), true;

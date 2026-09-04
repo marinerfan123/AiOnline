@@ -6,7 +6,8 @@
  * （buildStoryboardPlan 的 { beats, totalShots } 输出，单一真源）逐 beat.shot 落为
  * project_shots_rows（迁移 0045）行。端点挂载（鉴权/角色）由主线在 server.js 完成；
  * 本模块是纯 DB 服务，返回 { ok, ... }，HTTP 语义以 status 字段表达：
- *   200 → { ok:true, projectId, scriptId, version, inserted, replaced, skippedLocked }
+ *   200 → { ok:true, projectId, scriptId, version, inserted, replaced, skippedLocked,
+ *           fingerprint }        （fingerprint = 本次 apply 落行的计划指纹）
  *   400 → { ok:false, status:400, errors:[...] }          （入参/计划形状非法）
  *   404 → { ok:false, status:404, error }                 （项目或 script 不属于该项目）
  *   DB 异常原样抛出（已回滚）。
@@ -28,11 +29,22 @@
  * 本次 plan。locked=true 的行保留（DELETE 不命中、覆写被跳过），replaced 与
  * inserted 计数均不含它们，persist 返回 skippedLocked=[锁定 shot_id 列表]。
  *
+ * ── 计划指纹 / 脏标记（迁移 0054，三视图叶 2）────────────────────
+ * persistStoryboardShots 每次 apply 用 computePlanFingerprint(plan)（稳定指纹：
+ * sha256(行数+每 shot{shotId,scene,beat,kind,intent,durationMs}+scriptRowIds 序) hex 前 16）
+ * 写入每行 plan_fingerprint，新行 dirty=false。markDirty({pg,projectId,scriptId}) 把某
+ * (project, script) 的全部持久化计划行标 dirty=true —— 调用点：scriptApi rows 写
+ * （POST/PATCH/PUT order/DELETE）之后（scriptApi.cjs；本叶不接线 scriptApi，仅导出服务，
+ * 接线见后续叶）。dirty=true 行存在 ⇒ 该 script 持久化计划落后于 script_rows（STALE），
+ * 下次成功 apply 落新行即清。跨项目/无行 → 0 行 → 404。
+ *
  * ── 事务 ───────────────────────────────────────────────────────────────
  * pg.connect 存在时（node-postgres Pool/Client）取专属 client，BEGIN…COMMIT/
  * ROLLBACK 并 release；否则退回在 pg 上直接执行（与 scriptApi PUT /order 同款
  * 约定）—— 生产挂载请传暴露 connect() 的 pg，保证 DELETE+INSERT 原子。
  */
+
+const crypto = require('crypto');
 
 const INTENTS = new Set(['dialogue', 'reaction', 'action']); // G13 S2/S3 intent 枚举
 // 事务级咨询锁：串行化同一 (project_id, script_id) 的并发 apply。MAX(version)+1 是
@@ -53,8 +65,8 @@ const INSERT_SHOT_SQL =
   `INSERT INTO project_shots_rows
      (project_id, script_id, shot_id, beat_id, scene_index, beat_index,
       shot_index, kind, intent, subject_refs, duration_ms, ordering, version,
-      locked, source_trace)
-   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`;
+      locked, source_trace, plan_fingerprint, dirty)
+   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`;
 // 锁定/解锁（lockShot/lockShots/setLocked）：按 (project_id, script_id, shot_id)
 // 作用域更新 locked —— 跨项目/不存在 → 0 行 → 404。
 const SET_LOCKED_SQL =
@@ -65,6 +77,11 @@ const SET_LOCKED_BATCH_SQL =
   `UPDATE project_shots_rows SET locked = $4, updated_at = NOW()
    WHERE script_id = $1 AND project_id = $2 AND shot_id = ANY($3::text[])
    RETURNING shot_id`;
+// markDirty（0054）：script_rows 写后由 scriptApi 调（本叶只导出服务不接线），
+// 把该 (project, script) 全部持久化计划行标 dirty=true；0 行 → 404。单条 UPDATE 原子。
+const MARK_DIRTY_SQL =
+  `UPDATE project_shots_rows SET dirty = true, updated_at = NOW()
+   WHERE script_id = $1 AND project_id = $2`;
 // 不可变时间戳语义：appliedAtMs 固定值，apply 输出确定（不随系统时钟漂移）。
 const APPLIED_AT_MS = 0;
 
@@ -150,10 +167,60 @@ function validatePersistArgs({ pg, projectId, scriptId, plan }) {
 }
 
 /**
+ * 稳定计划指纹 —— sha256 hex 前 16。输入 = plan 的“持久化有效结构”：行数（总 shot 行）
+ * + 每 shot {shotId, scene(beat.sceneIndex), beat(beatId), kind, intent, durationMs}
+ * （扁平序）+ 每 beat scriptRowIds 有序拼接。kind/durationMs 归一化与 buildShotRows
+ * 完全一致（缺省 'standard' / 3000），保证指纹 == 落行内容的指纹。
+ *
+ * 稳定性：序列化按数组序（join 分隔符用不可见控制符），不依赖对象键序/字段顺序；
+ * 不含 summary/camera/subjectRefs 等非持久化或纯文本字段 —— 只追踪会落库的结构。
+ * 确定性：同输入恒同值；任一参与字段/顺序/数量/refs 变化 → sha256 全位雪崩（几乎
+ * 必然变值）。纯函数，无 I/O。用途：persist 落库 plan_fingerprint，之后与实时重算
+ * plan 的指纹比对即知“持久化计划是否落后于 script_rows”（三视图 STALE 检测）。
+ * @throws {TypeError} plan 形状非 { beats } 时抛错（持久化路径已先过 400 校验）。
+ */
+function computePlanFingerprint(plan) {
+  if (plan == null || typeof plan !== 'object' || Array.isArray(plan) || !Array.isArray(plan.beats)) {
+    throw new TypeError('plan object { beats } required');
+  }
+  const FIELD_SEP = '\u0001'; // 字段分隔 —— 用户内容可含 '|'/'\n'，控制符消除歧义
+  const REF_SEP = '\u0002';   // refs 数组内分隔
+  const parts = [];
+  let shotCount = 0;
+  for (const beat of plan.beats) {
+    if (beat == null || typeof beat !== 'object' || Array.isArray(beat)) {
+      throw new TypeError('plan.beats entries must be beat objects');
+    }
+    const shots = Array.isArray(beat.shots) ? beat.shots : [];
+    shotCount += shots.length;
+    for (const shot of shots) {
+      const kind = (shot && typeof shot.kind === 'string' && shot.kind !== '') ? shot.kind : 'standard';
+      const durationMs = (shot && Number.isInteger(shot.durationMs)) ? shot.durationMs : 3000;
+      parts.push([
+        's',
+        shot && typeof shot.shotId === 'string' ? shot.shotId : '',
+        String(beat.sceneIndex),
+        (shot && typeof shot.beatId === 'string' && shot.beatId !== '')
+          ? shot.beatId
+          : (typeof beat.beatId === 'string' ? beat.beatId : ''),
+        kind,
+        shot && typeof shot.intent === 'string' ? shot.intent : '',
+        String(durationMs),
+      ].join(FIELD_SEP));
+    }
+    const refs = Array.isArray(beat.scriptRowIds) ? beat.scriptRowIds.map((r) => String(r)) : [];
+    parts.push(`r${FIELD_SEP}${refs.join(REF_SEP)}`);
+  }
+  const payload = [`n${FIELD_SEP}${shotCount}`, ...parts].join('\n');
+  return crypto.createHash('sha256').update(payload, 'utf8').digest('hex').slice(0, 16);
+}
+
+/**
  * 纯函数：把 plan 拍平成 project_shots_rows 的 INSERT 参数行。
  * ordering = 全 script 扁平序（按 beats 数组序 × shots 数组序，0..N-1）。
+ * planFingerprint（0054）：本次 apply 的计划指纹，逐行冗余落列；新行恒 dirty=false。
  */
-function buildShotRows({ plan, projectId, scriptId, version }) {
+function buildShotRows({ plan, projectId, scriptId, version, planFingerprint = null }) {
   const rows = [];
   let ordering = 0;
   for (const beat of plan.beats) {
@@ -175,6 +242,8 @@ function buildShotRows({ plan, projectId, scriptId, version }) {
         duration_ms: durationMs,
         ordering,
         version,
+        plan_fingerprint: planFingerprint,
+        dirty: false, // 新行恒 clean —— dirty 只由 markDirty 置位，apply 落新行即清
         locked: false, // 新行恒为未锁定；锁定只经 lockShot/lockShots 置位
         source_trace: {
           scriptRowIds: beat.scriptRowIds,
@@ -216,6 +285,8 @@ async function persistStoryboardShots({ pg, projectId, scriptId, plan }) {
   const check = validatePersistArgs({ pg, projectId, scriptId, plan });
   if (!check.ok) return check;
   const { refs } = check;
+  // 0054：本次 apply 的计划指纹 —— 形状已 400 校验，computePlanFingerprint 必然可算。
+  const fingerprint = computePlanFingerprint(plan);
 
   let result;
   try {
@@ -244,7 +315,7 @@ async function persistStoryboardShots({ pg, projectId, scriptId, plan }) {
     const replaced = del && Number.isInteger(del.rowCount) ? del.rowCount : 0;
 
     // 覆写跳过 locked shot_id（其行保留），inserted / replaced 均不含它们。
-    const rows = buildShotRows({ plan, projectId, scriptId, version })
+    const rows = buildShotRows({ plan, projectId, scriptId, version, planFingerprint: fingerprint })
       .filter((row) => !lockedSet.has(row.shot_id));
     for (const row of rows) {
       await q.query(INSERT_SHOT_SQL, [
@@ -253,9 +324,10 @@ async function persistStoryboardShots({ pg, projectId, scriptId, plan }) {
         row.intent, JSON.stringify(row.subject_refs), row.duration_ms,
         row.ordering, row.version, row.locked,
         JSON.stringify(row.source_trace),
+        row.plan_fingerprint, row.dirty,
       ]);
     }
-    return { ok: true, projectId, scriptId, version, inserted: rows.length, replaced, skippedLocked };
+    return { ok: true, projectId, scriptId, version, inserted: rows.length, replaced, skippedLocked, fingerprint };
     });
   } catch (e) {
     if (e && Number.isInteger(e.status)) return { ok: false, status: e.status, error: e.message };
@@ -302,12 +374,40 @@ async function lockShots({ pg, projectId, scriptId, shotIds, locked }) {
   return { ok: true, projectId, scriptId, updated, locked };
 }
 
+/**
+ * 把 (project, script) 的全部持久化计划行标 dirty=true（0054）。
+ *
+ * 调用点：scriptApi rows 写 —— POST /rows 批量、PATCH /rows/:id、PUT /order、
+ * DELETE /rows/:id —— 成功后都应调用 markDirty，使“该 script 持久化计划落后于
+ * script_rows”可被查询（dirty=true 行存在 ⇒ STALE）。本叶不接线 scriptApi.cjs
+ * （scriptApi 属另一叶），此处只导出服务并注明调用点。
+ *
+ * 作用域按 (project_id, script_id) —— 只置位本 script 行，他项目/他 script 不动。
+ * 0 行（项目不存在 / script 从未 apply 无计划行 / script 属他项目）→ 404，
+ * 与 setLocked 同款约定。
+ * @returns { ok:true, projectId, scriptId, updated }
+ *        | { ok:false, status:404, error } | { ok:false, status:400, errors }
+ */
+async function markDirty({ pg, projectId, scriptId }) {
+  if (!pg || typeof pg.query !== 'function') return { ok: false, status: 400, errors: ['pg (query) required'] };
+  if (!isNonEmptyString(projectId)) return { ok: false, status: 400, errors: ['projectId must be a non-empty string'] };
+  if (!isNonEmptyString(scriptId)) return { ok: false, status: 400, errors: ['scriptId must be a non-empty string'] };
+  const r = await pg.query(MARK_DIRTY_SQL, [scriptId, projectId]);
+  const updated = Number.isInteger(r.rowCount) ? r.rowCount : ((r.rows && r.rows.length) || 0);
+  if (updated === 0) {
+    return { ok: false, status: 404, error: 'script 不存在或不属于该项目' };
+  }
+  return { ok: true, projectId, scriptId, updated };
+}
+
 module.exports = {
   persistStoryboardShots,
+  computePlanFingerprint,
+  markDirty,
   validatePersistArgs,
   buildShotRows,
   setLocked,
   lockShot,
   lockShots,
-  SQL: { LOCK_SQL, OWNER_PROJECT_SQL, OWNER_ROWS_SQL, MAX_VERSION_SQL, LOCKED_SHOT_IDS_SQL, DELETE_UNLOCKED_SQL, INSERT_SHOT_SQL, SET_LOCKED_SQL, SET_LOCKED_BATCH_SQL },
+  SQL: { LOCK_SQL, OWNER_PROJECT_SQL, OWNER_ROWS_SQL, MAX_VERSION_SQL, LOCKED_SHOT_IDS_SQL, DELETE_UNLOCKED_SQL, INSERT_SHOT_SQL, SET_LOCKED_SQL, SET_LOCKED_BATCH_SQL, MARK_DIRTY_SQL },
 };

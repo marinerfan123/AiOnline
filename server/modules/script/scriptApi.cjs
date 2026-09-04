@@ -24,6 +24,26 @@
  *          persistStoryboardShots; the request body is ignored (empty OK), so
  *          a client can never forge persisted beats/shots. rows 空 → 400.
  *          Success 200 { ok:true, applied:{ version, shotCount, replaced } }.
+ *   POST   /api/v2/script/:scriptId/storyboard/batch  (or
+ *          /api/v2/script/storyboard/batch?scriptId=) V2.0 must#4 — enqueue an
+ *          image_gen BATCH for the storyboard plan. Same dual spelling, same
+ *          write gate (owner/editor) as apply, body ignored: the plan is
+ *          recomputed server-side (rows → buildStoryboardPlan → beats →
+ *          storyboardBatchPlan) and every shot lacking a produced image is
+ *          enqueued via batchTaskStore.createBatch. rows 空 / 计划空 → 400.
+ *          Success 200 { ok:true, batchId, enqueued, total }.
+ *   GET    /api/v2/script/storyboard/batches/:batchId   batch view (tasks +
+ *          progress). Read follows GET /rows (viewer may read).
+ *   POST   /api/v2/script/storyboard/batches/:batchId/retry-failed   batch-wide
+ *          retry: resets every FAILED task with attempt < max_attempts →
+ *          200 { ok:true, reset }.
+ *   POST   /api/v2/script/storyboard/batches/:batchId/tasks/:taskId/retry
+ *          single-task retry (only FAILED && attempt < max_attempts) →
+ *          200 { ok:true, reset:1 }; non-retryable → 409; missing → 404.
+ *   Batch rows (0051) carry no project_id — project isolation of batch
+ *   resource routes rests on the same requireProject membership gate every
+ *   sibling route uses (batchId is an unguessable bt-UUID minted only for the
+ *   requesting project's script).
  * Rows carry integer-ms timing only (Blueprint hard rule). Speaker enforced for
  * dialogue by validateScriptRow.
  */
@@ -31,48 +51,112 @@ const crypto = require('crypto');
 const { validateScriptRow, buildSceneRows, normalizeContinuityNotes } = require('./scriptModel.cjs');
 const { buildStoryboardPlan } = require('./storyboardPlan.cjs');
 const { persistStoryboardShots } = require('./storyboardShots.cjs');
+const { storyboardBatchPlan } = require('./storyboardBatchPlan.cjs');
+const { createBatchTaskStore } = require('./batchTaskStore.cjs');
 
 /**
- * Match the storyboard routes on a scriptApi URL. Two spellings are accepted
- * for each (same handler, same semantics):
- *   A) /api/v2/script/:scriptId/storyboard[/apply]  — scriptId in the path
- *   B) /api/v2/script/storyboard[/apply]?scriptId=… — scriptId in params/query
+ * Match the storyboard routes on a scriptApi URL. Accepted spellings
+ * (same handler, same semantics for the scriptId-carrying ones):
+ *   A) /api/v2/script/:scriptId/storyboard[/apply|/batch]  — scriptId in path
+ *   B) /api/v2/script/storyboard[/apply|/batch]?scriptId=… — scriptId in query
+ *   C) /api/v2/script/storyboard/batches/:batchId[/
+ *         retry-failed | tasks/:taskId/retry]              — batch resource
  * (projectId is always supplied the way sibling rows routes receive it — from
  * the query string via req.params, project-bound SQL does the ownership.)
- * Returns { scriptId, apply } when the URL is a storyboard route — apply:true
- * for the POST persist endpoint (…/storyboard/apply), apply:false for the GET
- * plan view (…/storyboard). scriptId may be null when spelling B omits it (the
- * handler then 400s), else null for any other URL.
- * The 'rows' / 'order' prefixes are reserved by the CRUD routes, so
- * /api/v2/script/rows/storyboard stays a rows/:id GET, never a plan view.
+ * Returns null when the URL is not a storyboard route. Success shape:
+ *   { kind, method, scriptId?, batchId?, taskId? } where kind ∈
+ *   'plan' (GET plan view), 'apply' (POST persist), 'createBatch'
+ *   (POST enqueue), 'listBatch' (GET), 'retryBatch' (POST),
+ *   'retryTask' (POST). scriptId may be null when spelling B omits it (the
+ *   handler then 400s). The 'rows' / 'order' prefixes are reserved by the CRUD
+ *   routes, so /api/v2/script/rows/storyboard… stays a rows route, never a
+ *   storyboard view/action.
  */
+function decodeSegment(raw) {
+  try { return decodeURIComponent(raw); } catch (_) { return null; }
+}
+
+function scriptIdFromParams(params) {
+  const sid = params && typeof params.scriptId === 'string' ? params.scriptId.trim() : '';
+  return sid !== '' ? sid : null;
+}
+
 function matchStoryboardRoute(urlPath, params) {
-  // POST persist form: /api/v2/script/storyboard/apply[?scriptId=…]
-  if (urlPath === '/api/v2/script/storyboard/apply') {
-    const sid = params && typeof params.scriptId === 'string' ? params.scriptId.trim() : '';
-    return { scriptId: sid !== '' ? sid : null, apply: true };
-  }
-  const am = /^\/api\/v2\/script\/([^/]+)\/storyboard\/apply$/.exec(urlPath);
-  if (am && am[1] !== 'rows' && am[1] !== 'order') {
-    let sid = null;
-    try { sid = decodeURIComponent(am[1]); } catch (e) { sid = null; }
-    return { scriptId: sid, apply: true };
-  }
-  // GET plan-view form: /api/v2/script/storyboard[?scriptId=…]
+  const sidParam = scriptIdFromParams(params);
+  // B) query-form plan view / apply / batch create — scriptId lives in params.
   if (urlPath === '/api/v2/script/storyboard') {
-    const sid = params && typeof params.scriptId === 'string' ? params.scriptId.trim() : '';
-    return { scriptId: sid !== '' ? sid : null, apply: false };
+    return { kind: 'plan', method: 'GET', scriptId: sidParam };
   }
-  const sm = /^\/api\/v2\/script\/([^/]+)\/storyboard$/.exec(urlPath);
-  if (sm && sm[1] !== 'rows' && sm[1] !== 'order') {
-    let sid = null;
-    try { sid = decodeURIComponent(sm[1]); } catch (e) { sid = null; }
-    return { scriptId: sid, apply: false };
+  if (urlPath === '/api/v2/script/storyboard/apply') {
+    return { kind: 'apply', method: 'POST', scriptId: sidParam };
+  }
+  if (urlPath === '/api/v2/script/storyboard/batch') {
+    return { kind: 'createBatch', method: 'POST', scriptId: sidParam };
+  }
+  // A) path-form plan view / apply / batch create — :scriptId segment in path.
+  const pm = /^\/api\/v2\/script\/([^/]+)\/storyboard(?:\/(apply|batch))?$/.exec(urlPath);
+  if (pm && pm[1] !== 'rows' && pm[1] !== 'order') {
+    const sid = decodeSegment(pm[1]);
+    const verb = pm[2];
+    if (verb === 'apply') return { kind: 'apply', method: 'POST', scriptId: sid };
+    if (verb === 'batch') return { kind: 'createBatch', method: 'POST', scriptId: sid };
+    return { kind: 'plan', method: 'GET', scriptId: sid };
+  }
+  // C) batch resource subtree (0051 storyboard_batch_tasks).
+  const listM = /^\/api\/v2\/script\/storyboard\/batches\/([^/]+)$/.exec(urlPath);
+  if (listM) {
+    const bid = decodeSegment(listM[1]);
+    return bid ? { kind: 'listBatch', method: 'GET', batchId: bid } : { kind: 'badBatchId', method: 'GET' };
+  }
+  const retryM = /^\/api\/v2\/script\/storyboard\/batches\/([^/]+)\/retry-failed$/.exec(urlPath);
+  if (retryM) {
+    const bid = decodeSegment(retryM[1]);
+    return bid ? { kind: 'retryBatch', method: 'POST', batchId: bid } : { kind: 'badBatchId', method: 'POST' };
+  }
+  const taskM = /^\/api\/v2\/script\/storyboard\/batches\/([^/]+)\/tasks\/([^/]+)\/retry$/.exec(urlPath);
+  if (taskM) {
+    const bid = decodeSegment(taskM[1]);
+    const tid = decodeSegment(taskM[2]);
+    if (!bid || !tid) return { kind: 'badBatchId', method: 'POST' };
+    return { kind: 'retryTask', method: 'POST', batchId: bid, taskId: tid };
   }
   return null;
 }
 
+// 单任务重试（store 无此原语；retryFailed 只按 batch 复位，markTask 受终态锁
+// 约束无法 FAILED→QUEUED，故路由层直接发这条带守卫的 UPDATE——与 0051 状态机
+// 一致：仅 status=FAILED 且 attempt < max_attempts 的行被复位为 QUEUED）。
+const RETRY_TASK_SQL = `
+UPDATE storyboard_batch_tasks
+   SET status = 'QUEUED', attempt = attempt + 1, result_ref = NULL,
+       error = NULL, updated_at = NOW()
+ WHERE batch_id = $1 AND task_id = $2 AND status = 'FAILED'
+   AND attempt < max_attempts
+ RETURNING task_id`;
+// UPDATE 0 行时的回查：区分「任务不存在」(404) 与「存在但不可重试」(409)。
+const READ_TASK_SQL = `
+SELECT status, attempt, max_attempts FROM storyboard_batch_tasks
+ WHERE batch_id = $1 AND task_id = $2`;
+
 function createScriptApi({ pg, sessionUser, sendJSON, parseBody }) {
+  // Batch store (0051): one instance per API — createBatch/listTasks/markTask/
+  // retryFailed/progress all hit the same injected pg the rows CRUD uses.
+  const batchStore = createBatchTaskStore({ pg });
+
+  // GET …/batches/:batchId → tasks keep the documented public shape only.
+  function publicTask(t) {
+    return {
+      taskId: t.taskId,
+      shotId: t.shotId,
+      kind: t.kind,
+      status: t.status,
+      attempt: t.attempt,
+      maxAttempts: t.maxAttempts,
+      resultRef: t.resultRef,
+      error: t.error,
+    };
+  }
+
   function requireUser(req, res) {
     const user = sessionUser ? sessionUser(req) : null;
     if (!user) { sendJSON(res, 401, { ok: false, error: '未登录' }); return null; }
@@ -95,12 +179,49 @@ function createScriptApi({ pg, sessionUser, sendJSON, parseBody }) {
     return { ...r.rows[0], role: m.rows[0].role };
   }
 
+  // Batch existence guard shared by GET …/batches/:batchId and
+  // POST …/batches/:batchId/retry-failed. 0051 rows carry no project_id, so an
+  // unknown/foreign batchId surfaces here as 404 (ids are unguessable bt-UUIDs
+  // minted by createBatch for the requesting project's own script).
+  async function loadBatchOr404(res2, batchId) {
+    await batchStore.ensureSchema();
+    const listed = await batchStore.listTasks(batchId);
+    const tasks = listed && listed.ok === true ? listed.tasks : [];
+    if (tasks.length === 0) {
+      sendJSON(res2, 404, { ok: false, error: '批次不存在' });
+      return null;
+    }
+    return tasks;
+  }
+
+  // POST …/batches/:batchId/tasks/:taskId/retry — single-task partial retry.
+  // Only a FAILED row with attempt < max_attempts may be reset to QUEUED
+  // (attempt+1, result_ref/error cleared). Rejected otherwise: 404 when the
+  // task is unknown, 409 when it exists but is not retryable.
+  async function handleRetryTask(res2, batchId, taskId) {
+    await batchStore.ensureSchema();
+    const r = await pg.query(RETRY_TASK_SQL, [batchId, taskId]);
+    if (r && Number(r.rowCount) > 0) {
+      return sendJSON(res2, 200, { ok: true, reset: Number(r.rowCount) });
+    }
+    const cur = await pg.query(READ_TASK_SQL, [batchId, taskId]);
+    const row = cur && cur.rows && cur.rows[0];
+    if (!row) return sendJSON(res2, 404, { ok: false, error: '任务不存在或不属于该批次' });
+    const attempt = Number(row.attempt);
+    const max = Number(row.max_attempts);
+    const why = row.status === 'FAILED' && attempt >= max
+      ? `任务已 FAILED 且 attempt ${attempt} 已达上限 ${max}，不可再重试`
+      : `任务状态 ${row.status} 非 FAILED，不可单任务重试`;
+    return sendJSON(res2, 409, { ok: false, error: why });
+  }
+
   async function handle(req, res, urlPath, method) {
-    // Storyboard routes — GET …/storyboard (plan view) and POST …/storyboard/apply
-    // (persist). Each route answers exactly one method; anything else falls
-    // through unhandled (false) to the outer router.
+    // Storyboard routes — GET …/storyboard (plan view), POST …/storyboard/apply
+    // (persist), POST …/storyboard/batch (enqueue) and the batch resource
+    // subtree …/storyboard/batches/:batchId[…]. Each route answers exactly one
+    // method; anything else falls through unhandled (false) to the outer router.
     const storyboard = matchStoryboardRoute(urlPath, req.params || {});
-    if (storyboard && method !== (storyboard.apply ? 'POST' : 'GET')) return false;
+    if (storyboard && method !== storyboard.method) return false;
     const m = urlPath.match(/^\/api\/v2\/script\/rows(?:\/([^/]+))?$/) || urlPath.match(/^\/api\/v2\/script\/order$/);
     if (!m && !storyboard) return false;
     const isOrder = urlPath === '/api/v2/script/order';
@@ -172,8 +293,36 @@ function createScriptApi({ pg, sessionUser, sendJSON, parseBody }) {
     // included). POST …/storyboard/apply — persist: recomputes the SAME
     // server-side plan (rows → buildStoryboardPlan → persistStoryboardShots)
     // and never trusts a client-supplied body, so persisted shots can't be
-    // forged or point at rows outside this project.
+    // forged or point at rows outside this project. POST …/storyboard/batch —
+    // enqueue: same server-side plan, then storyboardBatchPlan turns every
+    // shot missing a produced image into one image_gen task row (0051).
     if (storyboard) {
+      // ── Batch resource subtree (no scriptId in URL; batchId is a bt-UUID
+      // minted by this API for the requesting project's script). ──
+      if (storyboard.kind === 'badBatchId') {
+        return sendJSON(res, 400, { ok: false, error: '批次/任务 ID 无效' });
+      }
+      if (storyboard.kind === 'listBatch'
+        || storyboard.kind === 'retryBatch'
+        || storyboard.kind === 'retryTask') {
+        if (storyboard.kind === 'retryTask') return handleRetryTask(res, storyboard.batchId, storyboard.taskId);
+        const tasks = await loadBatchOr404(res, storyboard.batchId);
+        if (!tasks) return true; // 404 sent
+        if (storyboard.kind === 'retryBatch') {
+          const r = await batchStore.retryFailed(storyboard.batchId);
+          return sendJSON(res, 200, { ok: true, reset: r && r.ok === true ? r.reset : 0 });
+        }
+        const p = await batchStore.progress(storyboard.batchId);
+        const progress = p && p.ok === true
+          ? { total: p.total, byStatus: p.byStatus }
+          : { total: tasks.length, byStatus: {} };
+        return sendJSON(res, 200, {
+          ok: true,
+          batchId: storyboard.batchId,
+          tasks: tasks.map(publicTask),
+          progress,
+        });
+      }
       const scriptId = storyboard.scriptId;
       if (!scriptId) return sendJSON(res, 400, { ok: false, error: 'scriptId 必填' });
       const ctx = await loadStoryboardContext(res, projectId);
@@ -189,7 +338,38 @@ function createScriptApi({ pg, sessionUser, sendJSON, parseBody }) {
           errors: plan && Array.isArray(plan.errors) ? plan.errors : ['计划构建失败：脚本行不满足模型校验'],
         });
       }
-      if (storyboard.apply) {
+      if (storyboard.kind === 'createBatch') {
+        // shotImagesByShotId: 当前没有"已产出图"注册表（迁移 0001–0052 无
+        // shot→produced-image 表）——传空查找即每个计划 shot 都入队；执行引擎
+        // 经 result_ref 记录产出后，后续叶子可接入真实查找让已产出 shot 跳过。
+        const bp = storyboardBatchPlan({ beats: plan.beats, shotImagesByShotId: {} });
+        if (!bp || bp.ok !== true || !Array.isArray(bp.tasks)) {
+          return sendJSON(res, 400, {
+            ok: false,
+            error: '批次计划构建失败',
+            errors: bp && Array.isArray(bp.errors) ? bp.errors : undefined,
+          });
+        }
+        if (bp.tasks.length === 0) {
+          return sendJSON(res, 400, { ok: false, error: '计划为空：无待生成的镜头任务（空计划）' });
+        }
+        const created = await batchStore.createBatch({ scriptId, tasks: bp.tasks });
+        if (!created || created.ok !== true) {
+          const e = created && created.error;
+          const reason = e && typeof e.message === 'string'
+            ? e.message
+            : (e && typeof e.code === 'string' ? e.code : '批次创建失败');
+          return sendJSON(res, 500, { ok: false, error: reason });
+        }
+        const total = bp.counts && Number.isInteger(bp.counts.total) ? bp.counts.total : bp.tasks.length;
+        return sendJSON(res, 200, {
+          ok: true,
+          batchId: created.batchId,
+          enqueued: created.enqueued,
+          total,
+        });
+      }
+      if (storyboard.kind === 'apply') {
         const persisted = await persistStoryboardShots({ pg, projectId, scriptId, plan });
         if (!persisted || persisted.ok !== true) {
           const status = persisted && Number.isInteger(persisted.status) ? persisted.status : 400;
@@ -336,7 +516,7 @@ function createScriptApi({ pg, sessionUser, sendJSON, parseBody }) {
     return false;
   }
 
-  return { handle };
+  return { handle, batchStore };
 }
 
 module.exports = { createScriptApi };

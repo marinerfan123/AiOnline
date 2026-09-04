@@ -31,25 +31,32 @@ function mkEdge(id, source, target) {
   return { edgeId: id, sourceNodeId: source, sourceHandle: null, targetNodeId: target, targetHandle: null,
     edgeType: 'data', data: {} };
 }
+/** 绑定节点: data 顶层携带权威 shotId / structureNodeId(与 durableNodeData 持久化键一致)。 */
+function mkBoundNode(id, { shotId = null, structureNodeId = null, nodeType = 'storyboard' } = {}, x = 30, y = 40) {
+  return { nodeId: id, nodeType, nodeSchemaVersion: 1, position: { x, y }, width: 260, height: 120,
+    data: { nodeKind: nodeType, schemaVersion: 1, title: `T-${id}`, status: 'IDLE', parameters: {}, shotId, structureNodeId } };
+}
 
 /** 建画布域假数据库。 */
 function createCanvasDb(seed = {}) {
   const projectId = seed.projectId || 'prj-1';
   const canvasId = seed.canvasId || 'canvas-1';
   let revision = seed.revision === undefined ? 1 : seed.revision;
-  const canvases = [{ id: canvasId, project_id: projectId, workspace_id: 'ws-1', name: 'Primary Canvas',
+  let canvases = [{ id: canvasId, project_id: projectId, workspace_id: 'ws-1', name: 'Primary Canvas',
     revision, schema_version: 1, viewport_json: null, created_by: 'u-42', updated_by: 'u-42',
     created_at: new Date('2026-01-01T00:00:00Z'), updated_at: new Date('2026-01-01T00:00:00Z'),
     archived_at: null, restored_from_version_id: null }];
   const projects = [{ id: projectId, workspace_id: 'ws-1', status: 'active', owner_id: 'u-1' }];
   const memberships = [{ workspace_id: 'ws-1', user_id: USER.id, role: 'owner' }];
   const membershipsAll = seed.memberships || memberships;
-  const nodesByCanvas = new Map();   // canvasId -> Map<node_id, row>
-  const edgesByCanvas = new Map();   // canvasId -> Map<edge_id, row>
-  const mutations = [];              // studio_canvas_mutations rows
-  const logByCanvas = new Map();     // canvasId -> Map<command_id, row>
+  let nodesByCanvas = new Map();   // canvasId -> Map<node_id, row>
+  let edgesByCanvas = new Map();   // canvasId -> Map<edge_id, row>
+  let mutations = [];              // studio_canvas_mutations rows
+  let logByCanvas = new Map();     // canvasId -> Map<command_id, row>
   let logSeq = 0;                    // canvas_command_log 全局序列(BIGSERIAL)
   let insertAttempts = 0;            // INSERT INTO canvas_command_log 尝试次数
+  const shotIds = seed.shotIds || [];          // 权威执行 shot(shots.id, 项目域)
+  const structureNodeIds = seed.structureNodeIds || []; // 权威结构节点(project_structure_nodes.id)
   const canvasRow = () => canvases[0];
 
   function canvasRef(c) { return canvases.find((x) => x.id === c); }
@@ -57,11 +64,37 @@ function createCanvasDb(seed = {}) {
   function edgeMap(c) { if (!edgesByCanvas.has(c)) edgesByCanvas.set(c, new Map()); return edgesByCanvas.get(c); }
   function logMap(c) { if (!logByCanvas.has(c)) logByCanvas.set(c, new Map()); return logByCanvas.get(c); }
 
+  // 事务语义: BEGIN 快照全部可变态, ROLLBACK 整幅还原(仿真实 PG —— CAS revision+1
+  // 与同事务内写均随回滚撤销), COMMIT 弃快照。W2-06 校验失败回滚即依赖此还原。
+  let txSnap = null;
+  function snapState() {
+    return {
+      canvases: structuredClone(canvases),
+      nodesByCanvas: structuredClone(nodesByCanvas),
+      edgesByCanvas: structuredClone(edgesByCanvas),
+      mutations: structuredClone(mutations),
+      logByCanvas: structuredClone(logByCanvas),
+      logSeq,
+      insertAttempts,
+    };
+  }
+  function restoreState(s) {
+    canvases = s.canvases;
+    nodesByCanvas = s.nodesByCanvas;
+    edgesByCanvas = s.edgesByCanvas;
+    mutations = s.mutations;
+    logByCanvas = s.logByCanvas;
+    logSeq = s.logSeq;
+    insertAttempts = s.insertAttempts;
+  }
+
   async function query(text, params = []) {
     const sql = String(text).trim();
     const p = params || [];
 
-    if (sql === 'BEGIN' || sql === 'COMMIT' || sql === 'ROLLBACK') return { rows: [], rowCount: 0 };
+    if (sql === 'BEGIN') { txSnap = snapState(); return { rows: [], rowCount: 0 }; }
+    if (sql === 'COMMIT') { txSnap = null; return { rows: [], rowCount: 0 }; }
+    if (sql === 'ROLLBACK') { if (txSnap) restoreState(txSnap); txSnap = null; return { rows: [], rowCount: 0 }; }
 
     /* ── canvas_command_log(命令日志地基表) ─────────────────────── */
     if (sql.includes('INSERT INTO canvas_command_log')) {
@@ -183,6 +216,16 @@ function createCanvasDb(seed = {}) {
       return { rows, rowCount: rows.length };
     }
 
+    /* ── W2-06 权威绑定集(叶2 接线后 handlePatch 装载) ─────────── */
+    // shots.id = 执行 shot, 项目域 = episodes.project_id 归集。
+    if (sql.includes('SELECT id FROM shots WHERE episode_id IN')) {
+      const [pid] = p;
+      return { rows: shotIds.map((id) => ({ id, project_id: pid })), rowCount: shotIds.length };
+    }
+    if (sql.includes('SELECT id FROM project_structure_nodes WHERE project_id=$1')) {
+      return { rows: structureNodeIds.map((id) => ({ id })), rowCount: structureNodeIds.length };
+    }
+
     throw new Error(`mock canvas pg: unhandled SQL: ${sql}`);
   }
 
@@ -195,6 +238,9 @@ function createCanvasDb(seed = {}) {
     pg,
     canvasRow,
     mutationRows: () => [...mutations],
+    /** 已存节点行(canvasId → 按 node_id 升序; data_json 已解析)。 */
+    nodesOf: (canvasId = 'canvas-1') =>
+      [...(nodeMap(canvasId).values())].sort((a, b) => (a.node_id < b.node_id ? -1 : 1)),
     /** command_log 落行(canvasId → 按 seq 升序)。 */
     logRows: (canvasId = 'canvas-1') =>
       [...(logMap(canvasId).values())].sort((a, b) => Number(a.seq) - Number(b.seq))
@@ -366,4 +412,123 @@ test('G22 注入 appendCommand 返回 400 拒绝 → PATCH 仍 200, 仅 warn', a
   } finally {
     cap.restore();
   }
+});
+
+/* ─────────────────────────────────────────────────────────────── */
+/* W2-06 — 权威绑定校验接线(三视图叶2): handlePatch 在 CAS 通过后、写入前                */
+/* 装载权威 shotIds(shots.id 执行 shot, 项目域) + structureNodeIds                       */
+/* (project_structure_nodes.id), 对携带绑定的 upsert 节点校验;                          */
+/* 非法 → 409 BINDING_INVALID + 明细; 全写路径(节点/边/删除)共用同一流级守卫。          */
+/* ─────────────────────────────────────────────────────────────── */
+
+test('W2-06 合法绑定(shotId/structureNodeId 均在权威集)照常落库', async () => {
+  const db = createCanvasDb({ shotIds: ['shot-1', 'shot-2'], structureNodeIds: ['sn-a'] });
+  const p = makePersistence(db);
+  const r = await doPatch(p, {
+    clientMutationId: 'm-bound-ok', baseRevision: 1,
+    upsertNodes: [mkBoundNode('n1', { shotId: 'shot-1', structureNodeId: 'sn-a' }), mkBoundNode('n2', { shotId: 'shot-2' })],
+    upsertEdges: [mkEdge('e1', 'n1', 'n2')], deleteNodeIds: [], deleteEdgeIds: [],
+  });
+
+  assert.equal(r.status, 200, '合法绑定不拦');
+  assert.equal(r.body.applied, true);
+  assert.equal(r.body.canvas.revision, 2);
+  const nodes = db.nodesOf();
+  assert.equal(nodes.length, 2);
+  const n1 = nodes.find((x) => x.node_id === 'n1');
+  assert.equal(n1.data_json.shotId, 'shot-1', 'shotId 持久化');
+  assert.equal(n1.data_json.structureNodeId, 'sn-a', 'structureNodeId 持久化');
+  assert.equal(nodes.find((x) => x.node_id === 'n2').data_json.shotId, 'shot-2');
+});
+
+test('W2-06 非法 shotId → 409 BINDING_INVALID + 明细, 零写入; 修正后同 mutationId 重试 200(CAS 未被烧)', async () => {
+  const db = createCanvasDb({ shotIds: ['shot-1'] });
+  const p = makePersistence(db);
+  const bad = await doPatch(p, {
+    clientMutationId: 'm-bad', baseRevision: 1,
+    upsertNodes: [mkBoundNode('n1', { shotId: 'shot-bogus' })], upsertEdges: [], deleteNodeIds: [], deleteEdgeIds: [],
+  });
+
+  assert.equal(bad.status, 409);
+  assert.equal(bad.body.ok, false);
+  assert.equal(bad.body.error, 'BINDING_INVALID');
+  assert.ok(Array.isArray(bad.body.errors) && bad.body.errors.length >= 1, '带明细');
+  assert.ok(bad.body.errors[0].includes('node.n1') && bad.body.errors[0].includes('shot-bogus'), `明细=${bad.body.errors[0]}`);
+  assert.equal(bad.body.canvasId, 'canvas-1');
+  assert.equal(db.canvasRow().revision, 1, '409 不推进 revision(整事务回滚)');
+  assert.equal(db.nodesOf().length, 0, '非法节点未落库');
+  assert.equal(db.mutationRows().length, 0, '零 mutation 行(重试不命中幂等毒丸)');
+  assert.equal(db.logCount(), 0, '零命令日志');
+
+  // 同 mutationId + 同 baseRevision 修正 shotId 重试 → 正常 200(revision 未被 409 烧掉)
+  const fixed = await doPatch(p, {
+    clientMutationId: 'm-bad', baseRevision: 1,
+    upsertNodes: [mkBoundNode('n1', { shotId: 'shot-1' })], upsertEdges: [], deleteNodeIds: [], deleteEdgeIds: [],
+  });
+  assert.equal(fixed.status, 200, '修正后重试成功');
+  assert.equal(fixed.body.applied, true);
+  assert.equal(db.canvasRow().revision, 2);
+  assert.equal(db.nodesOf()[0].data_json.shotId, 'shot-1');
+});
+
+test('W2-06 删除节点后重绑正常(delete+re-upsert 同 id 换新 shotId)', async () => {
+  const db = createCanvasDb({ shotIds: ['shot-1', 'shot-2'] });
+  const p = makePersistence(db);
+  const first = await doPatch(p, {
+    clientMutationId: 'm-rebind-1', baseRevision: 1,
+    upsertNodes: [mkBoundNode('n1', { shotId: 'shot-1' })], upsertEdges: [], deleteNodeIds: [], deleteEdgeIds: [],
+  });
+  assert.equal(first.status, 200);
+  assert.equal(db.nodesOf().length, 1);
+
+  // 删除 n1(删除路径不校验绑定)并在同一 PATCH 重绑到 shot-2
+  const second = await doPatch(p, {
+    clientMutationId: 'm-rebind-2', baseRevision: 2,
+    upsertNodes: [mkBoundNode('n1', { shotId: 'shot-2' })], deleteNodeIds: ['n1'], upsertEdges: [], deleteEdgeIds: [],
+  });
+  assert.equal(second.status, 200, '删除后重绑放行');
+  const nodes = db.nodesOf();
+  assert.equal(nodes.length, 1, '无残留重复行');
+  assert.equal(nodes[0].node_id, 'n1');
+  assert.equal(nodes[0].data_json.shotId, 'shot-2', '重绑到新合法 shotId');
+  assert.equal(db.canvasRow().revision, 3);
+});
+
+test('W2-06 无绑定节点(普通 prompt)不拦; 空串/纯空白占位与 parameters 内自由串也不拦', async () => {
+  const db = createCanvasDb({ shotIds: ['shot-1'] });
+  const p = makePersistence(db);
+  const r = await doPatch(p, {
+    clientMutationId: 'm-unbound', baseRevision: 1,
+    upsertNodes: [
+      mkNode('n1'),                                            // 普通 prompt, 无绑定键
+      mkBoundNode('n2', { shotId: '' }),                       // storyboard 占位: 空串=未绑定
+      { ...mkBoundNode('n3', { shotId: '   ' }), nodeId: 'n3' }, // 纯空白=未绑定
+      { ...mkNode('n4'), nodeId: 'n4',
+        data: { nodeKind: 'prompt', schemaVersion: 1, title: 'T-n4', status: 'IDLE', parameters: { shotId: 'free-string-in-parameters' } } }, // parameters 内自由串(非顶层键)不拦
+    ],
+    upsertEdges: [], deleteNodeIds: [], deleteEdgeIds: [],
+  });
+
+  assert.equal(r.status, 200, '无绑定/占位/parameters 内串均不拦');
+  assert.equal(r.body.applied, true);
+  const nodes = db.nodesOf();
+  assert.equal(nodes.length, 4);
+  const n2 = nodes.find((x) => x.node_id === 'n2');
+  assert.equal(n2.data_json.shotId, '', '空串照常持久化(未绑定占位)');
+  assert.equal(nodes.find((x) => x.node_id === 'n4').data_json.parameters.shotId, 'free-string-in-parameters');
+});
+
+test('W2-06 非法 structureNodeId 同样 409 BINDING_INVALID 并点名该字段', async () => {
+  const db = createCanvasDb({ shotIds: ['shot-1'], structureNodeIds: ['sn-a'] });
+  const p = makePersistence(db);
+  const r = await doPatch(p, {
+    clientMutationId: 'm-struct-bad', baseRevision: 1,
+    upsertNodes: [mkBoundNode('n1', { shotId: 'shot-1', structureNodeId: 'sn-not-exist' })],
+    upsertEdges: [], deleteNodeIds: [], deleteEdgeIds: [],
+  });
+
+  assert.equal(r.status, 409);
+  assert.equal(r.body.error, 'BINDING_INVALID');
+  assert.ok(r.body.errors[0].includes('structureNodeId sn-not-exist'), `明细=${r.body.errors[0]}`);
+  assert.equal(db.nodesOf().length, 0);
 });

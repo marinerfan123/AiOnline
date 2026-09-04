@@ -4,10 +4,11 @@ const assert = require('node:assert/strict');
 const { createScriptApi } = require('./scriptApi.cjs');
 
 function makeHarness({ memberFor = ['p-1'], role = 'editor', characters = [], locations = [] } = {}) {
-  const state = { rows: [], nextIndex: 0, deleted: 0, shots: [] };
+  const state = { rows: [], nextIndex: 0, deleted: 0, shots: [], batches: [] };
   const sendJSON = async (res, status, body) => { res.status = status; res.body = body; };
   const pg = {
     async query(sql, params = []) {
+      sql = String(sql).trim(); // node-pg 语义：忽略首尾空白（store SQL 模板带前导换行）
       if (/INSERT INTO script_rows/.test(sql)) {
         state.rows.push({ id: params[0], project_id: params[1], scene_index: params[3], row_index: params[4], kind: params[5], text: params[7], continuity_notes: params[10] });
         return { rows: [] };
@@ -62,6 +63,67 @@ function makeHarness({ memberFor = ['p-1'], role = 'editor', characters = [], lo
       if (/FROM script_rows/.test(sql)) {
         const sc = params.length > 1 ? params[1] : null;
         return { rows: state.rows.filter((r) => (sc === null ? true : r.scene_index === sc)) };
+      }
+      // ── storyboard_batch_tasks (batchTaskStore, 0051) emulation ──
+      const batchRow = (b, t) => state.batches.find((r) => r.batch_id === b && r.task_id === t);
+      if (/^CREATE TABLE IF NOT EXISTS storyboard_batch_tasks/.test(sql)) return { rows: [], rowCount: 0 };
+      if (/^INSERT INTO storyboard_batch_tasks/.test(sql)) {
+        // createBatch 单条多行 INSERT：每行 6 参 [batch, task, script, shot, kind, params_json]。
+        const inserted = [];
+        for (let i = 0; i < params.length; i += 6) {
+          const [batch_id, task_id, script_id, shot_id, kind, paramsJson] = params.slice(i, i + 6);
+          state.batches.push({
+            batch_id, task_id, script_id, shot_id, kind,
+            status: 'QUEUED', attempt: 0, max_attempts: 3,
+            params: JSON.parse(paramsJson), result_ref: null, error: null,
+          });
+          inserted.push({ task_id });
+        }
+        return { rows: inserted, rowCount: inserted.length };
+      }
+      if (/^UPDATE storyboard_batch_tasks/.test(sql)) {
+        if (sql.includes("status IN ('QUEUED', 'RUNNING')")) {
+          // markTask CAS：终态/不存在 → rowCount 0。
+          const [batchId, taskId, status, attemptVal, resultRefVal, errorVal] = params;
+          const row = batchRow(batchId, taskId);
+          if (!row || (row.status !== 'QUEUED' && row.status !== 'RUNNING')) return { rows: [], rowCount: 0 };
+          row.status = status;
+          if (attemptVal !== null && attemptVal !== undefined) row.attempt = attemptVal;
+          if (resultRefVal !== null && resultRefVal !== undefined) row.result_ref = resultRefVal;
+          if (errorVal !== null && errorVal !== undefined) row.error = errorVal;
+          return { rows: [row], rowCount: 1 };
+        }
+        // retryFailed(1 参) / 单任务重试(2 参)：仅 FAILED 且 attempt < max_attempts。
+        const reset = [];
+        const candidates = params.length === 1
+          ? state.batches.filter((r) => r.batch_id === params[0])
+          : [batchRow(params[0], params[1])].filter(Boolean);
+        for (const row of candidates) {
+          if (row.status === 'FAILED' && row.attempt < row.max_attempts) {
+            row.status = 'QUEUED'; row.attempt += 1; row.result_ref = null; row.error = null;
+            reset.push({ task_id: row.task_id });
+          }
+        }
+        return { rows: reset, rowCount: reset.length };
+      }
+      if (/FROM storyboard_batch_tasks/.test(sql)) {
+        if (sql.includes('GROUP BY status')) {
+          const map = {};
+          for (const r of state.batches.filter((b) => b.batch_id === params[0])) map[r.status] = (map[r.status] || 0) + 1;
+          return { rows: Object.entries(map).map(([status, n]) => ({ status, n })) };
+        }
+        if (/^SELECT status FROM storyboard_batch_tasks/.test(sql)) {
+          const row = batchRow(params[0], params[1]);
+          return row ? { rows: [{ status: row.status }] } : { rows: [] };
+        }
+        if (/^SELECT status, attempt, max_attempts FROM storyboard_batch_tasks/.test(sql)) {
+          const row = batchRow(params[0], params[1]);
+          return row ? { rows: [{ status: row.status, attempt: row.attempt, max_attempts: row.max_attempts }] } : { rows: [] };
+        }
+        const rows = state.batches
+          .filter((r) => r.batch_id === params[0])
+          .sort((a, b) => (a.task_id < b.task_id ? -1 : a.task_id > b.task_id ? 1 : 0));
+        return { rows };
       }
       return { rows: [] };
     },
@@ -517,4 +579,278 @@ test('G13: POST storyboard/apply unauthenticated → 401', async () => {
   const res = {};
   await anon.handle({ params: { projectId: 'p-1' } }, res, '/api/v2/script/s-1/storyboard/apply', 'POST');
   assert.equal(res.status, 401);
+});
+
+// ══ G13 V2.0 must#4 — storyboard batch + partial retry API ═════════════════
+// 2 行同 scene → 1 content beat → 2 计划 shot（s0:b0:k0 / s0:b0:k1）。
+const batchRows2 = () => [
+  seedRow('sb-a', { scene_index: 0, row_index: 0, kind: 'action', text: 'A enters the hall.' }),
+  seedRow('sb-b', { scene_index: 0, row_index: 1, kind: 'action', text: 'B follows.' }),
+];
+// 4 行 scene0 + 1 行 scene1 → 2 beats → 4 计划 shot。
+const batchRows4 = () => [
+  seedRow('sb-a', { scene_index: 0, row_index: 0, kind: 'action', text: 'A enters.' }),
+  seedRow('sb-b', { scene_index: 0, row_index: 1, kind: 'action', text: 'B reacts.' }),
+  seedRow('sb-c', { scene_index: 0, row_index: 2, kind: 'action', text: 'C speaks.' }),
+  seedRow('sb-d', { scene_index: 0, row_index: 3, kind: 'action', text: 'D leaves.' }),
+  seedRow('sb-e', { scene_index: 1, row_index: 0, kind: 'action', text: 'E pans.' }),
+];
+const taskRowOf = (state, batchId, taskId) =>
+  state.batches.find((r) => r.batch_id === batchId && r.task_id === taskId);
+
+test('V2.0#4: POST storyboard/batch (path form) → 200 {ok,batchId,enqueued,total}; GET batch view → tasks + progress', async () => {
+  const { api, state } = makeHarness();
+  state.rows.push(...batchRows2());
+  const created = await callParams(api, 'POST', '/api/v2/script/s-1/storyboard/batch', { projectId: 'p-1' });
+  assert.equal(created.status, 200);
+  assert.equal(created.body.ok, true);
+  assert.match(created.body.batchId, /^bt-/);
+  // 2 行 → 1 beat → 2 个 image_gen 任务；服务端现算（无 shot 已产出 → 全入队）。
+  assert.equal(created.body.enqueued, 2);
+  assert.equal(created.body.total, 2);
+
+  const view = await callParams(api, 'GET', `/api/v2/script/storyboard/batches/${created.body.batchId}`, { projectId: 'p-1' });
+  assert.equal(view.status, 200);
+  assert.equal(view.body.ok, true);
+  assert.equal(view.body.batchId, created.body.batchId);
+  assert.equal(view.body.tasks.length, 2);
+  // 文档化 task 形状：八字段，无多余列。
+  assert.deepEqual(
+    Object.keys(view.body.tasks[0]).sort(),
+    ['attempt', 'error', 'kind', 'maxAttempts', 'resultRef', 'shotId', 'status', 'taskId'],
+  );
+  for (const t of view.body.tasks) {
+    assert.equal(t.kind, 'image_gen');
+    assert.equal(t.status, 'QUEUED');
+    assert.equal(t.attempt, 0);
+    assert.equal(t.maxAttempts, 3);
+    assert.equal(t.resultRef, null);
+    assert.equal(t.error, null);
+    assert.ok(t.taskId.endsWith('::image_gen'));
+  }
+  assert.deepEqual(new Set(view.body.tasks.map((t) => t.shotId)), new Set(['s0:b0:k0', 's0:b0:k1']));
+  assert.deepEqual(view.body.progress, {
+    total: 2,
+    byStatus: { QUEUED: 2, RUNNING: 0, SUCCEEDED: 0, FAILED: 0, SKIPPED: 0 },
+  });
+  // 入队行是服务端 storyboardBatchPlan 产出（R4 prompt 模板、model null 路由器决定）。
+  const stored = state.batches.filter((r) => r.batch_id === created.body.batchId);
+  assert.equal(stored.length, 2);
+  assert.ok(stored.every((r) => r.script_id === 's-1' && r.params.prompt === '[medium] action' && r.params.model === null));
+});
+
+test('V2.0#4: repeat batch create mints a NEW batchId; both batches stay independent', async () => {
+  const { api, state } = makeHarness();
+  state.rows.push(...batchRows2());
+  const b1 = await callParams(api, 'POST', '/api/v2/script/s-1/storyboard/batch', { projectId: 'p-1' });
+  const b2 = await callParams(api, 'POST', '/api/v2/script/s-1/storyboard/batch', { projectId: 'p-1' });
+  assert.equal(b1.status, 200);
+  assert.equal(b2.status, 200);
+  assert.notEqual(b1.body.batchId, b2.body.batchId);
+  assert.equal(state.batches.length, 4); // 两批 4 行互不覆盖
+  const v1 = await callParams(api, 'GET', `/api/v2/script/storyboard/batches/${b1.body.batchId}`, { projectId: 'p-1' });
+  const v2 = await callParams(api, 'GET', `/api/v2/script/storyboard/batches/${b2.body.batchId}`, { projectId: 'p-1' });
+  assert.equal(v1.body.tasks.length, 2);
+  assert.equal(v2.body.tasks.length, 2);
+  assert.ok(v1.body.tasks.every((t) => t.status === 'QUEUED'));
+  // query 拼写 (?scriptId=) 同语义：script_id 落库为 q-1。
+  const b3 = await callParams(api, 'POST', '/api/v2/script/storyboard/batch', { projectId: 'p-1', scriptId: 'q-1' });
+  assert.equal(b3.status, 200);
+  assert.ok(state.batches.filter((r) => r.batch_id === b3.body.batchId).every((r) => r.script_id === 'q-1'));
+});
+
+test('V2.0#4: batch create guards — missing scriptId 400, zero script rows 400 (空计划)', async () => {
+  const { api, state } = makeHarness();
+  state.rows.push(...batchRows2());
+  const miss = await callParams(api, 'POST', '/api/v2/script/storyboard/batch', { projectId: 'p-1' });
+  assert.equal(miss.status, 400);
+  assert.ok(miss.body.error.includes('scriptId'));
+  const { api: emptyApi, state: emptyState } = makeHarness();
+  const noRows = await callParams(emptyApi, 'POST', '/api/v2/script/s-1/storyboard/batch', { projectId: 'p-1' });
+  assert.equal(noRows.status, 400);
+  assert.ok(noRows.body.error.includes('至少 1 行'));
+  assert.equal(emptyState.batches.length, 0);
+});
+
+test('V2.0#4: batch URLs answer exactly one method each — wrong methods fall through (false)', async () => {
+  const { api, state } = makeHarness();
+  state.rows.push(...batchRows2());
+  const cases = [
+    ['GET', '/api/v2/script/s-1/storyboard/batch'],
+    ['POST', '/api/v2/script/storyboard/batches/bt-x'],
+    ['GET', '/api/v2/script/storyboard/batches/bt-x/retry-failed'],
+    ['GET', '/api/v2/script/storyboard/batches/bt-x/tasks/t1/retry'],
+    ['PUT', '/api/v2/script/s-1/storyboard/batch'],
+  ];
+  for (const [method, path] of cases) {
+    const res = {};
+    const handled = await api.handle(h({}, { projectId: 'p-1' }), res, path, method);
+    assert.equal(handled, false, `${method} ${path} must fall through`);
+    assert.equal(res.status, undefined);
+  }
+});
+
+test('V2.0#4: POST retry-failed resets ONLY retryable FAILED tasks (attempt < max) — 200 {ok,reset}', async () => {
+  const { api, state } = makeHarness();
+  state.rows.push(...batchRows4());
+  const created = await callParams(api, 'POST', '/api/v2/script/s-1/storyboard/batch', { projectId: 'p-1' });
+  const { batchId } = created.body;
+  const T_RETRY = 's0:b0:k0::image_gen';
+  const T_QUEUED = 's0:b0:k1::image_gen';
+  const T_SUCC = 's1:b0:k0::image_gen';
+  const T_EXH = 's1:b0:k1::image_gen';
+  // 执行引擎视角的状态迁移（同一 store 实例，markTask 为公开原语）。
+  await api.batchStore.markTask({ batchId, taskId: T_RETRY, status: 'FAILED', error: 'provider timeout' });
+  await api.batchStore.markTask({ batchId, taskId: T_SUCC, status: 'SUCCEEDED', resultRef: 'oss://a.png' });
+  await api.batchStore.markTask({ batchId, taskId: T_EXH, status: 'FAILED', error: 'final' });
+  taskRowOf(state, batchId, T_EXH).attempt = 3; // 已重试到上限（等价 DB 现状）
+  // T_QUEUED 保持 QUEUED。
+
+  const retry = await callParams(api, 'POST', `/api/v2/script/storyboard/batches/${batchId}/retry-failed`, { projectId: 'p-1' });
+  assert.equal(retry.status, 200);
+  assert.deepEqual(retry.body, { ok: true, reset: 1 });
+  assert.equal(taskRowOf(state, batchId, T_RETRY).status, 'QUEUED');
+  assert.equal(taskRowOf(state, batchId, T_RETRY).attempt, 1);
+  assert.equal(taskRowOf(state, batchId, T_RETRY).error, null);
+  assert.equal(taskRowOf(state, batchId, T_EXH).status, 'FAILED', 'attempt-capped FAILED stays');
+  assert.equal(taskRowOf(state, batchId, T_EXH).attempt, 3);
+  assert.equal(taskRowOf(state, batchId, T_SUCC).status, 'SUCCEEDED');
+  assert.equal(taskRowOf(state, batchId, T_QUEUED).status, 'QUEUED');
+
+  const view = await callParams(api, 'GET', `/api/v2/script/storyboard/batches/${batchId}`, { projectId: 'p-1' });
+  assert.deepEqual(view.body.progress, {
+    total: 4,
+    byStatus: { QUEUED: 2, RUNNING: 0, SUCCEEDED: 1, FAILED: 1, SKIPPED: 0 },
+  });
+});
+
+test('V2.0#4: retry-failed with nothing retryable → 200 {ok,reset:0}, state untouched', async () => {
+  const { api, state } = makeHarness();
+  state.rows.push(...batchRows2());
+  const created = await callParams(api, 'POST', '/api/v2/script/s-1/storyboard/batch', { projectId: 'p-1' });
+  const retry = await callParams(api, 'POST', `/api/v2/script/storyboard/batches/${created.body.batchId}/retry-failed`, { projectId: 'p-1' });
+  assert.equal(retry.status, 200);
+  assert.deepEqual(retry.body, { ok: true, reset: 0 });
+  assert.ok(state.batches.every((r) => r.status === 'QUEUED' && r.attempt === 0));
+});
+
+test('V2.0#4: single-task retry resets only FAILED attempt<max; terminal/exhausted/non-FAILED rejected 409; unknown 404', async () => {
+  const { api, state } = makeHarness();
+  state.rows.push(...batchRows4());
+  const created = await callParams(api, 'POST', '/api/v2/script/s-1/storyboard/batch', { projectId: 'p-1' });
+  const { batchId } = created.body;
+  const T_R = 's0:b0:k0::image_gen'; // 可重试 FAILED
+  const T_Q = 's0:b0:k1::image_gen'; // QUEUED
+  const T_S = 's1:b0:k0::image_gen'; // SUCCEEDED
+  const T_X = 's1:b0:k1::image_gen'; // FAILED 且 attempt=3（耗尽）
+  await api.batchStore.markTask({ batchId, taskId: T_R, status: 'FAILED', error: 'boom' });
+  await api.batchStore.markTask({ batchId, taskId: T_S, status: 'SUCCEEDED', resultRef: 'oss://ok.png' });
+  await api.batchStore.markTask({ batchId, taskId: T_X, status: 'FAILED', error: 'boom-x' });
+  taskRowOf(state, batchId, T_X).attempt = 3;
+
+  const retryPath = (taskId) => `/api/v2/script/storyboard/batches/${batchId}/tasks/${encodeURIComponent(taskId)}/retry`;
+
+  // 合法单任务重试：FAILED 且 attempt<max → 200 reset:1 → QUEUED + attempt+1 + 清错。
+  const ok = await callParams(api, 'POST', retryPath(T_R), { projectId: 'p-1' });
+  assert.equal(ok.status, 200);
+  assert.deepEqual(ok.body, { ok: true, reset: 1 });
+  assert.equal(taskRowOf(state, batchId, T_R).status, 'QUEUED');
+  assert.equal(taskRowOf(state, batchId, T_R).attempt, 1);
+  assert.equal(taskRowOf(state, batchId, T_R).error, null);
+  const view = await callParams(api, 'GET', `/api/v2/script/storyboard/batches/${batchId}`, { projectId: 'p-1' });
+  const seen = view.body.tasks.find((t) => t.taskId === T_R);
+  assert.equal(seen.status, 'QUEUED');
+  assert.equal(seen.attempt, 1);
+  assert.equal(seen.error, null);
+
+  // 再次重试（已 QUEUED，非 FAILED）→ 409。
+  const again = await callParams(api, 'POST', retryPath(T_R), { projectId: 'p-1' });
+  assert.equal(again.status, 409);
+  assert.ok(again.body.error.includes('非 FAILED'));
+
+  // 终态 SUCCEEDED → 409，状态不动。
+  const succ = await callParams(api, 'POST', retryPath(T_S), { projectId: 'p-1' });
+  assert.equal(succ.status, 409);
+  assert.equal(taskRowOf(state, batchId, T_S).status, 'SUCCEEDED');
+
+  // 耗尽 FAILED（attempt=3=max）→ 409。
+  const exh = await callParams(api, 'POST', retryPath(T_X), { projectId: 'p-1' });
+  assert.equal(exh.status, 409);
+  assert.ok(exh.body.error.includes('已达上限'));
+  assert.equal(taskRowOf(state, batchId, T_X).status, 'FAILED');
+  assert.equal(taskRowOf(state, batchId, T_X).attempt, 3);
+
+  // QUEUED 非 FAILED → 409。
+  const queued = await callParams(api, 'POST', retryPath(T_Q), { projectId: 'p-1' });
+  assert.equal(queued.status, 409);
+
+  // 批次存在但任务不存在 → 404；批次不存在 → 404。
+  const ghostTask = await callParams(api, 'POST', retryPath('ghost::image_gen'), { projectId: 'p-1' });
+  assert.equal(ghostTask.status, 404);
+  const ghostBatch = await callParams(api, 'POST', '/api/v2/script/storyboard/batches/bt-none/tasks/ghost/retry', { projectId: 'p-1' });
+  assert.equal(ghostBatch.status, 404);
+});
+
+test('V2.0#4: cross-project / unknown batch → 404; project gate identical to rows/apply', async () => {
+  const { api, state } = makeHarness();
+  state.rows.push(...batchRows2());
+  const created = await callParams(api, 'POST', '/api/v2/script/s-1/storyboard/batch', { projectId: 'p-1' });
+  const { batchId } = created.body;
+  // 另一项目（ghost 不存在/无权限）→ requireProject 404，任何批次端点一致。
+  const foreignGet = await callParams(api, 'GET', `/api/v2/script/storyboard/batches/${batchId}`, { projectId: 'ghost' });
+  assert.equal(foreignGet.status, 404);
+  assert.equal(foreignGet.body.error, '项目不存在');
+  const foreignRetry = await callParams(api, 'POST', `/api/v2/script/storyboard/batches/${batchId}/retry-failed`, { projectId: 'ghost' });
+  assert.equal(foreignRetry.status, 404);
+  const foreignTask = await callParams(api, 'POST', `/api/v2/script/storyboard/batches/${batchId}/tasks/t1/retry`, { projectId: 'ghost' });
+  assert.equal(foreignTask.status, 404);
+  const foreignCreate = await callParams(api, 'POST', '/api/v2/script/s-1/storyboard/batch', { projectId: 'ghost' });
+  assert.equal(foreignCreate.status, 404);
+  // 本项目中未知 batchId → 404。
+  const noBatch = await callParams(api, 'GET', '/api/v2/script/storyboard/batches/bt-none', { projectId: 'p-1' });
+  assert.equal(noBatch.status, 404);
+  assert.equal(noBatch.body.error, '批次不存在');
+  const noBatchRetry = await callParams(api, 'POST', '/api/v2/script/storyboard/batches/bt-none/retry-failed', { projectId: 'p-1' });
+  assert.equal(noBatchRetry.status, 404);
+});
+
+test('V2.0#4: viewer role — batch create/retry writes 403 (same write gate as apply); batch GET stays readable', async () => {
+  const { api, state } = makeHarness({ role: 'viewer' });
+  state.rows.push(...batchRows2());
+  const create = await callParams(api, 'POST', '/api/v2/script/s-1/storyboard/batch', { projectId: 'p-1' });
+  assert.equal(create.status, 403);
+  assert.ok(create.body.error.includes('只读成员'));
+  assert.equal(state.batches.length, 0);
+  // 预置一批（等价于 editor 曾建批）→ viewer 可读、不可写。
+  state.batches.push(
+    { batch_id: 'bt-view', task_id: 's0:b0:k0::image_gen', script_id: 's-1', shot_id: 's0:b0:k0', kind: 'image_gen', status: 'FAILED', attempt: 0, max_attempts: 3, params: {}, result_ref: null, error: 'e' },
+    { batch_id: 'bt-view', task_id: 's0:b0:k1::image_gen', script_id: 's-1', shot_id: 's0:b0:k1', kind: 'image_gen', status: 'QUEUED', attempt: 0, max_attempts: 3, params: {}, result_ref: null, error: null },
+  );
+  const view = await callParams(api, 'GET', '/api/v2/script/storyboard/batches/bt-view', { projectId: 'p-1' });
+  assert.equal(view.status, 200);
+  assert.equal(view.body.tasks.length, 2);
+  const retry = await callParams(api, 'POST', '/api/v2/script/storyboard/batches/bt-view/retry-failed', { projectId: 'p-1' });
+  assert.equal(retry.status, 403);
+  const taskRetry = await callParams(api, 'POST', '/api/v2/script/storyboard/batches/bt-view/tasks/s0:b0:k0::image_gen/retry', { projectId: 'p-1' });
+  assert.equal(taskRetry.status, 403);
+  assert.equal(state.batches.find((r) => r.batch_id === 'bt-view' && r.status === 'FAILED').status, 'FAILED', '403 write attempts mutate nothing');
+});
+
+test('V2.0#4: batch endpoints unauthenticated → 401', async () => {
+  const anon = createScriptApi({
+    pg: { query: async () => ({ rows: [] }) }, sessionUser: () => null,
+    sendJSON: (r, code, body) => { r.status = code; r.body = body; },
+    parseBody: async () => ({}),
+  });
+  const cases = [
+    ['POST', '/api/v2/script/s-1/storyboard/batch'],
+    ['GET', '/api/v2/script/storyboard/batches/bt-x'],
+    ['POST', '/api/v2/script/storyboard/batches/bt-x/retry-failed'],
+    ['POST', '/api/v2/script/storyboard/batches/bt-x/tasks/t1/retry'],
+  ];
+  for (const [method, path] of cases) {
+    const res = {};
+    await anon.handle({ params: { projectId: 'p-1' } }, res, path, method);
+    assert.equal(res.status, 401, `${method} ${path}`);
+  }
 });

@@ -3,6 +3,8 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const {
   persistStoryboardShots,
+  computePlanFingerprint,
+  markDirty,
   validatePersistArgs,
   buildShotRows,
   setLocked,
@@ -91,6 +93,14 @@ function makePg(opts = {}) {
       );
       return { rowCount: before - state.shots.length };
     }
+    if (/UPDATE project_shots_rows SET dirty/.test(sql)) {
+      // MARK_DIRTY_SQL：script_id=$1, project_id=$2 → 全行 dirty=true
+      let n = 0;
+      for (const s of state.shots) {
+        if (s.script_id === params[0] && s.project_id === params[1]) { s.dirty = true; n += 1; }
+      }
+      return { rowCount: n };
+    }
     if (/UPDATE project_shots_rows SET locked/.test(sql) && /ANY\(\$3::text\[\]\)/.test(sql)) {
       // SET_LOCKED_BATCH_SQL：script_id=$1, project_id=$2, shot_ids=$3, locked=$4
       const ids = params[2];
@@ -125,6 +135,7 @@ function makePg(opts = {}) {
         subject_refs: JSON.parse(params[9]), duration_ms: params[10],
         ordering: params[11], version: params[12],
         locked: params[13], source_trace: JSON.parse(params[14]),
+        plan_fingerprint: params[15], dirty: params[16],
       });
       return { rowCount: 1 };
     }
@@ -714,6 +725,179 @@ test('G13 V2.0: lockShot/lockShots validate bad input (400)', async () => {
     () => lockShot({ pg, projectId: P_ID, scriptId: S_ID, shotId: 'x', locked: 'yes' }),
     () => lockShots({ pg, projectId: P_ID, scriptId: S_ID, shotIds: [], locked: true }),
     () => lockShots({ pg, projectId: P_ID, scriptId: S_ID, shotIds: ['x', 42], locked: true }),
+  ];
+  for (const fn of cases) {
+    const res = await fn();
+    assert.equal(res.ok, false);
+    assert.equal(res.status, 400);
+    assert.ok(Array.isArray(res.errors) && res.errors.length > 0);
+  }
+});
+
+// ------------------------------------------------- plan fingerprint (0054)
+test('G13 V2.1: computePlanFingerprint is deterministic, 16-hex, and scoped to the spec fields', () => {
+  const { plan } = samplePlan();
+  const fp = computePlanFingerprint(plan);
+  assert.match(fp, /^[0-9a-f]{16}$/, 'sha256 hex 前 16');
+  assert.equal(fp, computePlanFingerprint(plan), '纯函数 —— 同输入恒同值');
+  // 序列化按数组序 → 对象键序 / JSON 往返不影响指纹
+  assert.equal(fp, computePlanFingerprint(JSON.parse(JSON.stringify(plan))));
+  // 归一化与 buildShotRows 一致：kind 缺省→standard、durationMs=3000 显式写 == 缺省
+  const explicitDefaults = JSON.parse(JSON.stringify(plan));
+  explicitDefaults.beats[0].shots[0].kind = 'standard';
+  explicitDefaults.beats[1].shots[1].durationMs = 3000;
+  assert.equal(fp, computePlanFingerprint(explicitDefaults));
+  // 非参与字段（summary/camera/subjectRefs/杂项）变化 → 指纹不变（契约 = 持久化结构）
+  const irrelevant = JSON.parse(JSON.stringify(plan));
+  irrelevant.beats[0].summary = 'CHANGED summary';
+  irrelevant.beats[0].shots[0].camera.shotSize = 'wide';
+  irrelevant.beats[0].shots[0].subjectRefs = [{ entityType: 'character', entityId: 'char-x', label: 'X' }];
+  irrelevant.extraNoise = { any: 'thing' };
+  assert.equal(fp, computePlanFingerprint(irrelevant));
+  // 缺 beats / 非 plan 输入 → 抛 TypeError（持久化路径先 400 校验，不会走到这里）
+  assert.throws(() => computePlanFingerprint(null), TypeError);
+  assert.throws(() => computePlanFingerprint({}), TypeError);
+  assert.throws(() => computePlanFingerprint({ beats: 'x' }), TypeError);
+  assert.throws(() => computePlanFingerprint({ beats: [null] }), TypeError);
+});
+
+test('G13 V2.1: fingerprint changes when any fingerprint field / order / count / refs change', () => {
+  const { plan } = samplePlan();
+  const base = computePlanFingerprint(plan);
+  const changed = (fn) => {
+    const p = JSON.parse(JSON.stringify(plan));
+    fn(p);
+    const f = computePlanFingerprint(p);
+    assert.match(f, /^[0-9a-f]{16}$/);
+    return f;
+  };
+  const cases = [
+    (p) => { p.beats[0].shots[0].shotId = 's0:b0:kX'; },                    // shotId 变
+    (p) => { p.beats[0].sceneIndex = 9; },                                   // scene 变
+    (p) => { p.beats[0].shots[0].beatId = 's9:b0'; },                        // beat 变
+    (p) => { p.beats[0].shots[0].kind = 'closeup'; },                        // kind 变
+    (p) => { p.beats[0].shots[0].intent = 'action'; },                       // intent 变
+    (p) => { p.beats[0].shots[0].durationMs = 5000; },                       // durationMs 变
+    (p) => { p.beats[0].scriptRowIds = [p.beats[0].scriptRowIds[0]]; },      // refs 少一
+    (p) => { p.beats[0].scriptRowIds = [...p.beats[0].scriptRowIds].reverse(); }, // refs 序变
+    (p) => { p.beats[1].shots = p.beats[1].shots.slice(1); },                // 行数变（总 shot -1）
+    (p) => { p.beats.push({ ...p.beats[1], beatId: 's9:b9' }); },            // beat 数变
+    (p) => { [p.beats[0], p.beats[1]] = [p.beats[1], p.beats[0]]; },         // beat 序变
+    (p) => { [p.beats[0].shots[0], p.beats[0].shots[1]] = [p.beats[0].shots[1], p.beats[0].shots[0]]; }, // shot 序变
+  ];
+  for (const fn of cases) {
+    assert.notEqual(changed(fn), base, 'fingerprint must change on input change');
+  }
+});
+
+test('G13 V2.1: persist stamps every inserted row with the plan fingerprint and dirty=false', async () => {
+  const { plan } = samplePlan();
+  const pg = makePg();
+  const res = await callPersist(pg, { plan });
+  assert.equal(res.ok, true);
+  const expected = computePlanFingerprint(plan);
+  assert.equal(res.fingerprint, expected, 'persist 返回本次 apply 的指纹');
+  assert.equal(pg.state.shots.length, 4);
+  for (const s of pg.state.shots) {
+    assert.equal(s.plan_fingerprint, expected, `row ${s.shot_id} carries the plan fingerprint`);
+    assert.equal(s.dirty, false, 'new rows are never dirty');
+  }
+  // 同 plan 幂等重跑 → 新 version 行指纹不变（指纹确定性）
+  const again = await callPersist(pg, { plan });
+  assert.equal(again.version, 2);
+  assert.equal(again.fingerprint, expected);
+  assert.ok(pg.state.shots.every((s) => s.plan_fingerprint === expected && s.dirty === false));
+});
+
+test('G13 V2.1: a changed plan persists rows under a new fingerprint (old version gone)', async () => {
+  const { plan: planA } = samplePlan();
+  const pg = makePg();
+  const first = await callPersist(pg, { plan: planA });
+  const fpA = first.fingerprint;
+
+  const rows = [D('MAYA', 'Revised.', { scene_index: 0 })];
+  const planB = buildStoryboardPlan({ rows, characters: [MAYA] });
+  const res = await callPersist(pg, { plan: planB });
+  assert.equal(res.ok, true);
+  const fpB = computePlanFingerprint(planB);
+  assert.equal(res.fingerprint, fpB);
+  assert.notEqual(fpB, fpA, '输入变 → 指纹变');
+  assert.equal(pg.state.shots.length, 2);
+  assert.ok(pg.state.shots.every((s) => s.plan_fingerprint === fpB && s.dirty === false && s.version === 2));
+});
+
+// ----------------------------------------------------- markDirty (0054)
+test('G13 V2.1: markDirty flags every row of (project, script) and respects project/script scope', async () => {
+  const { plan: planA } = samplePlan();
+  // 两个 project 各持有同名 script 的行 + p-1 下另有一个 script —— 验证作用域不越界
+  const pg = makePg({ ownerRowsOf: ['p-1', 'p-OTHER'] });
+  await callPersist(pg, { plan: planA });                                                   // p-1 / s-1: 4 rows
+  const otherRows = [A('other project plan', { scene_index: 0 })];
+  const planOther = buildStoryboardPlan({ rows: otherRows });
+  await persistStoryboardShots({ pg, projectId: 'p-OTHER', scriptId: S_ID, plan: planOther }); // p-OTHER / s-1: 2 rows
+  const secondRows = [D('LEO', 'second script', { scene_index: 0 })];
+  const planS2 = buildStoryboardPlan({ rows: secondRows });
+  await persistStoryboardShots({ pg, projectId: P_ID, scriptId: 's-2', plan: planS2 });       // p-1 / s-2: 2 rows
+
+  const d1 = await markDirty({ pg, projectId: P_ID, scriptId: S_ID });
+  assert.equal(d1.ok, true);
+  assert.equal(d1.updated, 4, '只更新 p-1/s-1 的 4 行');
+  assert.ok(pg.state.shots.filter((s) => s.project_id === P_ID && s.script_id === S_ID).every((s) => s.dirty === true));
+  // 作用域不越界：p-OTHER/s-1 与 p-1/s-2 的行保持 clean
+  assert.ok(pg.state.shots.filter((s) => s.project_id === 'p-OTHER' && s.script_id === S_ID).every((s) => s.dirty === false));
+  assert.ok(pg.state.shots.filter((s) => s.project_id === P_ID && s.script_id === 's-2').every((s) => s.dirty === false));
+
+  const d2 = await markDirty({ pg, projectId: 'p-OTHER', scriptId: S_ID });
+  assert.equal(d2.ok, true);
+  assert.equal(d2.updated, 2);
+  assert.ok(pg.state.shots.filter((s) => s.project_id === 'p-OTHER').every((s) => s.dirty === true));
+
+  const d3 = await markDirty({ pg, projectId: P_ID, scriptId: 's-2' });
+  assert.equal(d3.ok, true);
+  assert.equal(d3.updated, 2);
+  assert.ok(pg.state.shots.every((s) => s.dirty === true));
+});
+
+test('G13 V2.1: dirty set by markDirty is cleared by the next persist (re-apply writes clean rows)', async () => {
+  const { plan } = samplePlan();
+  const pg = makePg();
+  await callPersist(pg, { plan });
+  const marked = await markDirty({ pg, projectId: P_ID, scriptId: S_ID });
+  assert.equal(marked.ok, true);
+  assert.ok(pg.state.shots.every((s) => s.dirty === true));
+
+  const rerun = await callPersist(pg, { plan }); // 无锁定行 → DELETE+INSERT 全量替换
+  assert.equal(rerun.ok, true);
+  assert.equal(rerun.version, 2);
+  assert.ok(pg.state.shots.every((s) => s.dirty === false && s.plan_fingerprint === computePlanFingerprint(plan)));
+});
+
+test('G13 V2.1: markDirty on a foreign project / never-applied script → 404 (no row touched)', async () => {
+  const { plan } = samplePlan();
+  const pg = makePg();
+  await callPersist(pg, { plan }); // rows under p-1 / s-1
+
+  const foreign = await markDirty({ pg, projectId: 'p-OTHER', scriptId: S_ID });
+  assert.equal(foreign.ok, false);
+  assert.equal(foreign.status, 404);
+  assert.match(foreign.error, /script 不存在或不属于该项目/);
+
+  const neverApplied = await markDirty({ pg, projectId: P_ID, scriptId: 's-never' });
+  assert.equal(neverApplied.ok, false);
+  assert.equal(neverApplied.status, 404);
+
+  // 两处 404 均未触碰 p-1/s-1 的行
+  assert.ok(pg.state.shots.every((s) => s.dirty === false));
+});
+
+test('G13 V2.1: markDirty validates bad input (400)', async () => {
+  const pg = makePg();
+  const cases = [
+    () => markDirty({ pg: null, projectId: P_ID, scriptId: S_ID }),
+    () => markDirty({ pg, projectId: '', scriptId: S_ID }),
+    () => markDirty({ pg, projectId: P_ID, scriptId: '' }),
+    () => markDirty({ pg, projectId: P_ID }),
+    () => markDirty({ pg, projectId: P_ID, scriptId: null }),
   ];
   for (const fn of cases) {
     const res = await fn();

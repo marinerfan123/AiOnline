@@ -557,3 +557,323 @@ test('G21: 404 run / unknown route behaviour stays intact next to the events rou
   assert.equal(res.statusCode, 404); // ghost run → guard 404
   assert.deepEqual(JSON.parse(res.chunks.join('')), { ok: false, error: 'RUN_NOT_FOUND' });
 });
+
+// ═════════════════════════════════════════════════════════════════════════════
+// V2.0 must#2 — run create 预算护栏 + GET /runs/estimate（单写者 studioRunApi）
+// ═════════════════════════════════════════════════════════════════════════════
+// 策略（与 studioRunApi.cjs 头注一致）：
+//  - 价格真源 models.credit_cost = 每逻辑模型「每任务价」（与 server.js L5
+//    billingCount 语义对齐：video 固定 1 任务、image 按件，画布节点无 count → 1）。
+//  - 无 project_budgets 行 → 放行（NO_BUDGET 策略）。
+//  - 单位换算：1 credit = 10000 units（budgetEstimate，N(14,4)）。
+
+function genPromptRow(id) {
+  return {
+    node_id: id, node_type: 'prompt', node_schema_version: 1,
+    data_json: { nodeKind: 'prompt', schemaVersion: 1, status: 'READY', parameters: { prompt: 'p' }, prompt: 'p' },
+  };
+}
+function genImageRow(id, model) {
+  return {
+    node_id: id, node_type: 'image-generation', node_schema_version: 1,
+    data_json: { nodeKind: 'image-generation', schemaVersion: 1, status: 'READY', parameters: { logicalModelId: model, aspectRatio: '1:1', resolution: '1024x1024' } },
+  };
+}
+function genVideoRow(id, model, duration = 5) {
+  return {
+    node_id: id, node_type: 'text-to-video', node_schema_version: 1,
+    data_json: { nodeKind: 'text-to-video', schemaVersion: 1, status: 'READY', parameters: { logicalModelId: model, duration, aspectRatio: '16:9', resolution: '1280x720' } },
+  };
+}
+function genEdge(id, from, to) {
+  return { edge_id: id, source_node_id: from, source_handle: 'text', target_node_id: to, target_handle: 'text', edge_type: 'smoothstep' };
+}
+
+/**
+ * 专用 mock pg（预算门 / 估算端点的 SQL 面）：projects / members / canvases /
+ * canvas nodes+edges / project_budgets / models / studio_runs(canvas+key)。
+ * connect() 返回与池同路由的 client（handleCreate 的事务面是 no-op 直连）。
+ */
+function createBudgetPgMock() {
+  const state = {
+    projects: new Map(),   // projectId -> { id, workspace_id }
+    members: new Set(),    // 'workspaceId|userId'（成员默认 owner）
+    canvases: new Map(),   // projectId -> { id, project_id, revision, schema_version }
+    nodes: new Map(),      // canvasId -> rows[]
+    edges: new Map(),      // canvasId -> rows[]
+    budgets: new Map(),    // projectId -> { budget, spent }
+    modelPrices: new Map(), // model_id -> credit_cost
+    runsByKey: new Map(),  // 'canvasId|key' -> runId
+  };
+  const calls = [];
+  const countBy = (re) => calls.filter((c) => re.test(c.sql)).length;
+
+  async function query(sql, params = []) {
+    calls.push({ sql: String(sql).trim(), params });
+    const text = String(sql);
+
+    if (text.includes('FROM studio_canvas_nodes')) {
+      const rows = state.nodes.get(params[0]) || [];
+      return { rows, rowCount: rows.length };
+    }
+    if (text.includes('FROM studio_canvas_edges')) {
+      const rows = state.edges.get(params[0]) || [];
+      return { rows, rowCount: rows.length };
+    }
+    if (text.includes('FROM studio_canvases')) {
+      const canvas = state.canvases.get(params[0]);
+      return { rows: canvas ? [canvas] : [], rowCount: canvas ? 1 : 0 };
+    }
+    if (text.includes('FROM project_budgets')) {
+      const b = state.budgets.get(params[0]);
+      if (!b) return { rows: [], rowCount: 0 };
+      return { rows: [{ project_id: params[0], workspace_id: (state.projects.get(params[0]) || {}).workspace_id, budget: b.budget, spent: b.spent, warning_threshold: 0.8, approval_threshold: 1 }], rowCount: 1 };
+    }
+    if (text.includes('FROM models')) {
+      const ids = new Set(params[0] || []);
+      const rows = [...state.modelPrices.entries()].filter(([mid]) => ids.has(mid)).map(([model_id, credit_cost]) => ({ model_id, credit_cost }));
+      return { rows, rowCount: rows.length };
+    }
+    if (text.includes('FROM studio_runs WHERE canvas_id')) {
+      const id = state.runsByKey.get(`${params[0]}|${params[1]}`);
+      return { rows: id ? [{ id }] : [], rowCount: id ? 1 : 0 };
+    }
+    if (text.includes('FROM projects p JOIN workspaces w')) {
+      const p = state.projects.get(params[0]);
+      if (!p) return { rows: [], rowCount: 0 };
+      return { rows: [{ ...p, workspace_owner_id: 'owner-u', status: 'active', project_type: 'studio' }], rowCount: 1 };
+    }
+    if (text.includes('FROM workspace_members')) {
+      const ok = state.members.has(`${params[0]}|${params[1]}`);
+      return { rows: ok ? [{ workspace_id: params[0], user_id: params[1], role: 'owner' }] : [], rowCount: ok ? 1 : 0 };
+    }
+    throw new Error(`budget mock pg: unhandled SQL: ${text}`);
+  }
+
+  return {
+    pg: { query, connect: async () => ({ query, release: async () => {} }) },
+    calls,
+    countBy,
+    addProject(projectId, workspaceId) { state.projects.set(projectId, { id: projectId, workspace_id: workspaceId }); },
+    addMember(workspaceId, userId) { state.members.add(`${workspaceId}|${userId}`); },
+    addCanvas(projectId, canvasId, revision) {
+      state.canvases.set(projectId, { id: canvasId, project_id: projectId, revision, schema_version: 1, is_primary: true, archived_at: null });
+    },
+    setNodes(canvasId, rows) { state.nodes.set(canvasId, rows); },
+    setEdges(canvasId, rows) { state.edges.set(canvasId, rows); },
+    setBudget(projectId, budget, spent) { state.budgets.set(projectId, { budget, spent }); },
+    setModelPrice(modelId, creditCost) { state.modelPrices.set(modelId, creditCost); },
+    addRun(canvasId, idempotencyKey, runId) { state.runsByKey.set(`${canvasId}|${idempotencyKey}`, runId); },
+  };
+}
+
+function makeBudgetHarness({ pgMock, sessionUser, parseBodyFn, engineOverrides = {} } = {}) {
+  const engineCalls = { create: 0, snapshot: 0 };
+  const responses = [];
+  const engine = {
+    createRunFromCanvas: async (p) => { engineCalls.create += 1; return { ok: true, runId: 'run-created', status: 'QUEUED', idempotent: false, canvasRevision: p.requestedCanvasRevision }; },
+    getRunSnapshot: async () => { engineCalls.snapshot += 1; return null; },
+    ...engineOverrides,
+  };
+  const api = createStudioRunApi({
+    pg: pgMock.pg,
+    engine,
+    sessionUser: sessionUser || (() => ({ id: 'u-1', role: 'editor' })),
+    sendJSON: (res, code, body) => {
+      responses.push({ code, body });
+      if (res && !res.headersSent && typeof res.writeHead === 'function') {
+        res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' });
+      } else if (res) res.statusCode = code;
+      if (res && typeof res.end === 'function') res.end(JSON.stringify(body));
+    },
+    parseBody: parseBodyFn || (async (req) => req._body || {}),
+  });
+  return { api, responses, engineCalls };
+}
+
+// 默认种子：p-1/w-1/u-1（owner），cv-1 rev2，prompt→image(model m-img cc=1)
+function seedImageProject(m, { budget, spent, cc = 1 } = {}) {
+  m.addProject('p-1', 'w-1');
+  m.addMember('w-1', 'u-1');
+  m.addCanvas('p-1', 'cv-1', 2);
+  m.setNodes('cv-1', [genPromptRow('pa'), genImageRow('ga', 'm-img')]);
+  m.setEdges('cv-1', [genEdge('e1', 'pa', 'ga')]);
+  m.setModelPrice('m-img', cc);
+  if (budget != null) m.setBudget('p-1', budget, spent || 0);
+}
+
+function createReq(body, query = {}) {
+  const req = makeReq();
+  req._body = body;
+  req.query = query;
+  return req;
+}
+
+test('V2.0: 有预算且估算超剩余 → POST create 409 BUDGET_INSUFFICIENT（不建 run，引擎不被调）', async () => {
+  const m = createBudgetPgMock();
+  seedImageProject(m, { budget: 10, spent: 9.5 }); // remaining 0.5 credit = 5000 units
+  const { api, responses, engineCalls } = makeBudgetHarness({ pgMock: m });
+  const res = makeRes();
+  const req = createReq({ runMode: 'ALL', canvasRevision: 2, idempotencyKey: 'ik-over' });
+  await api.handle(req, res, '/api/v2/projects/p-1/studio/runs', 'POST');
+  assert.equal(res.statusCode, 409);
+  const body = JSON.parse(res.chunks.join(''));
+  assert.equal(body.ok, false);
+  assert.equal(body.error, 'BUDGET_INSUFFICIENT');
+  assert.equal(body.estimateUnits, 10000); // m-img 1 credit = 1 任务
+  assert.equal(body.remainingUnits, 5000);
+  assert.equal(engineCalls.create, 0, 'run must NOT be created when the budget gate blocks');
+});
+
+test('V2.0: 有预算且余量足 → POST create 202（引擎创建成功）', async () => {
+  const m = createBudgetPgMock();
+  seedImageProject(m, { budget: 10, spent: 0 }); // remaining 10 credit = 100000 units ≥ 10000
+  const { api, responses, engineCalls } = makeBudgetHarness({ pgMock: m });
+  const res = makeRes();
+  const req = createReq({ runMode: 'ALL', canvasRevision: 2, idempotencyKey: 'ik-ok' });
+  await api.handle(req, res, '/api/v2/projects/p-1/studio/runs', 'POST');
+  assert.equal(res.statusCode, 202, JSON.stringify(res.chunks.join('')));
+  assert.equal(JSON.parse(res.chunks.join('')).ok, true);
+  assert.equal(engineCalls.create, 1);
+  assert.equal(responses[0].body.budgetGate, undefined, '成功响应不新增预算字段（保持原形状）');
+});
+
+test('V2.0: 无预算行 → 放行（NO_BUDGET 策略），引擎被调用 → 202', async () => {
+  const m = createBudgetPgMock();
+  seedImageProject(m); // 无 project_budgets 行
+  const { api, engineCalls } = makeBudgetHarness({ pgMock: m });
+  const res = makeRes();
+  const req = createReq({ runMode: 'ALL', canvasRevision: 2, idempotencyKey: 'ik-nobudget' });
+  await api.handle(req, res, '/api/v2/projects/p-1/studio/runs', 'POST');
+  assert.equal(res.statusCode, 202, JSON.stringify(res.chunks.join('')));
+  assert.equal(engineCalls.create, 1);
+  // 门确实走过了预算读（策略行在 → 无行 → 放行），证明不是绕过了门
+  assert.ok(m.countBy(/FROM project_budgets/) >= 1, 'budget gate must consult project_budgets');
+});
+
+test('V2.0: 幂等重放（同 canvas+key 已有 run）→ 预算不足也不拦，引擎回放 → 202', async () => {
+  const m = createBudgetPgMock();
+  seedImageProject(m, { budget: 10, spent: 9.9 }); // remaining 0.1 credit = 1000 units < 估算 10000
+  m.addRun('cv-1', 'ik-replay', 'run-existing');
+  const { api, engineCalls } = makeBudgetHarness({ pgMock: m });
+  const res = makeRes();
+  const req = createReq({ runMode: 'ALL', canvasRevision: 2, idempotencyKey: 'ik-replay' });
+  await api.handle(req, res, '/api/v2/projects/p-1/studio/runs', 'POST');
+  assert.equal(res.statusCode, 202, 'replay of an existing run is not a new spend — must not 409');
+  assert.equal(engineCalls.create, 1);
+});
+
+test('V2.0: GET /runs/estimate 200 形状 — video+image 闭包、有预算、精确 units', async () => {
+  const m = createBudgetPgMock();
+  m.addProject('p-1', 'w-1');
+  m.addMember('w-1', 'u-1');
+  m.addCanvas('p-1', 'cv-1', 2);
+  m.setNodes('cv-1', [genPromptRow('pb'), genVideoRow('gb', 'm-vid', 5), genPromptRow('pc'), genImageRow('gc', 'm-img')]);
+  m.setEdges('cv-1', [genEdge('e2', 'pb', 'gb'), genEdge('e3', 'pc', 'gc')]);
+  m.setModelPrice('m-vid', 2);  // video 每任务 2 credit → 20000 units
+  m.setModelPrice('m-img', 1);  // image 每任务 1 credit → 10000 units
+  m.setBudget('p-1', 100, 0);   // 100 credit = 1000000 units
+  const { api } = makeBudgetHarness({ pgMock: m });
+  const res = makeRes();
+  const req = createReq({ runMode: 'ALL' }); // canvasRevision 缺省 → 当前 revision
+  await api.handle(req, res, '/api/v2/projects/p-1/studio/runs/estimate', 'GET');
+  assert.equal(res.statusCode, 200, JSON.stringify(res.chunks.join('')));
+  const body = JSON.parse(res.chunks.join(''));
+  assert.equal(body.ok, true);
+  assert.equal(body.canvas.revision, 2);
+  assert.equal(body.run.runMode, 'ALL');
+  assert.equal(body.run.nodeCount, 4); // 2 prompt + video + image（可执行闭包）
+  assert.equal(body.run.generationNodeCount, 2);
+  assert.equal(body.estimate.shotCount, 2);
+  assert.equal(body.estimate.totalUnits, 30000); // 20000 video + 10000 image
+  assert.deepEqual(body.estimate.perKind, { video: 20000, image: 10000 });
+  assert.equal(body.estimate.hasUnpriced, false);
+  assert.equal(body.estimate.breakdown.length, 2);
+  assert.equal(body.estimate.breakdown[0].shotId, 'gb');
+  assert.equal(body.estimate.breakdown[0].kind, 'video');
+  assert.equal(body.estimate.breakdown[0].model, 'm-vid');
+  assert.equal(body.estimate.breakdown[0].seconds, 5);
+  assert.equal(body.estimate.breakdown[0].units, 20000);
+  assert.equal(body.estimate.breakdown[1].kind, 'image');
+  assert.equal(body.estimate.breakdown[1].count, 1);
+  assert.equal(body.estimate.breakdown[1].units, 10000);
+  assert.equal(body.budget.exists, true);
+  assert.equal(body.budget.policy, 'BUDGETED');
+  assert.equal(body.budget.budgetUnits, 1000000);
+  assert.equal(body.budget.spentUnits, 0);
+  assert.equal(body.budget.remainingUnits, 1000000);
+  assert.equal(body.budget.blocked, false);
+});
+
+test('V2.0: GET /runs/estimate — 缺价模型标 unpriced（按 L5 兜底 0），预算不足以拦截 → blocked=true', async () => {
+  const m = createBudgetPgMock();
+  m.addProject('p-1', 'w-1');
+  m.addMember('w-1', 'u-1');
+  m.addCanvas('p-1', 'cv-1', 2);
+  m.setNodes('cv-1', [genPromptRow('pa'), genImageRow('ga', 'm-img'), genPromptRow('pd'), genImageRow('gd', 'm-ghost')]);
+  m.setEdges('cv-1', [genEdge('e1', 'pa', 'ga'), genEdge('e4', 'pd', 'gd')]);
+  m.setModelPrice('m-img', 1); // m-ghost 无 models 行 → unpriced → 0
+  m.setBudget('p-1', 0.5, 0.2); // remaining 0.3 credit = 3000 units < 10000
+  const { api } = makeBudgetHarness({ pgMock: m });
+  const res = makeRes();
+  const req = createReq({ runMode: 'ALL', canvasRevision: 2 });
+  await api.handle(req, res, '/api/v2/projects/p-1/studio/runs/estimate', 'GET');
+  assert.equal(res.statusCode, 200, JSON.stringify(res.chunks.join('')));
+  const body = JSON.parse(res.chunks.join(''));
+  assert.equal(body.estimate.totalUnits, 10000); // 只计有价项（ghost → 0）
+  assert.equal(body.estimate.hasUnpriced, true);
+  assert.deepEqual(body.estimate.unpricedModelIds, ['m-ghost']);
+  assert.equal(body.estimate.breakdown[1].unpriced, true);
+  assert.equal(body.estimate.breakdown[1].units, null);
+  assert.equal(body.budget.exists, true);
+  assert.equal(body.budget.remainingUnits, 3000);
+  assert.equal(body.budget.blocked, true); // 10000 > 3000（与 create 门同判据）
+});
+
+test('V2.0: GET /runs/estimate — 无预算项目 → 200 budget.exists=false policy=NO_BUDGET', async () => {
+  const m = createBudgetPgMock();
+  seedImageProject(m); // 无预算行
+  const { api } = makeBudgetHarness({ pgMock: m });
+  const res = makeRes();
+  const req = createReq({ runMode: 'ALL', canvasRevision: 2 });
+  await api.handle(req, res, '/api/v2/projects/p-1/studio/runs/estimate', 'GET');
+  assert.equal(res.statusCode, 200);
+  const body = JSON.parse(res.chunks.join(''));
+  assert.equal(body.ok, true);
+  assert.equal(body.budget.exists, false);
+  assert.equal(body.budget.policy, 'NO_BUDGET');
+  assert.equal(body.estimate.totalUnits, 10000);
+  assert.equal(body.budget.blocked, undefined);
+});
+
+test('V2.0: GET /runs/estimate — stale revision → 409 CANVAS_REVISION_STALE（与 create 同判据）', async () => {
+  const m = createBudgetPgMock();
+  seedImageProject(m, { budget: 100 });
+  const { api } = makeBudgetHarness({ pgMock: m });
+  const res = makeRes();
+  const req = createReq({ runMode: 'ALL', canvasRevision: 1 }); // 当前是 2
+  await api.handle(req, res, '/api/v2/projects/p-1/studio/runs/estimate', 'GET');
+  assert.equal(res.statusCode, 409);
+  const body = JSON.parse(res.chunks.join(''));
+  assert.equal(body.ok, false);
+  assert.equal(body.error, 'CANVAS_REVISION_STALE');
+  assert.equal(body.serverRevision, 2);
+  assert.equal(body.requestedRevision, 1);
+});
+
+test('V2.0: GET /runs/estimate — 非法 runMode → 400 INVALID_RUN_MODE；缺鉴权 → 401', async () => {
+  const m = createBudgetPgMock();
+  seedImageProject(m, { budget: 100 });
+  const { api } = makeBudgetHarness({ pgMock: m });
+  const res = makeRes();
+  await api.handle(createReq({ runMode: 'BOGUS' }), res, '/api/v2/projects/p-1/studio/runs/estimate', 'GET');
+  assert.equal(res.statusCode, 400);
+  assert.equal(JSON.parse(res.chunks.join('')).error, 'INVALID_RUN_MODE');
+
+  const m2 = createBudgetPgMock();
+  seedImageProject(m2, { budget: 100 });
+  const { api: api2 } = makeBudgetHarness({ pgMock: m2, sessionUser: () => null });
+  const res2 = makeRes();
+  await api2.handle(createReq({ runMode: 'ALL' }), res2, '/api/v2/projects/p-1/studio/runs/estimate', 'GET');
+  assert.equal(res2.statusCode, 401);
+});

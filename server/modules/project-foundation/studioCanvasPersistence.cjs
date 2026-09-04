@@ -200,9 +200,33 @@ function createStudioCanvasPersistence(deps) {
       if (prior.rows.length) { await client.query('COMMIT'); return sendJSON(res, 200, { ...prior.rows[0].response_json, idempotent: true }); }
       const cas = await client.query('UPDATE studio_canvases SET revision=revision+1, viewport_json=COALESCE($3, viewport_json), updated_by=$4, updated_at=NOW() WHERE id=$1 AND revision=$2 RETURNING *', [canvas.id, base, body.viewport === undefined ? null : JSON.stringify(safeJson(body.viewport, {})), user.id]);
       if (!cas.rows.length) { const cur = await client.query('SELECT revision FROM studio_canvases WHERE id=$1', [canvas.id]); await client.query('ROLLBACK'); return sendErr(sendJSON, res, 409, 'CONFLICT', { serverRevision: cur.rows[0]?.revision || canvas.revision, canvasId: canvas.id }); }
+      // W2-06 — 权威绑定校验接线(三视图叶2)。CAS 通过后、任何写入(delete/upsert)之前,
+      // 对本次 upsertNodes 全部先归一化再校验 —— 绑定只可能随节点 data_json.shotId /
+      // data_json.structureNodeId 进入, 故边 upsert / 节点删除路径不携带绑定串, 由同一
+      // 流级守卫覆盖: 凡含绑定节点的 PATCH 无论是否同时 upsertEdges/删除都被拦截于写前。
+      //   权威集 = 项目域执行 shot(shots.id, 经 episodes 项目归属) + 项目结构节点
+      //   (project_structure_nodes.id), 与 23-project-truth-three-view §2.2-3/叶3 目标一致。
+      //   限制(注释声明, 不做迁移): 计划 shot(project_shots_rows.shot_id, s{scene}:b{beat}:k{shot})
+      //   与执行 shot(shots.id) 双 id 空间尚未统一(叶4 迁移), 本守卫按现有语义仅校验存在性;
+      //   计划空间 id 在统一前会被 409 拒 —— canvas data.shotId 语义锁定 = 执行 shot。
+      //   空串/纯空白视为"未绑定"(FE storyboard 默认 shotId:'' 占位), 不参与校验。
+      const normNodes = upsertNodes.map(normalizeNode);
+      const boundNodes = normNodes.filter((n) => {
+        const d = n.data || {};
+        return (typeof d.shotId === 'string' && d.shotId.trim() !== '')
+          || (typeof d.structureNodeId === 'string' && d.structureNodeId.trim() !== '');
+      });
+      if (boundNodes.length) {
+        const [shotRows, structRows] = await Promise.all([
+          client.query('SELECT id FROM shots WHERE episode_id IN (SELECT id FROM episodes WHERE project_id=$1)', [access.project.id]),
+          client.query('SELECT id FROM project_structure_nodes WHERE project_id=$1', [access.project.id]),
+        ]);
+        const chk = validateAuthoritativeBindings(boundNodes, { shotIds: shotRows.rows.map((r) => r.id), structureNodeIds: structRows.rows.map((r) => r.id) });
+        if (!chk.ok) throw Object.assign(new Error('BINDING_INVALID'), { bindingErrors: chk.errors, canvasId: canvas.id });
+      }
       if (deleteEdgeIds.length) await client.query('DELETE FROM studio_canvas_edges WHERE canvas_id=$1 AND edge_id = ANY($2::text[])', [canvas.id, deleteEdgeIds]);
       if (deleteNodeIds.length) await client.query('DELETE FROM studio_canvas_nodes WHERE canvas_id=$1 AND node_id = ANY($2::text[])', [canvas.id, deleteNodeIds]);
-      for (const raw of upsertNodes) { const n = normalizeNode(raw); await client.query(`INSERT INTO studio_canvas_nodes (canvas_id,node_id,node_type,node_schema_version,position_x,position_y,width,height,z_index,data_json,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW(),NOW()) ON CONFLICT (canvas_id,node_id) DO UPDATE SET node_type=EXCLUDED.node_type,node_schema_version=EXCLUDED.node_schema_version,position_x=EXCLUDED.position_x,position_y=EXCLUDED.position_y,width=EXCLUDED.width,height=EXCLUDED.height,z_index=EXCLUDED.z_index,data_json=EXCLUDED.data_json,updated_at=NOW()`, [canvas.id,n.nodeId,n.nodeType,n.nodeSchemaVersion,n.positionX,n.positionY,n.width,n.height,n.zIndex,JSON.stringify(n.data)]); }
+      for (const n of normNodes) { await client.query(`INSERT INTO studio_canvas_nodes (canvas_id,node_id,node_type,node_schema_version,position_x,position_y,width,height,z_index,data_json,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW(),NOW()) ON CONFLICT (canvas_id,node_id) DO UPDATE SET node_type=EXCLUDED.node_type,node_schema_version=EXCLUDED.node_schema_version,position_x=EXCLUDED.position_x,position_y=EXCLUDED.position_y,width=EXCLUDED.width,height=EXCLUDED.height,z_index=EXCLUDED.z_index,data_json=EXCLUDED.data_json,updated_at=NOW()`, [canvas.id,n.nodeId,n.nodeType,n.nodeSchemaVersion,n.positionX,n.positionY,n.width,n.height,n.zIndex,JSON.stringify(n.data)]); }
       for (const raw of upsertEdges) { const e = normalizeEdge(raw); await client.query(`INSERT INTO studio_canvas_edges (canvas_id,edge_id,source_node_id,source_handle,target_node_id,target_handle,edge_type,data_json,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW(),NOW()) ON CONFLICT (canvas_id,edge_id) DO UPDATE SET source_node_id=EXCLUDED.source_node_id,source_handle=EXCLUDED.source_handle,target_node_id=EXCLUDED.target_node_id,target_handle=EXCLUDED.target_handle,edge_type=EXCLUDED.edge_type,data_json=EXCLUDED.data_json,updated_at=NOW()`, [canvas.id,e.edgeId,e.sourceNodeId,e.sourceHandle,e.targetNodeId,e.targetHandle,e.edgeType,JSON.stringify(e.data)]); }
       const graph = await loadGraph(client, canvas.id); const fresh = (await client.query('SELECT * FROM studio_canvases WHERE id=$1', [canvas.id])).rows[0]; const resp = response(fresh, graph, fresh.viewport_json, { permissions: access.permissions, extra: { applied: true, clientMutationId: cmid } });
       await client.query('INSERT INTO studio_canvas_mutations (canvas_id,client_mutation_id,base_revision,resulting_revision,response_json,created_by) VALUES ($1,$2,$3,$4,$5,$6)', [canvas.id, cmid, base, fresh.revision, JSON.stringify(resp), user.id]);
@@ -212,7 +236,7 @@ function createStudioCanvasPersistence(deps) {
       // warn-only(见 recordCanvasPatch), 不破主链。409/校验失败/回滚路径永不走到此处。
       await recordCanvasPatch({ canvasId: canvas.id, commandId: cmid, actorId: user.id, baseRevision: base, ops: { nodeUpserts: upsertNodes.length, nodeDeletes: deleteNodeIds.length, edgeUpserts: upsertEdges.length, edgeDeletes: deleteEdgeIds.length } });
       await emit('canvas.updated', { canvas_id: canvas.id, project_id: projectId, workspace_id: fresh.workspace_id, revision: fresh.revision, actor_id: user.id, timestamp: new Date().toISOString() }); return sendJSON(res, 200, resp);
-    } catch (e) { try { await client.query('ROLLBACK'); } catch (_) {} if (['INVALID_NODE','INVALID_EDGE'].includes(e.message)) return sendErr(sendJSON, res, 400, e.message); if (e.code === '23503') return sendErr(sendJSON, res, 400, 'INTEGRITY_ERROR'); throw e; } finally { client.release(); }
+    } catch (e) { try { await client.query('ROLLBACK'); } catch (_) {} if (e.message === 'BINDING_INVALID') return sendErr(sendJSON, res, 409, 'BINDING_INVALID', { errors: e.bindingErrors || [], canvasId: e.canvasId }); if (['INVALID_NODE','INVALID_EDGE'].includes(e.message)) return sendErr(sendJSON, res, 400, e.message); if (e.code === '23503') return sendErr(sendJSON, res, 400, 'INTEGRITY_ERROR'); throw e; } finally { client.release(); }
   }
   async function handleVersionList(req, res, user, projectId) { const access = await requireProject(pg, res, user, projectId); if (!access) return; const canvas = await getCanvas(pg, projectId); if (!canvas) return sendJSON(res, 200, { versions: [], pagination: { limit: 20, offset: 0, total: 0, hasMore: false } }); const q = req.query || {}; const limit = Math.min(Math.max(Number(q.limit) || 20, 1), 100); const offset = Math.max(Number(q.offset) || 0, 0); const cr = await pg.query('SELECT COUNT(*)::int AS total FROM studio_canvas_versions WHERE canvas_id=$1', [canvas.id]); const r = await pg.query('SELECT id,canvas_id,revision,version_number,name,description,snapshot_json,created_by,restore_source_version_id,created_at FROM studio_canvas_versions WHERE canvas_id=$1 ORDER BY version_number DESC LIMIT $2 OFFSET $3', [canvas.id, limit, offset]); const versions = r.rows.map(v => ({ id:v.id, canvasId:v.canvas_id, revision:v.revision, versionNumber:v.version_number, name:v.name, description:v.description, createdBy:v.created_by, createdAt:toIso(v.created_at), restoredFromVersionId:v.restore_source_version_id, nodeCount:(v.snapshot_json?.nodes||[]).length, edgeCount:(v.snapshot_json?.edges||[]).length })); return sendJSON(res, 200, { versions, pagination: { limit, offset, total: cr.rows[0].total, hasMore: offset + versions.length < cr.rows[0].total } }); }
   async function handleVersionCreate(req, res, user, projectId) { const body = (await parseBody(req)) || {}; const client = await pg.connect(); try { await client.query('BEGIN'); const access = await requireProject(client, res, user, projectId); if (!access) { await client.query('ROLLBACK'); return; } if (!access.permissions.canUpdate) { await client.query('ROLLBACK'); return sendErr(sendJSON, res, 403, '无权编辑该项目'); } const canvas = await ensureCanvas(client, access.project, user); // Commercial hardening (B): serialize concurrent version creates per canvas.
