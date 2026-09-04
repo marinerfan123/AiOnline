@@ -10,11 +10,15 @@ const volcano = require('./volcano.cjs');
 
 const adapters = { agnes, minimax, volcano };
 
+// 只认自有键：adapters 是普通对象字面量，裸 adapters[v] 会让 'constructor'/'__proto__' 等
+// prototype 链键穿透路由（命中 Object.prototype）并让后续 submitAndPoll 抛 TypeError。
+const hasAdapter = (v) => typeof v === 'string' && Object.prototype.hasOwnProperty.call(adapters, v);
+
 function resolveKey(provider, model) {
   const me = (model && model.endpoint) || {};
   const pe = (provider && (provider.default_endpoint || provider.defaultEndpoint)) || {};
   const v = me.videoAdapter || pe.videoAdapter;
-  if (v && adapters[v]) return v;
+  if (hasAdapter(v)) return v;
   const base = (provider && provider.base_url) || '';
   if (/agnes-ai\.cn/i.test(base)) return 'agnes';
   if (/minimax/i.test(base)) return 'minimax';

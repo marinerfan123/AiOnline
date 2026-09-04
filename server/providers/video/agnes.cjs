@@ -27,23 +27,25 @@ function resolveAgnesEndpoint(provider, model) {
   const baseUrl = (provider && provider.base_url) || 'https://api.agnes-ai.cn/v1';
   const rootBase = agnesRootBase(baseUrl);
 
-  const submitEp = me.generate
-    ? { baseUrl, method: 'POST', ...me.generate }
-    : { baseUrl, path: '/videos', method: 'POST' };
+  // 部分覆盖语义：显式配置只覆盖其提供的键，未提供的键保留默认（否则只配 taskPollIntervalMs
+  // 会让 pollEp.path 变 undefined，轮询时 callEndpoint 直接 TypeError）。完整覆盖行为不变。
+  const DEFAULT_SUBMIT_EP = { baseUrl, path: '/videos', method: 'POST' };
+  const submitEp = me.generate ? { ...DEFAULT_SUBMIT_EP, ...me.generate } : { ...DEFAULT_SUBMIT_EP };
   const taskIdPath = submitEp.taskIdPath || 'video_id';
 
+  const DEFAULT_POLL_EP = {
+    baseUrl: rootBase,
+    path: '/agnesapi',
+    method: 'GET',
+    taskQueryParam: 'video_id',
+    taskResultPath: 'metadata.url',
+    taskStatusPath: 'status',
+    taskSuccessValues: ['completed'],
+    taskPollIntervalMs: 8000,
+  };
   const pollEp = me.poll
-    ? { baseUrl: me.poll.baseUrl || rootBase, method: 'GET', ...me.poll }
-    : {
-        baseUrl: rootBase,
-        path: '/agnesapi',
-        method: 'GET',
-        taskQueryParam: 'video_id',
-        taskResultPath: 'metadata.url',
-        taskStatusPath: 'status',
-        taskSuccessValues: ['completed'],
-        taskPollIntervalMs: 8000,
-      };
+    ? { ...DEFAULT_POLL_EP, ...me.poll, baseUrl: me.poll.baseUrl || rootBase }
+    : { ...DEFAULT_POLL_EP };
 
   return { submitEp, pollEp, taskIdPath, baseUrl };
 }

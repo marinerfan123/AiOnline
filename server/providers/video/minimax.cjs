@@ -47,11 +47,22 @@ async function submit(provider, model, opts) {
   };
 
   const base = (provider.base_url || 'https://api.minimaxi.com/v2').replace(/\/+$/, '');
-  const submitRes = await fetchJson(`${base}/video_generation`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${apiKey}` },
-    body,
-  });
+  let submitRes;
+  try {
+    submitRes = await fetchJson(`${base}/video_generation`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${apiKey}` },
+      body,
+    });
+  } catch (e) {
+    // 网络错 / 上游 60s 超时归一：不得向上抛（与 agnes.submit 提交异常口径一致），
+    // 交上层按瞬时 error 冷却本账号后切换下一家（任务可能未创建，无重复计费风险）。
+    const name = (e && e.name) || '';
+    const msg = (e && e.message) || String(e);
+    const cause = (e && e.cause && e.cause.message) ? `（${e.cause.message}）` : '';
+    const reason = name === 'AbortError' ? `上游请求超时（60s 无响应）：${msg}` : `${msg}${cause}`;
+    return { videoUrl: '', status: 'error', images: [], error: `提交异常：${reason}`.slice(0, 160) };
+  }
   if (submitRes.status >= 400) return makeError(submitRes.body, submitRes.status, '视频任务提交失败');
 
   // 返回结构：{ task_id, base_resp:{status_code,status_msg} } 或错误体
@@ -82,7 +93,7 @@ async function poll(provider, model, taskId, startedAt = 0, isCancelled = null) 
         const url = String((task.content && task.content.url) || b2.video_url || '');
         return url ? { videoUrl: url, status: 'success' } : { videoUrl: '', status: 'error', error: '任务成功但未返回视频 URL' };
       }
-      if (st === 'failed') return { videoUrl: '', status: 'error', error: `视频生成失败：${JSON.stringify(task).slice(0, 160)}` };
+      if (st === 'failed') return { videoUrl: '', status: 'failed', error: `视频生成失败：${JSON.stringify(task).slice(0, 160)}` };
       return { videoUrl: '', status: 'pending' };
     },
   });
