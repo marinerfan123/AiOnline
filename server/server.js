@@ -51,6 +51,8 @@ import aiControlRouterMod from './modules/ai-control/routes/aiControlRoutes.cjs'
 import projectFoundationMod from './modules/project-foundation/projectFoundation.cjs';
 import presenceApiMod from './modules/collaboration/presenceApi.cjs';
 import presenceBusMod from './modules/collaboration/presenceBus.cjs';
+import presencePgStoreMod from './modules/collaboration/presencePgStore.cjs';
+import presencePgBusAdapterMod from './modules/collaboration/presencePgBusAdapter.cjs';
 import assetFoundationMod from './modules/project-foundation/assetFoundation.cjs';
 import studioModelsApiMod from './modules/modelhub/studioModelsApi.cjs';
 import uploadApiMod from './modules/media/uploadApi.cjs';
@@ -1566,10 +1568,14 @@ const continuityApi = continuityApiMod.createContinuityApi({
   parseBody,
 });
 
-// G22 — Presence API (/api/v2/presence): in-process memory presence bus
-// (createPresenceBus defaults to its memory store) with periodic TTL sweep.
-// Production swaps a PG/Redis store via the same seam.
-const presenceBus = presenceBusMod.createPresenceBus({});
+// G22 — Presence API (/api/v2/presence): PG-backed presence (0047 canvas_presence)
+// via presencePgStore + async bus adapter; 30s TTL sweep on an interval.
+const presencePgStore = presencePgStoreMod.createPresencePgStore({
+  pg: {
+    query: (sql, params) => pgPool ? pgPool.query(sql, params) : Promise.reject(Object.assign(new Error('数据库未就绪'), { status: 503 })),
+  },
+});
+const presenceBus = presencePgBusAdapterMod.createPresencePgBusAdapter({ store: presencePgStore });
 
 // V3.1 Community Phase-0 — /api/v2/community/works.
 const communityWorksStore = communityWorksStoreMod.createWorksStore({
@@ -1589,7 +1595,7 @@ const presenceApi = presenceApiMod.createPresenceApi({
   sendJSON,
   parseBody,
 });
-setInterval(() => { try { presenceBus.sweep(); } catch (_) {} }, 15000);
+setInterval(() => { presenceBus.sweep().catch(() => {}); }, 15000);
 
 // G06 — General asset upload (/api/v2/uploads + finalize). Signed PUT adapter:
 // active storage config (Aliyun→Tencent), else null → 503.

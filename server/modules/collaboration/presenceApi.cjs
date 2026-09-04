@@ -12,6 +12,7 @@
  *     本模块只做 会话(401) → 路由 → 字段透传 → 结果序列化。userId 一律取自
  *     sessionUser(req).id，绝不信任客户端传入的 userId（防冒名）。
  *   - 归一保证：state=busy 是 legacy alias，bus.heartbeat 在入列前归一 busy→editing，
+ *   - 异步兼容：bus 方法一律 await（内存 bus 同步返回亦可 await），支持 PG-backed adapter。
  *     HTTP 层原样透传（canonical 枚举与 alias 语义的单一真源在 presenceBus.cjs）。
  *   - 无会话（sessionUser(req) 为 null/undefined）→ 401 {ok:false,error:'未登录'}，
  *     与 timelineApi/scriptApi 等既有模块一致。
@@ -76,7 +77,7 @@ function createPresenceApi({ bus, sessionUser, sendJSON, parseBody }) {
       if (!user) return true;
       // 客户端可传 canvasId/state；userId 只取会话身份，忽略 body.userId（防冒名）。
       const body = (await parseBody(req)) || {};
-      const result = bus.heartbeat({
+      const result = await bus.heartbeat({
         userId: user.id,
         canvasId: body && body.canvasId,
         state: body && body.state,
@@ -99,7 +100,7 @@ function createPresenceApi({ bus, sessionUser, sendJSON, parseBody }) {
       let canvasId;
       try { canvasId = decodeURIComponent(peersMatch[1]); } catch { return sendJSON(res, 400, { ok: false, error: 'canvasId 非法' }); }
       // bus.peers 惰性过滤：仅返回该画布 ≤TTL 且在线的成员；过期记录由外部 sweep 清。
-      const peers = bus.peers(canvasId);
+      const peers = await bus.peers(canvasId);
       return sendJSON(res, 200, { ok: true, canvasId, peers });
     }
 
