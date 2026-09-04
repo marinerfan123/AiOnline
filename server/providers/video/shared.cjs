@@ -188,6 +188,7 @@ async function pollLoop({ intervalMs = 3000, timeoutMs = 90 * 60 * 1000, pollFn,
   const deadline = Date.now() + timeoutMs;
   const base = startedAt || Date.now();   // 持久化 startedAt（崩溃恢复接入时传入）→ 重启任务不重置密度；否则用本进程起点
   const wasCancelled = () => typeof isCancelled === 'function' && isCancelled();
+  let backoffMs = 0;                       // pollFn 可回传 retryAfterMs 驱动 429/5xx 瞬时退避（下一轮 sleep 下限）
   while (Date.now() < deadline) {
     // 取消信号①：sleep 前（最高频命中，用户取消后下一轮立即退出，避免白等一个 interval）
     if (wasCancelled()) return { videoUrl: '', status: 'canceled', error: '用户已取消' };
@@ -201,7 +202,9 @@ async function pollLoop({ intervalMs = 3000, timeoutMs = 90 * 60 * 1000, pollFn,
       else if (elapsed < 15 * 60_000) iv = Math.max(intervalMs, 30_000);  // 5~15 分钟：≥30s
       else iv = Math.max(intervalMs, 60_000);                             // >15 分钟：60s 封顶
     }
+    iv = Math.max(iv, backoffMs);          // 429/5xx 退避：不因自适应被压短，封顶由 pollFn 决定
     await sleep(iv);
+    backoffMs = 0;                          // 本轮退避已消费
     // 取消信号②：sleep 后立即检查（避免刚睡完还去打 provider）
     if (wasCancelled()) return { videoUrl: '', status: 'canceled', error: '用户已取消' };
     let r;
@@ -212,6 +215,10 @@ async function pollLoop({ intervalMs = 3000, timeoutMs = 90 * 60 * 1000, pollFn,
     }
     // 取消信号③：拿到 provider 回复后再确认一次（防止取消瞬间恰好发出请求）
     if (wasCancelled()) return { videoUrl: '', status: 'canceled', error: '用户已取消' };
+    // 429/5xx 瞬时退避：pollFn 回传 retryAfterMs → 下一轮 sleep 至少等这么久（继续轮询，不判失败）
+    if (r && typeof r.retryAfterMs === 'number' && r.retryAfterMs > 0) {
+      backoffMs = Math.min(Math.ceil(r.retryAfterMs), 300_000);
+    }
     // 成功 / 明确的生成端失败 / 瞬时异常 都立即返回（不让 pollLoop 继续空等）。
     // 注意：'failed' 是 provider 任务 definitive 终态（failed/error/canceled），必须作为终态返回，
     // 与瞬时 'error'（网络抖动/提交失败）区分——上层据此立即终态化、绝不切下一个账号空转。

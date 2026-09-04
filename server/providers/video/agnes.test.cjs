@@ -35,6 +35,13 @@ function installFetch(stub) {
   return () => { global.fetch = orig; };
 }
 
+// 期间把全局 setTimeout 夹到 ≤15ms，让 poll 的 429/5xx 退避（30s 级）秒级跑完；结束必还原
+async function withFastTimeout(fn) {
+  const orig = global.setTimeout;
+  global.setTimeout = (cb, ms, ...args) => orig(cb, Math.max(0, Math.min(ms, 15)), ...args);
+  try { return await fn(); } finally { global.setTimeout = orig; }
+}
+
 const PROVIDER = { base_url: 'https://api.agnes-ai.cn/v1', api_key: 'sk-test-1' };
 const NOKEY = { base_url: 'https://api.agnes-ai.cn/v1' };
 const MODEL = { model_id: 'agnes-image-2.1-flash', upstreamModelName: 'agnes-image-2.1-flash' };
@@ -111,7 +118,7 @@ test('resolveAgnesEndpoint: 默认端点（POST {base}/videos + GET {origin}/agn
   assert.equal(pollEp.taskQueryParam, 'video_id');
   assert.equal(pollEp.taskResultPath, 'metadata.url');
   assert.equal(pollEp.taskStatusPath, 'status');
-  assert.deepEqual(pollEp.taskSuccessValues, ['completed']);
+  assert.deepEqual(pollEp.taskSuccessValues, agnes.AGNES_SUCCESS_STATUSES);
   assert.equal(pollEp.taskPollIntervalMs, 8000);
 });
 
@@ -142,7 +149,7 @@ test('resolveAgnesEndpoint: 部分覆盖不丢默认（回归：仅配 interval 
   assert.equal(pollEp.taskQueryParam, 'video_id');
   assert.equal(pollEp.taskResultPath, 'metadata.url');
   assert.equal(pollEp.taskStatusPath, 'status');
-  assert.deepEqual(pollEp.taskSuccessValues, ['completed']);
+  assert.deepEqual(pollEp.taskSuccessValues, agnes.AGNES_SUCCESS_STATUSES);
 
   // generate 同理：只加 headers 不丢 path/method
   const { submitEp } = agnes.resolveAgnesEndpoint(PROVIDER, { endpoint: { generate: { headers: { 'X-Trace': '1' } } } });
@@ -356,7 +363,90 @@ test('poll: 部分 poll 覆盖（仅 interval）+ pending→success 端到端（
   } finally { restore(); }
 });
 
-// ─── submitAndPoll ──────────────────────────────────────────────
+// ─── poll 健壮性硬化（G11 波：状态词表放宽 / internal_status 回退 / 429·5xx 退避 / expires）───
+
+test('poll: 顶层 status=done（非 completed）→ success（放宽成功词表，不再空转到超时）', async () => {
+  const stub = seqFetch([jsonRes(200, { status: 'done', url: 'https://cdn/done.mp4' })]);
+  const restore = installFetch(stub);
+  try {
+    const r = await agnes.poll(PROVIDER, FAST_MODEL, 'vt-1');
+    assert.equal(r.status, 'success');
+    assert.equal(r.videoUrl, 'https://cdn/done.mp4');
+    assert.equal(stub.calls().length, 1, 'done 一次即终态，不再 pending 空转');
+  } finally { restore(); }
+});
+
+test('poll: 顶层 status=expired → failed 终态（URL 过期不再空转）', async () => {
+  const stub = seqFetch([jsonRes(200, { status: 'expired' })]);
+  const restore = installFetch(stub);
+  try {
+    const r = await agnes.poll(PROVIDER, FAST_MODEL, 'vt-1');
+    assert.equal(r.status, 'failed');
+    assert.match(r.error, /视频生成失败/);
+    assert.equal(stub.calls().length, 1);
+  } finally { restore(); }
+});
+
+test('poll: 缺顶层 status 但 internal_status=completed → success（历史响应回退）', async () => {
+  const stub = seqFetch([jsonRes(200, { internal_status: 'completed', url: 'https://cdn/int.mp4' })]);
+  const restore = installFetch(stub);
+  try {
+    const r = await agnes.poll(PROVIDER, FAST_MODEL, 'vt-1');
+    assert.equal(r.status, 'success');
+    assert.equal(r.videoUrl, 'https://cdn/int.mp4');
+  } finally { restore(); }
+});
+
+test('poll: success 携带 expires_at → expiresAt 透传（URL 时效可被上层识别）', async () => {
+  const stub = seqFetch([jsonRes(200, { status: 'completed', metadata: { url: 'https://cdn/e.mp4' }, expires_at: 1730000000 })]);
+  const restore = installFetch(stub);
+  try {
+    const r = await agnes.poll(PROVIDER, FAST_MODEL, 'vt-1');
+    assert.equal(r.status, 'success');
+    assert.equal(r.expiresAt, 1730000000);
+  } finally { restore(); }
+});
+
+test('poll: 401 → 终态 error（鉴权失败，绝不空转 90 分钟）', async () => {
+  const stub = seqFetch([jsonRes(401, { error: { message: 'bad key' } })]);
+  const restore = installFetch(stub);
+  try {
+    const r = await agnes.poll(PROVIDER, FAST_MODEL, 'vt-1');
+    assert.equal(r.status, 'error');
+    assert.match(r.error, /轮询鉴权失败/);
+    assert.equal(stub.calls().length, 1);
+  } finally { restore(); }
+});
+
+test('poll: 429 → 退避续轮询（不判失败），随后 completed → success', async () => {
+  const stub = seqFetch([
+    jsonRes(429, { error: { message: 'slow down' } }),
+    jsonRes(200, { status: 'completed', url: 'https://cdn/rl.mp4' }),
+  ]);
+  const restore = installFetch(stub);
+  try {
+    const r = await withFastTimeout(() => agnes.poll(PROVIDER, FAST_MODEL, 'vt-1'));
+    assert.equal(r.status, 'success');
+    assert.equal(r.videoUrl, 'https://cdn/rl.mp4');
+    assert.equal(stub.calls().length, 2, '429 后继续轮询（退避），不提前判失败');
+  } finally { restore(); }
+});
+
+test('poll: 5xx → 退避续轮询，随后 completed → success（瞬时不判失败）', async () => {
+  const stub = seqFetch([
+    jsonRes(500, { message: 'upstream boom' }),
+    jsonRes(200, { status: 'completed', url: 'https://cdn/5xx.mp4' }),
+  ]);
+  const restore = installFetch(stub);
+  try {
+    const r = await withFastTimeout(() => agnes.poll(PROVIDER, FAST_MODEL, 'vt-1'));
+    assert.equal(r.status, 'success');
+    assert.equal(r.videoUrl, 'https://cdn/5xx.mp4');
+    assert.equal(stub.calls().length, 2);
+  } finally { restore(); }
+});
+
+
 test('submitAndPoll: 提交阶段报错直接透传（不进轮询）', async () => {
   const stub = seqFetch([]);
   const restore = installFetch(stub);
@@ -446,8 +536,8 @@ test('M02镜像: status 语义无漂移 —— 本文件判定的成功/终态�
   const { AGNES_STATUS_MAP: map } = mirror;
   // 成功集合：本文件默认 taskSuccessValues ['completed'] → M02 判 SUCCEEDED
   assert.equal(map.completed, 'SUCCEEDED');
-  // 终态失败集合：本文件 terminal failed 的四个 raw → M02 必须落在 {FAILED, CANCELLED}（isTerminal）
-  for (const raw of ['failed', 'error', 'canceled', 'cancelled']) {
+  // 终态失败集合：本文件 terminal failed 的 raw → M02 必须落在 {FAILED, CANCELLED}（isTerminal）
+  for (const raw of ['failed', 'error', 'canceled', 'cancelled', 'expired']) {
     const state = map[raw];
     assert.ok(['FAILED', 'CANCELLED'].includes(state), `raw=${raw} → ${state}`);
     assert.ok(isTerminal(state), `raw=${raw} 两侧同判终态`);

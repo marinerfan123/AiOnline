@@ -93,7 +93,9 @@ const billing = {
   // Release: atomically refund balance and insert release transaction.
   // Idempotent: ON CONFLICT prevents double refund.
   // Wrapped in transaction so balance + transaction are atomic.
-  // W1C: now writes balance_after (snapshot after refund).
+  // W1C: now writes balance_after — note: captured BEFORE the refund UPDATE
+  // (the INSERT ... (SELECT credits) runs first, then UPDATE +amount), so it is the
+  // pre-refund snapshot. finance.reconcile ignores it and adds amount instead.
   async releaseCredits(pg, userId, amount, ref, pool = 'recharge') {
     if (!amount || amount <= 0) return true;
     const col = pool === 'reward' ? 'reward_credits' : 'recharge_credits';

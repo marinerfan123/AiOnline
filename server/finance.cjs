@@ -8,9 +8,10 @@
 //   5. topup-packages 充值套餐 CRUD（后台可配置，替换前端硬编码预设）
 // 依赖（由 server.js 注入）：getPg / session / sendJSON / fromSnake / parseBody
 // 设计依据：credit_transactions.kind ∈ {reserve,commit,release,grant,adjust}
-//   - reserve / release 实际改动余额但不写 balance_after
-//   - commit / grant / adjust 写 balance_after（余额快照）
-//   对账引擎据此混合重建，对任何漏记/重复记账都能暴露漂移。
+//   - billing W1C 起，reserve / release / commit / grant / adjust 全部写 balance_after（余额快照）
+//   - 但 reserve / release 的 balance_after 仅作审计/账本参考，对账引擎不采信（见 reconcile）
+//   - commit / grant / adjust 的 balance_after 为权威快照，对账引擎据此校准
+//   对账引擎混合重建（快照校准 + 金额逐笔加减），对任何漏记/重复记账都能暴露漂移。
 
 function createFinance(ctx) {
   const { getPg, session, sendJSON, fromSnake, parseBody, invalidateProviders, loader } = ctx;
@@ -303,9 +304,13 @@ function createFinance(ctx) {
 
   // ───────────────────────── 对账：混合重建法核对账实相符 ─────────────────────────
   // 规则：逐笔推进 sim ——
-  //   reserve: 实际扣余额（sim -= amount，无快照也减）
-  //   release: 实际补余额（sim += amount，无快照也加）
+  //   reserve: 实际扣余额（sim -= amount）
+  //   release: 实际补余额（sim += amount）
   //   commit / grant / adjust: 用 balance_after 校准 sim（权威快照）
+  // 注意（billing W1C）：reserve / release / commit / grant / adjust 现都写 balance_after，
+  //   但 reserve / release 仍按 amount 加减、不读其 balance_after——因为 commit/grant/adjust
+  //   的 balance_after 快照已包含此前 reserve/release 的影响，若 reserve/release 也改用
+  //   balance_after 校准会与快照叠加导致双算；金额加减保持与快照语义一致。
   // 最终 sim 必须 == users.credits，否则账实不符 / 漏记 / 重复记账。
   async function reconcile() {
     const p = pg();

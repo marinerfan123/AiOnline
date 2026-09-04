@@ -1571,7 +1571,32 @@ async function resumeOneImageTask(pgPool, row, opts) {
   }
 }
 
-async function resumeOneTask(pgPool, row) {
+// ─── 续轮询多轮等待（防御性）───
+// 现状核验（2026-09-05）：built-in 视频适配器（agnes/minimax/volcano，见 providers/video/*.cjs）与 generic 路径
+// （genericVideoPoll）内部都经 shared.pollLoop 自适应循环至终态——success/failed/error/canceled/timeout，
+// 单次 await videoRouter.poll 即会循环完成、绝不返回 'pending'（pollLoop 对 pending 继续等生成端回复）。
+// 因此 resume 不再自建 90 分钟大循环，避免与 pollLoop 双重空转。此 helper 仅为兜底「单查适配器」：
+// 若未来某适配器 poll 只做一次查询、返回 'pending'（未达终态），resume 层补多轮等待直到终态或超时上限，
+// 绝不把 pending 直接漏到下方终态机（否则会误判失败、误释放 held）。
+const RESUME_POLL_TIMEOUT_MS = 90 * 60 * 1000;   // 单查适配器的补轮询等待上限（与 pollLoop 安全线一致）
+const RESUME_POLL_INTERVAL_MS = 10 * 1000;       // 单查适配器 pending 时的补轮询间隔
+async function resumePollToTerminal(pollFn, task_id, { pollTimeoutMs = RESUME_POLL_TIMEOUT_MS, pollIntervalMs = RESUME_POLL_INTERVAL_MS } = {}) {
+  const deadline = Date.now() + pollTimeoutMs;
+  let res = await pollFn();
+  while (res && res.status === 'pending' && Date.now() < deadline) {
+    // 取消护栏：单查适配器轮询期间被 cancelTask 取消 → 立即返回 canceled（不向 provider 继续打）
+    if (cancelledTasks.has(task_id)) return { videoUrl: '', status: 'canceled', error: '用户已取消' };
+    await sleep(pollIntervalMs);
+    res = await pollFn();
+  }
+  if (res && res.status === 'pending') {
+    // 单查适配器超过安全线仍 pending → 归一为 timeout（保留待复核，不判失败、不释放，成败只听生成端）
+    return { videoUrl: '', status: 'timeout', error: '续轮询超过安全线仍未达终态，任务保留待复核' };
+  }
+  return res;
+}
+
+async function resumeOneTask(pgPool, row, opts = {}) {
   const { task_id, provider_id, model_id, provider_key, provider_task_id, user_id, idempotency_key, cost, cost_pool, model, content_type, count } = row;
   // 兼容旧任务：model_id 可能为空（遗留图片 / 视频任务），用 display_name 兜底解析 canonical
   const effectiveModelId = model_id || (await resolveModelIdentity(pgPool, model))[0] || model;
@@ -1602,32 +1627,43 @@ async function resumeOneTask(pgPool, row) {
       if (Number.isFinite(t)) startedAt = t;
     }
   } catch {}
-  let pollRes;
+  let pollFn;
   if (provider_key && provider_key !== 'generic' && videoRouter.poll) {
-    pollRes = await videoRouter.poll(provider, mdl, provider_task_id, startedAt, () => cancelledTasks.has(task_id));
+    pollFn = () => videoRouter.poll(provider, mdl, provider_task_id, startedAt, () => cancelledTasks.has(task_id));
   } else if (provider_key === 'generic') {
-    pollRes = await genericVideoPoll(provider, mdl, provider_task_id, startedAt, () => cancelledTasks.has(task_id));
+    pollFn = () => genericVideoPoll(provider, mdl, provider_task_id, startedAt, () => cancelledTasks.has(task_id));
   } else {
     console.warn('[resume] 任务', task_id, 'provider_key 未知:', provider_key, '跳过');
     return;
   }
+  const pollRes = await resumePollToTerminal(pollFn, task_id, opts);
   // 智能路由尝试数据：崩溃/重启后恢复续轮询，补记一条 resume 任务（best-effort，不阻断恢复）
   await recordResumeJob(pgPool, {
     taskId: task_id, providerId: provider_id, modelId: effectiveModelId,
     bindingId: (mdl && mdl.binding_id) || '', status: pollRes.status,
   }).catch(() => {});
 
-  // 包装成 generation_tasks 终态结果形状 → 复用与正常完成一致的最终处理（commit / 释放 / 保留）
+  // ─── resume 视频终态机（审计裁决，2026-09-05）───
+  // 成败只听生成端回复：pollLoop 只在生成端明确返回 failed/error/canceled 时才给 'failed'（terminal）；
+  // 'pending'（单查适配器未达终态，已被 resumePollToTerminal 归一为 timeout）与瞬时 'error'（网络抖动 /
+  // URL 提取失败）均为未决，绝不据此释放 held 或判失败——保持 running，留待下一轮 resume 或 stuck 看门狗兜底。
   let result;
   if (pollRes.status === 'success') {
+    // 成功 → finalizeResumedTask：commit 一次 + videoUrl 经 uploadQueue→assetFinalize 拉取落 OSS/local
     result = {
       status: 'success', images: [pollRes.videoUrl], videoUrl: pollRes.videoUrl, source: 'provider',
       consumption: [{ providerId: provider_id, modelId: model_id, modelType: 'video', units: 1, bindingId: (mdl && mdl.binding_id) || '' }],
     };
+  } else if (pollRes.status === 'failed') {
+    result = { status: 'failed', error: pollRes.error };
   } else if (pollRes.status === 'timeout') {
     result = { status: 'timeout', error: pollRes.error };
+  } else if (pollRes.status === 'canceled') {
+    result = { status: 'canceled', error: pollRes.error };
   } else {
-    result = { status: 'failed', error: pollRes.error };
+    // 未决（pending/error/未知）：保持 running，不释放 held、不写失败终态，留待下轮/watchdog
+    console.warn('[resume] 任务', task_id, '续轮询未决（', pollRes.status, '），保持 running 留待下轮/看门狗');
+    return;
   }
   await finalizeResumedTask(pgPool, { taskId: task_id, user_id, idempotencyKey: idempotency_key, cost, costPool: cost_pool, contentType: content_type, model, count }, result);
 }
@@ -1975,7 +2011,7 @@ module.exports = {
   // 仅导出既有函数供注入 fake 上游的单元测试直测，不改任何运行时行为。
   dispatchOne, attemptOnAccount, imageGenerate, videoGenerate, completeViaQueue,
   setLogSink, logError,
-  resumeRunningTasks, resumeWaitingArea, resumeRunningImageTasks, persistProviderTaskId, finalizeResumedTask, genericVideoPoll,
+  resumeRunningTasks, resumeWaitingArea, resumeRunningImageTasks, persistProviderTaskId, finalizeResumedTask, genericVideoPoll, resumeOneTask,
   startStuckTaskWatchdog,
   getAcct, normalizeRateLimits, costFor, getAccountStates, setManualState,
   // ── 多 Key 池（同一供应商多把 API Key，各自独立参与生成分配）──

@@ -77,7 +77,8 @@ async function loadDispatchPairs(pgPool, modelIds, contentType) {
   // 3) 加载涉及的模型行（按 model_id，保留 provider 特定配置：endpoint/capabilities/param_template/...）
   const rowModelIds = [...new Set(targets.map((t) => t.model_id))];
   const mRes = await pgPool.query(
-    `SELECT * FROM models WHERE model_id = ANY($1) AND enabled = true`,
+    `SELECT * FROM models WHERE model_id = ANY($1) AND enabled = true
+      ORDER BY model_id ASC, provider_id ASC, id ASC`,
     [rowModelIds],
   );
   // key = model_id|provider_id → 行（同组合多行取首个，保持确定性）

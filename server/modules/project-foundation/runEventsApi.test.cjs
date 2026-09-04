@@ -191,6 +191,66 @@ test('rowToApiEvent: empty/non-string optional payload values are omitted; Date 
   assert.equal(typeof rowToApiEvent({ seq: 4, type: 't.d', payload_json: null, created_at: null }).tsMs, 'number');
 });
 
+test('rowToApiEvent: spend kinds surface code/amount/projectId (+nodeId) only when present', () => {
+  // spend_rejected full payload → nodeId + code + amount + projectId
+  assert.deepEqual(
+    rowToApiEvent({
+      seq: 10, type: 'studio.run_node.spend_rejected',
+      payload_json: { run_node_id: 'n-a', projectId: 'p-1', code: 'SPEND_OVER_REMAINING', amount: 7 },
+      created_at: '2026-09-04T00:00:00.000Z',
+    }),
+    { seq: 10, kind: 'studio.run_node.spend_rejected', nodeId: 'n-a', code: 'SPEND_OVER_REMAINING', amount: 7, projectId: 'p-1', tsMs: BASE_TS }
+  );
+  // spend_no_budget → code + amount + projectId (no nodeId)
+  assert.deepEqual(
+    rowToApiEvent({
+      seq: 11, type: 'studio.run_node.spend_no_budget',
+      payload_json: { projectId: 'p-2', code: 'SPEND_NO_BUDGET', amount: 11 },
+      created_at: '2026-09-04T00:00:00.000Z',
+    }),
+    { seq: 11, kind: 'studio.run_node.spend_no_budget', code: 'SPEND_NO_BUDGET', amount: 11, projectId: 'p-2', tsMs: BASE_TS }
+  );
+  // spend_failed carries `error` (no `code`) → code omitted, amount/projectId/nodeId present
+  assert.deepEqual(
+    rowToApiEvent({
+      seq: 12, type: 'studio.run_node.spend_failed',
+      payload_json: { run_node_id: 'n-c', projectId: 'p-3', amount: 4, error: 'store down' },
+      created_at: '2026-09-04T00:00:00.000Z',
+    }),
+    { seq: 12, kind: 'studio.run_node.spend_failed', nodeId: 'n-c', amount: 4, projectId: 'p-3', tsMs: BASE_TS }
+  );
+});
+
+test('rowToApiEvent: legacy spend rows without new fields and non-spend kinds are unchanged', () => {
+  // legacy spend row (payload lacks code/amount/projectId) → only generic fields
+  assert.deepEqual(
+    rowToApiEvent({
+      seq: 20, type: 'studio.run_node.spend_rejected',
+      payload_json: { run_node_id: 'n-old', status: 'WARN' },
+      created_at: '2026-09-04T00:00:00.000Z',
+    }),
+    { seq: 20, kind: 'studio.run_node.spend_rejected', status: 'WARN', nodeId: 'n-old', tsMs: BASE_TS }
+  );
+  // empty-string / null spend payload fields are omitted (有则带, 无则省略)
+  assert.deepEqual(
+    rowToApiEvent({
+      seq: 21, type: 'studio.run_node.spend_no_budget',
+      payload_json: { code: '', amount: null, projectId: '  ' },
+      created_at: '2026-09-04T00:00:00.000Z',
+    }),
+    { seq: 21, kind: 'studio.run_node.spend_no_budget', tsMs: BASE_TS }
+  );
+  // non-spend kind carrying spend-shaped payload fields must NOT leak them
+  assert.deepEqual(
+    rowToApiEvent({
+      seq: 22, type: 'studio.run_node.succeeded',
+      payload_json: { run_node_id: 'n-x', code: 'SPEND_OVER_REMAINING', amount: 7, projectId: 'p-9' },
+      created_at: '2026-09-04T00:00:00.000Z',
+    }),
+    { seq: 22, kind: 'studio.run_node.succeeded', nodeId: 'n-x', tsMs: BASE_TS }
+  );
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // forward pagination (正翻页): afterSeq cursor + limit + hasMore
 // ─────────────────────────────────────────────────────────────────────────────

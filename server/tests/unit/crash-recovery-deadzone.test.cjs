@@ -462,3 +462,164 @@ test('generateAsync throttled → 等待区 opts=runOpts（含 taskId）；泵�
   }
 });
 
+// ─── 13) resume 视频终态机（v4-pro 修复）：pending 不落 failed、未决保持 running、success 恰一次 commit ───
+// 背景（2026-09-05 实况 gap）：crash-era 视频任务 resumeOneTask 单次 poll 后未达终态，行永卡 running。
+// 核验结论：built-in 适配器（agnes/minimax/volcano）+ generic 路径内部都经 shared.pollLoop 循环至终态，
+// 单次 await videoRouter.poll 即会循环完成；真正的缺陷在 resumeOneTask 的终态映射——旧 `else` 分支把
+// pending/error/canceled 一律按 failed 处理（误释放 held）。修复后：success/failed/timeout/canceled 各自
+// 终态；pending（单查适配器）由 resumePollToTerminal 补多轮等待；瞬时 error 保持 running 留待下轮/看门狗。
+const RESUME_MODEL_SELECT = /m\.model_id=\$1 AND m\.provider_id=\$2/;
+function videoResumeRow(over = {}) {
+  return Object.assign({
+    task_id: 'r-vid', provider_id: 'provV', model_id: 'm-vid', provider_key: 'agnes',
+    provider_task_id: 'pt-vid', user_id: 'u1', idempotency_key: 'ik-rv', cost: 5,
+    cost_pool: 'recharge', model: 'm-vid', content_type: 'video', count: 1,
+    resume_meta: { submittedAt: new Date(Date.now() - 30000).toISOString() },
+  }, over);
+}
+const RESUME_PROVIDER_ROW = [{ id: 'provV', api_key: 'sk-x', base_url: 'https://api.agnes-ai.cn/v1' }];
+const RESUME_MODEL_ROW = [{ model_id: 'm-vid', provider_id: 'provV', upstream_model_name: 'm-vid', binding_id: '' }];
+
+test('resumeOneTask: 假 poll pending×2→completed → done（commit 恰好一次）+ videoUrl 入上传队列', async () => {
+  const commits = [];
+  const releases = [];
+  const enqueues = [];
+  stubAll({
+    commitCredits: async (pg, userId, amount, ref) => commits.push({ userId, amount, ref }),
+    releaseCredits: async (pg, userId, amount, ref) => releases.push({ userId, amount, ref }),
+    recordConsumption: async () => {},
+    enqueueFinalize: async (pg, job) => enqueues.push(job),
+    finalizeAndEmit: async () => {},
+  });
+  const savedPoll = videoIndex.poll;
+  let pollCalls = 0;
+  videoIndex.poll = async () => {
+    pollCalls++;
+    if (pollCalls <= 2) return { videoUrl: '', status: 'pending' };
+    return { videoUrl: 'https://cdn/resumed.mp4', status: 'success' };
+  };
+  const pool = makePool([
+    { match: PROVIDER_SELECT, rows: RESUME_PROVIDER_ROW },
+    { match: RESUME_MODEL_SELECT, rows: RESUME_MODEL_ROW },
+  ]);
+  try {
+    await dispatcher.resumeOneTask(pool, videoResumeRow({ task_id: 'r-vid-done' }), { pollIntervalMs: 5, pollTimeoutMs: 2000 });
+    assert.strictEqual(pollCalls, 3, 'pending×2 后第三次查询达 completed（单查适配器由 resume 层补多轮等待）');
+    assert.strictEqual(commits.length, 1, '终态 done：commit 恰好一次');
+    assert.deepStrictEqual(commits[0], { userId: 'u1', amount: 5, ref: 'ik-rv' });
+    assert.strictEqual(enqueues.length, 1, '成功应入上传队列（videoUrl 落 OSS/local）');
+    assert.strictEqual(enqueues[0].providerVideoUrl, 'https://cdn/resumed.mp4');
+    assert.strictEqual(releases.length, 0, '成功绝不释放 held');
+    assert.strictEqual(lastStatusUpdate(pool, 'failed'), null, '不得落 failed');
+  } finally {
+    videoIndex.poll = savedPoll;
+  }
+});
+
+test('resumeOneTask: 假 poll 永 pending → 超时归一 timeout → waiting 保留待复核（不释放 held）', async () => {
+  const commits = [];
+  const releases = [];
+  stubAll({
+    commitCredits: async (pg, userId, amount, ref) => commits.push({ userId, amount, ref }),
+    releaseCredits: async (pg, userId, amount, ref) => releases.push({ userId, amount, ref }),
+    recordConsumption: async () => {},
+    enqueueFinalize: async () => {},
+    finalizeAndEmit: async () => {},
+  });
+  const savedPoll = videoIndex.poll;
+  videoIndex.poll = async () => ({ videoUrl: '', status: 'pending' });
+  const pool = makePool([
+    { match: PROVIDER_SELECT, rows: RESUME_PROVIDER_ROW },
+    { match: RESUME_MODEL_SELECT, rows: RESUME_MODEL_ROW },
+  ]);
+  try {
+    await dispatcher.resumeOneTask(pool, videoResumeRow({ task_id: 'r-vid-pending' }), { pollIntervalMs: 5, pollTimeoutMs: 200 });
+    assert.strictEqual(releases.length, 0, '永 pending 超时绝不释放 held（误释放防护）');
+    assert.strictEqual(commits.length, 0, '永 pending 绝不 commit');
+    const w = lastStatusUpdate(pool, 'waiting');
+    assert.ok(w, '超时应落 waiting（保留待复核，不判失败）');
+    assert.strictEqual(w.params[0], 'r-vid-pending');
+    assert.strictEqual(lastStatusUpdate(pool, 'failed'), null, '不得落 failed');
+  } finally {
+    videoIndex.poll = savedPoll;
+  }
+});
+
+test('resumeOneTask: 假 poll 返回瞬时 error → 保持 running（不释放、不判失败）', async () => {
+  const commits = [];
+  const releases = [];
+  stubAll({
+    commitCredits: async (pg, userId, amount, ref) => commits.push({ userId, amount, ref }),
+    releaseCredits: async (pg, userId, amount, ref) => releases.push({ userId, amount, ref }),
+    recordConsumption: async () => {},
+    enqueueFinalize: async () => {},
+    finalizeAndEmit: async () => {},
+  });
+  const savedPoll = videoIndex.poll;
+  videoIndex.poll = async () => ({ videoUrl: '', status: 'error', error: '轮询异常：网络抖动' });
+  const pool = makePool([
+    { match: PROVIDER_SELECT, rows: RESUME_PROVIDER_ROW },
+    { match: RESUME_MODEL_SELECT, rows: RESUME_MODEL_ROW },
+  ]);
+  try {
+    await dispatcher.resumeOneTask(pool, videoResumeRow({ task_id: 'r-vid-err' }), { pollIntervalMs: 5, pollTimeoutMs: 200 });
+    assert.strictEqual(releases.length, 0, '未决 error 绝不释放 held（误释放防护）');
+    assert.strictEqual(commits.length, 0, '未决 error 绝不 commit');
+    assert.strictEqual(lastStatusUpdate(pool, 'failed'), null, '未决 error 不得落 failed');
+    assert.strictEqual(lastStatusUpdate(pool, 'waiting'), null, '未决 error 不应落 waiting（保持 running 留待下轮/看门狗）');
+  } finally {
+    videoIndex.poll = savedPoll;
+  }
+});
+
+test('resumeOneTask: 假 poll 返回 failed（生成端终态失败）→ 释放 held 一次 + failed 终态', async () => {
+  const releases = [];
+  stubAll({
+    commitCredits: async () => {},
+    releaseCredits: async (pg, userId, amount, ref) => releases.push({ userId, amount, ref }),
+    recordConsumption: async () => {},
+    enqueueFinalize: async () => {},
+    finalizeAndEmit: async () => {},
+  });
+  const savedPoll = videoIndex.poll;
+  videoIndex.poll = async () => ({ videoUrl: '', status: 'failed', error: '视频生成失败' });
+  const pool = makePool([
+    { match: PROVIDER_SELECT, rows: RESUME_PROVIDER_ROW },
+    { match: RESUME_MODEL_SELECT, rows: RESUME_MODEL_ROW },
+  ]);
+  try {
+    await dispatcher.resumeOneTask(pool, videoResumeRow({ task_id: 'r-vid-fail' }), { pollIntervalMs: 5, pollTimeoutMs: 200 });
+    assert.strictEqual(releases.length, 1, '生成端终态失败 → 释放 held 恰好一次');
+    assert.deepStrictEqual(releases[0], { userId: 'u1', amount: 5, ref: 'ik-rv' });
+    const f = lastStatusUpdate(pool, 'failed');
+    assert.ok(f, '应落 failed 终态');
+    assert.strictEqual(f.params[0], 'r-vid-fail');
+  } finally {
+    videoIndex.poll = savedPoll;
+  }
+});
+
+test('resumeOneTask: 假 poll 返回 canceled → canceled 终态（不重复释放）', async () => {
+  const releases = [];
+  stubAll({
+    commitCredits: async () => {},
+    releaseCredits: async (pg, userId, amount, ref) => releases.push({ userId, amount, ref }),
+    recordConsumption: async () => {},
+    enqueueFinalize: async () => {},
+    finalizeAndEmit: async () => {},
+  });
+  const savedPoll = videoIndex.poll;
+  videoIndex.poll = async () => ({ videoUrl: '', status: 'canceled', error: '用户已取消' });
+  const pool = makePool([
+    { match: PROVIDER_SELECT, rows: RESUME_PROVIDER_ROW },
+    { match: RESUME_MODEL_SELECT, rows: RESUME_MODEL_ROW },
+  ]);
+  try {
+    await dispatcher.resumeOneTask(pool, videoResumeRow({ task_id: 'r-vid-cancel' }), { pollIntervalMs: 5, pollTimeoutMs: 200 });
+    assert.strictEqual(releases.length, 0, 'canceled 不释放（cancelTask 已释放，不重复）');
+    assert.ok(lastStatusUpdate(pool, 'canceled'), '应落 canceled 终态');
+  } finally {
+    videoIndex.poll = savedPoll;
+  }
+});
+

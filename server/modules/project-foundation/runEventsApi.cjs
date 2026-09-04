@@ -106,6 +106,18 @@ SELECT seq, type, payload_json, created_at
 
 function isNonEmptyString(v) { return typeof v === 'string' && v.trim().length > 0; }
 
+function isFiniteNumber(v) { return typeof v === 'number' && Number.isFinite(v); }
+
+// Spend warning kinds whose payload carries the quantifiable leak (code/amount/
+// projectId). JSON read face must surface these — SSE already does (audit
+// 60b18cd): spend_failed carries `error` (no `code`), so `code` stays omitted
+// there (有则带, 无则省略 — backward compatible).
+const SPEND_KINDS = Object.freeze({
+  'studio.run_node.spend_rejected': true,
+  'studio.run_node.spend_failed': true,
+  'studio.run_node.spend_no_budget': true,
+});
+
 function parsePayloadJsonValue(v) {
   // node-pg returns jsonb already parsed; mocks / odd drivers may hand back strings.
   if (typeof v === 'string') { try { return JSON.parse(v); } catch (_) { return v; } }
@@ -131,6 +143,11 @@ function rowToApiEvent(row) {
   };
   if (isNonEmptyString(payload.status)) out.status = payload.status;
   if (isNonEmptyString(payload.run_node_id)) out.nodeId = payload.run_node_id;
+  if (SPEND_KINDS[row.type]) {
+    if (isNonEmptyString(payload.code)) out.code = payload.code;
+    if (isFiniteNumber(payload.amount)) out.amount = payload.amount;
+    if (isNonEmptyString(payload.projectId)) out.projectId = payload.projectId;
+  }
   return out;
 }
 

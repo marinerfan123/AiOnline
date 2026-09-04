@@ -393,6 +393,25 @@ test('pollLoop: startedAt 持久化语义（重启不重置密度计时基准，
   assert.equal(polls, 1);
 });
 
+// pollLoop: pollFn 回传 retryAfterMs → 下一轮 sleep 至少该值（429/5xx 瞬时退避，继续轮询不判失败）
+test('pollLoop: retryAfterMs 退避 —— 退避轮后仍继续并成功，且等待时长被抬高', async () => {
+  let polls = 0;
+  const t0 = Date.now();
+  const r = await pollLoop({
+    intervalMs: 5, timeoutMs: 2000,
+    pollFn: async () => {
+      polls += 1;
+      if (polls === 1) return { videoUrl: '', status: 'pending', retryAfterMs: 120 };
+      return { videoUrl: 'https://cdn/v.mp4', status: 'success' };
+    },
+  });
+  const elapsed = Date.now() - t0;
+  assert.equal(r.status, 'success');
+  assert.equal(r.videoUrl, 'https://cdn/v.mp4');
+  assert.equal(polls, 2);
+  assert.ok(elapsed >= 100, `退避后第二轮 sleep 应 ≥120ms（实际 ${elapsed}ms）`);
+});
+
 // sleep 微冒烟：本文件轮询测试依赖它
 test('sleep: 基础延时可用', async () => {
   const t0 = Date.now();

@@ -11,6 +11,13 @@
 //   - 成功时视频地址在 metadata.url（旧版也可能落在根 url），两者都尝试读取。
 const { callEndpoint, getByPath, agnesVideoSize, pollLoop, makeError } = require('./shared.cjs');
 
+// Agnes poll 状态词表（与 shared.normalizeVideoStatus / status.cjs 成功集合对齐）：
+// 历史仅认 'completed'，这里放宽到 agnes 真实返回 + 常见终态成功词，防 'done'/'succeeded' 等
+// 合法成功态被误判为 pending、空转到 90 分钟超时导致视频永不返回。
+const AGNES_SUCCESS_STATUSES = ['completed', 'succeeded', 'success', 'succeed', 'done', 'complete', 'finished'];
+// 终态失败词表（含 'expired'：URL 已过期即终态失败，不再空转）
+const AGNES_FAIL_STATUSES = ['failed', 'error', 'cancelled', 'canceled', 'expired'];
+
 // 取 base_url 的协议+主机（去掉 /v1 等路径），用于 poll 端点
 function agnesRootBase(baseUrl) {
   try {
@@ -40,7 +47,7 @@ function resolveAgnesEndpoint(provider, model) {
     taskQueryParam: 'video_id',
     taskResultPath: 'metadata.url',
     taskStatusPath: 'status',
-    taskSuccessValues: ['completed'],
+    taskSuccessValues: AGNES_SUCCESS_STATUSES,
     taskPollIntervalMs: 8000,
   };
   const pollEp = me.poll
@@ -112,22 +119,41 @@ async function poll(provider, model, taskId, startedAt = 0, isCancelled = null) 
   const apiKey = provider.api_key;
   const { pollEp } = resolveAgnesEndpoint(provider, model);
   const pollQueryParam = pollEp.taskQueryParam || 'video_id';
+  let backoffHits = 0; // 连续 429/5xx/404 计数，驱动指数退避
   return pollLoop({
     intervalMs: pollEp.taskPollIntervalMs || 8000, adaptive: true, startedAt, isCancelled,
     pollFn: async () => {
       const r = await callEndpoint(provider.base_url, pollEp, apiKey, { [pollQueryParam]: taskId });
-      const st = String(getByPath(r.body, pollEp.taskStatusPath || 'status') ?? '').toLowerCase();
-      const okVals = (pollEp.taskSuccessValues || ['completed']).map((s) => s.toLowerCase());
+      const http = r.status || 0;
+      // 鉴权失败 → 终态 error（绝不空转 90 分钟、不切下一个账号重复计费）
+      if (http === 401 || http === 403) {
+        return makeError(r.body, http, '轮询鉴权失败');
+      }
+      // 429 / 5xx / 404 → 瞬时退避继续轮询（指数退避封顶 5min；404 可能是任务刚建尚未可见）
+      if (http === 429 || http === 404 || http >= 500) {
+        backoffHits += 1;
+        const baseMs = http === 429 ? 30000 : 15000;
+        const retryAfterMs = Math.min(baseMs * Math.pow(2, Math.min(backoffHits - 1, 3)), 300000);
+        return { videoUrl: '', status: 'pending', retryAfterMs };
+      }
+      backoffHits = 0; // 正常响应复位退避
+      // 状态读取：顶层 status 优先，缺位回退 internal_status（历史响应兼容）
+      const st = String(
+        (getByPath(r.body, pollEp.taskStatusPath || 'status') || getByPath(r.body, 'internal_status')) || ''
+      ).toLowerCase();
+      const okVals = (pollEp.taskSuccessValues || AGNES_SUCCESS_STATUSES).map((s) => String(s).toLowerCase());
       if (okVals.includes(st)) {
         // 成功视频地址优先级：taskResultPath → metadata.url → 根 url（兼容旧版）
         let url = getByPath(r.body, pollEp.taskResultPath || 'metadata.url');
         if (!url) url = getByPath(r.body, 'metadata.url');
         if (!url) url = getByPath(r.body, 'url');
-        return url
-          ? { videoUrl: String(url), status: 'success' }
-          : { videoUrl: '', status: 'error', error: '任务成功但未返回视频 URL（taskResultPath？）' };
+        if (!url) return { videoUrl: '', status: 'error', error: '任务成功但未返回视频 URL（taskResultPath？）' };
+        const out = { videoUrl: String(url), status: 'success' };
+        const expiresAt = getByPath(r.body, 'expires_at') ?? getByPath(r.body, 'expire_at') ?? getByPath(r.body, 'expires');
+        if (expiresAt) out.expiresAt = expiresAt;
+        return out;
       }
-      if (st === 'failed' || st === 'error' || st === 'canceled' || st === 'cancelled') {
+      if (AGNES_FAIL_STATUSES.includes(st)) {
         // 生成端明确终态失败：用 terminal 'failed'（区别于瞬时 'error'）—— 上层据此立即终态化，
         // 绝不切下一个账号空转（每个 key 会新建真实 provider 任务并轮询到完成，多 key 下会卡 running 数小时）。
         return { videoUrl: '', status: 'failed', error: `视频生成失败：${JSON.stringify(r.body).slice(0, 160)}` };
@@ -144,4 +170,4 @@ async function submitAndPoll(provider, model, opts) {
   return poll(provider, model, s.taskId);
 }
 
-module.exports = { submit, poll, submitAndPoll, resolveAgnesEndpoint, agnesRootBase, buildAgnesVars };
+module.exports = { submit, poll, submitAndPoll, resolveAgnesEndpoint, agnesRootBase, buildAgnesVars, AGNES_SUCCESS_STATUSES, AGNES_FAIL_STATUSES };
