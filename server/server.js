@@ -61,6 +61,7 @@ import timelineExportMod from './modules/media/timelineExport.cjs';
 import projectExportMod from './modules/project-foundation/projectExport.cjs';
 import canvasCommandLogApiMod from './modules/project-foundation/canvasCommandLogApi.cjs';
 import runEventsApiMod from './modules/project-foundation/runEventsApi.cjs';
+import canvasProjectionApiMod from './modules/project-foundation/canvasProjectionApi.cjs';
 import mediaWorkerMod from './modules/media/mediaWorker.cjs';
 import mediaExecMod from './modules/media/executors.cjs';
 import bibleApiMod from './modules/project-foundation/bibleApi.cjs';
@@ -1552,6 +1553,13 @@ const canvasCommandLogApi = canvasCommandLogApiMod.createCanvasCommandLogApi({
   },
   authProject: async (req, projectId) => projectMembershipOk(projectId, session.getUserFromCookie(req)),
 });
+const canvasProjectionApi = canvasProjectionApiMod.createCanvasProjectionApi({
+  pg: {
+    query: (sql, params) => pgPool ? pgPool.query(sql, params) : Promise.reject(Object.assign(new Error('数据库未就绪'), { status: 503 })),
+    connect: () => pgPool ? pgPool.connect() : Promise.reject(Object.assign(new Error('数据库未就绪'), { status: 503 })),
+  },
+  authProject: async (req, projectId) => projectMembershipOk(projectId, session.getUserFromCookie(req)),
+});
 const runEventsApi = runEventsApiMod.createRunEventsApi({
   pg: {
     query: (sql, params) => pgPool ? pgPool.query(sql, params) : Promise.reject(Object.assign(new Error('数据库未就绪'), { status: 503 })),
@@ -2701,6 +2709,10 @@ async function handleAPI(req, res) {
   const cmdMatch = url.split('?')[0].match(/^\/api\/v2\/projects\/([^/]+)\/studio\/canvas\/commands$/);
   if (cmdMatch) {
     if (await canvasCommandLogApi.handle(req, res, { projectId: decodeURIComponent(cmdMatch[1]) })) return;
+  }
+  const projMatch = url.split('?')[0].match(/^\/api\/v2\/projects\/([^/]+)\/studio\/canvas\/projection$/);
+  if (projMatch) {
+    if (await canvasProjectionApi.handle(req, res, { projectId: decodeURIComponent(projMatch[1]) })) return;
   }
   if (/\/api\/v2\/projects\/[^/]+\/studio\/canvas/.test(url)) {
     if (await studioCanvasPersistence.handle(req, res, url.split('?')[0], method)) return;
