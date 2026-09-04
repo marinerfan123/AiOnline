@@ -320,3 +320,160 @@ test('M05-C commercial hardening: concurrent version numbering + set-based bulk 
     await dropDb(dbName);
   }
 });
+/* ─────────────────────────────────────────────────────────────── */
+/* G22 env-on 真 PG 集成组: STUDIO_CANVAS_KIND_SCOPED=1 双模语义。  */
+/* spawnTestServer 为 fork 型(fork 时快照 process.env), 故 env 开关  */
+/* 在本组内设/清: 组首设 ON 再 fork serverOn; env-off 子用例内清后   */
+/* 再 fork serverOff(同库双端对照); t.after 还原 env。              */
+/* 真 PG 专用(fail-closed: bootstrapDb 连不上 PG 即整文件报错)。     */
+/* ─────────────────────────────────────────────────────────────── */
+test('M05-C G22 env-on kind-scoped: LWW/merge 直写不改 revision+command_log 落行, reject 桶仍整画布 CAS, env-off 双端回归', { concurrency: 1 }, async (t) => {
+  process.env.STUDIO_CANVAS_KIND_SCOPED = '1'; // env on(本组内设)
+  let serverOn, serverOff, pg, dbName, user, project, canvasId;
+  t.before(async () => {
+    ({ dbName, pg } = await bootstrapDb());
+    process.env.TEST_PG_DATABASE = dbName;
+    serverOn = await spawnTestServer(); // fork 时快照 env ON
+  });
+  t.after(async () => {
+    if (serverOn) await serverOn.stop();
+    if (serverOff) await serverOff.stop();
+    delete process.env.STUDIO_CANVAS_KIND_SCOPED; // 还原 env(env-on 组完成)
+    delete process.env.TEST_PG_DATABASE;
+    if (pg) await pg.end();
+    if (dbName) await dropDb(dbName);
+  });
+
+  const logRows = async () => (await pg.query('SELECT command_id, type, base_revision, payload FROM canvas_command_log WHERE canvas_id=$1 ORDER BY seq ASC', [canvasId])).rows;
+  const getGraph = async (server) => (await authRequest(server.baseUrl, { method: 'GET', path: `/api/v2/projects/${project.id}/studio/canvas` }, user.cookies)).body;
+
+  await t.test('seed: env-on 建画布 + 两个新节点(node.create=reject 桶)仍整画布 CAS(mode canvas-cas, revision+1, CAS 摘要命令日志)', async () => {
+    user = await register(serverOn.baseUrl, { email: `m05c-g22on-${Date.now()}@test.local` });
+    ({ project } = await newProject(serverOn.baseUrl, user, 'M05C G22 EnvOn'));
+    const c = await createCanvas(serverOn.baseUrl, user.cookies, project.id);
+    assert.equal(c.status, 201, JSON.stringify(c.body));
+    canvasId = c.body.canvas.id;
+    assert.equal(c.body.canvas.revision, 1);
+    const seed = await patchCanvas(serverOn.baseUrl, user.cookies, project.id, { baseRevision: 1, clientMutationId: crypto.randomUUID(), upsertNodes: [promptNode('n1', 1, 1), promptNode('n2', 2, 2)] });
+    assert.equal(seed.status, 200, JSON.stringify(seed.body));
+    assert.equal(seed.body.mode, 'canvas-cas', '新建节点=reject409 桶 → CAS 成功路径带 mode=canvas-cas');
+    assert.equal(seed.body.canvas.revision, 2);
+    const rows = await logRows();
+    assert.equal(rows.length, 1, 'CAS 成功亦落 1 行命令日志');
+    assert.equal(rows[0].type, 'canvas.patch');
+    assert.equal(rows[0].base_revision, 1);
+    assert.equal(rows[0].payload.mode, undefined, 'CAS 摘要日志无 mode');
+    assert.ok(!Array.isArray(rows[0].payload.ops), 'CAS 日志 ops 为计数摘要对象(非 kind 数组)');
+  });
+
+  await t.test('LWW: env-on data-only node.update → kind-scoped-lww, revision 不变, data 新值, command_log 有行(bucket lww 计数=1)', async () => {
+    const body = await getGraph(serverOn);
+    const node = body.nodes.find((x) => x.nodeId === 'n1');
+    assert.ok(node);
+    const updated = JSON.parse(JSON.stringify(node)); // 全量 upsert(仅 data 域变更)
+    updated.data.prompt = 'lww-新值';
+    updated.data.parameters = { ...(updated.data.parameters || {}), prompt: 'lww-新值' };
+    const cmid = crypto.randomUUID();
+    // 陈旧 baseRevision(1≠当前 2)也成功 → LWW 直写无整画布 CAS 门
+    const r = await patchCanvas(serverOn.baseUrl, user.cookies, project.id, { baseRevision: 1, clientMutationId: cmid, upsertNodes: [updated] });
+    assert.equal(r.status, 200, JSON.stringify(r.body));
+    assert.equal(r.body.ok, true);
+    assert.equal(r.body.mode, 'kind-scoped-lww');
+    assert.equal(r.body.canvas.revision, 2, 'revision 未变');
+    const after = await getGraph(serverOn);
+    assert.equal(after.canvas.revision, 2);
+    assert.equal(after.nodes.find((x) => x.nodeId === 'n1').data.prompt, 'lww-新值', 'node data 新值已持久化');
+    const rows = await logRows();
+    const row = rows.find((x) => x.command_id === cmid);
+    assert.ok(row, 'command_log 有该 lww 行');
+    assert.equal(row.type, 'canvas.patch');
+    assert.equal(row.base_revision, 1);
+    assert.equal(row.payload.mode, 'kind-scoped-lww');
+    assert.ok(Array.isArray(row.payload.ops), 'kind 分解 ops 数组');
+    assert.equal(row.payload.ops.length, 1, 'bucket lww 计数 = 1');
+    const op = row.payload.ops[0];
+    assert.equal(op.op, 'upsertNode');
+    assert.equal(op.kind, 'node.update');
+    assert.equal(op.nodeId, 'n1');
+    assert.equal(op.reason, 'NODE_UPDATE_DATA_ONLY');
+    assert.deepEqual(op.fields, ['data']);
+    assert.equal(op.data.prompt, 'lww-新值');
+    const mut = (await pg.query('SELECT base_revision,resulting_revision FROM studio_canvas_mutations WHERE canvas_id=$1 AND client_mutation_id=$2', [canvasId, cmid])).rows;
+    assert.equal(mut.length, 1);
+    assert.equal(mut[0].base_revision, 1);
+    assert.equal(mut[0].resulting_revision, 2, 'mutation 行 base==resulting(revision 未推进)');
+  });
+
+  await t.test('merge: env-on upsertEdges 新边 → 成功且 revision 不变; deleteEdges(含不存在边)→ 幂等 200, revision 不变', async () => {
+    const cmidE = crypto.randomUUID();
+    const e = await patchCanvas(serverOn.baseUrl, user.cookies, project.id, { baseRevision: 2, clientMutationId: cmidE, upsertEdges: [edge('e1', 'n1', 'n2'), edge('e2', 'n2', 'n1')] });
+    assert.equal(e.status, 200, JSON.stringify(e.body));
+    assert.equal(e.body.mode, 'kind-scoped-merge');
+    assert.equal(e.body.canvas.revision, 2, 'upsertEdges 不改 revision');
+    assert.equal(e.body.edges.length, 2);
+    const rowE = (await logRows()).find((x) => x.command_id === cmidE);
+    assert.ok(rowE, 'command_log 有 merge upsert 行');
+    assert.equal(rowE.payload.mode, 'kind-scoped-merge');
+    assert.equal(rowE.payload.ops.length, 2, 'bucket merge 计数 = 2');
+    assert.ok(rowE.payload.ops.every((o) => o.op === 'upsertEdge' && o.kind === 'edge.create' && o.edge && typeof o.edge.edgeId === 'string'));
+    const cmidD = crypto.randomUUID();
+    const d = await patchCanvas(serverOn.baseUrl, user.cookies, project.id, { baseRevision: 2, clientMutationId: cmidD, deleteEdgeIds: ['e1', 'e-ghost-not-exist'] });
+    assert.equal(d.status, 200, JSON.stringify(d.body));
+    assert.equal(d.body.mode, 'kind-scoped-merge');
+    assert.equal(d.body.canvas.revision, 2, 'deleteEdges 不改 revision');
+    assert.equal(d.body.edges.length, 1, 'e1 已删, e2 保留');
+    assert.equal(d.body.edges[0].edgeId, 'e2');
+    // 幂等: 再次删除同集合(新 cmid)仍 200 —— 不存在边 delete 0 行=幂等成功
+    const d2 = await patchCanvas(serverOn.baseUrl, user.cookies, project.id, { baseRevision: 2, clientMutationId: crypto.randomUUID(), deleteEdgeIds: ['e1', 'e-ghost-not-exist'] });
+    assert.equal(d2.status, 200, JSON.stringify(d2.body));
+    assert.equal(d2.body.mode, 'kind-scoped-merge');
+    assert.equal(d2.body.edges.length, 1, '0 行删除幂等成功');
+    assert.equal((await getGraph(serverOn)).edges.length, 1);
+  });
+
+  await t.test('reject 桶仍整画布 CAS: env-on 新建节点陈旧 base → 409 CONFLICT 形状(读现 409 body: ok/error/serverRevision/canvasId, 无 mode); 新 base → canvas-cas 推进 revision', async () => {
+    const stale = await patchCanvas(serverOn.baseUrl, user.cookies, project.id, { baseRevision: 1, clientMutationId: crypto.randomUUID(), upsertNodes: [promptNode('n3', 3, 3)] });
+    assert.equal(stale.status, 409, JSON.stringify(stale.body));
+    assert.equal(stale.body.ok, false);
+    assert.equal(stale.body.error, 'CONFLICT');
+    assert.equal(stale.body.serverRevision, 2);
+    assert.equal(stale.body.canvasId, canvasId);
+    assert.equal(stale.body.mode, undefined, '409 冲突响应无 mode 键');
+    const afterStale = await getGraph(serverOn);
+    assert.equal(afterStale.canvas.revision, 2, '409 不推进 revision');
+    assert.equal(afterStale.nodes.some((x) => x.nodeId === 'n3'), false, '被拒节点未落库');
+    const fresh = await patchCanvas(serverOn.baseUrl, user.cookies, project.id, { baseRevision: 2, clientMutationId: crypto.randomUUID(), upsertNodes: [promptNode('n3', 3, 3)] });
+    assert.equal(fresh.status, 200, JSON.stringify(fresh.body));
+    assert.equal(fresh.body.mode, 'canvas-cas', '新 base 下 reject 桶走 CAS 成功路径');
+    assert.equal(fresh.body.canvas.revision, 3);
+  });
+
+  await t.test('env-off 双端: 组内清 env 后 fork 对照服务器, 同一 data-only patch 走整画布 CAS(revision+1, 无 mode); 陈旧 base 409 回归', async () => {
+    delete process.env.STUDIO_CANVAS_KIND_SCOPED; // env 清(用例内)
+    assert.equal(process.env.STUDIO_CANVAS_KIND_SCOPED, undefined);
+    serverOff = await spawnTestServer(); // fork 时快照 env OFF(同库第二实例)
+    const before = await getGraph(serverOff);
+    assert.equal(before.canvas.revision, 3, 'env-on LWW/merge 直写结果跨实例可见');
+    assert.equal(before.nodes.find((x) => x.nodeId === 'n1').data.prompt, 'lww-新值');
+    const node = before.nodes.find((x) => x.nodeId === 'n1');
+    const updated = JSON.parse(JSON.stringify(node));
+    updated.data.prompt = 'cas-新值';
+    updated.data.parameters = { ...(updated.data.parameters || {}), prompt: 'cas-新值' };
+    const cmid = crypto.randomUUID();
+    const r = await patchCanvas(serverOff.baseUrl, user.cookies, project.id, { baseRevision: 3, clientMutationId: cmid, upsertNodes: [updated] });
+    assert.equal(r.status, 200, JSON.stringify(r.body));
+    assert.equal(r.body.mode, undefined, 'env-off 200 响应无 mode 标记');
+    assert.equal(r.body.canvas.revision, 4, 'env-off: 同 payload 走整画布 CAS, revision+1');
+    const after = await getGraph(serverOff);
+    assert.equal(after.nodes.find((x) => x.nodeId === 'n1').data.prompt, 'cas-新值');
+    const row = (await logRows()).find((x) => x.command_id === cmid);
+    assert.ok(row, 'env-off CAS 亦落命令日志');
+    assert.equal(row.payload.mode, undefined, 'env-off 命令日志无 mode');
+    assert.ok(!Array.isArray(row.payload.ops), 'env-off 日志 ops 为计数摘要对象');
+    const stale = await patchCanvas(serverOff.baseUrl, user.cookies, project.id, { baseRevision: 3, clientMutationId: crypto.randomUUID(), upsertNodes: [promptNode('x1', 9, 9)] });
+    assert.equal(stale.status, 409, JSON.stringify(stale.body));
+    assert.equal(stale.body.error, 'CONFLICT');
+    assert.equal(stale.body.serverRevision, 4, 'env-off 回归: 陈旧 base 409 语义不变');
+    assert.equal((await getGraph(serverOff)).canvas.revision, 4);
+  });
+});

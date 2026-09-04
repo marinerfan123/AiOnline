@@ -215,8 +215,11 @@ function createStudioCanvasPersistence(deps) {
   // = 幂等成功; 边 upsert 0 行(防御) → 返回 false 回落整画布 CAS(409 语义)。
   // 顺序对齐整画布 CAS 路径: 删除先、upsert 后。命令日志写于 COMMIT 后(warn-only)。
   async function applyKindScopedMerge(client, res, access, user, canvas, body, base, cmid, mergeOps) {
+    // body.upsertEdges 可能缺席(纯 deleteEdgeIds patch, handlePatch 已归一 [] 语义)——必须与
+    // 整画布 CAS 路径一致容忍缺失键, 否则 delete-only 合并 patch 会 500。
+    const rawUpsertEdges = Array.isArray(body.upsertEdges) ? body.upsertEdges : [];
     const upsertById = new Map();
-    for (const raw of body.upsertEdges) upsertById.set(String((raw && raw.edgeId) || (raw && raw.id) || '').trim(), raw);
+    for (const raw of rawUpsertEdges) upsertById.set(String((raw && raw.edgeId) || (raw && raw.id) || '').trim(), raw);
     const deleteOps = mergeOps.filter((o) => o.op === 'deleteEdge');
     const upsertOps = mergeOps.filter((o) => o.op === 'upsertEdge');
 

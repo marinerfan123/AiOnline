@@ -165,3 +165,58 @@ describe('M05-C persistence hook — F1 conflict rebase', () => {
     expect(result.current.revision).toBe(10);
   });
 });
+
+describe('M05-C persistence hook — G22 conflict-shape extension (client)', () => {
+  it('threads kindPolicy/commandSeq from a new-format 409 body into conflict state; reject409 keeps reload semantics', async () => {
+    const patchCanvas = v2studio.patchCanvas as unknown as ReturnType<typeof vi.fn>;
+    patchCanvas
+      .mockRejectedValueOnce(new StudioCanvasApiError(409, 'CONFLICT', { kindPolicy: 'reject409', serverRevision: 5, commandSeq: 42, canvasId: 'c1' }))
+      .mockRejectedValueOnce(new StudioCanvasApiError(409, 'CONFLICT', { kindPolicy: 'reject409', serverRevision: 9, commandSeq: 55, canvasId: 'c1' }));
+
+    const { result } = renderHook(() => useStudioCanvasPersistence('p1'));
+    await drain();
+
+    act(() => { useStudioStore.getState().addNode('prompt', { x: 10, y: 20 }); });
+    act(() => { result.current.retry(); });
+    await drain();
+
+    expect(patchCanvas).toHaveBeenCalledTimes(2);
+    expect(result.current.status).toBe('Conflict');
+    // New extension fields surfaced on the conflict info; core fields unchanged.
+    expect(result.current.conflict).toEqual({ serverRevision: 9, commandSeq: 55, kindPolicy: 'reject409', canvasId: 'c1' });
+
+    // Reload semantics unchanged for reject409: reloadFromServer fetches the
+    // server version and clears the Conflict state.
+    await act(async () => { await result.current.reloadFromServer(); });
+    await drain();
+    expect(result.current.status).toBe('Saved');
+    expect(result.current.conflict).toBeNull();
+  });
+
+  it.each(['lww', 'merge'] as const)('kindPolicy %s 409 still routes through the existing F1 retry (no reload)', async (kindPolicy) => {
+    const patchCanvas = v2studio.patchCanvas as unknown as ReturnType<typeof vi.fn>;
+    patchCanvas
+      .mockRejectedValueOnce(new StudioCanvasApiError(409, 'CONFLICT', { kindPolicy, serverRevision: 7, commandSeq: 101, canvasId: 'c1' }))
+      .mockResolvedValueOnce({ canvas: { revision: 8 }, nodes: [], edges: [], viewport: null });
+
+    const { result } = renderHook(() => useStudioCanvasPersistence('p1'));
+    await drain();
+
+    let addedId: string | null = null;
+    act(() => { addedId = useStudioStore.getState().addNode('prompt', { x: 10, y: 20 }); });
+    act(() => { result.current.retry(); });
+    await drain();
+
+    expect(patchCanvas).toHaveBeenCalledTimes(2);
+    const firstPatch = patchCanvas.mock.calls[0][1];
+    const secondPatch = patchCanvas.mock.calls[1][1];
+    expect(firstPatch.baseRevision).toBe(1);
+    expect(secondPatch.baseRevision).toBe(7); // F1 rebase onto serverRevision — same as legacy body
+    expect(secondPatch.upsertNodes).toHaveLength(1);
+    expect(secondPatch.upsertNodes[0].nodeId).toBe(addedId);
+    expect(result.current.status).toBe('Saved');
+    expect(result.current.conflict).toBeNull();
+    // No whole-canvas reload happened: getCanvas was only called on mount.
+    expect(v2studio.getCanvas as unknown as ReturnType<typeof vi.fn>).toHaveBeenCalledTimes(1);
+  });
+});
