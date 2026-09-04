@@ -14,19 +14,18 @@
  *
  *   runOnce(batchId):
  *     1. listTasks(batchId) -> 过滤 status==='QUEUED' 且未被本 runner 在途占用；
- *     2. 取前 (maxInFlight - inFlight.size) 个，先同步预留 inFlight 再 markTask RUNNING；
+ *     2. 取前 (maxInFlight - inFlight.size) 个，先同步预留 inFlight 再 claimTask RUNNING；
  *     3. executor.run(task) -> { ok:true, resultRef? } | { ok:false, error }；
  *     4. 按结果 markTask SUCCEEDED(resultRef) / FAILED(error)；executor 抛 -> FAILED。
  *
  *   executor 契约：{ run(task) -> Promise<{ok, resultRef?}|{ok:false, error}> }。
  *
- * 单执行保证（诚实边界，不虚报强一致）：
+ * 单执行保证（诚实边界）：
  *   - 进程内并发 runOnce 防双跑：inFlight 集合在单线程 JS 中「同步预留」——任何
- *     await 之前先占用 (batchId,taskId) key，第二个 runOnce 过滤时即排除（= CAS 防双跑）。
- *   - DB 层 claim 经 markTask RUNNING；batchTaskStore 的 CAS 是「终态锁」
- *     (WHERE status IN ('QUEUED','RUNNING'))，跨进程严格 QUEUED->RUNNING 单赢者
- *     需 store 提供 WHERE status='QUEUED' 的更严 CAS——不在本叶职责（勿动 batchTaskStore），
- *     此处如实标注，不声称跨进程强一致。
+ *     await 之前先占用 (batchId,taskId) key，第二个 runOnce 过滤时即排除。
+ *   - 跨进程单执行：claim 经 store.claimTask（WHERE status='QUEUED' 的严格 CAS），
+ *     双 runner 并发领同一任务时只有一方成功，另一方得 ALREADY_CLAIMED 而放弃 ——
+ *     消除旧 markTask(RUNNING) 允许 RUNNING→RUNNING 的跨进程双跑面。
  *   - attempt / retry 完全由 store 管（markTask.attempt、retryFailed）；runner 永不
  *     传 attempt、永不重试，只推进 QUEUED->RUNNING->终态，不越权。
  *
@@ -79,8 +78,8 @@ function createBatchRunner(options) {
   const pollMs = opts.pollMs === undefined ? DEFAULT_POLL_MS : opts.pollMs;
   const maxInFlight = opts.maxInFlight === undefined ? DEFAULT_MAX_IN_FLIGHT : opts.maxInFlight;
 
-  if (!store || typeof store.listTasks !== 'function' || typeof store.markTask !== 'function') {
-    throw new TypeError('createBatchRunner requires { store } with listTasks() and markTask()');
+  if (!store || typeof store.listTasks !== 'function' || typeof store.claimTask !== 'function' || typeof store.markTask !== 'function') {
+    throw new TypeError('createBatchRunner requires { store } with listTasks(), claimTask() and markTask()');
   }
   if (!isPosInt(maxInFlight)) {
     throw new TypeError('maxInFlight must be a positive integer');
@@ -121,9 +120,10 @@ function createBatchRunner(options) {
   async function executeOne(batchId, task) {
     let claimed = false;
     try {
-      const claim = await store.markTask({ batchId, taskId: task.taskId, status: 'RUNNING' });
+      const claim = await store.claimTask({ batchId, taskId: task.taskId });
       if (!claim || claim.ok !== true) {
-        // TASK_NOT_FOUND / TERMINAL_STATE（并发跑者已终结）-> 放弃，不算执行。
+        // TASK_NOT_FOUND / ALREADY_CLAIMED（他 runner 已领）/ TERMINAL_STATE（并发跑者已终结）
+        // -> 放弃，不算执行。
         const code = claim && claim.error ? claim.error.code : 'CLAIM_FAILED';
         logEvent('warn', `skip claim ${task.taskId}`, { batchId, taskId: task.taskId, code });
         return { taskId: task.taskId, claimed: false, reason: code };

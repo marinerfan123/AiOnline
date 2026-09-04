@@ -354,6 +354,80 @@ test('listPublic rejects malformed cursor / limit / tags', async () => {
   assert.equal((await store.listPublic({ tags: [1] })).error.code, 'INVALID_TAGS');
 });
 
+test('listPublic rejects forged cursor whose createdAt is not a timestamp (no 500 cast error)', async () => {
+  const { store } = makeStore();
+  const b64 = (s) => Buffer.from(s, 'utf8').toString('base64url');
+  // 伪造游标：合法 base64url 且含 |，但 createdAt 非时间戳 → 一律 INVALID_CURSOR。
+  assert.equal((await store.listPublic({ cursor: b64('not-a-date|cw-x') })).error.code, 'INVALID_CURSOR');
+  assert.equal((await store.listPublic({ cursor: b64('2026/09/04 00:00:00|cw-x') })).error.code, 'INVALID_CURSOR');
+  assert.equal((await store.listPublic({ cursor: b64('2026-13-99T00:00:00Z|cw-x') })).error.code, 'INVALID_CURSOR');
+  assert.equal((await store.listPublic({ cursor: b64('2026-09-04T00:00:00+08:00|cw-x') })).error.code, 'INVALID_CURSOR');
+  // 合法 ISO UTC 游标仍可用（含微秒 6 位）
+  const ok1 = await store.listPublic({ cursor: b64('2026-09-04T00:00:00.000Z|cw-x') });
+  assert.equal(ok1.ok, true);
+  const ok2 = await store.listPublic({ cursor: b64('2026-09-04T00:00:00.123456Z|cw-x') });
+  assert.equal(ok2.ok, true);
+});
+
+test('listPublic keyset cursor preserves microsecond precision (same-ms rows not lost)', async () => {
+  // 专用 mock：created_at 以 JS Date（毫秒截断，镜像 node-pg）返回，
+  // created_at_cursor 以 to_char 全文（微秒）返回 —— 与真实 Postgres 语义一致。
+  const rowsById = new Map();
+  const micro = (iso) => {
+    const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,6}))?Z$/.exec(iso);
+    const sec = Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]);
+    return sec * 1000 + Number((m[7] || '').padEnd(6, '0'));
+  };
+  const seed = (id, createdAtIso) => rowsById.set(id, {
+    id, title: id, description: null, creator_user_id: 'u1', media_asset_id: null,
+    status: 'PUBLISHED', tags: [], view_count: 0, like_count: 0,
+    created_at: new Date(createdAtIso), // node-pg 返回 Date（毫秒）
+    created_at_cursor: createdAtIso,    // to_char 全文（微秒）
+    updated_at: createdAtIso,
+  });
+  const pg = {
+    async query(sql, params = []) {
+      const s = String(sql).trim();
+      if (s.startsWith('CREATE TABLE IF NOT EXISTS community_works')) return { rows: [], rowCount: 0 };
+      if (s.includes('ORDER BY created_at DESC, id DESC')) {
+        const p = [...params];
+        const limit = p.pop();
+        let cursor = null;
+        if (s.includes('(created_at, id) <')) { const cId = p.pop(); const cAt = p.pop(); cursor = { createdAt: cAt, id: cId }; }
+        let rows = [...rowsById.values()].filter((r) => r.status === 'PUBLISHED');
+        if (cursor) {
+          const cMicro = micro(cursor.createdAt);
+          rows = rows.filter((r) => {
+            const rm = micro(r.created_at_cursor);
+            return rm < cMicro || (rm === cMicro && r.id < cursor.id);
+          });
+        }
+        rows.sort((a, b) => {
+          const am = micro(a.created_at_cursor); const bm = micro(b.created_at_cursor);
+          return am === bm ? (a.id < b.id ? 1 : a.id > b.id ? -1 : 0) : (am < bm ? 1 : -1);
+        });
+        return { rows: rows.slice(0, limit).map((r) => ({ ...r })), rowCount: Math.min(rows.length, limit) };
+      }
+      throw new Error(`unhandled SQL: ${s}`);
+    },
+  };
+  const store = createWorksStore({ pg });
+  // 同一毫秒内、微秒不同：cw-aaa (.123456) 排序在前，cw-bbb (.123400) 在后。
+  seed('cw-aaa', '2026-09-04T00:00:00.123456Z');
+  seed('cw-bbb', '2026-09-04T00:00:00.123400Z');
+
+  const collected = [];
+  let cursor;
+  for (;;) {
+    const r = await store.listPublic({ limit: 1, cursor });
+    assert.equal(r.ok, true);
+    collected.push(...r.works.map((w) => w.id));
+    if (r.nextCursor === null) break;
+    cursor = r.nextCursor;
+  }
+  assert.deepEqual(collected, ['cw-aaa', 'cw-bbb'], '同一毫秒内微秒相邻的行不得漏行');
+});
+
 // ------------------------------------------------------------ listByCreator
 test('listByCreator returns only that creator, all statuses, created_at DESC', async () => {
   const { store } = makeStore();

@@ -8,6 +8,9 @@
  *   RUNNING -> SUCCEEDED / FAILED / SKIPPED
  *   终态（SUCCEEDED / FAILED / SKIPPED）不可被 markTask 覆写（终态锁）。
  *   retryFailed 单独把 FAILED 且 attempt < max_attempts 的行复位为 QUEUED 并 attempt+1。
+ *   claimTask 跨进程单赢者领单：仅 QUEUED→RUNNING 原子迁移（WHERE status='QUEUED'），
+ *   消除双 runner 并发双跑（旧 markTask 的 WHERE status IN ('QUEUED','RUNNING') 曾允许
+ *   RUNNING→RUNNING 二次成功）。
  *
  * 每批独立键 (batch_id, task_id)；UNIQUE(script_id, shot_id, kind, batch_id) 含批，故同一
  * (script, shot, kind) 可跨批次重复入队（重试批次再排同一镜头），同批内则不允许重复。
@@ -63,8 +66,12 @@ SELECT batch_id, task_id, script_id, shot_id, kind, status, attempt, max_attempt
  ORDER BY task_id ASC`;
 
 /**
- * CAS 迁移（终态锁）：仅当当前 status ∈ {QUEUED, RUNNING} 时执行 UPDATE；
- * 终态行被 WHERE 排除 → rowCount 0。attempt/result_ref/error 为可选（COALESCE 保留现值）。
+ * markTask 转移矩阵 CAS：迁移按「源状态 × 目标状态」严格限定，非仅终态锁——
+ *   - RUNNING 目标：仅 QUEUED 可迁（claim 语义；RUNNING→RUNNING 不再二次成功 → 双跑面消除）
+ *   - SUCCEEDED/FAILED/SKIPPED 目标：仅 QUEUED/RUNNING 可迁（终态不可覆写）
+ *   - QUEUED 目标：一律禁止（降级/空转；retryFailed 用专用 SQL 复位 FAILED→QUEUED）
+ * 非法迁移 / 终态覆写 / 不存在 → rowCount 0，随后回查区分错误码。
+ * attempt/result_ref/error 为可选（COALESCE 保留现值）。
  */
 const MARK_TASK_SQL = `
 UPDATE storyboard_batch_tasks
@@ -75,7 +82,25 @@ UPDATE storyboard_batch_tasks
        updated_at = NOW()
  WHERE batch_id = $1
    AND task_id  = $2
-   AND status IN ('QUEUED', 'RUNNING')
+   AND (
+          ($3 = 'RUNNING'                           AND status = 'QUEUED')
+       OR ($3 IN ('SUCCEEDED', 'FAILED', 'SKIPPED') AND status IN ('QUEUED', 'RUNNING'))
+   )
+ RETURNING batch_id, task_id, script_id, shot_id, kind, status, attempt, max_attempts,
+           params, result_ref, error, created_at, updated_at`;
+
+/**
+ * claimTask 严格单赢者 CAS：仅 status='QUEUED' 可迁 RUNNING（跨进程原子）。
+ * RUNNING（他 runner 已领）/ 终态 / 不存在 → rowCount 0，回查后给出精确错误码。
+ * 不改 attempt/result_ref/error —— claim 不消费重试计数，也不越权清错。
+ */
+const CLAIM_TASK_SQL = `
+UPDATE storyboard_batch_tasks
+   SET status = 'RUNNING',
+       updated_at = NOW()
+ WHERE batch_id = $1
+   AND task_id  = $2
+   AND status = 'QUEUED'
  RETURNING batch_id, task_id, script_id, shot_id, kind, status, attempt, max_attempts,
            params, result_ref, error, created_at, updated_at`;
 
@@ -232,8 +257,10 @@ function createBatchTaskStore({ pg }) {
 
   /**
    * markTask({ batchId, taskId, status, attempt?, resultRef?, error? })
-   * CAS 迁移：仅 QUEUED/RUNNING 可迁出；终态不可覆写。
-   * 非法状态 / 任务不存在 / 终态覆写均返回 { ok:false, error }。
+   * 转移矩阵 CAS：QUEUED→{RUNNING,SUCCEEDED,FAILED,SKIPPED}；RUNNING→{SUCCEEDED,FAILED,SKIPPED}。
+   * RUNNING→RUNNING（二次 claim）与 RUNNING→QUEUED（降级）均被拒 → INVALID_TRANSITION。
+   * 终态覆写 → TERMINAL_STATE；任务不存在 → TASK_NOT_FOUND；非法状态 → INVALID_STATUS。
+   * 注：claim RUNNING 请用 claimTask（更严的单赢者 CAS + 精确 ALREADY_CLAIMED 错误码）。
    */
   async function markTask({ batchId, taskId, status, attempt, resultRef, error } = {}) {
     if (!isNonEmptyString(batchId)) {
@@ -256,13 +283,45 @@ function createBatchTaskStore({ pg }) {
     if (r && r.rows && r.rows[0]) {
       return { ok: true, task: normalizeRow(r.rows[0]) };
     }
-    // rowCount 0 → 区分任务不存在 vs 终态锁。
+    // rowCount 0 → 区分任务不存在 vs 终态锁 vs 非法迁移。
     const cur = await pg.query(READ_STATUS_SQL, [batchId, taskId]);
     const row = cur && cur.rows && cur.rows[0];
     if (!row) {
       return err('TASK_NOT_FOUND', `task ${taskId} not found in batch ${batchId}`);
     }
-    return err('TERMINAL_STATE', `task ${taskId} is ${row.status} (terminal); terminal states cannot be overwritten`);
+    if (TERMINAL_STATUSES.has(row.status)) {
+      return err('TERMINAL_STATE', `task ${taskId} is ${row.status} (terminal); terminal states cannot be overwritten`);
+    }
+    return err('INVALID_TRANSITION', `cannot transition ${row.status} → ${status}`);
+  }
+
+  /**
+   * claimTask({ batchId, taskId }) -> { ok:true, task } | { ok:false, error }
+   * 跨进程单赢者 claim：仅 status='QUEUED' 原子迁到 RUNNING（WHERE status='QUEUED'）。
+   * 失败回查精确区分：RUNNING → ALREADY_CLAIMED（他 runner 已领）；终态 → TERMINAL_STATE；
+   * 不存在 → TASK_NOT_FOUND。不改 attempt/result_ref/error。
+   */
+  async function claimTask({ batchId, taskId } = {}) {
+    if (!isNonEmptyString(batchId)) {
+      return err('INVALID_BATCH_ID', 'batchId (non-empty string) required');
+    }
+    if (!isNonEmptyString(taskId)) {
+      return err('INVALID_TASK_ID', 'taskId (non-empty string) required');
+    }
+    await ensureSchema();
+    const r = await pg.query(CLAIM_TASK_SQL, [batchId, taskId]);
+    if (r && r.rows && r.rows[0]) {
+      return { ok: true, task: normalizeRow(r.rows[0]) };
+    }
+    const cur = await pg.query(READ_STATUS_SQL, [batchId, taskId]);
+    const row = cur && cur.rows && cur.rows[0];
+    if (!row) {
+      return err('TASK_NOT_FOUND', `task ${taskId} not found in batch ${batchId}`);
+    }
+    if (row.status === 'RUNNING') {
+      return err('ALREADY_CLAIMED', `task ${taskId} is already RUNNING (claimed by another runner)`);
+    }
+    return err('TERMINAL_STATE', `task ${taskId} is ${row.status} (terminal); cannot be claimed`);
   }
 
   /**
@@ -299,7 +358,7 @@ function createBatchTaskStore({ pg }) {
     return { ok: true, total, byStatus };
   }
 
-  return { ensureSchema, createBatch, listTasks, markTask, retryFailed, progress };
+  return { ensureSchema, createBatch, listTasks, markTask, claimTask, retryFailed, progress };
 }
 
 module.exports = {
@@ -307,5 +366,5 @@ module.exports = {
   VALID_STATUSES,
   TERMINAL_STATUSES,
   createBatchTaskStore,
-  SQL: { ENQUEUE_SQL, LIST_SQL, MARK_TASK_SQL, READ_STATUS_SQL, RETRY_FAILED_SQL, PROGRESS_SQL },
+  SQL: { ENQUEUE_SQL, LIST_SQL, MARK_TASK_SQL, CLAIM_TASK_SQL, READ_STATUS_SQL, RETRY_FAILED_SQL, PROGRESS_SQL },
 };

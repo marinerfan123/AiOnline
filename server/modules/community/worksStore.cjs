@@ -63,6 +63,12 @@ CREATE TABLE IF NOT EXISTS community_works (
 const COLS = `id, title, description, creator_user_id, media_asset_id, status,
        tags, view_count, like_count, created_at, updated_at`;
 
+/** 分页列表（listPublic / listByCreator）额外投影全文精度的 created_at 供游标使用。
+ *  node-pg 将 timestamptz 解析为 JS Date（毫秒精度），toISOString() 截断微秒，
+ *  若用截断值作键集游标，同一毫秒内的相邻行会被漏掉（漏行）。游标改从本列取
+ *  to_char 全文（微秒），保证与 DB 比较精度一致。 */
+const LIST_COLS = `${COLS}, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at_cursor`;
+
 const INSERT_SQL = `
 INSERT INTO community_works
   (id, title, description, creator_user_id, media_asset_id, tags)
@@ -138,13 +144,26 @@ function normalizeTags(tags) {
 function encodeCursor(createdAtIso, id) {
   return Buffer.from(`${createdAtIso}|${id}`, 'utf8').toString('base64url');
 }
+
+/** 游标内 createdAt 必须是合法 UTC ISO-8601 时间戳（Postgres ::timestamptz 可解析）。
+ *  拒绝一切非时间戳（伪造游标），否则 SQL 的 `$n::timestamptz` 转型会抛错 → 未处理 500。 */
+const CURSOR_TS_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?Z$/;
+function isValidTimestampStr(s) {
+  if (!isNonEmptyString(s)) return false;
+  if (!CURSOR_TS_RE.test(s)) return false;
+  return Number.isFinite(Date.parse(s));
+}
+
 function decodeCursor(c) {
   if (!isNonEmptyString(c)) return null;
   let s;
   try { s = Buffer.from(c, 'base64url').toString('utf8'); } catch (_) { return null; }
   const i = s.indexOf('|');
   if (i <= 0 || i === s.length - 1) return null;
-  return { createdAt: s.slice(0, i), id: s.slice(i + 1) };
+  const createdAt = s.slice(0, i);
+  const id = s.slice(i + 1);
+  if (!isValidTimestampStr(createdAt)) return null;
+  return { createdAt, id };
 }
 
 function normalizeRow(r) {
@@ -330,12 +349,16 @@ function createWorksStore({ pg, resolveMedia }) {
       where.push(`(created_at, id) < ($${params.length - 1}::timestamptz, $${params.length}::text)`);
     }
     params.push(limit);
-    const sql = `SELECT ${COLS}\n  FROM community_works\n WHERE ${where.join('\n   AND ')}\n ORDER BY created_at DESC, id DESC\n LIMIT $${params.length}`;
+    const sql = `SELECT ${LIST_COLS}\n  FROM community_works\n WHERE ${where.join('\n   AND ')}\n ORDER BY created_at DESC, id DESC\n LIMIT $${params.length}`;
     const r = await pg.query(sql, params);
-    const works = (r && r.rows ? r.rows : []).map(normalizeRow);
-    const last = works[works.length - 1];
-    const nextCursor = works.length === limit && last
-      ? encodeCursor(tsStr(last.createdAt), last.id)
+    const rawRows = (r && r.rows ? r.rows : []);
+    const works = rawRows.map(normalizeRow);
+    const lastRaw = rawRows[rawRows.length - 1];
+    const cursorTs = lastRaw && lastRaw.created_at_cursor
+      ? lastRaw.created_at_cursor
+      : (lastRaw ? tsStr(lastRaw.created_at) : null);
+    const nextCursor = works.length === limit && lastRaw
+      ? encodeCursor(cursorTs, lastRaw.id)
       : null;
     return { ok: true, works, nextCursor };
   }

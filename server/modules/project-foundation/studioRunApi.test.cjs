@@ -602,8 +602,11 @@ function createBudgetPgMock() {
     nodes: new Map(),      // canvasId -> rows[]
     edges: new Map(),      // canvasId -> rows[]
     budgets: new Map(),    // projectId -> { budget, spent }
-    modelPrices: new Map(), // model_id -> credit_cost
+    modelPricing: new Map(), // model_id -> creditPrice（model_pricing 真源，L5 第一读）
+    modelHistory: new Map(), // model_id -> creditCost（model_price_history 快照）
+    modelsCredit: new Map(), // model_id -> creditCost（models.credit_cost 兜底）
     runsByKey: new Map(),  // 'canvasId|key' -> runId
+    failBudgetRead: false, // 置 true 使 project_budgets 读抛错（测 fail-open）
   };
   const calls = [];
   const countBy = (re) => calls.filter((c) => re.test(c.sql)).length;
@@ -625,14 +628,22 @@ function createBudgetPgMock() {
       return { rows: canvas ? [canvas] : [], rowCount: canvas ? 1 : 0 };
     }
     if (text.includes('FROM project_budgets')) {
+      if (state.failBudgetRead) throw new Error('boom: budget read fault');
       const b = state.budgets.get(params[0]);
       if (!b) return { rows: [], rowCount: 0 };
       return { rows: [{ project_id: params[0], workspace_id: (state.projects.get(params[0]) || {}).workspace_id, budget: b.budget, spent: b.spent, warning_threshold: 0.8, approval_threshold: 1 }], rowCount: 1 };
     }
+    if (text.includes('FROM model_pricing')) {
+      const p = state.modelPricing.get(params[0]);
+      return p != null ? { rows: [{ credit_price: p, reward_price: 0, currency: 'CNY' }], rowCount: 1 } : { rows: [], rowCount: 0 };
+    }
+    if (text.includes('FROM model_price_history')) {
+      const p = state.modelHistory.get(params[0]);
+      return p != null ? { rows: [{ credit_cost: p }], rowCount: 1 } : { rows: [], rowCount: 0 };
+    }
     if (text.includes('FROM models')) {
-      const ids = new Set(params[0] || []);
-      const rows = [...state.modelPrices.entries()].filter(([mid]) => ids.has(mid)).map(([model_id, credit_cost]) => ({ model_id, credit_cost }));
-      return { rows, rowCount: rows.length };
+      const p = state.modelsCredit.get(params[0]);
+      return p != null ? { rows: [{ credit_cost: p }], rowCount: 1 } : { rows: [], rowCount: 0 };
     }
     if (text.includes('FROM studio_runs WHERE canvas_id')) {
       const id = state.runsByKey.get(`${params[0]}|${params[1]}`);
@@ -662,14 +673,18 @@ function createBudgetPgMock() {
     setNodes(canvasId, rows) { state.nodes.set(canvasId, rows); },
     setEdges(canvasId, rows) { state.edges.set(canvasId, rows); },
     setBudget(projectId, budget, spent) { state.budgets.set(projectId, { budget, spent }); },
-    setModelPrice(modelId, creditCost) { state.modelPrices.set(modelId, creditCost); },
+    setModelPrice(modelId, creditCost) { state.modelsCredit.set(modelId, creditCost); },
+    setModelPricing(modelId, creditPrice) { state.modelPricing.set(modelId, creditPrice); },
+    setModelHistory(modelId, creditCost) { state.modelHistory.set(modelId, creditCost); },
+    setFailBudgetRead(v) { state.failBudgetRead = Boolean(v); },
     addRun(canvasId, idempotencyKey, runId) { state.runsByKey.set(`${canvasId}|${idempotencyKey}`, runId); },
   };
 }
 
-function makeBudgetHarness({ pgMock, sessionUser, parseBodyFn, engineOverrides = {} } = {}) {
+function makeBudgetHarness({ pgMock, sessionUser, parseBodyFn, engineOverrides = {}, logEvent } = {}) {
   const engineCalls = { create: 0, snapshot: 0 };
   const responses = [];
+  const events = [];
   const engine = {
     createRunFromCanvas: async (p) => { engineCalls.create += 1; return { ok: true, runId: 'run-created', status: 'QUEUED', idempotent: false, canvasRevision: p.requestedCanvasRevision }; },
     getRunSnapshot: async () => { engineCalls.snapshot += 1; return null; },
@@ -687,8 +702,9 @@ function makeBudgetHarness({ pgMock, sessionUser, parseBodyFn, engineOverrides =
       if (res && typeof res.end === 'function') res.end(JSON.stringify(body));
     },
     parseBody: parseBodyFn || (async (req) => req._body || {}),
+    logEvent: logEvent || (async (pg, ev) => { events.push(ev); }),
   });
-  return { api, responses, engineCalls };
+  return { api, responses, engineCalls, events };
 }
 
 // 默认种子：p-1/w-1/u-1（owner），cv-1 rev2，prompt→image(model m-img cc=1)
@@ -761,6 +777,40 @@ test('V2.0: 幂等重放（同 canvas+key 已有 run）→ 预算不足也不拦
   await api.handle(req, res, '/api/v2/projects/p-1/studio/runs', 'POST');
   assert.equal(res.statusCode, 202, 'replay of an existing run is not a new spend — must not 409');
   assert.equal(engineCalls.create, 1);
+});
+
+test('V2.0: 价格真源与 L5 同链 — model_pricing 有价、models.credit_cost 过期 → 门按 model_pricing 拦截', async () => {
+  const m = createBudgetPgMock();
+  seedImageProject(m, { budget: 3, spent: 1 }); // remaining 2 credit = 20000 units
+  m.setModelPricing('m-img', 5); // 真源 model_pricing=5 credit；models.credit_cost 仍是 seed 的 1
+  const { api, engineCalls } = makeBudgetHarness({ pgMock: m });
+  const res = makeRes();
+  const req = createReq({ runMode: 'ALL', canvasRevision: 2, idempotencyKey: 'ik-truth' });
+  await api.handle(req, res, '/api/v2/projects/p-1/studio/runs', 'POST');
+  assert.equal(res.statusCode, 409, JSON.stringify(res.chunks.join('')));
+  const body = JSON.parse(res.chunks.join(''));
+  assert.equal(body.error, 'BUDGET_INSUFFICIENT');
+  // 关键回归：门必须读 model_pricing（5 credit = 50000 units），而非过期的
+  // models.credit_cost（1 credit = 10000 units）。若读错库行会放行并让 L5 实扣 5 credit。
+  assert.equal(body.estimateUnits, 50000);
+  assert.equal(body.remainingUnits, 20000);
+  assert.equal(engineCalls.create, 0, 'run must NOT be created when the gate blocks on the true price');
+});
+
+test('V2.0: 预算门读故障 → fail-open 放行并落结构化告警（不 409、引擎照建、emit 记录）', async () => {
+  const m = createBudgetPgMock();
+  seedImageProject(m, { budget: 10, spent: 9.9 }); // 有预算；若无故障应 409
+  m.setFailBudgetRead(true);
+  const { api, engineCalls, events } = makeBudgetHarness({ pgMock: m });
+  const res = makeRes();
+  const req = createReq({ runMode: 'ALL', canvasRevision: 2, idempotencyKey: 'ik-failopen' });
+  await api.handle(req, res, '/api/v2/projects/p-1/studio/runs', 'POST');
+  assert.equal(res.statusCode, 202, JSON.stringify(res.chunks.join('')));
+  assert.equal(engineCalls.create, 1, 'fail-open: engine still creates the run');
+  const ev = events.find((e) => e.eventType === 'studio.run.budget_gate_fail_open');
+  assert.ok(ev, 'structured alert must be emitted on budget-gate fail-open');
+  assert.equal(ev.payload.project_id, 'p-1');
+  assert.equal(ev.payload.canvas_id, 'cv-1');
 });
 
 test('V2.0: GET /runs/estimate 200 形状 — video+image 闭包、有预算、精确 units', async () => {

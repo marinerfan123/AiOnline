@@ -377,6 +377,48 @@ test('G22 presencePgStore: sweep 非法 nowMs → {removed:0} 且不发 DELETE�
   assert.deepEqual((await store.list('c-1')).map((x) => x.userId), ['u-live']);
 });
 
+/* ── 时间戳精度守卫：巨值/小数/负 nowMs 与 lastSeenMs 一律拒 ────── */
+test('G22 presencePgStore: sweep 巨值/负/小数 nowMs → {removed:0}；upsert 非安全整数 lastSeenMs 拒(400)', async () => {
+  const m = createMockPg();
+  const store = createPresencePgStore({ pg: m.pg });
+  await store.upsert({ canvasId: 'c-1', userId: 'u-live', state: 'online', lastSeenMs: 1_752_000_000_000 });
+
+  const before = m.deleteCount();
+  // 巨值 nowMs（>=2^53 或 1e300）过去会经 isFinite 放行并清空全表；安全整数守卫下应拒
+  for (const bad of [Number.MAX_SAFE_INTEGER + 1, 1e300, -5, 1.5, NaN, Infinity]) {
+    assert.deepEqual(await store.sweep('c-1', bad), { removed: 0 }, `nowMs=${bad} 应拒`);
+  }
+  assert.equal(m.deleteCount(), before, '非法 nowMs 不发 DELETE');
+  assert.equal(m.storedCount('c-1'), 1, 'u-live 未被误清');
+
+  // 小数/巨值 lastSeenMs 应被 upsert 校验拒（int8 写库前挡掉精度丢失）
+  for (const bad of [1.5, Number.MAX_SAFE_INTEGER + 1, 1e300]) {
+    const r = await store.upsert({ canvasId: 'c-2', userId: 'u-x', state: 'online', lastSeenMs: bad });
+    assert.equal(r.ok, false, `lastSeenMs=${bad} 应拒`);
+    assert.equal(r.status, 400);
+    assert.ok(r.errors.some((e) => e.includes('lastSeenMs')));
+  }
+  assert.equal(m.storedCount('c-2'), 0, '被拒 lastSeenMs 零落行');
+});
+
+/* ── 多实例同表 sweep：实例 B 全库清不误清实例 A 刚心跳的活跃用户 ── */
+test('G22 presencePgStore: 多实例同表 —— 他实例全库 sweep 不误清本实例活跃用户（含时钟偏移余量）', async () => {
+  const m = createMockPg(); // 共享一张 canvas_presence 表（两个实例各挂一个 store）
+  const storeA = createPresencePgStore({ pg: m.pg });
+  const storeB = createPresencePgStore({ pg: m.pg });
+  const now = 1_752_000_000_000;
+
+  // 实例 A 刚处理活跃用户 u-active 的最近心跳（age 0）；同画布 u-stale 已 40s 未心跳
+  await storeA.upsert({ canvasId: 'c-1', userId: 'u-active', state: 'online', lastSeenMs: now });
+  await storeA.upsert({ canvasId: 'c-1', userId: 'u-stale', state: 'online', lastSeenMs: now - 40_000 });
+
+  // 实例 B 的全库 sweep（各自 setInterval 15s 触发），带 1s 时钟偏移（NTP 下远小于此，放大验证余量）
+  const r = await storeB.sweep(undefined, now + 1_000);
+  assert.equal(r.removed, 1, '只清 u-stale，u-active 存活');
+  const rows = await storeA.list('c-1');
+  assert.deepEqual(rows.map((x) => x.userId), ['u-active'], '他实例 sweep 未误清活跃用户');
+});
+
 /* ── SQL 常量 ↔ 迁移 0047 对拍 ─────────────────────────────────── */
 test('G22 presencePgStore: 导出 SQL 常量与迁移 0047 表结构一致', () => {
   const migration = fs.readFileSync(MIGRATION_PATH, 'utf8');

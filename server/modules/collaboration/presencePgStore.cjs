@@ -103,7 +103,12 @@ DELETE FROM canvas_presence
 /* ── 内部谓词（对齐 repo contracts 风格） ───────────────────────── */
 const isNonEmptyString = (v) => typeof v === 'string' && v.trim().length > 0;
 const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
-const isEpochMs = (v) => typeof v === 'number' && Number.isFinite(v) && v >= 0;
+/**
+ * epoch-ms 时间戳校验：必须是非负【安全整数】。Date.now() 远小于 2^53，安全整数
+ * 判定可同时挡掉负数、NaN/Infinity、小数与 >=2^53 的巨值 —— 巨值经 node-pg 写
+ * int8 会丢失 JS number 精度（BIGINT 上限 2^63-1 > 2^53），故写库前即拒。
+ */
+const isEpochMs = (v) => typeof v === 'number' && Number.isSafeInteger(v) && v >= 0;
 
 function bad(errors) {
   return { ok: false, status: 400, errors };
@@ -200,7 +205,7 @@ function createPresencePgStore({ pg } = {}) {
    * 清过期行：DELETE last_seen_ms < (nowMs - HEARTBEAT_TTL_MS)（严格小于 ——
    * age 恰为 TTL 的记录本拍保留，peers 读路径已惰性排除，方向安全）。
    * @param {string} [canvasId] 缺省/空白 = 清全库过期行；否则只清该画布。
-   * @param {number} [nowMs]    缺省 = Date.now()；必须是非负 epoch ms。
+   * @param {number} [nowMs]    缺省 = Date.now()；必须是非负安全整数 epoch ms。
    * @returns {Promise<{removed:number}>} 本次删除的行数。
    */
   async function sweep(canvasId, nowMs = Date.now()) {

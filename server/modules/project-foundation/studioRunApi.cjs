@@ -22,6 +22,9 @@ const { createRunEventStore } = require('./runEventStore.cjs');
 // V2.0 must#2 — 预算前置门（纯估算核心 + project_budgets 读模型）。
 const { estimateRun, creditsToUnits } = require('../budget/budgetEstimate.cjs');
 const { getBudgetSpent } = require('./budgetSpentStore.cjs');
+// 价格真源必须与 L5 计费同链（accounting.getModelPrice：model_pricing → history →
+// models → 0），否则门读错库行（只读 models.credit_cost）会系统性低估、放行超预算。
+const accounting = require('../../accounting.cjs');
 
 const RUNS_RE = /^\/api\/v2\/projects\/([^/]+)\/studio\/runs(?:\/([^/]+)(?:\/([^/]+))?)?$/;
 
@@ -54,13 +57,15 @@ function toIso(v) { return v ? new Date(v).toISOString() : null; }
 // V2.0 must#2 — run 预算前置门 / 估算（估算侧与引擎共用同一纯编译函数）。
 //
 // 策略注（诚实边界）：
-//  - 价格真源：models.credit_cost（每逻辑模型单任务价，N(18,4)）。金额语义与
-//    server.js 的 L5 计费一致：image 节点按件（画布 image-generation 节点无
-//    count 字段 → 每节点 1 件）、video 节点固定 1 任务（duration 不放大价格，
-//    server.js billingCount = 1）。故 unitPrices 注入纯数字（每任务价），
-//    不做 per-second/per-image 加权 —— budgetEstimate 支持该形状。
-//  - 无 models 行/无 credit_cost 的模型 → 按 L5 双读链兜底 0 credit 计（不计
-//    入 totalUnits，但标 unpriced，前端可见）。
+//  - 价格真源：accounting.getModelPrice（model_pricing → model_price_history →
+//    models.credit_cost → 0），与 server.js L5 计费同链。金额语义与 L5 一致：
+//    image 节点按件（画布 image-generation 节点无 count 字段 → 每节点 1 件）、
+//    video 节点固定 1 任务（duration 不放大价格，server.js billingCount = 1）。
+//    故 unitPrices 注入纯数字（每任务价 = creditPrice），不做 per-second/
+//    per-image 加权 —— budgetEstimate 支持该形状。
+//  - 全链无价（getModelPrice source==='none'）的模型 → 0 credit 计（不计入
+//    totalUnits，但标 unpriced，前端可见）。与 L5 一致（L5 对 source 'none' 也
+//    按 0 计），故不存在「门放行、L5 实扣」的偏离面。
 //  - 预算不存在（无 project_budgets 行）→ 放行（NO_BUDGET 策略，不设门）。
 //  - 本 API 只读估算 + 门；预算的持久扣减仍归 budgetSpentStore.recordSpend
 //    （带守卫的 UPDATE，真正的并发防线）。门是保守的事前拦截，非结算。
@@ -80,7 +85,6 @@ const GENERATION_VIDEO_TYPES = new Set(['image-to-video', 'text-to-video']);
 const CANVAS_BY_PROJECT_SQL = 'SELECT id, revision, schema_version FROM studio_canvases WHERE project_id=$1 AND is_primary=TRUE AND archived_at IS NULL LIMIT 1';
 const CANVAS_NODES_SQL = 'SELECT node_id, node_type, node_schema_version, data_json FROM studio_canvas_nodes WHERE canvas_id=$1';
 const CANVAS_EDGES_SQL = 'SELECT edge_id, source_node_id, source_handle, target_node_id, target_handle, edge_type FROM studio_canvas_edges WHERE canvas_id=$1';
-const MODELS_PRICE_SQL = 'SELECT model_id, credit_cost FROM models WHERE model_id = ANY($1::text[])';
 const RUN_BY_CANVAS_KEY_SQL = 'SELECT id FROM studio_runs WHERE canvas_id=$1 AND idempotency_key=$2';
 
 /**
@@ -114,12 +118,16 @@ function deriveGenerationShots(graph) {
   return { shots, generationNodeCount, unmappedGenerationNodes };
 }
 
-/** models 行 → modelId → credit_cost 数字（每任务价；缺价模型不在表内 → unpriced）。 */
-function rowsToUnitPrices(rows) {
+/**
+ * modelIds → modelId → 每任务价（creditPrice），走 accounting 三读链
+ * （model_pricing → model_price_history → models.credit_cost → 0），与 L5 计费
+ * 同源。source==='none'（全链无价）→ 不注入 → 估算标 unpriced（0 units）。
+ */
+async function buildUnitPrices(pg, modelIds) {
   const prices = {};
-  for (const row of (Array.isArray(rows) ? rows : [])) {
-    const cc = Number(row && row.credit_cost);
-    if (row && row.model_id != null && Number.isFinite(cc)) prices[row.model_id] = cc;
+  for (const mid of modelIds) {
+    const p = await accounting.getModelPrice(pg, mid);
+    if (p && p.source !== 'none') prices[mid] = p.creditPrice;
   }
   return prices;
 }
@@ -528,8 +536,7 @@ function createStudioRunApi(deps) {
     if (!compiled.ok) return { ok: false, error: { code: compiled.error.code, nodeIds: compiled.error.nodeIds || [] } };
     const { shots, generationNodeCount, unmappedGenerationNodes } = deriveGenerationShots(compiled.graph);
     const modelIds = Array.from(new Set(shots.map((s) => s.model).filter(Boolean)));
-    const priceRes = modelIds.length ? await pg.query(MODELS_PRICE_SQL, [modelIds]) : null;
-    const unitPrices = rowsToUnitPrices(priceRes && priceRes.rows);
+    const unitPrices = await buildUnitPrices(pg, modelIds);
     const estimate = estimateRun({ shots, unitPrices, unitsPerCredit: UNITS_PER_CREDIT });
     return {
       ok: true,
@@ -612,6 +619,12 @@ function createStudioRunApi(deps) {
       });
     } catch (e) {
       console.error('[studio-runs] budget gate read failed — fail-open create:', e && e.stack);
+      // 结构化告警：fail-open 是无声的预算绕过面（recordSpend 尚未接入生产 create
+      // 路径，门是当前唯一拦截），必须落一条可观测事件，不能只 console.error。
+      await emit('studio.run.budget_gate_fail_open', {
+        project_id: projectId, canvas_id: canvasId, actor_id: user.id,
+        error: e && e.message, timestamp: new Date().toISOString(),
+      });
     }
     if (gate && gate.blocked) {
       return sendErr(sendJSON, res, 409, 'BUDGET_INSUFFICIENT', {

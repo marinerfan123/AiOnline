@@ -131,6 +131,46 @@ test('G22 presenceApi: bus 拒绝心跳 → 400 + errors 透传', async () => {
   assert.deepEqual(r.body.errors, errors);
 });
 
+/* ── 异步 adapter rejection（DB 故障）→ 5xx，不冒泡为未处理拒绝 ───── */
+test('G22 presenceApi: bus.heartbeat/peers rejection（DB 故障）→ 5xx 而非未处理拒绝', async () => {
+  const throwingBus = {
+    heartbeat: async () => { throw Object.assign(new Error('数据库未就绪'), { status: 503 }); },
+    peers: async () => { throw new Error('db down'); },
+  };
+  const api = createPresenceApi({
+    bus: throwingBus,
+    sessionUser: () => ({ id: 'u-1' }),
+    sendJSON: (res, code, body) => { res.status = code; res.body = body; },
+    parseBody: async (req) => (req._body !== undefined ? req._body : {}),
+  });
+
+  const hb = {};
+  await api.handle({ _body: { canvasId: 'c-1', state: EDITING } }, hb, '/api/v2/presence/heartbeat', 'POST');
+  assert.equal(hb.status, 503, 'err.status=503（数据库未就绪）透传');
+  assert.equal(hb.body.ok, false);
+
+  const pr = {};
+  await api.handle({}, pr, '/api/v2/presence/peers/c-1', 'GET');
+  assert.equal(pr.status, 500, '无 status 的 DB 错误 → 500');
+  assert.equal(pr.body.ok, false);
+  assert.equal(pr.body.error, 'presence 服务暂不可用');
+});
+
+/* ── 认领即 true：心跳/peers 200 后 handle 返回 true（契约一致） ──── */
+test('G22 presenceApi: 心跳 200 / peers 200 → handle 返回 true（认领并已响应）', async () => {
+  const bus = fakeBus({
+    heartbeatResult: { ok: true, presence: { userId: 'u-1', canvasId: 'c-1', state: EDITING, lastSeenMs: 1234 } },
+    peersResult: [],
+  });
+  const h = makeApi({ bus });
+  const r1 = await h.call('POST', '/api/v2/presence/heartbeat', { body: { canvasId: 'c-1', state: EDITING } });
+  assert.equal(r1.status, 200);
+  assert.equal(r1.handled, true, '心跳 200 后 handle 应返回 true');
+  const r2 = await h.call('GET', '/api/v2/presence/peers/c-1');
+  assert.equal(r2.status, 200);
+  assert.equal(r2.handled, true, 'peers 200 后 handle 应返回 true');
+});
+
 test('G22 presenceApi: parseBody 返回 null/undefined（坏 JSON 兜底）→ 400 而非崩溃', async () => {
   const bus = fakeBus({ heartbeatResult: { ok: false, status: 400, errors: ['canvasId (non-empty string) required'] } });
   const h = makeApi({ bus });

@@ -75,6 +75,19 @@ function createFakeStore(taskDefs) {
       if (error !== undefined && error !== null) r.error = error;
       return { ok: true, task: normalize(r) };
     },
+    async claimTask({ batchId, taskId }) {
+      calls.claimTask = (calls.claimTask || 0) + 1;
+      const r = rows.get(k(batchId, taskId));
+      if (!r) return { ok: false, error: { code: 'TASK_NOT_FOUND', message: 'not found' } };
+      if (r.status === 'SUCCEEDED' || r.status === 'FAILED' || r.status === 'SKIPPED') {
+        return { ok: false, error: { code: 'TERMINAL_STATE', message: `task is ${r.status}` } };
+      }
+      if (r.status === 'RUNNING') {
+        return { ok: false, error: { code: 'ALREADY_CLAIMED', message: 'already running' } };
+      }
+      r.status = 'RUNNING';
+      return { ok: true, task: normalize(r) };
+    },
     row: (batchId, taskId) => rows.get(k(batchId, taskId)),
     all: (batchId) => [...rows.values()].filter((r) => r.batch_id === batchId),
   };
@@ -100,10 +113,11 @@ test('缺省 executor：任务 QUEUED→RUNNING→FAILED，code=EXECUTOR_UNCONFI
   assert.equal(row.status, 'FAILED');
   assert.equal(errorCode(row), 'EXECUTOR_UNCONFIGURED');
 
-  // 迁移链：RUNNING 先于 FAILED
+  // 迁移链：claimTask(RUNNING) 先于 markTask(FAILED)
+  assert.equal(store.calls.claimTask, 1);
   assert.deepEqual(
     store.calls.markTask.map((c) => c.status),
-    ['RUNNING', 'FAILED'],
+    ['FAILED'],
   );
 });
 
@@ -167,11 +181,12 @@ test('runner 不越权 attempt/retry：从不传 attempt、不重试 FAILED', as
   const runner = createBatchRunner({ store, executor });
 
   await runner.runOnce('b1'); // → FAILED
-  // runner 不越权：所有 markTask 调用都不携带 attempt。
+  // runner 不越权：claim 走 claimTask（无 attempt 参数），所有 markTask 调用都不携带 attempt。
+  assert.equal(store.calls.claimTask, 1, 'runner claims via claimTask');
   for (const c of store.calls.markTask) {
     assert.equal(c.attempt, undefined, 'runner must never set attempt');
   }
-  // runner 只做了 RUNNING + FAILED，从不触 retryFailed（store 无该方法，runner 不引用）。
+  // runner 只做了 claimTask(RUNNING) + markTask(FAILED)，从不触 retryFailed（store 无该方法，runner 不引用）。
   assert.equal(store.calls.retryFailed, 0);
 
   // FAILED 是终态：再次 runOnce 不得重领（重试归 store.retryFailed 管）。
@@ -211,6 +226,45 @@ test('并发 runOnce 单执行：N 个并发轮次只执行每 task 一次', asy
   assert.equal(totalClaimed, 3);
 
   // 全部终态 SUCCEEDED。
+  for (const t of tasks) assert.equal(store.row('b1', t.taskId).status, 'SUCCEEDED');
+});
+
+test('跨进程双 runner：严格 claimTask 保证每 task 只被一个 runner 执行', async () => {
+  const tasks = [
+    { batchId: 'b1', taskId: 't1::image_gen' },
+    { batchId: 'b1', taskId: 't2::image_gen' },
+  ];
+  const store = createFakeStore(tasks);
+  const runs = [];
+  const makeExecutor = () => ({
+    run: async (task) => {
+      await sleep(5); // 放大竞态窗口
+      runs.push(task.taskId);
+      return { ok: true, resultRef: `oss://${task.taskId}.png` };
+    },
+  });
+  // 两个独立 runner 实例（模拟两个进程）共享同一 store：进程内 inFlight 互不可见，
+  // 只有 store 的 claimTask 严格 CAS（QUEUED→RUNNING 单赢者）能防双跑。
+  const r1 = createBatchRunner({ store, executor: makeExecutor(), maxInFlight: 4 });
+  const r2 = createBatchRunner({ store, executor: makeExecutor(), maxInFlight: 4 });
+
+  const [a, b] = await Promise.all([r1.runOnce('b1'), r2.runOnce('b1')]);
+  assert.equal(a.ok && b.ok, true);
+
+  // 每个 task 恰好执行一次（无重复、无遗漏）。
+  assert.deepEqual(runs.sort(), ['t1::image_gen', 't2::image_gen']);
+  assert.equal(runs.length, 2);
+
+  // 两 runner 各尝试领 2 个候选（各自 listTasks 都看到 QUEUED），但实际只有 2 次成功，
+  // 其余 2 次被 claimTask 拒（ALREADY_CLAIMED）而放弃。
+  const allResults = [...a.results, ...b.results];
+  assert.equal(allResults.filter((r) => r.claimed === true).length, 2, 'exactly 2 successful claims');
+  assert.equal(allResults.filter((r) => r.claimed === false).length, 2, '2 loser claims skipped');
+  assert.ok(
+    allResults.filter((r) => r.claimed === false).every((r) => r.reason === 'ALREADY_CLAIMED'),
+    'losers skipped with ALREADY_CLAIMED',
+  );
+
   for (const t of tasks) assert.equal(store.row('b1', t.taskId).status, 'SUCCEEDED');
 });
 
@@ -301,6 +355,7 @@ test('createBatchRunner 校验：非法 store/maxInFlight/executor 抛 TypeError
   assert.throws(() => createBatchRunner({}), TypeError);
   assert.throws(() => createBatchRunner({ store: { markTask() {} } }), TypeError); // 缺 listTasks
   assert.throws(() => createBatchRunner({ store: { listTasks() {} } }), TypeError); // 缺 markTask
+  assert.throws(() => createBatchRunner({ store: { listTasks() {}, markTask() {} } }), TypeError); // 缺 claimTask
   const store = createFakeStore([]);
   assert.throws(() => createBatchRunner({ store, maxInFlight: 0 }), TypeError);
   assert.throws(() => createBatchRunner({ store, maxInFlight: 1.5 }), TypeError);
@@ -373,6 +428,14 @@ function createMinimalPg() {
             inserted.push({ task_id });
           }
           return { rows: inserted, rowCount: inserted.length };
+        }
+        if (sql.includes("SET status = 'RUNNING'") && !sql.includes('$3')) {
+          // claimTask：仅 QUEUED → RUNNING。
+          const [batchId, taskId] = params;
+          const r = rows.get(k(batchId, taskId));
+          if (!r || r.status !== 'QUEUED') return { rows: [], rowCount: 0 };
+          r.status = 'RUNNING';
+          return { rows: [{ ...r }], rowCount: 1 };
         }
         if (sql.includes("status IN ('QUEUED', 'RUNNING')")) {
           const [batchId, taskId, status, attemptVal, resultRefVal, errorVal] = params;

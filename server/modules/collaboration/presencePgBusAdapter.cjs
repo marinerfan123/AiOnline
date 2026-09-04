@@ -35,6 +35,8 @@
  *     上层不得再依赖 store 层重复校验。
  *   - 入参非法 → {ok:false,status:400,errors}；store 抛出的 DB/连接错误【原样上抛】
  *     （异步 rejection），由未来端点层映射 5xx —— 对齐 presencePgStore 的基建故障约定。
+ *   - store 返回 {ok:false,status:400,errors}（如 store 层二次校验拒收）时，本 adapter
+ *     【透传】该 400 而非吞掉谎报 ok:true —— await 后必须检查 store 结果再报成功。
  *   - store 注入契约：createPresencePgBusAdapter({ store })，store 只需
  *     { upsert, list, remove, sweep }（异步），本 adapter 不构造 SQL、不假设列名 ——
  *     与 presenceBus「bus 永不构造存储键」的哲学一致。
@@ -131,11 +133,25 @@ function createPresencePgBusAdapter({ store } = {}) {
     if (errors.length > 0) return { ok: false, status: 400, errors };
 
     if (normalized === PRESENCE_STATES.OFFLINE) {
-      await store.remove({ canvasId, userId });
+      const r = await store.remove({ canvasId, userId });
+      if (r && r.ok === false) {
+        return {
+          ok: false,
+          status: Number.isInteger(r.status) ? r.status : 400,
+          errors: Array.isArray(r.errors) && r.errors.length > 0 ? r.errors : ['presence remove rejected'],
+        };
+      }
       return { ok: true, presence: null };
     }
     const record = { userId, canvasId, state: normalized, lastSeenMs: Date.now() };
-    await store.upsert(record);
+    const r = await store.upsert(record);
+    if (r && r.ok === false) {
+      return {
+        ok: false,
+        status: Number.isInteger(r.status) ? r.status : 400,
+        errors: Array.isArray(r.errors) && r.errors.length > 0 ? r.errors : ['presence upsert rejected'],
+      };
+    }
     return { ok: true, presence: { ...record } };
   }
 

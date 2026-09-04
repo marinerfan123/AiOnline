@@ -411,15 +411,18 @@ function createScriptApi({ pg, sessionUser, sendJSON, parseBody }) {
           const r = await batchStore.retryFailed(storyboard.batchId);
           return sendJSON(res, 200, { ok: true, reset: r && r.ok === true ? r.reset : 0 });
         }
-        const p = await batchStore.progress(storyboard.batchId);
-        const progress = p && p.ok === true
-          ? { total: p.total, byStatus: p.byStatus }
-          : { total: tasks.length, byStatus: {} };
+        // 进度与任务列表同源：由同一 listTasks 快照派生，不再二次 GROUP BY。
+        // 否则两查询之间 runner 推进终态时，tasks 与 progress 会出现瞬时不一致
+        // （如 tasks 显示某任务 QUEUED 而 progress 已计为 RUNNING）。
+        const byStatus = { QUEUED: 0, RUNNING: 0, SUCCEEDED: 0, FAILED: 0, SKIPPED: 0 };
+        for (const t of tasks) {
+          if (Object.prototype.hasOwnProperty.call(byStatus, t.status)) byStatus[t.status] += 1;
+        }
         return sendJSON(res, 200, {
           ok: true,
           batchId: storyboard.batchId,
           tasks: tasks.map(publicTask),
-          progress,
+          progress: { total: tasks.length, byStatus },
         });
       }
       const scriptId = storyboard.scriptId;

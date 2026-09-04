@@ -13,6 +13,8 @@
  *     sessionUser(req).id，绝不信任客户端传入的 userId（防冒名）。
  *   - 归一保证：state=busy 是 legacy alias，bus.heartbeat 在入列前归一 busy→editing，
  *   - 异步兼容：bus 方法一律 await（内存 bus 同步返回亦可 await），支持 PG-backed adapter。
+ *     await 后的 rejection（DB 未就绪/连接错误等基建故障）在本模块内 catch 并映射 5xx
+ *     （err.status≥500 透传，否则 500），不冒泡为未处理拒绝；校验拒绝走 {ok:false,status:400}。
  *     HTTP 层原样透传（canonical 枚举与 alias 语义的单一真源在 presenceBus.cjs）。
  *   - 无会话（sessionUser(req) 为 null/undefined）→ 401 {ok:false,error:'未登录'}，
  *     与 timelineApi/scriptApi 等既有模块一致。
@@ -77,31 +79,55 @@ function createPresenceApi({ bus, sessionUser, sendJSON, parseBody }) {
       if (!user) return true;
       // 客户端可传 canvasId/state；userId 只取会话身份，忽略 body.userId（防冒名）。
       const body = (await parseBody(req)) || {};
-      const result = await bus.heartbeat({
-        userId: user.id,
-        canvasId: body && body.canvasId,
-        state: body && body.state,
-      });
+      let result;
+      try {
+        result = await bus.heartbeat({
+          userId: user.id,
+          canvasId: body && body.canvasId,
+          state: body && body.state,
+        });
+      } catch (err) {
+        // 基建故障（DB 未就绪/连接错误）——异步 adapter 在 await 后的 rejection 不冒泡
+        // 为未处理拒绝，显式映射 5xx（err.status 如 503 则透传，否则 500）。
+        const status = err && Number.isInteger(err.status) && err.status >= 500 ? err.status : 500;
+        sendJSON(res, status, { ok: false, error: 'presence 服务暂不可用' });
+        return true;
+      }
       if (!result || result.ok !== true) {
         const status = result && Number.isInteger(result.status) ? result.status : 400;
         const errors =
           result && Array.isArray(result.errors) && result.errors.length > 0
             ? result.errors
             : ['heartbeat rejected'];
-        return sendJSON(res, status, { ok: false, errors });
+        sendJSON(res, status, { ok: false, errors });
+        return true;
       }
       // 200：state=offline 时 bus 返回 presence:null（已摘除），原样透传。
-      return sendJSON(res, 200, { ok: true, presence: result.presence === undefined ? null : result.presence });
+      sendJSON(res, 200, { ok: true, presence: result.presence === undefined ? null : result.presence });
+      return true;
     }
 
     if (method === 'GET' && peersMatch) {
       const user = requireUser(req, res);
       if (!user) return true;
       let canvasId;
-      try { canvasId = decodeURIComponent(peersMatch[1]); } catch { return sendJSON(res, 400, { ok: false, error: 'canvasId 非法' }); }
+      try {
+        canvasId = decodeURIComponent(peersMatch[1]);
+      } catch {
+        sendJSON(res, 400, { ok: false, error: 'canvasId 非法' });
+        return true;
+      }
       // bus.peers 惰性过滤：仅返回该画布 ≤TTL 且在线的成员；过期记录由外部 sweep 清。
-      const peers = await bus.peers(canvasId);
-      return sendJSON(res, 200, { ok: true, canvasId, peers });
+      let peers;
+      try {
+        peers = await bus.peers(canvasId);
+      } catch (err) {
+        const status = err && Number.isInteger(err.status) && err.status >= 500 ? err.status : 500;
+        sendJSON(res, status, { ok: false, error: 'presence 服务暂不可用' });
+        return true;
+      }
+      sendJSON(res, 200, { ok: true, canvasId, peers });
+      return true;
     }
 
     // 路由存在但方法不在集合（如 GET /heartbeat）→ 404（同未匹配处理）。

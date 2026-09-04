@@ -278,6 +278,21 @@ async function withTx(pg, fn) {
 }
 
 /**
+ * 事务内先取 (project, script) 咨询锁（与 apply 的 LOCK_SQL 同键）再执行 fn。
+ * lock/unlock 路由（setLocked/lockShots）用它串行化与 apply 的竞态：apply 的
+ * DELETE+INSERT 在事务内持锁，若 lock 的 UPDATE 落在「DELETE 已删、INSERT 未提交」
+ * 的窗口会阻塞到 apply COMMIT 后回查 —— 旧行已删 → 0 行 → 404，锁丢失（新行仍是
+ * unlocked）。同键咨询锁让 lock 阻塞到 apply 事务结束再对最终行集置位，消除丢失锁。
+ * hashtext 碰撞仅导致无谓串行，绝不破坏正确性（与 LOCK_SQL 注释一致）。
+ */
+async function withLockedTx(pg, projectId, scriptId, fn) {
+  return withTx(pg, async (q) => {
+    await q.query(LOCK_SQL, [projectId, scriptId]);
+    return fn(q);
+  });
+}
+
+/**
  * 持久化一个 storyboard plan 的 beats/shots 到 project_shots_rows。
  * @returns 见文件头返回约定。
  */
@@ -339,6 +354,8 @@ async function persistStoryboardShots({ pg, projectId, scriptId, plan }) {
 /**
  * 单个 shot 锁定/解锁（显式布尔置位）。按 (project_id, script_id, shot_id)
  * 作用域更新 —— 跨项目/不存在 → 0 行 → 404。纯 DB 服务，与 persist 同款返回约定。
+ * 0054 并发收口：事务内取 (project, script) 咨询锁（withLockedTx），与 apply 串行化，
+ * 避免 lock 落在 apply DELETE+INSERT 中间窗口导致锁丢失（旧行删掉 → 0 行 → 404）。
  * @returns { ok:true, projectId, scriptId, shotId, locked }
  *        | { ok:false, status:404, error } | { ok:false, status:400, errors }
  */
@@ -348,7 +365,9 @@ async function setLocked({ pg, projectId, scriptId, shotId, locked }) {
   if (!isNonEmptyString(scriptId)) return { ok: false, status: 400, errors: ['scriptId must be a non-empty string'] };
   if (!isNonEmptyString(shotId)) return { ok: false, status: 400, errors: ['shotId must be a non-empty string'] };
   if (typeof locked !== 'boolean') return { ok: false, status: 400, errors: ['locked must be a boolean'] };
-  const r = await pg.query(SET_LOCKED_SQL, [scriptId, shotId, projectId, locked]);
+  const r = await withLockedTx(pg, projectId, scriptId, (q) =>
+    q.query(SET_LOCKED_SQL, [scriptId, shotId, projectId, locked]),
+  );
   if (!r.rows || r.rows.length === 0) {
     return { ok: false, status: 404, error: 'shot 不存在或不属于该项目' };
   }
@@ -360,7 +379,8 @@ async function lockShot(args) {
   return setLocked(args);
 }
 
-/** 批量锁定/解锁：同一 script 下多个 shot_id 一次置位；部分命中只回命中集。 */
+/** 批量锁定/解锁：同一 script 下多个 shot_id 一次置位；部分命中只回命中集。
+ *  0054 并发收口：事务内取 (project, script) 咨询锁（withLockedTx），与 apply 串行化（同 setLocked）。 */
 async function lockShots({ pg, projectId, scriptId, shotIds, locked }) {
   if (!pg || typeof pg.query !== 'function') return { ok: false, status: 400, errors: ['pg (query) required'] };
   if (!isNonEmptyString(projectId)) return { ok: false, status: 400, errors: ['projectId must be a non-empty string'] };
@@ -369,7 +389,9 @@ async function lockShots({ pg, projectId, scriptId, shotIds, locked }) {
     return { ok: false, status: 400, errors: ['shotIds must be a non-empty array of shot ids'] };
   }
   if (typeof locked !== 'boolean') return { ok: false, status: 400, errors: ['locked must be a boolean'] };
-  const r = await pg.query(SET_LOCKED_BATCH_SQL, [scriptId, projectId, shotIds, locked]);
+  const r = await withLockedTx(pg, projectId, scriptId, (q) =>
+    q.query(SET_LOCKED_BATCH_SQL, [scriptId, projectId, shotIds, locked]),
+  );
   const updated = (r.rows || []).map((row) => String(row.shot_id));
   return { ok: true, projectId, scriptId, updated, locked };
 }

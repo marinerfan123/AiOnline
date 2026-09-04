@@ -82,13 +82,24 @@ function createMockPg() {
     }
 
     if (sql.startsWith('UPDATE storyboard_batch_tasks')) {
+      if (sql.includes("SET status = 'RUNNING'") && !sql.includes('$3')) {
+        // claimTask 严格 CAS：仅 QUEUED → RUNNING（单赢者）。
+        const [batchId, taskId] = params;
+        const row = rowFor(batchId, taskId);
+        if (!row || row.status !== 'QUEUED') return { rows: [], rowCount: 0 };
+        row.status = 'RUNNING';
+        row.updated_at = now();
+        return { rows: [full(row)], rowCount: 1 };
+      }
       if (sql.includes("status IN ('QUEUED', 'RUNNING')")) {
-        // markTask CAS：终态/不存在 → rowCount 0。
+        // markTask 转移矩阵 CAS：RUNNING 目标仅从 QUEUED；终态目标仅从 QUEUED/RUNNING。
         const [batchId, taskId, status, attemptVal, resultRefVal, errorVal] = params;
         const row = rowFor(batchId, taskId);
-        if (!row || (row.status !== 'QUEUED' && row.status !== 'RUNNING')) {
-          return { rows: [], rowCount: 0 };
-        }
+        if (!row) return { rows: [], rowCount: 0 };
+        const from = row.status;
+        const allowed = (status === 'RUNNING' && from === 'QUEUED')
+          || (['SUCCEEDED', 'FAILED', 'SKIPPED'].includes(status) && (from === 'QUEUED' || from === 'RUNNING'));
+        if (!allowed) return { rows: [], rowCount: 0 };
         row.status = status;
         if (attemptVal !== null && attemptVal !== undefined) row.attempt = attemptVal;
         if (resultRefVal !== null && resultRefVal !== undefined) row.result_ref = resultRefVal;
@@ -268,6 +279,73 @@ test('markTask rejects invalid status / missing task / bad attempt', async () =>
   assert.equal((await store.markTask({ batchId, taskId: 'ghost::image_gen', status: 'RUNNING' })).error.code, 'TASK_NOT_FOUND');
   assert.equal((await store.markTask({ batchId, taskId: 'a::image_gen', status: 'RUNNING', attempt: -1 })).error.code, 'INVALID_ATTEMPT');
   assert.equal(m.row(batchId, 'a::image_gen').status, 'QUEUED', 'no mutation after rejected calls');
+});
+
+// ------------------------------------------------------------ claimTask 单赢者
+test('claimTask: QUEUED→RUNNING 成功；二次 claim 得 ALREADY_CLAIMED（跨进程单赢者）', async () => {
+  const m = createMockPg();
+  const store = createBatchTaskStore({ pg: m.pg });
+  const { batchId } = await store.createBatch({ scriptId: 's', tasks: [TASK('a::image_gen', 'a')] });
+
+  const first = await store.claimTask({ batchId, taskId: 'a::image_gen' });
+  assert.equal(first.ok, true);
+  assert.equal(first.task.status, 'RUNNING');
+  assert.equal(first.task.attempt, 0, 'claim 不消费重试计数');
+
+  const second = await store.claimTask({ batchId, taskId: 'a::image_gen' });
+  assert.equal(second.ok, false);
+  assert.equal(second.error.code, 'ALREADY_CLAIMED');
+  assert.equal(m.row(batchId, 'a::image_gen').status, 'RUNNING', '二次 claim 不改状态');
+});
+
+test('claimTask: 终态 → TERMINAL_STATE；不存在 → TASK_NOT_FOUND', async () => {
+  const m = createMockPg();
+  const store = createBatchTaskStore({ pg: m.pg });
+  const { batchId } = await store.createBatch({
+    scriptId: 's',
+    tasks: [TASK('ok::image_gen', 'ok'), TASK('fail::image_gen', 'fail')],
+  });
+  await store.markTask({ batchId, taskId: 'ok::image_gen', status: 'SUCCEEDED', resultRef: 'r' });
+  await store.markTask({ batchId, taskId: 'fail::image_gen', status: 'FAILED', error: 'e' });
+
+  const succ = await store.claimTask({ batchId, taskId: 'ok::image_gen' });
+  assert.equal(succ.ok, false);
+  assert.equal(succ.error.code, 'TERMINAL_STATE');
+  const fail = await store.claimTask({ batchId, taskId: 'fail::image_gen' });
+  assert.equal(fail.error.code, 'TERMINAL_STATE');
+  const ghost = await store.claimTask({ batchId, taskId: 'ghost::image_gen' });
+  assert.equal(ghost.error.code, 'TASK_NOT_FOUND');
+});
+
+// ------------------------------------------------------------ markTask 转移矩阵（禁止双跑/降级）
+test('markTask 转移矩阵：RUNNING→RUNNING 与 RUNNING→QUEUED 被拒（INVALID_TRANSITION）', async () => {
+  const m = createMockPg();
+  const store = createBatchTaskStore({ pg: m.pg });
+  const { batchId } = await store.createBatch({ scriptId: 's', tasks: [TASK('a::image_gen', 'a')] });
+
+  await store.markTask({ batchId, taskId: 'a::image_gen', status: 'RUNNING' });
+  assert.equal(m.row(batchId, 'a::image_gen').status, 'RUNNING');
+
+  // 旧实现漏洞：RUNNING→RUNNING 曾二次成功 → 双跑。现在必须被拒。
+  const reRun = await store.markTask({ batchId, taskId: 'a::image_gen', status: 'RUNNING' });
+  assert.equal(reRun.ok, false);
+  assert.equal(reRun.error.code, 'INVALID_TRANSITION');
+
+  // RUNNING→QUEUED 降级同样被拒（复位只走 retryFailed 专用 SQL）。
+  const downgrade = await store.markTask({ batchId, taskId: 'a::image_gen', status: 'QUEUED' });
+  assert.equal(downgrade.ok, false);
+  assert.equal(downgrade.error.code, 'INVALID_TRANSITION');
+  assert.equal(m.row(batchId, 'a::image_gen').status, 'RUNNING', '非法迁移不改状态');
+});
+
+test('markTask QUEUED→QUEUED 空转被拒（INVALID_TRANSITION），不作无谓写', async () => {
+  const m = createMockPg();
+  const store = createBatchTaskStore({ pg: m.pg });
+  const { batchId } = await store.createBatch({ scriptId: 's', tasks: [TASK('a::image_gen', 'a')] });
+  const r = await store.markTask({ batchId, taskId: 'a::image_gen', status: 'QUEUED' });
+  assert.equal(r.ok, false);
+  assert.equal(r.error.code, 'INVALID_TRANSITION');
+  assert.equal(m.row(batchId, 'a::image_gen').status, 'QUEUED');
 });
 
 // ------------------------------------------------------------ retryFailed 只重置可重试

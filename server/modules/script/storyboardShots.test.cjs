@@ -584,6 +584,177 @@ test('G13 CRITICAL: advisory lock is acquired before the MAX(version) read (mech
   assert.ok(calls.indexOf('lock') < calls.indexOf('max'), 'lock before MAX(version)');
 });
 
+// ------------------------------------------------------ lock/apply 竞态（0054 并发收口）
+/**
+ * 忠实模拟 Postgres 下 lock（setLocked/lockShots）与 apply 同 (project, script) 并发：
+ *   - advisory lock 以 (project, script) 为键互斥 —— apply 的 DELETE+INSERT 在事务内持锁，
+ *     lock 落在中间窗口会阻塞到 apply COMMIT 再回查（否则旧行已删 → 0 行 → 404 丢失锁）；
+ *   - committed 行集带 locked 字段；SET_LOCKED/SET_LOCKED_BATCH 与 LOCKED_SHOT_IDS 均实现。
+ */
+function makeLockRacePg() {
+  const committed = [];
+  const shotIds = new Set();
+  const locks = new Map();
+
+  const keyOf = (p, s) => `${p}|${s}`;
+  const ukey = (s, k) => `${s}|${k}`;
+
+  async function acquire(key) {
+    let l = locks.get(key);
+    if (!l) { l = { held: false, waiters: [] }; locks.set(key, l); }
+    if (!l.held) { l.held = true; return; }
+    await new Promise((resolve) => l.waiters.push(resolve));
+  }
+  function release(key) {
+    const l = locks.get(key);
+    if (!l) return;
+    if (l.waiters.length) l.waiters.shift()();
+    else l.held = false;
+  }
+
+  const state = { committed, lockLog: [] };
+
+  function execData(sql, params) {
+    if (/SELECT 1 AS ok FROM projects/.test(sql)) return { rows: [{ ok: 1 }] };
+    if (/SELECT id FROM script_rows WHERE project_id = \$1 AND id = ANY/.test(sql)) {
+      return { rows: (params[1] || []).map((id) => ({ id })) };
+    }
+    if (/COALESCE\(MAX\(version\)/.test(sql)) {
+      const [scriptId, projectId] = params;
+      const v = committed
+        .filter((s) => s.script_id === scriptId && s.project_id === projectId)
+        .reduce((m, s) => Math.max(m, s.version), 0);
+      return { rows: [{ v }] };
+    }
+    if (/SELECT shot_id FROM project_shots_rows WHERE script_id = \$1/.test(sql)) {
+      // LOCKED_SHOT_IDS_SQL：script_id=$1, project_id=$2, locked=true
+      return {
+        rows: committed
+          .filter((s) => s.script_id === params[0] && s.project_id === params[1] && s.locked)
+          .map((s) => ({ shot_id: s.shot_id })),
+      };
+    }
+    if (/DELETE FROM project_shots_rows WHERE script_id = \$1/.test(sql)) {
+      const [scriptId, projectId] = params;
+      const before = committed.length;
+      for (let i = committed.length - 1; i >= 0; i -= 1) {
+        const s = committed[i];
+        if (s.script_id === scriptId && s.project_id === projectId && !s.locked) {
+          shotIds.delete(ukey(s.script_id, s.shot_id));
+          committed.splice(i, 1);
+        }
+      }
+      return { rowCount: before - committed.length };
+    }
+    if (/UPDATE project_shots_rows SET locked/.test(sql) && /ANY\(\$3::text\[\]\)/.test(sql)) {
+      // SET_LOCKED_BATCH_SQL：script_id=$1, project_id=$2, shot_ids=$3, locked=$4
+      const updated = [];
+      for (const s of committed) {
+        if (s.script_id === params[0] && s.project_id === params[1] && params[2].includes(s.shot_id)) {
+          s.locked = params[3]; updated.push({ shot_id: s.shot_id });
+        }
+      }
+      return { rows: updated };
+    }
+    if (/UPDATE project_shots_rows SET locked/.test(sql)) {
+      // SET_LOCKED_SQL：script_id=$1, shot_id=$2, project_id=$3, locked=$4
+      const t = committed.find(
+        (s) => s.script_id === params[0] && s.shot_id === params[1] && s.project_id === params[2],
+      );
+      if (!t) return { rows: [] };
+      t.locked = params[3];
+      return { rows: [{ shot_id: t.shot_id, locked: t.locked }] };
+    }
+    if (/INSERT INTO project_shots_rows/.test(sql)) {
+      const [projectId, scriptId, shotId] = [params[0], params[1], params[2]];
+      const k = ukey(scriptId, shotId);
+      if (shotIds.has(k)) {
+        const e = new Error(`duplicate key (script_id, shot_id)=(${scriptId}, ${shotId})`);
+        e.code = '23505';
+        throw e;
+      }
+      shotIds.add(k);
+      committed.push({
+        project_id: projectId, script_id: scriptId, shot_id: shotId,
+        version: params[12], locked: params[13],
+      });
+      return { rowCount: 1 };
+    }
+    return { rows: [] };
+  }
+
+  const pg = {
+    state,
+    async query(sql, params = []) { return execData(sql, params); },
+    async connect() {
+      const txn = { lockedKey: null };
+      return {
+        async query(sql, params = []) {
+          if (sql === 'BEGIN') return { rows: [] };
+          if (sql === 'COMMIT') { if (txn.lockedKey) release(txn.lockedKey); return { rows: [] }; }
+          if (sql === 'ROLLBACK') { if (txn.lockedKey) release(txn.lockedKey); return { rows: [] }; }
+          if (/pg_advisory_xact_lock/.test(sql)) {
+            const key = keyOf(params[0], params[1]);
+            state.lockLog.push(`lock:${key}`);
+            await acquire(key);
+            txn.lockedKey = key;
+            return { rows: [] };
+          }
+          return execData(sql, params);
+        },
+        async release() {},
+      };
+    },
+  };
+  return pg;
+}
+
+test('G13 CRITICAL: lock/unlock acquires the advisory lock inside a txn before the UPDATE (apply 同锁串行化)', async () => {
+  const calls = [];
+  const pg = {
+    async query(sql, params = []) {
+      if (sql === 'BEGIN') { calls.push('begin'); return { rows: [] }; }
+      if (sql === 'COMMIT') { calls.push('commit'); return { rows: [] }; }
+      if (/pg_advisory_xact_lock/.test(sql)) { calls.push('lock'); return { rows: [] }; }
+      if (/UPDATE project_shots_rows SET locked/.test(sql)) { calls.push('update'); return { rows: [{ shot_id: 's0:b0:k0', locked: true }] }; }
+      return { rows: [] };
+    },
+    async connect() {
+      return { async query(sql, params = []) { return pg.query(sql, params); }, async release() {} };
+    },
+  };
+  const r = await setLocked({ pg, projectId: P_ID, scriptId: S_ID, shotId: 's0:b0:k0', locked: true });
+  assert.equal(r.ok, true);
+  assert.equal(calls[0], 'begin', 'lock route must run in a transaction');
+  assert.equal(calls[1], 'lock', 'advisory lock must precede the UPDATE');
+  assert.ok(calls.indexOf('lock') < calls.indexOf('update'), 'lock before UPDATE');
+});
+
+test('G13 CRITICAL: concurrent lock + apply on the same script — the lock is never lost (serialized, no 404)', async () => {
+  const { plan } = samplePlan();
+  const pg = makeLockRacePg();
+  await callPersist(pg, { plan }); // seed v1 unlocked rows
+
+  const [applyRes, lockRes] = await Promise.allSettled([
+    callPersist(pg, { plan }), // re-apply: DELETE+INSERT, bumps version
+    lockShot({ pg, projectId: P_ID, scriptId: S_ID, shotId: 's0:b0:k0', locked: true }),
+  ]);
+
+  assert.equal(applyRes.status, 'fulfilled', applyRes.reason && applyRes.reason.message);
+  assert.equal(lockRes.status, 'fulfilled', lockRes.reason && lockRes.reason.message);
+  // 修复前：lock 可能落在 apply 的 DELETE 后 INSERT 前 → 旧行已删 → 0 行 → 404 丢失锁。
+  // 修复后：同键咨询锁串行化 → lock 阻塞到 apply COMMIT 后对最终行集置位，绝不 404。
+  assert.equal(lockRes.value.ok, true, 'lock must not 404 while racing apply');
+  assert.equal(lockRes.value.locked, true);
+  const k0 = pg.state.committed
+    .filter((s) => s.script_id === S_ID && s.project_id === P_ID)
+    .find((s) => s.shot_id === 's0:b0:k0');
+  assert.ok(k0, 's0:b0:k0 must survive apply');
+  assert.equal(k0.locked, true, 'lock must land on the surviving (final) row');
+  // 咨询锁确实被 apply 与 lock 各取一次（互斥，非并发穿透）
+  assert.ok(pg.state.lockLog.length >= 2, `expected ≥2 lock acquisitions, got ${pg.state.lockLog.length}`);
+});
+
 // ------------------------------------------------------ locked semantics (0052)
 test('G13 V2.0: locked shot survives re-apply — row preserved, replaced/inserted exclude it, skippedLocked returned', async () => {
   const { plan } = samplePlan();
@@ -632,6 +803,27 @@ test('G13 V2.0: a locked shot no longer in the plan is still preserved (DELETE s
   assert.equal(pg.state.shots.length, 3);     // 2 新 + 1 锁定保留
   assert.ok(pg.state.shots.some((s) => s.shot_id === 's1:b0:k0' && s.locked && s.version === 1));
   assert.deepEqual(new Set(pg.state.shots.filter((s) => !s.locked).map((s) => s.shot_id)), new Set(['s0:b0:k0', 's0:b0:k1']));
+});
+
+test('G13 V2.0: unlock a ghost shot (locked, then dropped from plan) → next apply deletes it (ghost cleaned)', async () => {
+  const { plan: planA } = samplePlan();
+  const pg = makePg();
+  await callPersist(pg, { plan: planA }); // v1: 4 shots
+  await lockShot({ pg, projectId: P_ID, scriptId: S_ID, shotId: 's1:b0:k0', locked: true });
+  // 修订版 plan 只剩 scene0 → s1:b0:k0 变成锁定的「幽灵旧行」
+  const rows = [D('MAYA', 'Revised.', { scene_index: 0 })];
+  const planB = buildStoryboardPlan({ rows, characters: [MAYA] });
+  const res = await callPersist(pg, { plan: planB });
+  assert.equal(res.version, 2);
+  assert.ok(pg.state.shots.some((s) => s.shot_id === 's1:b0:k0' && s.locked && s.version === 1));
+  // 解锁幽灵 → 变成 unlocked 旧代行；下一次 apply 的 DELETE 命中它 → 清理。
+  const unlock = await lockShot({ pg, projectId: P_ID, scriptId: S_ID, shotId: 's1:b0:k0', locked: false });
+  assert.equal(unlock.ok, true);
+  assert.equal(pg.state.shots.find((s) => s.shot_id === 's1:b0:k0').locked, false);
+  const res3 = await callPersist(pg, { plan: planB });
+  assert.equal(res3.version, 3);
+  assert.ok(!pg.state.shots.some((s) => s.shot_id === 's1:b0:k0'), 'ghost unlocked row removed on next apply');
+  assert.equal(pg.state.shots.length, 2); // 终态 = 本次 plan 行集，无幽灵残留
 });
 
 // ------------------------------------------------------ source trace (0053)
@@ -824,6 +1016,32 @@ test('G13 V2.1: a changed plan persists rows under a new fingerprint (old versio
   assert.notEqual(fpB, fpA, '输入变 → 指纹变');
   assert.equal(pg.state.shots.length, 2);
   assert.ok(pg.state.shots.every((s) => s.plan_fingerprint === fpB && s.dirty === false && s.version === 2));
+});
+
+test('G13 V2.1: locked shot pinned to an old generation never surfaces as active-generation dirty (MAX-version scoping)', async () => {
+  const { plan } = samplePlan();
+  const pg = makePg();
+  await callPersist(pg, { plan }); // v1 clean, 4 rows
+  await lockShot({ pg, projectId: P_ID, scriptId: S_ID, shotId: 's0:b0:k0', locked: true });
+  await markDirty({ pg, projectId: P_ID, scriptId: S_ID }); // rows 写 → 全部行 dirty（含锁定 k0）
+  const rerun = await callPersist(pg, { plan }); // re-apply: k0 被跳过（脏标记卡住），3 行重插 clean
+  assert.equal(rerun.ok, true);
+  assert.equal(rerun.version, 2);
+
+  const k0 = pg.state.shots.find((s) => s.shot_id === 's0:b0:k0');
+  assert.equal(k0.version, 1, 'locked row keeps its old version');
+  assert.equal(k0.locked, true);
+  assert.equal(k0.dirty, true, 'locked row keeps its dirty flag (apply 跳过覆写)');
+
+  const latest = pg.state.shots.filter((s) => s.version === 2);
+  assert.equal(latest.length, 3);
+  assert.ok(latest.every((s) => s.dirty === false && s.locked === false));
+
+  // 关键断言：活动代（MAX version）无脏行 —— 锁行钉在旧代，不计入活动代 dirty
+  // （对应 PERSISTED_PLAN_SUMMARY_SQL 的 version = MAX(version) 过滤，防 dirty 误报）。
+  const maxV = Math.max(...pg.state.shots.map((s) => s.version));
+  const activeDirty = pg.state.shots.filter((s) => s.version === maxV).some((s) => s.dirty);
+  assert.equal(activeDirty, false, 'locked old-generation row must not surface as active dirty');
 });
 
 // ----------------------------------------------------- markDirty (0054)

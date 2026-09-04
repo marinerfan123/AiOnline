@@ -212,6 +212,27 @@ test('G22 adapter: heartbeat(offline) 摘除记录（走 store.remove）且 pres
   assert.equal(store.calls.upsert.length, 1, 'offline 不触发 upsert');
 });
 
+/* ── store 层 400 拒收 → adapter 透传（await 后检查 store 结果，不谎报 ok:true） ── */
+test('G22 adapter: store.upsert/remove 返回 {ok:false,status:400} → adapter 透传而非吞掉', async () => {
+  const rejecting = {
+    upsert: async () => ({ ok: false, status:400, errors: ['upsert rejected by store'] }),
+    list: async () => [],
+    remove: async () => ({ ok: false, status:400, errors: ['remove rejected by store'] }),
+    sweep: async () => ({ removed: 0 }),
+  };
+  const bus = createPresencePgBusAdapter({ store: rejecting });
+
+  const online = await bus.heartbeat({ userId: 'u-1', canvasId: 'c-1', state: ONLINE });
+  assert.equal(online.ok, false, 'store 层 upsert 拒收须透传，不谎报 ok:true');
+  assert.equal(online.status, 400);
+  assert.deepEqual(online.errors, ['upsert rejected by store']);
+
+  const offline = await bus.heartbeat({ userId: 'u-1', canvasId: 'c-1', state: OFFLINE });
+  assert.equal(offline.ok, false, 'store 层 remove 拒收须透传');
+  assert.equal(offline.status, 400);
+  assert.deepEqual(offline.errors, ['remove rejected by store']);
+});
+
 test('G22 adapter: 非法 heartbeat 入参拒(400) 且零 store 调用（校验口径同 presenceBus）', async () => {
   const store = fakeAsyncStore();
   const bus = createPresencePgBusAdapter({ store });
@@ -378,8 +399,8 @@ test('G22 adapter 组合: adapter 与 presenceBus 在同一喂入集上产出相
   assert.deepEqual(a, b, 'adapter 与 presenceBus 的 peers 成员集合须逐点等价（顺序除外）');
 });
 
-/* ── presenceApi 集成实测：同步调用 × 异步 adapter → 非「零改动」 ── */
-test('G22 adapter: presenceApi 同步调用 bus.heartbeat 拿到 Promise → 400（实测需补 await）', async () => {
+/* ── presenceApi 集成实测：已补 await → 异步 adapter 正确 200（回归旧「同步误判 400」） ── */
+test('G22 adapter: presenceApi 已 await 异步 adapter → heartbeat 200（非 Promise 误判 400）', async () => {
   const bus = createPresencePgBusAdapter({ store: fakeAsyncStore() });
   let captured;
   const api = createPresenceApi({
@@ -389,17 +410,15 @@ test('G22 adapter: presenceApi 同步调用 bus.heartbeat 拿到 Promise → 400
     parseBody: async () => ({ canvasId: 'c-1', state: ONLINE }),
   });
 
-  // presenceApi.handle 内是 `const result = bus.heartbeat(...)`（不 await）。
+  // presenceApi.handle 内已是 `const result = await bus.heartbeat(...)`（await 已补全）。
   const handled = await api.handle({}, {}, '/api/v2/presence/heartbeat', 'POST');
   assert.equal(handled, true, 'presenceApi 认领了该路由');
-  // 不 await → result 是 Promise → result.ok!==true → 400「heartbeat rejected」
-  assert.equal(captured.code, 400, '同步调用拿到 Promise，被误判为拒绝 → 400');
-  assert.deepEqual(captured.body, { ok: false, errors: ['heartbeat rejected'] });
+  // await 到位 → result 是实际结果对象 → 200 且 presence.state=online（非旧「Promise 误判 400」）
+  assert.equal(captured.code, 200, 'await 后拿到结果对象 → 200');
+  assert.equal(captured.body.ok, true);
+  assert.equal(captured.body.presence.state, ONLINE);
 
-  // 补 await（最小改动）即恢复正常 —— 证明改动仅两处 await。
-  const awaited = await bus.heartbeat({ userId: 'u-1', canvasId: 'c-1', state: ONLINE });
-  assert.equal(awaited.ok, true);
-  assert.equal(awaited.presence.state, ONLINE);
-  const peersAwaited = await bus.peers('c-1');
-  assert.deepEqual(peersAwaited.map((p) => p.userId), ['u-1']);
+  // 同一 adapter 读回已落库成员（peers 也 await）
+  const peers = await bus.peers('c-1');
+  assert.deepEqual(peers.map((p) => p.userId), ['u-1']);
 });

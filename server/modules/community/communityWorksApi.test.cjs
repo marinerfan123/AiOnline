@@ -309,6 +309,9 @@ test('api: GET list 参数校验 —— 非法 limit/cursor/tag → 400；详情
   assert.equal((await h.call('GET', '/api/v2/community/works', { query: { cursor: '!!bad!!' } })).status, 400);
   assert.equal((await h.call('GET', '/api/v2/community/works', { query: { cursor: 'bm9wZQ==' } })).status, 400);
   assert.equal((await h.call('GET', '/api/v2/community/works', { query: { tag: '  ' } })).status, 400);
+  // 伪造游标：合法 base64url 但 createdAt 非时间戳 → 400（防 ::timestamptz 转型 500）
+  const forgedTs = Buffer.from('not-a-date|cw-x', 'utf8').toString('base64url');
+  assert.equal((await h.call('GET', '/api/v2/community/works', { query: { cursor: forgedTs } })).status, 400);
 });
 
 /* ── detail：404 无泄漏（DRAFT/TAKEDOWN 对他人）────────────────────── */

@@ -1122,3 +1122,78 @@ test('router exposes PREFIX / ADMIN_PREFIX / sweepExpired for server.js wiring',
   const ok = await h.router.sweepExpired(new Date());
   assert.equal(ok.ok, true);
 });
+
+// ── 5) 审计安全回归（重放安全 / 脱敏完备性 / 篡改 fail-closed）──────────
+test('approve success response never leaks full secret; write executes as approver identity', async () => {
+  const h = harness({ role: AGENT.role, id: 'agent-1' });
+  const r1 = await h.call('POST', `${U}/providers`, {
+    body: { id: 'p-sec', name: 'Sec', apiKey: SECRET_A },
+  });
+  const id = r1.data.pendingId;
+  assert.equal(h.pending(id).payload.apiKey, SECRET_A, 'DB 行保留完整 secret 供重放');
+  h.setUser('admin', 'admin-1');
+  const app = await h.call('POST', `${A}/approvals/${id}/approve`, {});
+  assert.equal(app.code, 200);
+  // 整个 approve 响应（含 applied 与 pendingAction）不得出现完整 secret。
+  assert.ok(!JSON.stringify(app.data).includes(SECRET_A), 'approve 响应不得含完整 secret');
+  assert.match(app.data.pendingAction.payload.apiKey, /^\u2022{4}/, 'payload.apiKey 已 mask');
+  // applied.provider 走脱敏视图：无完整 api_key，仅 masked_legacy_key。
+  const prov = app.data.applied.provider;
+  assert.ok(prov, 'applied.provider 存在');
+  assert.ok(!('api_key' in prov), 'applied.provider 无完整 api_key 字段');
+  assert.equal(prov.credential.masked_legacy_key, `\u2022\u2022\u2022\u2022${SECRET_A.slice(-4)}`);
+  assert.equal(prov.credential.has_legacy_key, true);
+  // 重放以「审批人(admin)」身份执行（updated_by=admin-1），非提交者(agent-1)。
+  assert.equal(prov.updated_by, 'admin-1', '重放以审批人身份落 updated_by');
+});
+
+test('admin deny response never leaks full secret (keys array payload)', async () => {
+  const h = harness({ role: AGENT.role, id: 'agent-1' });
+  const r1 = await h.call('POST', `${U}/providers/p1/keys`, { body: { apiKeys: [KEY_A] } });
+  const id = r1.data.pendingId;
+  h.setUser('admin', 'admin-1');
+  const den = await h.call('POST', `${A}/approvals/${id}/deny`, {});
+  assert.equal(den.code, 200);
+  assert.equal(den.data.pendingAction.status, 'DENIED');
+  assert.ok(!JSON.stringify(den.data).includes(KEY_A), 'deny 响应不得含完整 key');
+  assert.match(den.data.pendingAction.payload.keys[0], /^\u2022{4}/, 'payload.keys 已 mask');
+});
+
+test('execution-error 402 response never leaks full secret (replay 409 → DENIED)', async () => {
+  const h = harness({ role: AGENT.role, id: 'agent-1' });
+  const r1 = await h.call('POST', `${U}/providers`, {
+    body: { id: 'p-dup', name: 'Dup', apiKey: SECRET_A },
+  });
+  const id = r1.data.pendingId;
+  // 审批前另一管理员已真实创建同 id provider → 重放将 409（revision/存在性重验）。
+  h.setUser('admin', 'admin-2');
+  const created = await h.call('POST', `${U}/providers`, {
+    body: { id: 'p-dup', name: 'Dup Other', apiKey: SECRET_A },
+  });
+  assert.equal(created.code, 201);
+  const app = await h.call('POST', `${A}/approvals/${id}/approve`, {});
+  assert.equal(app.code, 402);
+  assert.equal(app.data.error, 'EXECUTION_ERROR');
+  assert.equal(app.data.pendingAction.status, 'DENIED');
+  assert.ok(!JSON.stringify(app.data).includes(SECRET_A), '402 响应不得含完整 secret');
+  assert.match(app.data.pendingAction.payload.apiKey, /^\u2022{4}/, 'payload.apiKey 已 mask');
+});
+
+test('tampered unknown kind in DB → approve fails closed (402, zero real writes)', async () => {
+  const h = harness({ role: AGENT.role, id: 'agent-1' });
+  // 直接向内存 pending 表注入一条未知 kind 的 PENDING 行（模拟 DB 被篡改）。
+  h.db.pendingActions.set('pa-tampered', {
+    id: 'pa-tampered', kind: 'provider.explode',
+    actor_id: 'agent-1', actor_role: 'agent',
+    payload: { providerId: 'p-x' },
+    status: 'PENDING',
+    created_at: new Date(), decided_at: null, decided_by: null, decision_note: null,
+    expires_at: new Date(Date.now() + 3600_000),
+  });
+  h.setUser('admin', 'admin-1');
+  const app = await h.call('POST', `${A}/approvals/pa-tampered/approve`, {});
+  assert.equal(app.code, 402);
+  assert.equal(app.data.error, 'EXECUTION_ERROR');
+  assert.equal(h.realWrites().length, 0, '未知 kind 绝不执行真实写（fail-closed）');
+  assert.equal(h.pending('pa-tampered').status, 'DENIED', '落 DENIED 终态，不留悬空');
+});
