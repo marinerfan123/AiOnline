@@ -104,4 +104,261 @@ function projectModelBinding(row, providerRow = {}) {
   };
 }
 
-module.exports = { projectModelBinding, normalizeCapabilities, LEGACY_TO_CANONICAL, CANONICAL_KEYS };
+/* ══ Input Schema validation runtime (L4 · Blueprint 04 §8-9) ═══════
+ * Pure-JS JSON Schema (Draft 2020-12 subset) validator for operation
+ * `input_schema`. ajv is NOT a declared dependency: node_modules carries
+ * ajv@6 (draft-07 only, a transitive eslint/table dep) with no 2020-12
+ * support, so this leaf implements the required keyword subset directly:
+ *   type / required / min|max / minLength|maxLength / enum / pattern /
+ *   const / oneOf / allOf / anyOf / not / unevaluatedProperties
+ * (plus additionalProperties / patternProperties / minItems|maxItems).
+ *
+ * §9 rationale: `unevaluatedProperties:false` under allOf/oneOf must not
+ * falsely reject fields declared in a sibling branch. The validator tracks
+ * "evaluated property" annotations across allOf (union of every branch) and
+ * oneOf/anyOf (union of only the matching branches), so a field declared by
+ * ANY applicable branch is treated as evaluated — exactly the 2020-12
+ * behaviour that makes combination schemas safe where `additionalProperties:
+ * false` would misfire.
+ */
+
+const TYPE_CHECKS = {
+  null: (v) => v === null,
+  boolean: (v) => typeof v === 'boolean',
+  object: (v) => v !== null && typeof v === 'object' && !Array.isArray(v),
+  array: (v) => Array.isArray(v),
+  number: (v) => typeof v === 'number' && Number.isFinite(v),
+  integer: (v) => Number.isInteger(v),
+  string: (v) => typeof v === 'string',
+};
+
+const asArray = (v) => (Array.isArray(v) ? v : []);
+
+function typeMatches(t, v) {
+  const fn = TYPE_CHECKS[t];
+  return fn ? fn(v) : false;
+}
+
+function matchesType(typeKw, v) {
+  if (typeKw === undefined) return true;
+  if (Array.isArray(typeKw)) return typeKw.some((t) => typeMatches(t, v));
+  return typeMatches(typeKw, v);
+}
+
+function valueTypeName(v) {
+  if (v === null) return 'null';
+  if (Array.isArray(v)) return 'array';
+  return typeof v;
+}
+
+function deepEqual(a, b) {
+  if (a === b) return true;
+  if (a === null || b === null || typeof a !== typeof b) return a === b;
+  if (Array.isArray(a) || Array.isArray(b)) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+    return a.every((x, i) => deepEqual(x, b[i]));
+  }
+  if (typeof a === 'object') {
+    const ka = Object.keys(a);
+    const kb = Object.keys(b);
+    if (ka.length !== kb.length) return false;
+    return ka.every((k) => Object.prototype.hasOwnProperty.call(b, k) && deepEqual(a[k], b[k]));
+  }
+  return false;
+}
+
+function matchesPattern(pattern, v) {
+  try {
+    return new RegExp(pattern).test(v);
+  } catch {
+    return true; // malformed schema pattern (server-authored) → no constraint
+  }
+}
+
+function errorAt(path, msg) {
+  return path === '$' ? msg : `${path}: ${msg}`;
+}
+
+/** Fast pass/fail probe into a throwaway error list (no side effects). */
+function _passes(schema, value) {
+  const errs = [];
+  _validate(schema, value, '$', errs);
+  return errs.length === 0;
+}
+
+/** Collect property names "evaluated" by `schema` for object `value` (§9). */
+function _collectEvaluatedProps(schema, value, out) {
+  if (!schema || typeof schema !== 'object') return;
+
+  if (schema.properties && typeof schema.properties === 'object') {
+    for (const k of Object.keys(schema.properties)) out.add(k);
+  }
+  if (schema.patternProperties && typeof schema.patternProperties === 'object') {
+    for (const k of Object.keys(value)) {
+      for (const re of Object.keys(schema.patternProperties)) {
+        if (matchesPattern(re, k)) out.add(k);
+      }
+    }
+  }
+  // additionalProperties (non-false) applies to — and thus evaluates — all
+  // props not otherwise covered; over-approximating to "all value keys" is
+  // harmless since properties/patternProperties keys are already in `out`.
+  if ('additionalProperties' in schema && schema.additionalProperties !== false) {
+    for (const k of Object.keys(value)) out.add(k);
+  }
+
+  // allOf: annotations from EVERY branch count (§9 — the union that makes
+  // cross-branch fields legal). oneOf/anyOf: only matching branches count.
+  for (const sub of asArray(schema.allOf)) _collectEvaluatedProps(sub, value, out);
+  for (const sub of asArray(schema.oneOf)) if (_passes(sub, value)) _collectEvaluatedProps(sub, value, out);
+  for (const sub of asArray(schema.anyOf)) if (_passes(sub, value)) _collectEvaluatedProps(sub, value, out);
+}
+
+function _validateObject(schema, value, path, errors) {
+  if (Array.isArray(schema.required)) {
+    for (const k of schema.required) {
+      if (!Object.prototype.hasOwnProperty.call(value, k)) {
+        errors.push(errorAt(path, `required property "${k}" missing`));
+      }
+    }
+  }
+
+  const props = schema.properties;
+  if (props && typeof props === 'object') {
+    for (const k of Object.keys(props)) {
+      if (Object.prototype.hasOwnProperty.call(value, k)) {
+        _validate(props[k], value[k], `${path}.${k}`, errors);
+      }
+    }
+  }
+
+  const patProps = schema.patternProperties;
+  if (patProps && typeof patProps === 'object') {
+    for (const k of Object.keys(value)) {
+      for (const re of Object.keys(patProps)) {
+        if (matchesPattern(re, k)) _validate(patProps[re], value[k], `${path}.${k}`, errors);
+      }
+    }
+  }
+
+  if ('additionalProperties' in schema) {
+    const ap = schema.additionalProperties;
+    const declared = new Set(Object.keys(props || {}));
+    const patterns = Object.keys(patProps || {});
+    for (const k of Object.keys(value)) {
+      const covered = declared.has(k) || patterns.some((re) => matchesPattern(re, k));
+      if (!covered) {
+        if (ap === false) errors.push(errorAt(`${path}.${k}`, 'additional property not allowed'));
+        else if (ap !== true && ap && typeof ap === 'object') _validate(ap, value[k], `${path}.${k}`, errors);
+      }
+    }
+  }
+
+  if ('unevaluatedProperties' in schema) {
+    const up = schema.unevaluatedProperties;
+    const evaluated = new Set();
+    _collectEvaluatedProps(schema, value, evaluated);
+    for (const k of Object.keys(value)) {
+      if (!evaluated.has(k)) {
+        if (up === false) errors.push(errorAt(`${path}.${k}`, 'unevaluated property not allowed'));
+        else if (up !== true && up && typeof up === 'object') _validate(up, value[k], `${path}.${k}`, errors);
+      }
+    }
+  }
+}
+
+function _validate(schema, value, path, errors) {
+  if (schema === true || schema === undefined || schema === null) return;
+  if (schema === false) {
+    errors.push(errorAt(path, 'value disallowed (schema: false)'));
+    return;
+  }
+  if (typeof schema !== 'object') return;
+
+  if (schema.not !== undefined && _passes(schema.not, value)) {
+    errors.push(errorAt(path, 'must not satisfy the `not` schema'));
+  }
+
+  const allOf = asArray(schema.allOf);
+  for (const sub of allOf) _validate(sub, value, path, errors);
+
+  const anyOf = asArray(schema.anyOf);
+  if (anyOf.length && !anyOf.some((sub) => _passes(sub, value))) {
+    errors.push(errorAt(path, `anyOf: none of ${anyOf.length} alternatives matched`));
+  }
+
+  const oneOf = asArray(schema.oneOf);
+  if (oneOf.length) {
+    const passCount = oneOf.filter((sub) => _passes(sub, value)).length;
+    if (passCount !== 1) {
+      errors.push(errorAt(path, `oneOf: expected exactly 1 of ${oneOf.length} alternatives to match, got ${passCount}`));
+    }
+  }
+
+  if (!matchesType(schema.type, value)) {
+    errors.push(errorAt(path, `expected type ${JSON.stringify(schema.type)}, got ${valueTypeName(value)}`));
+  }
+
+  if (schema.const !== undefined && !deepEqual(schema.const, value)) {
+    errors.push(errorAt(path, `must equal const ${JSON.stringify(schema.const)}`));
+  }
+
+  if (Array.isArray(schema.enum) && !schema.enum.some((e) => deepEqual(e, value))) {
+    errors.push(errorAt(path, `must be one of ${JSON.stringify(schema.enum)}`));
+  }
+
+  if (typeof value === 'number') {
+    const min = schema.min ?? schema.minimum;
+    const max = schema.max ?? schema.maximum;
+    if (min !== undefined && value < min) errors.push(errorAt(path, `must be >= ${min} (got ${value})`));
+    if (max !== undefined && value > max) errors.push(errorAt(path, `must be <= ${max} (got ${value})`));
+  }
+
+  if (typeof value === 'string') {
+    if (schema.minLength !== undefined && value.length < schema.minLength) {
+      errors.push(errorAt(path, `string length ${value.length} < minLength ${schema.minLength}`));
+    }
+    if (schema.maxLength !== undefined && value.length > schema.maxLength) {
+      errors.push(errorAt(path, `string length ${value.length} > maxLength ${schema.maxLength}`));
+    }
+    if (schema.pattern !== undefined && !matchesPattern(schema.pattern, value)) {
+      errors.push(errorAt(path, `must match pattern /${schema.pattern}/`));
+    }
+  }
+
+  if (Array.isArray(value)) {
+    if (schema.minItems !== undefined && value.length < schema.minItems) {
+      errors.push(errorAt(path, `array length ${value.length} < minItems ${schema.minItems}`));
+    }
+    if (schema.maxItems !== undefined && value.length > schema.maxItems) {
+      errors.push(errorAt(path, `array length ${value.length} > maxItems ${schema.maxItems}`));
+    }
+  }
+
+  if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
+    _validateObject(schema, value, path, errors);
+  }
+}
+
+/**
+ * Validate an operation input against its input_schema (L2 `input_schema`
+ * JSONB, served to L3 registry / generation runtime). Returns the codebase
+ * canonical `{ ok, errors: string[] }` shape.
+ *
+ * NOTE: not yet wired into L2/L3 — the L2 `model_operation_revisions.
+ * input_schema` column is read by L3/L5 which consume this validator. This
+ * leaf only ships the runtime + tests.
+ */
+function validateOperationInput(schema, input) {
+  if (schema !== true && schema !== false && (schema === null || typeof schema !== 'object')) {
+    return { ok: false, errors: ['schema must be a JSON Schema object or boolean'] };
+  }
+  const errors = [];
+  _validate(schema, input, '$', errors);
+  return { ok: errors.length === 0, errors };
+}
+
+module.exports = {
+  projectModelBinding, normalizeCapabilities, LEGACY_TO_CANONICAL, CANONICAL_KEYS,
+  validateOperationInput,
+};
