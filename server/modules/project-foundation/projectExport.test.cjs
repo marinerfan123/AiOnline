@@ -48,6 +48,34 @@ function baseData() {
   };
 }
 
+/** Over-cap generators: deterministic rows for the capacity tests (see ROW_CAP). */
+function genScriptRows(n) {
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    out.push({
+      id: `sr-cap-${i}`, project_id: 'p-1', episode_id: null,
+      scene_index: '0', row_index: String(i), kind: 'dialogue',
+      speaker: i % 2 ? 'A' : 'B', text: `行 ${i}`, beat: null,
+      timing_ms: '100', continuity_notes: {},
+    });
+  }
+  return out;
+}
+
+function genPlanRows(n) {
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    out.push({
+      script_id: 'scr-cap', shot_id: `capshot-${i}`, beat_id: `b-${i}`,
+      scene_index: '0', beat_index: String(i), shot_index: '0',
+      kind: 'standard', intent: 'action', subject_refs: [],
+      duration_ms: '1000', ordering: String(i), version: '1',
+      plan_fingerprint: 'fp-cap',
+    });
+  }
+  return out;
+}
+
 /**
  * Shared fake pg serving BOTH projectExport queries and the real timelineExport
  * module (imported by the equivalence test). opts:
@@ -413,3 +441,93 @@ test('G24-EXP: BIGINT > 2^53 rejected → ok:false PROJECT_EXPORT_ERROR (no sile
   assert.match(res.error, /PROJECT_EXPORT_ERROR/);
   assert.match(res.error, /超出安全整数范围/);
 });
+
+// ── Capacity cap (导出容量上限) ─────────────────────────────────────────────
+// Mirrors the module's ROW_CAP — script_rows (bundle.scriptRows) and
+// project_shots_rows (bundle.storyboardPlan.rows) each export at most 5000 rows.
+const ROW_CAP = 5000;
+const CAP_OVERFLOW = ROW_CAP + 6; // > cap → LIMIT cap+1 shows a row past the cap
+
+test('G24-EXP: capacity — facets below ROW_CAP export unchanged, no truncated flag', async () => {
+  const { exportProject } = makeHarness();
+  const res = await exportProject({ projectId: 'p-1' });
+  assert.equal(res.ok, true);
+  assert.equal(res.bundle.scriptRows.length, 2); // every fixture row kept
+  assert.equal(res.bundle.storyboardPlan.rows.length, 3);
+  assert.deepEqual(res.bundle.meta.truncated, undefined); // flag key absent < cap
+  // Meta schema is stable when untouched (no extra key from the cap guard).
+  assert.deepEqual(
+    Object.keys(res.bundle.meta).sort(),
+    ['exportedAtMs', 'projectId', 'projectName', 'schemaVersion'],
+  );
+});
+
+test('G24-EXP: capacity — script_rows over ROW_CAP truncates to 5000 + meta.truncated.scriptRows', async () => {
+  const d = baseData();
+  d.scriptContent = genScriptRows(CAP_OVERFLOW); // 5006 rows → cap+1 probe fires
+  const { exportProject, calls } = makeHarness(d);
+  const res = await exportProject({ projectId: 'p-1' });
+  assert.equal(res.ok, true); // truncation is a size guard, not a schema fault
+  assert.equal(res.bundle.scriptRows.length, ROW_CAP);
+  // Deterministic ORDER BY prefix kept: first exported row is the first row…
+  assert.equal(res.bundle.scriptRows[0].id, 'sr-cap-0');
+  assert.equal(res.bundle.scriptRows[ROW_CAP - 1].id, `sr-cap-${ROW_CAP - 1}`);
+  // …and the over-cap tail is dropped.
+  assert.ok(!res.bundle.scriptRows.some((r) => r.id === `sr-cap-${ROW_CAP}`));
+  assert.deepEqual(res.bundle.meta.truncated, { scriptRows: true });
+  // The other capped facet is untouched (base fixture: 3 plan rows).
+  assert.equal(res.bundle.storyboardPlan.rows.length, 3);
+  assert.ok(!('storyboardPlan' in res.bundle.meta.truncated));
+  // Overflow detection rides on LIMIT cap+1 in the query itself (no COUNT query).
+  const q5 = calls.find((c) => c.sql.includes('FROM script_rows'));
+  assert.match(q5.sql, new RegExp('LIMIT ' + (ROW_CAP + 1) + '\\s*$'));
+});
+
+test('G24-EXP: capacity — project_shots_rows over ROW_CAP truncates to 5000 + meta.truncated.storyboardPlan', async () => {
+  const d = baseData();
+  d.psr = genPlanRows(CAP_OVERFLOW); // 5006 rows
+  const { exportProject, calls } = makeHarness(d);
+  const res = await exportProject({ projectId: 'p-1' });
+  assert.equal(res.ok, true);
+  const plan = res.bundle.storyboardPlan;
+  assert.equal(plan.rows.length, ROW_CAP);
+  assert.equal(plan.rows[0].shotId, 'capshot-0');
+  assert.equal(plan.rows[ROW_CAP - 1].shotId, `capshot-${ROW_CAP - 1}`);
+  assert.ok(!plan.rows.some((r) => r.shotId === `capshot-${ROW_CAP}`));
+  assert.deepEqual(res.bundle.meta.truncated, { storyboardPlan: true });
+  assert.equal(res.bundle.scriptRows.length, 2); // other facet untouched
+  const q6 = calls.find((c) => c.sql.includes('FROM project_shots_rows'));
+  assert.match(q6.sql, new RegExp('LIMIT ' + (ROW_CAP + 1) + '\\s*$'));
+});
+
+test('G24-EXP: capacity — both facets over ROW_CAP: flags both set, export still green', async () => {
+  const d = baseData();
+  d.scriptContent = genScriptRows(CAP_OVERFLOW);
+  d.psr = genPlanRows(CAP_OVERFLOW);
+  const { exportProject } = makeHarness(d);
+  const res = await exportProject({ projectId: 'p-1' });
+  assert.equal(res.ok, true);
+  assert.equal(res.bundle.scriptRows.length, ROW_CAP);
+  assert.equal(res.bundle.storyboardPlan.rows.length, ROW_CAP);
+  assert.deepEqual(res.bundle.meta.truncated, { scriptRows: true, storyboardPlan: true });
+  // Per-timeline scriptRows stay a subset of the (capped) plan read.
+  for (const tl of res.bundle.timelines) {
+    assert.ok((tl.scriptRows || []).length <= ROW_CAP);
+  }
+});
+
+test('G24-EXP: capacity — truncated export is a deterministic subset (two runs byte-identical after stamps)', async () => {
+  const d = baseData();
+  d.scriptContent = genScriptRows(ROW_CAP + 3);
+  d.psr = genPlanRows(ROW_CAP + 3);
+  const { exportProject } = makeHarness(d);
+  const a = (await exportProject({ projectId: 'p-1' })).bundle;
+  const b = (await exportProject({ projectId: 'p-1' })).bundle;
+  assert.equal(a.scriptRows.length, ROW_CAP);
+  assert.equal(a.storyboardPlan.rows.length, ROW_CAP);
+  assert.deepEqual(a.meta.truncated, { scriptRows: true, storyboardPlan: true });
+  // Same DB state → same 5000-row subset, byte-identical JSON (stamps aside).
+  assert.deepEqual(stripStamps(a), stripStamps(b));
+  assert.equal(JSON.stringify(stripStamps(a)), JSON.stringify(stripStamps(b)));
+});
+

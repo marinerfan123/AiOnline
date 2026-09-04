@@ -3,6 +3,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { Clapperboard, ListVideo, PlaySquare, History } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { v2studio } from '@/shared/api/contract/studio-canvas-client';
+import { StoryboardRowsPanel } from './StoryboardRowsPanel';
 
 const TABS = [
   { id: 'shots', label: 'Shots', icon: Clapperboard, phase: 'M05-D 镜头工作流' },
@@ -13,7 +14,7 @@ const TABS = [
 
 type TabId = (typeof TABS)[number]['id'];
 
-export function BottomDock({ projectId, revision, onRestored }: { projectId?: string; revision?: number | null; onRestored?: () => void }) {
+export function BottomDock({ projectId, scriptId, revision, onRestored }: { projectId?: string; scriptId?: string; revision?: number | null; onRestored?: () => void }) {
   const [active, setActive] = useState<TabId | null>(null);
   const tab = TABS.find((t) => t.id === active) ?? null;
   const qc = useQueryClient();
@@ -38,6 +39,11 @@ export function BottomDock({ projectId, revision, onRestored }: { projectId?: st
             <div className="mb-2 flex items-center gap-2"><span className="font-medium text-ml2-text">Versions</span><button data-test="create-version" onClick={() => createVersion.mutate()} className="rounded bg-ml2-surface-3 px-2 py-0.5">Create Version</button></div>
             {versions.isPending ? <p>Loading versions…</p> : versions.data?.versions.length ? <div className="grid max-h-20 gap-1 overflow-auto">{versions.data.versions.map((v) => <div key={v.id} data-test="version-row" className="flex items-center gap-2 rounded bg-ml2-surface-2 px-2 py-1"><span>v{v.versionNumber}</span><span className="truncate">{v.name || 'Untitled'}</span><span>rev {v.revision}</span><span>{v.nodeCount} nodes</span><span>{v.edgeCount} edges</span><button data-test={`restore-version-${v.id}`} onClick={() => restoreVersion.mutate(v.id)} className="ml-auto rounded bg-ml2-surface-3 px-2 py-0.5">Restore</button></div>)}</div> : <p>No versions yet.</p>}
           </div>
+        ) : active === 'shots' ? (
+          /* G13 — 分镜计划 rows 列表（首个消费面）。数据 = 项目剧本 script_rows 的
+             plan 投影（GET /api/v2/script/:scriptId/storyboard）。画布接入前无
+             scriptId → 面板显示未绑定说明空态；剧本工作区接入后传 scriptId 即亮。 */
+          <StoryboardRowsPanel projectId={projectId} scriptId={scriptId} />
         ) : <div className="grid h-full place-items-center"><p className="text-[11px] text-ml2-text-3"><span className="font-medium text-ml2-text-2">{tab.label}</span> — {tab.phase} 提供。</p></div>}
       </div>}
     </div>

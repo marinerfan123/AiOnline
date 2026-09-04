@@ -59,6 +59,18 @@
  * (one Date.now() captured at export start is reused for the top meta AND every nested
  * per-timeline meta). Tests deep-compare after ignoring exportedAtMs recursively.
  *
+ * Capacity cap (导出容量上限, audit LOW: 整项目导出无 LIMIT): script_rows (Q5) and
+ * project_shots_rows (Q6/Q6b) are the two response-bounding row facets. Each exports
+ * at most ROW_CAP = 5000 rows: the queries carry LIMIT ROW_CAP+1 so overflow is
+ * detected in the same round trip (no separate COUNT query); on overflow the exported
+ * rows are the deterministic ORDER BY prefix (the first ROW_CAP) and the bundle marks
+ * which facet lost rows via meta.truncated = { scriptRows?: true, storyboardPlan?:
+ * true }. Clips/tracks are NOT capped (media-edit bounded, small in practice);
+ * per-timeline scriptRows are a subset of the capped plan read so they never exceed
+ * it. Under truncation storyboardPlan.version/fingerprint describe the exported
+ * subset (rows past the cap are not part of the snapshot). A truncated export is
+ * still ok:true — truncation is a size guard, not a schema fault.
+ *
  * Read path: pure SELECTs, at most 8 queries regardless of timeline count.
  *   Q1 projects row (404 gate)
  *   Q2 project_timeline rows
@@ -190,27 +202,37 @@ const CLIPS_SQL =
   ' LEFT JOIN media m ON m.id = av.media_id' +
   ' WHERE c.track_id = ANY($1::text[])' +
   ' ORDER BY c.track_id, c.order_index, c.start_ms, c.id';
+// ── Row cap (容量上限) ──────────────────────────────────────────────────────
+// Only the two big row facets are bounded (script content + persisted storyboard
+// plan). Queries LIMIT ROW_CAP+1; a returned row past the cap means overflow → keep
+// the deterministic ORDER BY prefix and record the facet on meta.truncated.
+const ROW_CAP = 5000;
+const ROW_CAP_LIMIT = ROW_CAP + 1; // LIMIT cap+1 → overflow detectable in one query
+
 // Q5 — script content facet.
 const SCRIPT_ROWS_SQL =
   'SELECT id, episode_id, scene_index, row_index, kind, speaker, text, beat,' +
   ' timing_ms, continuity_notes' +
   ' FROM script_rows' +
   ' WHERE project_id = $1' +
-  ' ORDER BY episode_id NULLS FIRST, scene_index, row_index, id';
+  ' ORDER BY episode_id NULLS FIRST, scene_index, row_index, id' +
+  ` LIMIT ${ROW_CAP_LIMIT}`;
 // Q6 — persisted storyboard plan facet (0054 plan_fingerprint read best-effort).
 const PLAN_SQL =
   'SELECT script_id, shot_id, beat_id, scene_index, beat_index, shot_index,' +
   ' kind, intent, subject_refs, duration_ms, ordering, version, plan_fingerprint' +
   ' FROM project_shots_rows' +
   ' WHERE project_id = $1' +
-  ' ORDER BY ordering, shot_id, id';
+  ' ORDER BY ordering, shot_id, id' +
+  ` LIMIT ${ROW_CAP_LIMIT}`;
 // Q6b — same read without the 0054 additive column (legacy deployment retry).
 const PLAN_BASE_SQL =
   'SELECT script_id, shot_id, beat_id, scene_index, beat_index, shot_index,' +
   ' kind, intent, subject_refs, duration_ms, ordering, version' +
   ' FROM project_shots_rows' +
   ' WHERE project_id = $1' +
-  ' ORDER BY ordering, shot_id, id';
+  ' ORDER BY ordering, shot_id, id' +
+  ` LIMIT ${ROW_CAP_LIMIT}`;
 
 function createProjectExport({ pg }) {
   async function exportProject({ projectId }) {
@@ -252,10 +274,14 @@ function createProjectExport({ pg }) {
     }
 
     // Q5 — script content facet (0039). 42P01 → facet null + degraded result.
+    // Row cap: SQL already LIMITs ROW_CAP+1; a returned row past the cap truncates the
+    // exported facet to the deterministic ORDER BY prefix (recorded on meta.truncated).
     let scriptFacet;
     try {
       const res = await pg.query(SCRIPT_ROWS_SQL, [projectId]);
-      scriptFacet = { rows: res.rows || [] };
+      const rows = res.rows || [];
+      const truncated = rows.length > ROW_CAP;
+      scriptFacet = { rows: truncated ? rows.slice(0, ROW_CAP) : rows, truncated };
     } catch (e) {
       if (isTableMissing(e)) scriptFacet = { tableMissing: true, reason: errMsg(e) };
       else throw e;
@@ -263,15 +289,20 @@ function createProjectExport({ pg }) {
 
     // Q6 — storyboard plan facet (0045 + 0054 fingerprint). 42P01 → facet null +
     // degraded; 42703 (0054 not applied) → Q6b retry without the fingerprint column
-    // (fingerprint simply omitted; export stays complete for that schema).
+    // (fingerprint simply omitted; export stays complete for that schema). Row cap
+    // identical to Q5 (LIMIT ROW_CAP+1; overflow truncates + meta flag).
     let planFacet;
     try {
       const full = await pg.query(PLAN_SQL, [projectId]);
-      planFacet = { rows: full.rows || [], fingerprintRead: true };
+      const rows = full.rows || [];
+      const truncated = rows.length > ROW_CAP;
+      planFacet = { rows: truncated ? rows.slice(0, ROW_CAP) : rows, truncated, fingerprintRead: true };
     } catch (e) {
       if (isColumnMissing(e)) {
         const base = await pg.query(PLAN_BASE_SQL, [projectId]);
-        planFacet = { rows: base.rows || [], fingerprintRead: false };
+        const rows = base.rows || [];
+        const truncated = rows.length > ROW_CAP;
+        planFacet = { rows: truncated ? rows.slice(0, ROW_CAP) : rows, truncated, fingerprintRead: false };
       } else if (isTableMissing(e)) {
         planFacet = { tableMissing: true, reason: errMsg(e) };
       } else {
@@ -288,6 +319,12 @@ function createProjectExport({ pg }) {
         projectName: projectRow.name,
       },
     };
+    // Truncation notice — present ONLY when a capped facet actually lost rows
+    // (schema-missing facets stay null + degraded; they do not set this flag).
+    const truncated = {};
+    if (scriptFacet.truncated) truncated.scriptRows = true;
+    if (planFacet.truncated) truncated.storyboardPlan = true;
+    if (Object.keys(truncated).length) bundle.meta.truncated = truncated;
     const degrade = [];
 
     // ── per-timeline bundles (same shape as timelineExport.exportTimeline output) ──

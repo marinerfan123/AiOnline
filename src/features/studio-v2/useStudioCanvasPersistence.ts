@@ -4,7 +4,7 @@ import { useStudioStore, type StudioEdge, type StudioNode } from './store';
 import { AUTOSAVE_DEBOUNCE_MS, DirtyOperationBuffer, deserializeStudioEdge, deserializeStudioNode, serializeStudioEdge, serializeStudioNode, type CanvasPatchRequest } from './persistence';
 import { v2studio, StudioCanvasApiError } from '@/shared/api/contract/studio-canvas-client';
 import type { StudioCanvasResponse } from '@/shared/api/contract/schemas';
-import { parseConflictInfo, type ConflictInfo } from './schemas';
+import { parseConflictInfo, conflictClientMode, type ConflictInfo } from './schemas';
 
 export type SaveStatus = 'Loading' | 'Saved' | 'Saving' | 'Unsaved' | 'Offline' | 'Save failed' | 'Conflict';
 
@@ -58,6 +58,16 @@ export function useStudioCanvasPersistence(projectId: string, enabled = true) {
     markClean(useStudioStore.getState().nodes, useStudioStore.getState().edges, useStudioStore.getState().viewport);
   };
 
+  // Enter the blocked conflict state WITHOUT dropping the retained buffer —
+  // local edits survive for a later retry (retry()) or are discarded only by a
+  // successful whole-canvas reload (reloadFromServer).
+  const enterConflict = (c: ResolvedConflict) => {
+    blockedRef.current = true;
+    conflictRef.current = c;
+    setConflict(c);
+    setStatus('Conflict');
+  };
+
   // Classifies a 409 as a canvas conflict only when it carries the core rebase
   // fields — the same gate as before the G22 extension. kindPolicy/commandSeq
   // are additive: parsed off the raw body, undefined when the server has not
@@ -98,19 +108,28 @@ export function useStudioCanvasPersistence(projectId: string, enabled = true) {
     if (first.conflict) {
       // F1: server has moved past our base. Keep the uncommitted buffer and
       // replay once on top of the server's revision.
-      // Kind policy routing today: 'lww'/'merge' → this same F1 retry (their
-      // incremental rebase semantics); 'reject409'/undefined (legacy body) →
-      // the whole-canvas reload semantics below (current logic, unchanged);
-      // 'append' has no client path yet (conflictClientMode() in ./schemas).
+      //
+      // conflictClientMode() routing (G22 wiring): 'lww'/'merge' → 'rebase',
+      // this same F1 retry (their incremental rebase semantics); 'reject409' →
+      // 'reload' (whole-canvas CAS). An EXPLICIT 'reject409' marks a structural
+      // rejection — any patch against this canvas conflicts by construction, so
+      // the F1 replay would 409 again. Skip that doomed round-trip and surface
+      // Conflict immediately (kindPolicy rides on the state; the banner guides
+      // the reload). A legacy body (kindPolicy undefined — server has not
+      // merged the field) stays on today's rebase-once → double-409 → Conflict
+      // flow: the audit deemed the extra attempt acceptable, and short-circuit
+      // here would change behaviour against legacy servers. 'append' has no
+      // client path yet (never 409s today) and falls through to the F1 retry.
+      if (conflictClientMode(first.conflict.kindPolicy) === 'reload' && first.conflict.kindPolicy !== undefined) {
+        enterConflict(first.conflict);
+        return;
+      }
       const rebased = await attempt(first.conflict.serverRevision, mutationId());
       if (rebased.ok) { commitAndSave(rebased.res, rebased.patch); return; }
       if (rebased.conflict) {
         // Still conflicting: enter conflict state, but KEEP the buffer so the
         // user's local edits survive for a later retry.
-        blockedRef.current = true;
-        conflictRef.current = rebased.conflict;
-        setConflict(rebased.conflict);
-        setStatus('Conflict');
+        enterConflict(rebased.conflict);
         return;
       }
       setStatus(navigator.onLine === false ? 'Offline' : 'Save failed');

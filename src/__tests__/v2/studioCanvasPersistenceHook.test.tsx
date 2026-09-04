@@ -55,7 +55,9 @@ async function drain() {
 }
 
 beforeEach(() => {
-  vi.clearAllMocks();
+  // resetAllMocks: clear call history AND any unconsumed *Once queues left by
+  // a previous test (e.g. a short-circuited flush) so mocks never leak across.
+  vi.resetAllMocks();
   useStudioStore.setState({
     nodes: [], edges: [], viewport: { x: 0, y: 0, zoom: 1 },
     undoStack: [], redoStack: [], clipboard: null, invalidConnection: null, dragSnapshot: null, editSnapshot: null,
@@ -167,11 +169,13 @@ describe('M05-C persistence hook — F1 conflict rebase', () => {
 });
 
 describe('M05-C persistence hook — G22 conflict-shape extension (client)', () => {
-  it('threads kindPolicy/commandSeq from a new-format 409 body into conflict state; reject409 keeps reload semantics', async () => {
+  it('reject409 skips the doomed F1 rebase: one patch, straight to Conflict (kindPolicy surfaced); reload still clears it', async () => {
     const patchCanvas = v2studio.patchCanvas as unknown as ReturnType<typeof vi.fn>;
+    // Second rejection would never be reached: a structural reject409 must not
+    // get a rebase attempt at all (it would 409 again by construction), so a
+    // single rejection is the only patch outcome the client may observe.
     patchCanvas
-      .mockRejectedValueOnce(new StudioCanvasApiError(409, 'CONFLICT', { kindPolicy: 'reject409', serverRevision: 5, commandSeq: 42, canvasId: 'c1' }))
-      .mockRejectedValueOnce(new StudioCanvasApiError(409, 'CONFLICT', { kindPolicy: 'reject409', serverRevision: 9, commandSeq: 55, canvasId: 'c1' }));
+      .mockRejectedValueOnce(new StudioCanvasApiError(409, 'CONFLICT', { kindPolicy: 'reject409', serverRevision: 5, commandSeq: 42, canvasId: 'c1' }));
 
     const { result } = renderHook(() => useStudioCanvasPersistence('p1'));
     await drain();
@@ -180,10 +184,12 @@ describe('M05-C persistence hook — G22 conflict-shape extension (client)', () 
     act(() => { result.current.retry(); });
     await drain();
 
-    expect(patchCanvas).toHaveBeenCalledTimes(2);
+    // No second patch: the F1 rebase is short-circuited for explicit reject409.
+    expect(patchCanvas).toHaveBeenCalledTimes(1);
+    expect(patchCanvas.mock.calls[0][1].baseRevision).toBe(1);
     expect(result.current.status).toBe('Conflict');
-    // New extension fields surfaced on the conflict info; core fields unchanged.
-    expect(result.current.conflict).toEqual({ serverRevision: 9, commandSeq: 55, kindPolicy: 'reject409', canvasId: 'c1' });
+    // Conflict carries the FIRST 409's state; extension fields ride along.
+    expect(result.current.conflict).toEqual({ serverRevision: 5, commandSeq: 42, kindPolicy: 'reject409', canvasId: 'c1' });
 
     // Reload semantics unchanged for reject409: reloadFromServer fetches the
     // server version and clears the Conflict state.
@@ -193,7 +199,7 @@ describe('M05-C persistence hook — G22 conflict-shape extension (client)', () 
     expect(result.current.conflict).toBeNull();
   });
 
-  it.each(['lww', 'merge'] as const)('kindPolicy %s 409 still routes through the existing F1 retry (no reload)', async (kindPolicy) => {
+  it.each(['lww', 'merge', undefined] as const)('kindPolicy %s 409 still routes through the existing F1 retry (no reload)', async (kindPolicy) => {
     const patchCanvas = v2studio.patchCanvas as unknown as ReturnType<typeof vi.fn>;
     patchCanvas
       .mockRejectedValueOnce(new StudioCanvasApiError(409, 'CONFLICT', { kindPolicy, serverRevision: 7, commandSeq: 101, canvasId: 'c1' }))
