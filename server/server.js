@@ -55,6 +55,7 @@ import assetFoundationMod from './modules/project-foundation/assetFoundation.cjs
 import studioModelsApiMod from './modules/modelhub/studioModelsApi.cjs';
 import uploadApiMod from './modules/media/uploadApi.cjs';
 import timelineApiMod from './modules/media/timelineApi.cjs';
+import timelineExportMod from './modules/media/timelineExport.cjs';
 import mediaWorkerMod from './modules/media/mediaWorker.cjs';
 import mediaExecMod from './modules/media/executors.cjs';
 import bibleApiMod from './modules/project-foundation/bibleApi.cjs';
@@ -1517,6 +1518,15 @@ const timelineApi = timelineApiMod.createTimelineApi({
   parseBody,
 });
 
+// G24 — Timeline JSON bundle export service (/api/v2/timelines/:id/export).
+const timelineExport = timelineExportMod.createTimelineExport({
+  pg: {
+    query: (sql, params) => pgPool
+      ? pgPool.query(sql, params)
+      : Promise.reject(Object.assign(new Error('数据库未就绪'), { status: 503 })),
+  },
+});
+
 // G14 — Production Bible (/api/v2/bible/characters|environments|references):
 // project-scoped character/environment/reference CRUD (migrations 0026–0028 + 0038).
 const bibleApi = bibleApiMod.createBibleApi({
@@ -2675,6 +2685,26 @@ async function handleAPI(req, res) {
   // ── G18 Project timeline（/api/v2/timelines）──
   if (url.startsWith('/api/v2/timelines')) {
     if (await timelineApi.handle(req, res, url.split('?')[0], method)) return;
+    // G24 — timeline JSON bundle export: /api/v2/timelines/:id/export?projectId=
+    const exMatch = url.split('?')[0].match(/^\/api\/v2\/timelines\/([^/]+)\/export$/);
+    if (exMatch && method === 'GET') {
+      const projectId = decodeURIComponent(String((req.query && req.query.projectId) || ''));
+      if (!projectId) return sendJSON(res, 400, { ok: false, error: 'projectId 必填' });
+      const user = session.getUserFromCookie(req);
+      if (!user) return sendJSON(res, 401, { ok: false, error: '未登录' });
+      // Project membership gate (any role may read export; foreign → 404 no leak)
+      const auth = await pgPool.query(
+        `SELECT 1 FROM projects p JOIN workspaces w ON w.id = p.workspace_id
+          LEFT JOIN workspace_members wm ON wm.workspace_id = w.id AND wm.user_id = $2
+         WHERE p.id = $1 AND (wm.user_id IS NOT NULL OR w.owner_id = $2)`,
+        [projectId, user.id],
+      ).catch(() => ({ rows: [] }));
+      if (!auth.rows.length) return sendJSON(res, 404, { ok: false, error: '项目不存在' });
+      const out = await timelineExport.exportTimeline({ projectId, timelineId: decodeURIComponent(exMatch[1]) });
+      if (!out.ok && out.error === 'timeline 不存在或不属于该项目') return sendJSON(res, 404, { ok: false, error: out.error });
+      if (!out.ok) return sendJSON(res, 400, { ok: false, error: out.error });
+      return sendJSON(res, 200, out.bundle);
+    }
   }
 
   // ── G14 Continuity snapshots（/api/v2/bible/continuity/:shotId）──
