@@ -1519,7 +1519,7 @@ const studioModelsApi = studioModelsApiMod.createStudioModelsApi({
 
 // G19 — periodic expiry sweep for pending approvals (best-effort, non-blocking).
 if (typeof aiControlRouter.sweepExpired === 'function') {
-  setInterval(() => { try { aiControlRouter.sweepExpired(); } catch (_) {} }, 60000);
+  setInterval(() => { aiControlRouter.sweepExpired().catch(() => {}); }, 60000);
 }
 
 // G18 — Project timeline (/api/v2/timelines): ordered shot/asset-version clips,
