@@ -133,4 +133,193 @@ async function runActivityTick(pg, options = {}, injected = {}) {
   return runner.runOnce({ limit: options.limit });
 }
 
-module.exports = { defaultRecordAttempt, processItem, runWorkerTick, runActivityTick };
+// ---- Generation Group runner (§112/§113 渐进上线, L45) ----
+// 默认 OFF：与 runActivityTick 同旗标（options.enabled / GENERATION_V2_ACTIVITY_RUNNER=1），
+// 另加独立 env GENERATION_V2_GROUP_RUNNER=1 单独开启。组调度只读 generation_groups /
+// generation_group_items(0070) + generation_items_v2 归一化列，不触碰 runWorkerTick 装配。
+//
+// 组调度语义（§112/§113）：
+//   组内并发上限  policy.concurrency —— 组内「在途」item（非 queued/retry_wait/终态）达上限即
+//     本 tick 不再领取该组新 item。
+//   按序推进      generation_group_items.position ASC（created_at/item_id tie-break）——
+//     claimGroupItems 的 ORDER BY 保证组内顺序领取，不跳序。
+//   失败策略      fail_fast：任一 item 终态 failed → 整组 failed + 剩余 queued/retry_wait 项 cancel；
+//                 continue：单 item 失败不阻塞，其余继续推进，全组终态后再定 succeeded/failed。
+//   组终态        done+failed+canceled == 组内 total 时收尾：failed>0 → failed；全 canceled →
+//                 canceled；否则 succeeded。
+
+function normalizeGroupPolicy(policy) {
+  const p = (policy && typeof policy === 'object' && !Array.isArray(policy)) ? policy : {};
+  const rawConcurrency = Number(p.concurrency);
+  const concurrency = Number.isFinite(rawConcurrency) && rawConcurrency > 0
+    ? Math.min(50, Math.floor(rawConcurrency)) : 1;
+  const failurePolicy = p.failurePolicy === 'continue' ? 'continue' : 'fail_fast';
+  return { concurrency, failurePolicy };
+}
+
+// 把组调度的 SQL 函数绑定到一个 pg pool，作为 runGroupTick 的 store。
+function createPgGroupStore(pg) {
+  if (!pg || typeof pg.query !== 'function') throw new TypeError('pg.query is required');
+  return {
+    listActiveGroups: async ({ limit = 20 } = {}) => {
+      const safeLimit = Math.max(1, Math.min(100, Number(limit) || 20));
+      const r = await pg.query(
+        `SELECT id, project_id, name, media_type, status, policy, created_at, finished_at
+           FROM generation_groups
+          WHERE status IN ('queued','running')
+          ORDER BY created_at ASC, id ASC
+          LIMIT $1`, [safeLimit]);
+      return r.rows || [];
+    },
+    countInFlight: async ({ groupId }) => {
+      if (!groupId) throw new TypeError('groupId is required');
+      const r = await pg.query(
+        `SELECT count(*)::int AS n
+           FROM generation_group_items gi
+           JOIN generation_items_v2 i ON i.item_id = gi.item_id
+          WHERE gi.group_id = $1
+            AND i.status NOT IN ('queued','retry_wait','done','failed','canceled')`, [groupId]);
+      return (r.rows && r.rows[0]) ? r.rows[0].n : 0;
+    },
+    hasFailedItem: async ({ groupId }) => {
+      if (!groupId) throw new TypeError('groupId is required');
+      const r = await pg.query(
+        `SELECT EXISTS (
+           SELECT 1
+             FROM generation_group_items gi
+             JOIN generation_items_v2 i ON i.item_id = gi.item_id
+            WHERE gi.group_id = $1 AND i.status = 'failed'
+         ) AS failed`, [groupId]);
+      return !!(r.rows && r.rows[0] && r.rows[0].failed);
+    },
+    claimGroupItems: async ({ groupId, workerId, limit = 1, leaseSeconds = 120 } = {}) => {
+      if (!groupId || !workerId) throw new TypeError('groupId and workerId are required');
+      const safeLimit = Math.max(1, Math.min(100, Number(limit) || 1));
+      const safeLease = Math.max(10, Math.min(900, Number(leaseSeconds) || 120));
+      const r = await pg.query(
+        `WITH picked AS (
+           SELECT gi.item_id
+             FROM generation_group_items gi
+             JOIN generation_items_v2 i ON i.item_id = gi.item_id
+            WHERE gi.group_id = $1
+              AND i.status IN ('queued','retry_wait')
+              AND i.mode = 'real'
+              AND i.next_attempt_at <= NOW()
+            ORDER BY gi.position ASC, gi.created_at ASC, gi.item_id ASC
+            FOR UPDATE OF i SKIP LOCKED
+            LIMIT $2
+         )
+         UPDATE generation_items_v2 i
+            SET status='leased', lease_owner=$3,
+                lease_expires_at=NOW()+($4 * INTERVAL '1 second'),
+                lease_version=i.lease_version+1,
+                attempt_count=i.attempt_count+1
+           FROM picked p
+          WHERE i.item_id = p.item_id
+          RETURNING i.*`,
+        [groupId, safeLimit, workerId, safeLease]);
+      return r.rows || [];
+    },
+    markRunning: async ({ groupId }) => {
+      if (!groupId) throw new TypeError('groupId is required');
+      await pg.query(
+        `UPDATE generation_groups SET status='running' WHERE id=$1 AND status='queued'`, [groupId]);
+    },
+    failGroup: async ({ groupId }) => {
+      if (!groupId) throw new TypeError('groupId is required');
+      await pg.query(
+        `UPDATE generation_groups SET status='failed', finished_at=NOW() WHERE id=$1`, [groupId]);
+      await pg.query(
+        `UPDATE generation_items_v2 i
+            SET status='canceled', lease_owner=NULL, lease_expires_at=NULL
+           FROM generation_group_items gi
+          WHERE gi.group_id=$1 AND i.item_id=gi.item_id
+            AND i.status IN ('queued','retry_wait')`, [groupId]);
+    },
+    groupItemCounts: async ({ groupId }) => {
+      if (!groupId) throw new TypeError('groupId is required');
+      const r = await pg.query(
+        `SELECT count(*)::int AS total,
+                count(*) FILTER (WHERE i.status='done')::int AS done,
+                count(*) FILTER (WHERE i.status='failed')::int AS failed,
+                count(*) FILTER (WHERE i.status='canceled')::int AS canceled
+           FROM generation_group_items gi
+           JOIN generation_items_v2 i ON i.item_id = gi.item_id
+          WHERE gi.group_id = $1`, [groupId]);
+      const row = (r.rows && r.rows[0]) || {};
+      return { total: row.total || 0, done: row.done || 0, failed: row.failed || 0, canceled: row.canceled || 0 };
+    },
+    finalizeGroup: async ({ groupId, status }) => {
+      if (!groupId || !status) throw new TypeError('groupId and status are required');
+      await pg.query(
+        `UPDATE generation_groups SET status=$2, finished_at=NOW() WHERE id=$1`, [groupId, status]);
+    },
+  };
+}
+
+async function finalizeGroupIfTerminal(store, groupId, summary) {
+  const counts = await store.groupItemCounts({ groupId });
+  const terminal = counts.done + counts.failed + counts.canceled;
+  if (counts.total > 0 && terminal >= counts.total) {
+    let status = 'succeeded';
+    if (counts.failed > 0) status = 'failed';
+    else if (counts.canceled >= counts.total) status = 'canceled';
+    await store.finalizeGroup({ groupId, status });
+    summary.finalized++;
+  }
+}
+
+async function runGroupTick(pg, options = {}, injected = {}) {
+  const enabled = options.enabled === true
+    || process.env.GENERATION_V2_GROUP_RUNNER === '1'
+    || process.env.GENERATION_V2_ACTIVITY_RUNNER === '1';
+  if (!enabled) {
+    return { groups: 0, claimed: 0, dispatched: 0, finalized: 0, failFastStopped: 0, enabled: false, note: 'group runner disabled (§113 default off)' };
+  }
+  const workerId = options.workerId || injected.workerId;
+  if (!workerId) throw new TypeError('workerId is required');
+  const store = injected.store || createPgGroupStore(pg);
+  const processOne = injected.processItem || processItem;
+
+  const groups = await store.listActiveGroups({ limit: options.limit });
+  const summary = { groups: groups.length, claimed: 0, dispatched: 0, finalized: 0, failFastStopped: 0, enabled: true };
+
+  for (const group of groups) {
+    const policy = normalizeGroupPolicy(group.policy);
+    // fail_fast：任一 item 已 failed → 整组 fail + cancel 剩余（§113 Group 主动生成 N，失败策略控制）。
+    if (policy.failurePolicy === 'fail_fast') {
+      if (await store.hasFailedItem({ groupId: group.id })) {
+        await store.failGroup({ groupId: group.id });
+        summary.failFastStopped++;
+        continue;
+      }
+    }
+    const inFlight = await store.countInFlight({ groupId: group.id });
+    const slots = Math.max(0, policy.concurrency - inFlight);
+    if (slots <= 0) {
+      await finalizeGroupIfTerminal(store, group.id, summary);
+      continue;
+    }
+    const claimed = await store.claimGroupItems({
+      groupId: group.id, workerId, limit: slots,
+      leaseSeconds: options.leaseSeconds || 120,
+    });
+    if (claimed.length) {
+      await store.markRunning({ groupId: group.id });
+      summary.claimed += claimed.length;
+      const runtimeDeps = { ...injected, workerId, leaseSeconds: options.leaseSeconds || 120 };
+      // 组内并发上限由 claim 的 slots 保证；dispatch 按组内顺序（position）推进。
+      for (let offset = 0; offset < claimed.length; offset += policy.concurrency) {
+        await Promise.all(claimed.slice(offset, offset + policy.concurrency).map((item) => processOne(pg, item, runtimeDeps)));
+      }
+      summary.dispatched += claimed.length;
+    }
+    await finalizeGroupIfTerminal(store, group.id, summary);
+  }
+  return summary;
+}
+
+module.exports = {
+  defaultRecordAttempt, processItem, runWorkerTick, runActivityTick,
+  normalizeGroupPolicy, createPgGroupStore, runGroupTick,
+};

@@ -3778,6 +3778,30 @@ async function handleAPI(req, res) {
     }
     const cost = pay.amount;
 
+    // §88 L32: max_cost_authorized 重估闸 —— 余额门（resolvePayment）之后、reserve 之前插入。
+    // 以 pricing.cjs 对请求(operation + duration/frames)重算 expected provider cost；
+    // 超用户授权上限（body.maxCostAuthorized 或默认）→ 拒 402 COST_EXCEEDS_MAX，不能静默多扣。
+    // 只读、幂等：不扣余额、不写账，与既有 recharge/balance 门不双算；
+    // 仅在 pricing_rules 命中且可计算时生效，无规则/不可计算 → fail-open 跳过，不阻断生成。
+    const maxCostAuthorized = billing.resolveMaxCostAuthorized(body);
+    const expectedCost = await billing.estimateExpectedCost(pgPool, {
+      modelId: canonicalModel,
+      operationCode: billing.resolveGenerateOperation(body),
+      usage: billing.resolveGenerateUsage(body),
+    });
+    if (expectedCost.applied) {
+      const gate = billing.checkMaxCostAuthorized({ expected: expectedCost.expected, maxCostAuthorized });
+      if (!gate.ok) {
+        return sendJSON(res, 402, {
+          status: 'failed',
+          code: 'COST_EXCEEDS_MAX',
+          error: `预估成本 ${gate.expected} 超过授权上限 ${gate.max}，请重新确认后再提交`,
+          expected: gate.expected,
+          max: gate.max,
+        });
+      }
+    }
+
     // 套餐等级（供 dispatcher 等待区做会员优先调度；缺省 free）
     const planRes = await pgPool.query('SELECT plan FROM users WHERE id=$1', [realUser.id]);
     const userPlan = (planRes.rows[0] && planRes.rows[0].plan) || 'free';

@@ -1150,4 +1150,333 @@ function createStudioRunEngine(deps) {
   };
 }
 
-module.exports = { createStudioRunEngine, sanitizeError, retryDelayMs, leaseToken, RUN_STATUSES, TERMINAL_RUN, ACTIVE_NODE, TERMINAL_NODE, LIMITS };
+// ── SECTION:workflow-executor (L51/L52, §94-100) ──────────────────────────
+//
+// createWorkflowExecutor({ pg, submitJob }) → run({ workflowRevisionId, projectId, inputs?, idempotencyKey? })
+//
+// 墨渊 V2.0 §94-100 — Workflow 执行引擎：DAG 拓扑序 + revision pin + 快照物化 +
+// 经 Generation V2 Job 概念接口执行（§98 不直连 Provider）。
+//
+// Hard rules:
+//  - §95 Revision pinning: run 总是读「显式 pin 的 workflow_revision_id」（禁 latest），
+//    dag / failure_policy 在创建时物化进 workflow_runs.dag_snapshot /
+//    failure_policy_snapshot（副本，非引用）——此后 revision 再改不影响既有 run。
+//  - §98 No direct Provider: 每一步经注入的 submitJob 派发；executor 不 import、
+//    不调用任何 Provider adapter。job_id 落 workflow_step_runs.job_id。
+//  - 短事务：创建（run + 全部 step_runs）为单一事务；每步状态迁移为独立短事务，
+//    以 CAS WHERE status = 前置态 幂等推进（重复完成/失败为安全 no-op）。
+//  - 幂等重入：runId 由 (revision, project, inputs 或显式 idempotencyKey) 确定性派生，
+//    并发重入只建一个 run；落败方返回既有 run（idempotent:true）且绝不执行。
+//
+// failure_policy_snapshot 裁决（§97 词表 → L51 运行时二态）:
+//   有效策略 = node.failure_policy || snapshot.default || 'FAIL_WORKFLOW'
+//     FAIL_WORKFLOW → fail_fast（中止：该步失败即取消其余步，run 终态 failed）
+//     SKIP_STEP    → continue（跳过：失败步标 failed，其下游标 skipped，独立分支继续）
+//   snapshot 亦接受直白二态 {mode:'continue'|'fail_fast'}。
+//   RETRY_STEP / USE_FALLBACK / WAIT_FOR_USER 本批（L51）未实现 → 保守按 fail_fast。
+
+const WORKFLOW_RUN_STATUSES = ['queued', 'running', 'succeeded', 'failed', 'canceled', 'parked'];
+const WORKFLOW_STEP_STATUSES = ['pending', 'running', 'succeeded', 'failed', 'skipped', 'canceled'];
+const WORKFLOW_TERMINAL_STEP = new Set(['succeeded', 'failed', 'skipped', 'canceled']);
+// 单调状态机：pending → running → succeeded|failed；pending → skipped|canceled。
+const WORKFLOW_STEP_FROM = { running: 'pending', succeeded: 'running', failed: 'running', skipped: 'pending', canceled: 'pending' };
+
+/** 确定性稳定序列化（键序无关），用于派生幂等 key。 */
+function stableStringify(value) {
+  if (value === null || value === undefined) return 'null';
+  if (typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return '[' + value.map(stableStringify).join(',') + ']';
+  return '{' + Object.keys(value).sort().map((k) => JSON.stringify(k) + ':' + stableStringify(value[k])).join(',') + '}';
+}
+
+/**
+ * 校验 DAG 结构并返回稳定拓扑序（Kahn，按 nodes 原始顺序作 tiebreak）。
+ * @returns {{ok:true, order:string[], nodesByKey:Map}|{ok:false, error:{code}}}
+ */
+function validateWorkflowDag(dag) {
+  if (!dag || typeof dag !== 'object' || !Array.isArray(dag.nodes) || dag.nodes.length === 0) {
+    return { ok: false, error: { code: 'DAG_EMPTY' } };
+  }
+  const nodes = dag.nodes;
+  const nodesByKey = new Map();
+  for (const n of nodes) {
+    if (!n || typeof n.step_id !== 'string' || !n.step_id) return { ok: false, error: { code: 'DAG_INVALID_NODE', step: n && n.step_id } };
+    if (nodesByKey.has(n.step_id)) return { ok: false, error: { code: 'DAG_DUPLICATE_STEP_ID', step_id: n.step_id } };
+    nodesByKey.set(n.step_id, n);
+  }
+  for (const n of nodes) {
+    const deps = Array.isArray(n.dependencies) ? n.dependencies : [];
+    for (const d of deps) {
+      if (!nodesByKey.has(d)) return { ok: false, error: { code: 'DAG_UNRESOLVED_DEPENDENCY', step_id: n.step_id, dependency: d } };
+    }
+  }
+  if (Array.isArray(dag.edges)) {
+    for (const e of dag.edges) {
+      if (!e || !nodesByKey.has(e.from) || !nodesByKey.has(e.to)) return { ok: false, error: { code: 'DAG_UNRESOLVED_EDGE', edge: e } };
+    }
+  }
+  // Kahn 拓扑排序（稳定：ready 队列按 nodes 原始顺序进入）
+  const indegree = new Map();
+  const dependents = new Map();
+  for (const n of nodes) {
+    const deps = Array.isArray(n.dependencies) ? n.dependencies : [];
+    indegree.set(n.step_id, deps.length);
+    for (const d of deps) {
+      if (!dependents.has(d)) dependents.set(d, []);
+      dependents.get(d).push(n.step_id);
+    }
+  }
+  const order = [];
+  const ready = nodes.filter((n) => indegree.get(n.step_id) === 0).map((n) => n.step_id);
+  const queue = [...ready];
+  while (queue.length) {
+    const stepId = queue.shift();
+    order.push(stepId);
+    for (const c of (dependents.get(stepId) || [])) {
+      indegree.set(c, indegree.get(c) - 1);
+      if (indegree.get(c) === 0) queue.push(c);
+    }
+  }
+  if (order.length !== nodes.length) return { ok: false, error: { code: 'DAG_HAS_CYCLE' } };
+  return { ok: true, order, nodesByKey };
+}
+
+/** 裁决单步失败模式（continue|fail_fast），自 failure_policy_snapshot + 节点级覆盖。 */
+function resolveWorkflowFailureMode(failurePolicySnapshot, node) {
+  const nodePolicy = node && node.failure_policy;
+  const snap = failurePolicySnapshot && typeof failurePolicySnapshot === 'object' ? failurePolicySnapshot : null;
+  const def = snap ? (snap.default || snap.mode) : null;
+  const p = nodePolicy || def || 'FAIL_WORKFLOW';
+  if (p === 'SKIP_STEP' || p === 'continue') return 'continue';
+  if (p === 'FAIL_WORKFLOW' || p === 'fail_fast') return 'fail_fast';
+  return 'fail_fast'; // RETRY_STEP / USE_FALLBACK / WAIT_FOR_USER：L51 未实现 → 保守 fail_fast
+}
+
+/** 归一化并脱敏 step 执行错误（复用 sanitizeError 的凭证/URL 清洗）。 */
+function workflowStepError(err) {
+  const code = (err && (err.code || (err.error && err.error.code))) || 'STEP_FAILED';
+  const message = (err && (err.message || (err.error && err.error.message))) || 'step failed';
+  return sanitizeError({ code, message });
+}
+
+/**
+ * Workflow 执行引擎工厂（L51/L52）。
+ * @param {{pg:Pool, submitJob:Function, now?:Function, onLog?:Function}} deps
+ *   submitJob(jobCtx) — Generation V2 Job 概念接口（§98 唯一执行边界，不直连 Provider）。
+ *     jobCtx = { runId, projectId, stepKey, kind, operationId, childWorkflowId, node, input, upstream }
+ *     resolve {ok:true, jobId?, output?}（成功派发/完成）或 {ok:false, error:{code,message}}，或 throw。
+ */
+function createWorkflowExecutor(deps) {
+  const { pg } = deps || {};
+  const submitJob = deps && typeof deps.submitJob === 'function' ? deps.submitJob : null;
+  const emitLog = (deps && deps.onLog) || null;
+  const log = (tag, payload) => { try { if (emitLog) emitLog(tag, payload); } catch (_) {} };
+
+  function deriveRunId(idempotencyKey) {
+    return 'wfr-' + crypto.createHash('sha256').update(String(idempotencyKey)).digest('hex').slice(0, 32);
+  }
+
+  /**
+   * 创建阶段（单一事务）：pin revision（FOR UPDATE，禁 latest）→ 物化 dag/failure_policy
+   * 快照 → 插 workflow_runs(status queued) + 全部 step_runs(pending)。
+   * @returns {{fresh:boolean, runId:string, compiled:*, failurePolicySnapshot:*}}
+   */
+  async function createRunTx({ workflowRevisionId, projectId, idempotencyKey, inputs }) {
+    const client = await pg.connect();
+    try {
+      await client.query('BEGIN');
+      const rr = await client.query(
+        'SELECT * FROM workflow_revisions WHERE id = $1 FOR UPDATE',
+        [workflowRevisionId]
+      );
+      const revision = rr.rows[0];
+      if (!revision) {
+        await client.query('ROLLBACK');
+        throw Object.assign(new Error('WORKFLOW_REVISION_NOT_FOUND'), { code: 'WORKFLOW_REVISION_NOT_FOUND', workflowRevisionId });
+      }
+      // §100/§95: runtime_contract_revision 禁 'latest'（DB CHECK 已兜底，应用层双保险）。
+      if (revision.runtime_contract_revision === 'latest') {
+        await client.query('ROLLBACK');
+        throw Object.assign(new Error('RUNTIME_CONTRACT_LATEST_FORBIDDEN'), { code: 'RUNTIME_CONTRACT_LATEST_FORBIDDEN', workflowRevisionId });
+      }
+      const dag = revision.dag; // JSONB 已被 pg 解析为对象
+      const compiled = validateWorkflowDag(dag);
+      if (!compiled.ok) {
+        await client.query('ROLLBACK');
+        throw Object.assign(new Error(compiled.error.code), { code: compiled.error.code, structured: compiled.error });
+      }
+      const failurePolicySnapshot = revision.failure_policy || null;
+      const runId = deriveRunId(idempotencyKey);
+      const ins = await client.query(
+        `INSERT INTO workflow_runs (id, workflow_revision_id, project_id, status, dag_snapshot, failure_policy_snapshot, started_at)
+         VALUES ($1, $2, $3, 'queued', $4::jsonb, $5::jsonb, NULL)
+         ON CONFLICT (id) DO NOTHING
+         RETURNING id, status, (xmax = 0) AS is_fresh`,
+        [runId, workflowRevisionId, projectId, JSON.stringify(dag), failurePolicySnapshot == null ? null : JSON.stringify(failurePolicySnapshot)]
+      );
+      const fresh = ins.rows.length > 0 && ins.rows[0].is_fresh === true;
+      if (fresh) {
+        const payload = compiled.order.map((stepId) => ({ id: 'wsr-' + crypto.randomUUID(), step_key: stepId }));
+        await client.query(
+          `INSERT INTO workflow_step_runs (id, workflow_run_id, step_key, status, attempt_count)
+           SELECT r.id, $1, r.step_key, 'pending', 0
+           FROM jsonb_to_recordset($2::jsonb) AS r (id text, step_key text)`,
+          [runId, JSON.stringify(payload)]
+        );
+      }
+      await client.query('COMMIT');
+      return { fresh, runId, revision, compiled, failurePolicySnapshot };
+    } catch (e) {
+      try { await client.query('ROLLBACK'); } catch (_) {}
+      throw e;
+    } finally { client.release(); }
+  }
+
+  /** CAS 单步状态迁移（单调推进，幂等 no-op）。 */
+  async function markStep(runId, stepKey, toStatus, opts = {}) {
+    const fromStatus = WORKFLOW_STEP_FROM[toStatus];
+    if (!fromStatus) throw Object.assign(new Error('INVALID_STEP_STATUS'), { code: 'INVALID_STEP_STATUS', toStatus });
+    const { code, jobId } = opts;
+    let sql; let args;
+    if (toStatus === 'running') {
+      sql = `UPDATE workflow_step_runs
+               SET status = 'running', attempt_count = attempt_count + 1,
+                   started_at = COALESCE(started_at, NOW()), error_code = NULL
+             WHERE workflow_run_id = $1 AND step_key = $2 AND status = $3
+             RETURNING status, attempt_count`;
+      args = [runId, stepKey, fromStatus];
+    } else {
+      sql = `UPDATE workflow_step_runs
+               SET status = $3, error_code = $4, job_id = COALESCE($5, job_id), finished_at = NOW()
+             WHERE workflow_run_id = $1 AND step_key = $2 AND status = $6
+             RETURNING status, error_code, job_id`;
+      args = [runId, stepKey, toStatus, code || null, jobId || null, fromStatus];
+    }
+    const r = await pg.query(sql, args);
+    if (r.rows.length) {
+      const row = r.rows[0];
+      return { stepKey, status: row.status, changed: true, errorCode: row.error_code || null, jobId: row.job_id || null };
+    }
+    const cur = await pg.query('SELECT status, error_code, job_id FROM workflow_step_runs WHERE workflow_run_id = $1 AND step_key = $2', [runId, stepKey]);
+    const c = cur.rows[0];
+    return { stepKey, status: c ? c.status : 'missing', changed: false, errorCode: c ? c.error_code : null, jobId: c ? c.job_id : null };
+  }
+
+  /** 终态推进：全步终态后 CAS run → succeeded|failed（failed/skipped/canceled 存在即 failed）。 */
+  async function aggregateWorkflowRun(runId) {
+    const cr = await pg.query('SELECT status, COUNT(*)::int AS c FROM workflow_step_runs WHERE workflow_run_id = $1 GROUP BY status', [runId]);
+    const counts = {};
+    for (const row of cr.rows) counts[row.status] = row.c;
+    const pendingOrRunning = (counts.pending || 0) + (counts.running || 0);
+    let next = null;
+    if (pendingOrRunning === 0) {
+      next = ((counts.failed || 0) + (counts.skipped || 0) + (counts.canceled || 0) > 0) ? 'failed' : 'succeeded';
+    }
+    if (next) {
+      await pg.query(
+        `UPDATE workflow_runs SET status = $2, finished_at = COALESCE(finished_at, NOW())
+         WHERE id = $1 AND status IN ('queued','running')`,
+        [runId, next]
+      );
+    }
+    const fin = await pg.query('SELECT status FROM workflow_runs WHERE id = $1', [runId]);
+    return { status: fin.rows[0] ? fin.rows[0].status : 'running', counts };
+  }
+
+  /**
+   * 创建并执行一次 Workflow run 到终态。
+   * @param {{workflowRevisionId:string, projectId:string, inputs?:*, idempotencyKey?:string}} params
+   * @returns {{ok:true, runId, status, idempotent:boolean, stepCount:number, stepResults:Array}}
+   */
+  async function run(params) {
+    const { workflowRevisionId, projectId, inputs } = params || {};
+    if (!workflowRevisionId) throw Object.assign(new Error('INVALID_WORKFLOW_REVISION'), { code: 'INVALID_WORKFLOW_REVISION' });
+    if (!projectId) throw Object.assign(new Error('INVALID_PROJECT_ID'), { code: 'INVALID_PROJECT_ID' });
+    if (!pg) throw Object.assign(new Error('EXECUTOR_NO_PG'), { code: 'EXECUTOR_NO_PG' });
+    if (!submitJob) throw Object.assign(new Error('EXECUTOR_NO_SUBMIT_JOB'), { code: 'EXECUTOR_NO_SUBMIT_JOB' });
+    const explicitKey = params && params.idempotencyKey != null ? String(params.idempotencyKey).trim() : '';
+    const idempotencyKey = explicitKey || `wf:${workflowRevisionId}:${projectId}:${stableStringify(inputs === undefined ? null : inputs)}`;
+
+    const created = await createRunTx({ workflowRevisionId, projectId, idempotencyKey, inputs });
+    const { fresh, runId, compiled, failurePolicySnapshot } = created;
+
+    if (!fresh) {
+      // 幂等重入：另一 run() 已创建（并正在执行）此 run —— 不重复执行。
+      const existing = await pg.query('SELECT id, status FROM workflow_runs WHERE id = $1', [runId]);
+      return { ok: true, runId, status: existing.rows[0] ? existing.rows[0].status : 'queued', idempotent: true, stepCount: 0, stepResults: [] };
+    }
+
+    // 唯一 fresh 创建方拥有执行权（每 run 单执行者）。
+    await pg.query(
+      `UPDATE workflow_runs SET status = 'running', started_at = COALESCE(started_at, NOW())
+       WHERE id = $1 AND status = 'queued'`,
+      [runId]
+    );
+
+    const stepResults = [];
+    let aborted = false;
+    for (const stepId of compiled.order) {
+      const node = compiled.nodesByKey.get(stepId);
+      if (aborted) {
+        stepResults.push(await markStep(runId, stepId, 'canceled', { code: 'WORKFLOW_ABORTED' }));
+        continue;
+      }
+      // 依赖门：全部依赖须已 succeeded，否则按失败策略裁决（pending 等待 → skipped/canceled）。
+      const deps = Array.isArray(node.dependencies) ? node.dependencies : [];
+      const depStatuses = deps.length
+        ? await pg.query('SELECT step_key, status FROM workflow_step_runs WHERE workflow_run_id = $1 AND step_key = ANY($2::text[])', [runId, deps])
+        : { rows: [] };
+      const depMap = {};
+      for (const d of depStatuses.rows) depMap[d.step_key] = d.status;
+      const blockedBy = deps.filter((d) => depMap[d] !== 'succeeded');
+      if (blockedBy.length) {
+        const mode = resolveWorkflowFailureMode(failurePolicySnapshot, node);
+        if (mode === 'fail_fast') {
+          stepResults.push(await markStep(runId, stepId, 'canceled', { code: 'DEPENDENCY_FAILED' }));
+          aborted = true;
+        } else {
+          stepResults.push(await markStep(runId, stepId, 'skipped', { code: 'DEPENDENCY_FAILED' }));
+        }
+        continue;
+      }
+      // 派发（§98 经 Job 层，绝不直连 Provider）。
+      const leased = await markStep(runId, stepId, 'running', {});
+      if (!leased.changed) { stepResults.push(leased); continue; }
+      const upstream = {};
+      if (deps.length) {
+        const ur = await pg.query('SELECT step_key, job_id FROM workflow_step_runs WHERE workflow_run_id = $1 AND step_key = ANY($2::text[])', [runId, deps]);
+        for (const u of ur.rows) upstream[u.step_key] = { jobId: u.job_id };
+      }
+      const jobCtx = {
+        runId, projectId, stepKey: stepId,
+        kind: node.kind, operationId: node.operation_id || null, childWorkflowId: node.child_workflow_id || null,
+        node, input: inputs === undefined ? null : inputs, upstream,
+      };
+      try {
+        const out = await submitJob(jobCtx);
+        if (out && out.ok === false) {
+          throw Object.assign(
+            new Error((out.error && out.error.message) || 'job submission failed'),
+            { code: (out.error && out.error.code) || 'STEP_FAILED' }
+          );
+        }
+        const jobId = out && (out.jobId != null ? String(out.jobId) : (out.id != null ? String(out.id) : null));
+        stepResults.push(await markStep(runId, stepId, 'succeeded', { jobId }));
+      } catch (e) {
+        const err = workflowStepError(e);
+        stepResults.push(await markStep(runId, stepId, 'failed', { code: err.code }));
+        const mode = resolveWorkflowFailureMode(failurePolicySnapshot, node);
+        if (mode === 'fail_fast') aborted = true;
+        log('workflow.step_failed', { runId, stepKey: stepId, code: err.code, mode, aborted });
+      }
+    }
+
+    const final = await aggregateWorkflowRun(runId);
+    log('workflow.run_finished', { runId, status: final.status, counts: final.counts });
+    return { ok: true, runId, status: final.status, idempotent: false, stepCount: compiled.order.length, stepResults };
+  }
+
+  return { run, validateWorkflowDag, resolveWorkflowFailureMode };
+}
+
+module.exports = { createStudioRunEngine, createWorkflowExecutor, validateWorkflowDag, resolveWorkflowFailureMode, stableStringify, sanitizeError, retryDelayMs, leaseToken, RUN_STATUSES, TERMINAL_RUN, ACTIVE_NODE, TERMINAL_NODE, WORKFLOW_RUN_STATUSES, WORKFLOW_STEP_STATUSES, LIMITS };
