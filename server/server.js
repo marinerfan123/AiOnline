@@ -80,6 +80,7 @@ import generationV2Shadow from './modules/generation-v2/shadow.cjs';
 // ModelHub V3 Phase 1 — 唯一模型身份 resolver（server.js 仅在此一处调用，不再散落处理 display_name）
 import modelHubResolver from './modules/modelhub/resolver.cjs';
 import modelHubBindings from './modules/modelhub/bindings.cjs';
+import routerDecision from './modules/modelhub/routerDecision.cjs'; // L39 Resolve/dry-run 接线（读 registry 候选 + 注入双层路由）
 import revisionHelper from './modules/modelhub/revision.cjs'; // Phase 3 乐观锁 UPDATE 助手
 const { optimisticUpdate } = revisionHelper;
 import realtime from './realtime.cjs'; // 生成任务实时通道（SSE）：终态切换推前端，替代固定轮询
@@ -2336,6 +2337,30 @@ async function handleAPI(req, res) {
 
   // 应用网关：API_TOKEN 或 用户会话 cookie 任一通过
   if (!appGateway(req)) return sendJSON(res, 401, { error: 'Unauthorized' });
+
+  // ── L39 Resolve / dry-run（POST /api/v2/generation/resolve）──
+  // 纯只读 dry-run：不触发任何生成/预留/占槽，仅给出「当前若提交会路由到哪」的可解释决策。
+  // 无可路由（候选空/全被 admission 淘汰）是有效决策结果而非资源错误 → 恒 200 信封
+  // {ok:false, code:'NO_ROUTABLE_MODEL', decision:{...}}（§37 无提交权威：提交时须重新 resolve）。
+  if (url === '/api/v2/generation/resolve' && method === 'POST') {
+    if (!pgPool) return sendJSON(res, 503, { ok: false, code: 'DB_UNAVAILABLE', error: '数据库不可用' });
+    let body;
+    try { body = await parseBody(req); }
+    catch (_) { return sendJSON(res, 400, { ok: false, code: 'INVALID_ARGUMENT', error: 'Invalid JSON' }); }
+    if (!body || typeof body !== 'object') {
+      return sendJSON(res, 400, { ok: false, code: 'INVALID_ARGUMENT', error: 'Invalid JSON' });
+    }
+    const decision = await routerDecision.resolveRoute({
+      pg: pgPool,
+      mediaType: body.mediaType,
+      operationCode: body.operationCode,
+      logicalModelCode: body.logicalModelCode,
+      requirements: body.requirements,
+      usage: body.usage,
+      maxCostAuthorized: body.maxCostAuthorized,
+    });
+    return sendJSON(res, 200, decision);
+  }
 
   // 需会话的认证路由
   if (url === '/api/auth/me' && method === 'GET') return handleMe(req, res);

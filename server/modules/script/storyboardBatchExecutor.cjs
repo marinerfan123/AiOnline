@@ -7,10 +7,10 @@
  * 不触 store / DB / 计划；不改 runner / dispatcher / scriptApi 语义。
  *
  * 契约：
- *   createStoryboardBatchExecutor({ generate? })
+ *   createStoryboardBatchExecutor({ generate?, recordLineage? })
  *     -> { run(task) -> Promise<{ ok:true, resultRef } | { ok:false, error:{code,message} }> }
  *
- *   注入 generate 形如 async ({ modelId, prompt, taskId, idempotencyKey, count }) -> 下列之一：
+ *   注入 generate 形如 async ({ modelId, prompt, taskId, idempotencyKey, count, firstFrame? }) -> 下列之一：
  *     - { ok:true, mediaId } | { ok:true, url } | { ok:true, resultRef }  成功（另容忍
  *       { ok:true, media:{mediaId|url} } 包装）
  *     - { ok:false, error }        失败（error 为 {code,message} | string | Error）
@@ -22,7 +22,8 @@
  *
  * 规则：
  * R1  每个任务恰好一次 generate({ modelId, prompt, taskId: <任务行 id>,
- *      idempotencyKey: 'sb-task-' + <任务行 id>, count: 1 })。
+ *      idempotencyKey: 'sb-task-' + <任务行 id>, count: 1 })。firstFrame 仅当调用方
+ *      注入非空服务器资产引用时附加（见 §120）。
  *     任务行 id 取 task.taskId（batchRunner 从 batchTaskStore.listTasks 得到的归一
  *     camelCase 行）；兼容直接喂 snake_case 行（task.task_id）的拼写。
  * R2  modelId 解析优先级：params.modelId → params.model（storyboardBatchPlan 落
@@ -42,6 +43,13 @@
  *   - 同任务并发双跑由 batchRunner 防：进程内 inFlight 同步预留 + store.claimTask
  *     严格 CAS（QUEUED→RUNNING 单赢者，跨进程同锁）。executor 无状态、不做本地 memo、
  *     不回读 task.status —— 越权留给 runner/store。
+ *
+ * §120 连续镜头链（last_frame → first_frame 服务器资产链）：
+ *   resolveContinuityChain(shots) 纯函数解链 —— 同 sequence（默认同场景）相邻 shots，
+ *   shot N 尾帧资产 lastFrameAssetId（media/asset_versions id）→ shot N+1 首帧 firstFrame
+ *   （服务器资产引用，非客户端 URL）。调用方解链后把 firstFrameAssetId /
+ *   lineageSourceAssetIds 注入任务行；run() 透传 firstFrame 给 generate，并在成功后经注入的
+ *   recordLineage（L47）落 derived_from_asset 边（child=后拍 job, source=[前拍尾帧 media_id]）。
  */
 
 const SB_TASK_KEY_PREFIX = 'sb-task-';
@@ -90,9 +98,126 @@ function idempotencyKeyForTask(taskId) {
   return `${SB_TASK_KEY_PREFIX}${taskId}`;
 }
 
+/** 服务器资产引用值：media/asset_versions id（非客户端 URL）；非字符串/空 → null。 */
+function assetIdOf(v) {
+  return isNonEmptyString(v) ? String(v).trim() : null;
+}
+
+/**
+ * §120 — 首帧注入值解析（调用方注入语义）。优先级：task.firstFrameAssetId →
+ * params.firstFrameAssetId → task.firstFrame → params.firstFrame。取到非空字符串即
+ * 为服务器资产引用（media/asset_versions id），否则 null（首拍/断链 → 无注入）。
+ */
+function firstFrameOf(task, params) {
+  const t = task || {};
+  const p = params || {};
+  return assetIdOf(
+    t.firstFrameAssetId !== undefined ? t.firstFrameAssetId
+      : p.firstFrameAssetId !== undefined ? p.firstFrameAssetId
+        : t.firstFrame !== undefined ? t.firstFrame
+          : p.firstFrame,
+  );
+}
+
+/** §120 — lineage 源资产（前拍尾帧 media_id）解析：调用方注入的数组，去空归一。 */
+function lineageSourcesOf(task, params) {
+  const t = task || {};
+  const p = params || {};
+  const v = t.lineageSourceAssetIds !== undefined ? t.lineageSourceAssetIds : p.lineageSourceAssetIds;
+  if (!Array.isArray(v)) return [];
+  return v.filter((x) => x != null && String(x).trim() !== '').map((x) => String(x));
+}
+
+/** lineage 的 child（后拍 job）锚点：调用方注入 lineageChildJobId/jobId，否则回落 taskId。 */
+function lineageChildJobIdOf(task, taskId) {
+  const t = task || {};
+  const v = t.lineageChildJobId !== undefined ? t.lineageChildJobId : t.jobId;
+  return isNonEmptyString(v) ? String(v).trim() : taskId;
+}
+
+/** 尾帧资产（输出 last_frame 媒体资产 id）读取：shot.lastFrameAssetId 优先，shot.lastFrame 兜底。 */
+function lastFrameAssetIdOf(shot) {
+  const v = shot && (shot.lastFrameAssetId !== undefined ? shot.lastFrameAssetId : shot.lastFrame);
+  return assetIdOf(v);
+}
+
+/** sequence 键：shot.sequenceKey 优先；否则从 shotId 的 `s{scene}` 首段派生（连续镜头按场景成链）。 */
+function sequenceKeyOf(shot) {
+  if (shot && shot.sequenceKey !== undefined && shot.sequenceKey !== null && String(shot.sequenceKey).trim() !== '') {
+    return String(shot.sequenceKey).trim();
+  }
+  const sid = isNonEmptyString(shot && shot.shotId) ? shot.shotId : '';
+  const seg = sid.split(':')[0];
+  return isNonEmptyString(seg) ? seg : sid;
+}
+
+/** 后拍 job 锚点：shot.jobId → shot.taskId → shot.shotId（链解析时无 taskId 语境）。 */
+function jobIdOf(shot) {
+  if (isNonEmptyString(shot.jobId)) return shot.jobId;
+  if (isNonEmptyString(shot.taskId)) return shot.taskId;
+  if (isNonEmptyString(shot.shotId)) return shot.shotId;
+  return null;
+}
+
+/**
+ * §120 — 连续镜头链解析（纯函数，无 I/O）。
+ * 同 sequence（默认同一场景）内相邻 shots：shot N 的尾帧资产 lastFrameAssetId
+ * （输出 media/asset_versions id）→ shot N+1 的 firstFrame（服务器资产引用，非
+ * 客户端 URL）。首拍无前驱 → 无 firstFrame；前驱无尾帧资产（null/''/false）→
+ * 断链，跳过注入。同时产出 lineage 边：child=后拍 job、relation='derived_from_asset'、
+ * source_asset_ids=[前拍尾帧 media_id]（经 L47 recordLineage 由调用方落库）。
+ *
+ * @param {Array<{shotId:string, sequenceKey?:string, jobId?:string, taskId?:string, lastFrameAssetId?:string}>} shots
+ * @returns {{ok:true, firstFrameByShotId:Object<string,string>, lineageEdges:Array} | {ok:false, errors:string[]}}
+ */
+function resolveContinuityChain(shots) {
+  if (!Array.isArray(shots)) {
+    return { ok: false, errors: ['shots must be an array'] };
+  }
+  const errors = [];
+  const seenShotIds = new Set();
+  const bySequence = new Map(); // sequenceKey -> ordered shots
+  shots.forEach((shot, i) => {
+    if (shot == null || typeof shot !== 'object' || Array.isArray(shot)) {
+      errors.push(`shots[${i}]: shot object required`);
+      return;
+    }
+    if (!isNonEmptyString(shot.shotId)) {
+      errors.push(`shots[${i}]: shotId must be a non-empty string`);
+      return;
+    }
+    if (seenShotIds.has(shot.shotId)) errors.push(`duplicate shotId ${JSON.stringify(shot.shotId)}`);
+    seenShotIds.add(shot.shotId);
+    const key = sequenceKeyOf(shot);
+    if (!bySequence.has(key)) bySequence.set(key, []);
+    bySequence.get(key).push(shot);
+  });
+  if (errors.length > 0) return { ok: false, errors };
+
+  const firstFrameByShotId = {};
+  const lineageEdges = [];
+  for (const ordered of bySequence.values()) {
+    for (let i = 1; i < ordered.length; i += 1) {
+      const prev = ordered[i - 1];
+      const cur = ordered[i];
+      const tail = lastFrameAssetIdOf(prev);
+      if (tail == null) continue; // 断链：前驱无尾帧资产 → 跳过注入（首拍亦无前驱）
+      firstFrameByShotId[cur.shotId] = tail;
+      lineageEdges.push({
+        childJobId: jobIdOf(cur),
+        parentJobId: null,
+        relation: 'derived_from_asset',
+        sourceAssetIds: [tail],
+      });
+    }
+  }
+  return { ok: true, firstFrameByShotId, lineageEdges };
+}
+
 function createStoryboardBatchExecutor(options) {
   const opts = (options == null || typeof options !== 'object' || Array.isArray(options)) ? {} : options;
   const generate = typeof opts.generate === 'function' ? opts.generate : null;
+  const recordLineage = typeof opts.recordLineage === 'function' ? opts.recordLineage : null;
 
   async function run(task) {
     // R-缺省：generate 未注入 → EXECUTOR_UNCONFIGURED（runner 占位同码，占位先行于一切校验）。
@@ -120,6 +245,11 @@ function createStoryboardBatchExecutor(options) {
       ? params.modelId
       : (params.model !== undefined ? params.model : null);
 
+    // §120 — 首帧注入（服务器资产引用，media/asset_versions id，非客户端 URL）：
+    // 调用方经 resolveContinuityChain 解出后注入 firstFrameAssetId / lineageSourceAssetIds。
+    const firstFrame = firstFrameOf(t, params);
+    const lineageSources = lineageSourcesOf(t, params);
+
     const callArgs = {
       modelId,
       prompt,
@@ -127,6 +257,7 @@ function createStoryboardBatchExecutor(options) {
       idempotencyKey: idempotencyKeyForTask(taskId), // R1
       count: GENERATE_COUNT,
     };
+    if (firstFrame != null) callArgs.firstFrame = firstFrame; // 首拍/断链 → 无此键
 
     let out;
     try {
@@ -148,6 +279,20 @@ function createStoryboardBatchExecutor(options) {
           'generate ok:true but no mediaId/url/resultRef to record as resultRef (refusing fake success)',
         );
       }
+      // §120 — 落 lineage：child=后拍 job、relation='derived_from_asset'、
+      //   source_asset_ids=[前拍尾帧 media_id]（经 L47 recordLineage，调用方注入语义）。
+      //   best-effort：lineage 写失败不倒置已成功的生成结果。
+      if (recordLineage != null && lineageSources.length > 0) {
+        try {
+          await recordLineage({
+            childJobId: lineageChildJobIdOf(t, taskId),
+            relation: 'derived_from_asset',
+            sourceAssetIds: lineageSources,
+          });
+        } catch (_) {
+          /* lineage 元数据尽力而为 */
+        }
+      }
       return { ok: true, resultRef };
     }
 
@@ -164,6 +309,15 @@ module.exports = {
   idempotencyKeyForTask,
   extractResultRef,
   normalizeError,
+
+  // ─── §120 连续镜头链（last_frame → first_frame 服务器资产链）───
+  resolveContinuityChain,
+  sequenceKeyOf,
+  jobIdOf,
+  firstFrameOf,
+  lineageSourcesOf,
+  lineageChildJobIdOf,
+
   SB_TASK_KEY_PREFIX,
   GENERATE_COUNT,
 };
