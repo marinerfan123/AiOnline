@@ -114,6 +114,104 @@ const billing = {
     });
   },
 
+  // ────────────────────────────────────────────────────────────────────────
+  // L30 §84-90: Billing 三段分离（estimated / actual / user_charge）。
+  //   reserveCreditsV2 → 落 estimated（预扣用户估算额）
+  //   commitCreditsV2  → 以 actual（provider 计费或 pricing.cjs calculate）校准，
+  //                        user_charge = 最终扣用户；差额自动补扣/退回
+  //   refundUserCharge → 失败退款：退 user_charge 部分，actual 仍记账（§89 不抹除成本）
+  // 幂等：全部依赖 (ref, kind) 唯一约束（0004 uq_credit_transactions_ref_kind）。
+  // 裁决：additive 新增三列（0066 段 B），不改既有 reserve/commit/release 签名。
+  // ────────────────────────────────────────────────────────────────────────
+
+  // §85 reserve：预扣 estimated（= 预估 provider cost，也是预扣用户额），落 estimated 段。
+  // 幂等：同 (ref,'reserve') 已存在则跳过，不重复扣款。
+  async reserveCreditsV2(pg, { userId, estimated, ref, pool = 'recharge' } = {}) {
+    if (!userId || !ref) throw new TypeError('reserveCreditsV2: userId/ref required');
+    const est = Number(estimated);
+    if (!Number.isFinite(est) || est <= 0) return { idempotent: false, reserved: 0 };
+    const col = pool === 'reward' ? 'reward_credits' : 'recharge_credits';
+    return tx(pg, async (txClient) => {
+      const existing = await txClient.query(
+        `SELECT id FROM credit_transactions WHERE ref = $1 AND kind = 'reserve'`, [ref],
+      );
+      if (existing.rowCount) return { idempotent: true, reserved: 0 };
+      const r = await txClient.query(
+        `UPDATE users SET ${col} = ${col} - $1 WHERE id = $2 AND ${col} >= $1`,
+        [est, userId],
+      );
+      if (r.rowCount === 0) { const e = new Error('Balance insufficient'); e.code = 'INSUFFICIENT'; throw e; }
+      await txClient.query(
+        `INSERT INTO credit_transactions (user_id, kind, amount, ref, pool, balance_after, estimated_amount, user_charge_amount)
+         VALUES ($1, 'reserve', $2, $3, $4, (SELECT credits FROM users WHERE id = $1), $2, $2)
+         ON CONFLICT (ref, kind) DO NOTHING`,
+        [userId, est, ref, pool],
+      );
+      return { idempotent: false, reserved: est };
+    });
+  },
+
+  // §85 commit：以 actual 校准。user_charge = 最终扣用户（缺省 = actual）。
+  //   estimated = reserve 时已预扣额（缺省 = user_charge）。差额 delta = charge - estimated：
+  //     delta < 0 → 退回多扣；delta > 0 → 补扣（调用方须先过 §88 max_cost_authorized 闸）。
+  // 幂等：同 (ref,'commit') 已存在则跳过。
+  async commitCreditsV2(pg, { userId, actual, userCharge, estimated, ref, pool = 'recharge' } = {}) {
+    if (!userId || !ref) throw new TypeError('commitCreditsV2: userId/ref required');
+    const actualAmt = Number(actual);
+    if (!Number.isFinite(actualAmt)) throw new TypeError('commitCreditsV2: actual must be a finite number');
+    const charge = userCharge == null ? actualAmt : Number(userCharge);
+    const est = estimated == null ? charge : Number(estimated);
+    if (!Number.isFinite(charge) || charge < 0) throw new TypeError('commitCreditsV2: userCharge invalid');
+    const col = pool === 'reward' ? 'reward_credits' : 'recharge_credits';
+    return tx(pg, async (txClient) => {
+      const existing = await txClient.query(
+        `SELECT id FROM credit_transactions WHERE ref = $1 AND kind = 'commit'`, [ref],
+      );
+      if (existing.rowCount) return { idempotent: true };
+      const delta = charge - est;
+      if (delta < 0) {
+        await txClient.query(`UPDATE users SET ${col} = ${col} + $1 WHERE id = $2`, [Math.abs(delta), userId]);
+      } else if (delta > 0) {
+        const r = await txClient.query(
+          `UPDATE users SET ${col} = ${col} - $1 WHERE id = $2 AND ${col} >= $1`, [delta, userId],
+        );
+        if (r.rowCount === 0) { const e = new Error('Balance insufficient for actual calibration'); e.code = 'INSUFFICIENT'; throw e; }
+      }
+      await txClient.query(
+        `INSERT INTO credit_transactions (user_id, kind, amount, ref, pool, balance_after, estimated_amount, actual_amount, user_charge_amount)
+         VALUES ($1, 'commit', $2, $3, $4, (SELECT credits FROM users WHERE id = $1), $5, $6, $2)
+         ON CONFLICT (ref, kind) DO NOTHING`,
+        [userId, charge, ref, pool, est, actualAmt],
+      );
+      return { idempotent: false, userCharge: charge, actual: actualAmt, delta };
+    });
+  },
+
+  // §89 失败退款：provider 已收费但任务失败 → 退 user_charge 部分到余额，
+  //   actual_amount 仍记账（平台利润分析不抹除成本）。kind='refund'，ref=refund:{refund_id}。
+  // 幂等：ON CONFLICT (ref, kind) DO NOTHING → 重复退款不会重复加余额。
+  async refundUserCharge(pg, { userId, userCharge, actual, ref, pool = 'recharge' } = {}) {
+    if (!userId || !ref) throw new TypeError('refundUserCharge: userId/ref required');
+    const charge = Number(userCharge) || 0;
+    const actualAmt = Number(actual) || 0;
+    if (charge <= 0 && actualAmt <= 0) return { idempotent: false, refunded: 0 };
+    const col = pool === 'reward' ? 'reward_credits' : 'recharge_credits';
+    return tx(pg, async (txClient) => {
+      const inserted = await txClient.query(
+        `INSERT INTO credit_transactions (user_id, kind, amount, ref, pool, balance_after, actual_amount, user_charge_amount)
+         VALUES ($1, 'refund', $2, $3, $4, (SELECT credits FROM users WHERE id = $1), $5, $2)
+         ON CONFLICT (ref, kind) DO NOTHING
+         RETURNING id`,
+        [userId, charge, ref, pool, actualAmt],
+      );
+      if (inserted.rowCount === 0) return { idempotent: true, refunded: 0 };
+      if (charge > 0) {
+        await txClient.query(`UPDATE users SET ${col} = ${col} + $1 WHERE id = $2`, [charge, userId]);
+      }
+      return { idempotent: false, refunded: charge, actualKept: actualAmt };
+    });
+  },
+
   // Reconciliation fallback: find "running > N min" tasks still without commit transaction,
   // return them so the caller can release held credits.
   async findDanglingReserves(pg, staleMinutes = 30) {

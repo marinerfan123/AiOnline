@@ -93,3 +93,41 @@ COMMENT ON COLUMN pricing_rules.params IS
 
 COMMENT ON COLUMN pricing_rules.status IS
   'ACTIVE/DEPRECATED/RETIRED (DEFAULT ACTIVE); resolveRule only matches ACTIVE';
+
+-- ══════════════════════════════════════════════════════════════════════════
+-- 0066 段 B — L30 Billing 三段分离（estimated / actual / user_charge）
+-- ══════════════════════════════════════════════════════════════════════════
+-- 规范 §84-90（G10，审计 28:C3；与段 A pricing_rules 同文件、同段，串行）：
+--   §84  三概念严格分：estimated_provider_cost / actual_provider_cost / user_charge 绝不混。
+--   §85  reserve 落 estimated；commit 以 actual（provider 计费或 pricing.cjs calculate）校准；
+--        user_charge = 最终扣用户金额；失败 release/refund 只退 user_charge 部分。
+--   §86  Provider Cost ≠ 简单时长（多维度成本由段 A pricing_rules 表达，本段不存单价格字段）。
+--   §89  Provider 已收费但生成失败 → user_charge 可退，actual_provider_cost 仍记账（不抹除成本）。
+--   §90  ledger 幂等键：reserve:{job_id} / settle:{attempt_id} / release:{job_id} / refund:{refund_id}。
+--
+-- 裁决（加列 vs 复用）：**additive ADD COLUMN**。复用现有 amount 作为「主金额」，但三段
+--   绝不混记于 amount（§84 不混）：
+--     reserve 行  amount=estimated, estimated_amount=estimated, user_charge_amount=estimated(预)
+--     commit  行  amount=user_charge, actual_amount=actual, user_charge_amount=user_charge
+--     refund  行  amount=退款额, actual_amount=actual(保留), user_charge_amount=退款额
+--   不改、不删既有列/数据。幂等：纯 additive，可安全重放。Forward-only。
+
+-- ── credit_transactions（账务主表）：三段 ──
+ALTER TABLE credit_transactions ADD COLUMN IF NOT EXISTS estimated_amount NUMERIC(18,4);
+ALTER TABLE credit_transactions ADD COLUMN IF NOT EXISTS actual_amount NUMERIC(18,4);
+ALTER TABLE credit_transactions ADD COLUMN IF NOT EXISTS user_charge_amount NUMERIC(18,4);
+
+-- ── generation_credit_holds_v2（预留三段 + settle attempt 键）──
+ALTER TABLE generation_credit_holds_v2 ADD COLUMN IF NOT EXISTS estimated_amount NUMERIC(14,4);
+ALTER TABLE generation_credit_holds_v2 ADD COLUMN IF NOT EXISTS actual_amount NUMERIC(14,4);
+ALTER TABLE generation_credit_holds_v2 ADD COLUMN IF NOT EXISTS user_charge_amount NUMERIC(14,4);
+ALTER TABLE generation_credit_holds_v2 ADD COLUMN IF NOT EXISTS attempt_id BIGINT;
+
+COMMENT ON COLUMN credit_transactions.estimated_amount IS
+  '§84 estimated_provider_cost：reserve 时预扣/预估额（provider cost 估算，非最终）';
+COMMENT ON COLUMN credit_transactions.actual_amount IS
+  '§84 actual_provider_cost：commit 时 provider 实际计费（或 pricing.cjs calculate）结果；§89 失败也不抹除';
+COMMENT ON COLUMN credit_transactions.user_charge_amount IS
+  '§84 user_charge：最终实际扣用户的金额（失败退款 = 释放此部分）';
+COMMENT ON COLUMN generation_credit_holds_v2.attempt_id IS
+  '§90 settle 幂等键：关联 generation_item_attempts_v2.attempt_id';

@@ -24,6 +24,7 @@ const AGNES_STATUS_MAP = {
   completed: 'SUCCEEDED',
   failed: 'FAILED',
   error: 'FAILED',
+  expired: 'FAILED',
   canceled: 'CANCELLED',
   cancelled: 'CANCELLED',
 };

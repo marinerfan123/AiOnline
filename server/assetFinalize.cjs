@@ -19,6 +19,15 @@
 const ossMod = require('./oss.cjs');
 const crypto = require('crypto');
 const { Transform, PassThrough, Readable } = require('stream');
+// L29 — Media Metadata 扩展：checksum 完整性 + 元数据捕获（纯函数，落点见 outputMeta.cjs 头部裁决）。
+const {
+  computeSha256,
+  computeMd5Hex,
+  computeMd5Base64,
+  verifyChecksum,
+  normalizeOutputMetadata,
+  probeBufferWithFfprobe,
+} = require('./modules/media/outputMeta.cjs');
 
 const MAX_BYTES = 50 * 1024 * 1024; // 50 MB
 const FETCH_TIMEOUT_MS = 30000;
@@ -59,6 +68,19 @@ function normalizeContentType(url, responseContentType, fallback = 'image/jpeg')
     if (e === 'json') return 'application/json';
   }
   return fallback;
+}
+
+// Web ReadableStream → Buffer（L29 checksum/元数据捕获需要整字节；MAX_BYTES 上限内驻留可接受，
+// 与既有 streamToPassThroughWithMd5 的「整 buffer 算 MD5」同款折衷）。
+async function webStreamToBuffer(webStream) {
+  const reader = webStream.getReader();
+  const chunks = [];
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (value) chunks.push(Buffer.from(value));
+  }
+  return Buffer.concat(chunks);
 }
 
 async function fetchBytes(url) {
@@ -252,7 +274,7 @@ function buildGetUrl(cfg, objectKey) {
  */
 async function finalizeUrl(pgPool, opts) {
   if (!pgPool) throw new Error('数据库不可用，无法最终化资源');
-  const { userId, taskId, idx, providerUrl, type = 'image', prompt = '', model = '', ratio = '1:1', creditCost, pendingId } = opts;
+  const { userId, taskId, idx, providerUrl, type = 'image', prompt = '', model = '', ratio = '1:1', creditCost, pendingId, captureChecksum, expectedChecksum, probe } = opts;
   if (!userId) throw new Error('userId 缺失');
   if (!providerUrl) throw new Error('providerUrl 缺失');
 
@@ -267,6 +289,11 @@ async function finalizeUrl(pgPool, opts) {
   let contentType = normalizeContentType(providerUrl, null, type === 'video' ? 'video/mp4' : 'image/jpeg');
   let fileSize = 0;
   let status = 'pending_upload';
+  // L29 — checksum/元数据捕获结果（仅 captureChecksum/expectedChecksum 时计算；legacy finalizeTask 不请求 → null，向后兼容）。
+  let sha256 = null;
+  let md5Hex = null;
+  let md5Base64 = null;
+  let metaRaw = null;
 
   // ── 1. 拉字节 ──
   let fetched = null;
@@ -279,6 +306,42 @@ async function finalizeUrl(pgPool, opts) {
     ossLog('warn', 'finalize', `[assetFinalize] ⚠️ 拉取失败 ${tag} → ${e.message}（占位先入库，reaper 后重试）`, { taskId, userId, providerUrl: String(providerUrl).slice(0, 80), error: e.message, durationMs: 0 });
     await insertMedia(pgPool, { mediaId, userId, taskId, type, prompt, model, ratio, providerUrl, ossUrl, ossObjectKey, ossUploaded, contentType, fileSize: 0, status: 'pending_upload', errorMessage: e.message });
     return { mediaId, pendingId: mediaId, ossUrl: providerUrl, ossObjectKey: '', ossUploaded: false, status: 'pending_upload', providerUrl, contentType, fileSize: 0, type };
+  }
+
+  // ── 1.5 L29 校验和 + 元数据捕获（§82 Media Metadata / §79 VERIFY 闸）──
+  // 仅当 captureChecksum 或 expectedChecksum 请求时计算（output manifest 路径恒请求；legacy 路径不请求）。
+  const wantChecksum = !!(captureChecksum || expectedChecksum);
+  if (wantChecksum) {
+    try {
+      // 流式拉取先整读成 buffer（sha256/md5 需要整字节；50MB 上限内驻留可接受）
+      if (fetched.stream) {
+        const buf = await webStreamToBuffer(fetched.stream);
+        fetched = { buffer: buf, contentType: fetched.contentType, byteLength: buf.length, isStream: false };
+      }
+      const buf = fetched.buffer;
+      sha256 = computeSha256(buf);
+      md5Hex = computeMd5Hex(buf);
+      md5Base64 = computeMd5Base64(buf);
+      // 有 provider checksum 则核验（§79 VERIFY 闸）；算法不可识别（opaque etag）→ 宽容跳过，不判失败。
+      if (expectedChecksum) {
+        const v = verifyChecksum(buf, expectedChecksum);
+        if (v.verifiable && !v.matched) {
+          throw new Error(`checksum 校验失败（期望 ${expectedChecksum}，实际 sha256=${sha256}）`);
+        }
+      }
+    } catch (e) {
+      // checksum 校验失败：不落 success，写占位（reaper 重试重新拉取 + 重新校验），§79 Job 未成功。
+      ossLog('warn', 'finalize', `[assetFinalize] ⚠️ checksum 校验失败 ${tag} → ${e.message}（占位入库，reaper 重试）`, { taskId, userId, error: e.message });
+      await insertMedia(pgPool, { mediaId, userId, taskId, type, prompt, model, ratio, providerUrl, ossUrl, ossObjectKey, ossUploaded: false, contentType, fileSize, status: 'pending_upload', errorMessage: e.message });
+      return { mediaId, pendingId: mediaId, ossUrl: providerUrl, ossObjectKey: '', ossUploaded: false, status: 'pending_upload', providerUrl, contentType, fileSize, type, sha256: null };
+    }
+    // 元数据探针（best-effort，宽容：probe 缺失/失败 → metaRaw=null，不炸）
+    try {
+      const prober = probe || probeBufferWithFfprobe;
+      metaRaw = await prober(fetched.buffer);
+    } catch (_e) {
+      metaRaw = null;
+    }
   }
 
   // ── 2. OSS 直传 ──
@@ -318,7 +381,7 @@ async function finalizeUrl(pgPool, opts) {
     await insertMedia(pgPool, { mediaId, userId, taskId, type, prompt, model, ratio, providerUrl, thumbnail: '', ossUrl: providerUrl, ossObjectKey: '', ossUploaded: false, contentType, fileSize, status: 'success', errorMessage: '' });
     // G08 — 生成结果版本化（OSS 未启用：storage_key 为空）
     await recordAssetVersion(pgPool, { mediaId, taskId, model, storageKey: '', sizeBytes: fileSize });
-    return { mediaId, pendingId: mediaId, ossUrl: providerUrl, thumbnail: '', ossObjectKey: '', ossUploaded: false, status: 'success', providerUrl, contentType, fileSize, type };
+    return { mediaId, pendingId: mediaId, ossUrl: providerUrl, thumbnail: '', ossObjectKey: '', ossUploaded: false, status: 'success', providerUrl, contentType, fileSize, type, sha256, md5Hex, md5Base64, meta: metaRaw };
   }
 
   // ── 3. 写 media 表（成功/已有 OSS URL）──
@@ -327,7 +390,7 @@ async function finalizeUrl(pgPool, opts) {
   // G08 — 生成结果版本化：落 media 行后补写 asset_versions（kind='generated', status='ready'）
   await recordAssetVersion(pgPool, { mediaId, taskId, model, storageKey: ossObjectKey, sizeBytes: fileSize });
 
-  return { mediaId, pendingId: mediaId, ossUrl, thumbnail: thumbUrl, ossObjectKey, ossUploaded: true, status: 'success', providerUrl, contentType, fileSize, type };
+  return { mediaId, pendingId: mediaId, ossUrl, thumbnail: thumbUrl, ossObjectKey, ossUploaded: true, status: 'success', providerUrl, contentType, fileSize, type, sha256, md5Hex, md5Base64, meta: metaRaw };
 }
 
 // media 表 INSERT（或幂等 UPSERT）
@@ -505,6 +568,10 @@ function normalizeOutputArtifact(a) {
   if (!url) return null; // 无来源地址的 artifact 无法拉取，跳过（保留在 provider_manifest 原样里）
   const norm = { url, kind: String(kind), mimeType: mimeType ? String(mimeType) : null, sizeBytes: Number.isFinite(sizeBytes) ? sizeBytes : null };
   if (checksum) norm.checksum = String(checksum);
+  // L29 — 重放时保留已捕获的 metadata（JSONB 宽容；快照重放不得丢元数据）
+  if (a.metadata && typeof a.metadata === 'object' && Object.keys(a.metadata).length) {
+    norm.metadata = a.metadata;
+  }
   return norm;
 }
 
@@ -521,6 +588,71 @@ function deriveArtifactMediaType(kind, mimeType) {
   if (/video/i.test(String(kind || ''))) return 'video';
   if (mimeType && /^video\//i.test(String(mimeType))) return 'video';
   return 'image';
+}
+
+// ─── L28 — Finalize 独立重试（§80 续：经 snapshot retry_count 域，独立于 Job 总重试）──────────
+// 语义：
+//   1) 断点续拉：finalize 失败重试仅从快照重放，已落 media_ids 保留、绝不重复拉取（snapshotOutputManifest 已提供）。
+//   2) 独立重试计数/退避：retry_count 只计 FINALIZE 重试（与 generation_items_v2.attempt_count 的 Job 级重试无关）；
+//      达 maxRetries 上限 → job 域终态 failed（reasonCode=FINALIZE_EXHAUSTED，由接线层落 generation_items_v2），
+//      snapshot 保留（media_ids 不删、finalized_at 仍 NULL）供人工重放。
+//   3) 幂等（并发单拉取）：确定性 media id + 原子认领（ON CONFLICT DO NOTHING/DO UPDATE）→ 并发双 finalize 同 attempt
+//      只拉取一次；loser 读回/跳过，绝不双拉/双写。
+//   4) 终态后人工重放：FINALIZE_EXHAUSTED 后，人工重放（提高 maxRetries 或换新 attempt）仍可从快照续拉。
+const FINALIZE_DEFAULT_MAX_RETRIES = 3;
+const FINALIZE_RETRY_BASE_DELAY_MS = 1000;
+const FINALIZE_RETRY_MAX_DELAY_MS = 30000;
+const FINALIZE_EXHAUSTED_CODE = 'FINALIZE_EXHAUSTED';
+
+// 确定性 media id：并发双 finalize 同 (jobId, idx) → 同 id → ON CONFLICT 幂等锚点。
+// pendingId 优先（前端 id 锁定，绝不随机）；否则由 (jobId, idx) 确定性派生。
+function deterministicMediaId(jobId, idx, pendingId) {
+  if (pendingId) return pendingId;
+  return `mf-${String(jobId)}-${idx}`;
+}
+
+// FINALIZE 退避（独立于 Job 总重试）：只由 snapshot retry_count 决定，指数退避、封顶。
+function computeFinalizeBackoffMs(retryCount, baseMs, maxMs) {
+  const n = Math.max(0, Number(retryCount) || 0);
+  const exp = Math.min(n, 30); // 防 Math.pow 溢出
+  return Math.min((Number(baseMs) || 1000) * Math.pow(2, exp), Number(maxMs) || 30000);
+}
+
+// 原子认领 media 槽位（并发单拉取核心；仅 atomicClaim 路径调用）：
+//   - 无该 id 行 → INSERT 'finalizing' → 认领成功（winner，真正拉字节）。
+//   - 已有 'pending_upload'/'failed'/'canceled'（前次 finalize 失败占位）→ 翻转为 'finalizing' → 认领成功（重试续传）。
+//   - 已有 'finalizing'（他 worker 正在拉）或 'success'（已落库）→ 不动 → 认领失败（loser，跳过拉取 = 单拉取）。
+// 返回 { claimed: bool, mediaId }。ON CONFLICT 语义保证原子（并发下仅一方 claimed）。
+async function claimMediaSlot(pgPool, { mediaId, userId, taskId, type, providerUrl }) {
+  const r = await pgPool.query(
+    `INSERT INTO media (id, task_id, type, provider_url, user_id, category, source, status)
+     VALUES ($1,$2,$3,$4,$5,'generated','user','finalizing')
+     ON CONFLICT (id) DO UPDATE
+       SET status = 'finalizing'
+       WHERE media.status IN ('pending_upload','failed','canceled')
+     RETURNING id`,
+    [mediaId, taskId, type, providerUrl, userId],
+  );
+  return { claimed: !!(r.rows && r.rows.length), mediaId };
+}
+
+// 读回 media 槽位状态（loser 判断是「已落库」还是「他 worker 拉取中」）。
+async function readMediaSlot(pgPool, mediaId) {
+  const r = await pgPool.query(
+    `SELECT id, status, oss_url, oss_object_key, oss_uploaded, file_size, provider_url FROM media WHERE id = $1`,
+    [mediaId],
+  );
+  return (r.rows && r.rows[0]) || null;
+}
+
+// merge-safe 回填 media_ids：并发下 loser 不盲写覆盖 winner 已落库项（COALESCE 合并）。
+async function mergeManifestMediaIds(pgPool, jobId, incoming) {
+  const cur = await pgPool.query(
+    `SELECT media_ids FROM generation_output_manifests WHERE job_id = $1`,
+    [jobId],
+  ).then((r) => (r && r.rows && r.rows[0] && r.rows[0].media_ids) || null).catch(() => null);
+  if (!Array.isArray(cur) || !cur.length) return incoming.slice();
+  return incoming.map((m, i) => (m != null ? m : (cur[i] != null ? cur[i] : null)));
 }
 
 // 落库/重放 provider 快照（先于任何拉取，§80）。返回重放后的快照行 + 既有 media_ids。
@@ -592,13 +724,23 @@ async function snapshotOutputManifest(pgPool, opts) {
 }
 
 // 终态后编排：先存快照（§80 先于拉取）→ 逐件拉取落库 → 回填 media_ids/artifacts/finalized_at。
-// opts: { jobId, attemptId, providerManifest?, userId, prompt?, model?, ratio?, pendingIds? }
-// 返回 { jobId, attemptId, providerSuccess, jobSuccess, artifacts, mediaIds, finalizedAt, results }。
+// opts: { jobId, attemptId, providerManifest?, userId, prompt?, model?, ratio?, pendingIds?,
+//         maxRetries?, retryBaseDelayMs?, retryMaxDelayMs?, atomicClaim?, probe? }
+// 返回 { jobId, attemptId, providerSuccess, jobSuccess, finalizeExhausted, reasonCode,
+//         artifacts, mediaIds, finalizedAt, retryCount, retryAfterMs, results }。
 //   - providerSuccess = true（快照已落 = provider 成功产出 manifest）。
 //   - jobSuccess = true 仅当所有 artifacts 拉取落库成功 + media_ids 齐（无 NULL）；否则 false（仍 retry 域，§79）。
 //   - 重试（同 attempt）可省略 providerManifest：从快照重放，只补拉未落库 artifact（§80 绝不重新生成）。
+//   - L28 独立重试：retry_count 超 maxRetries → finalizeExhausted=true、reasonCode=FINALIZE_EXHAUSTED（job 域终态 failed，
+//     由接线层落 generation_items_v2），snapshot 保留供人工重放；退避 retryAfterMs 仅由 retry_count 决定（独立于 Job 总重试）。
 async function finalizeOutputManifest(pgPool, opts) {
-  const { jobId, attemptId, providerManifest, userId, prompt = '', model = '', ratio = '1:1', pendingIds } = opts || {};
+  const {
+    jobId, attemptId, providerManifest, userId, prompt = '', model = '', ratio = '1:1', pendingIds, probe,
+    maxRetries = FINALIZE_DEFAULT_MAX_RETRIES,
+    retryBaseDelayMs = FINALIZE_RETRY_BASE_DELAY_MS,
+    retryMaxDelayMs = FINALIZE_RETRY_MAX_DELAY_MS,
+    atomicClaim = false,
+  } = opts || {};
   if (!userId) throw new Error('userId 缺失');
 
   // 1. 快照先于拉取（§80）：写入/重放 generation_output_manifests，拿到归一 artifacts + 既有 media_ids
@@ -609,6 +751,30 @@ async function finalizeOutputManifest(pgPool, opts) {
   const results = new Array(artifacts.length);
   let allLanded = true;
 
+  // ── L28 独立重试上限（§80 续）：同 attempt 重放且 retry_count 超 maxRetries → job 域终态 failed。
+  //    不再拉取；snapshot 保留（media_ids 不删、finalized_at 仍 NULL）供人工重放。
+  if (snap.isRetry && snap.retryCount > maxRetries) {
+    return {
+      jobId, attemptId,
+      providerSuccess: true,
+      jobSuccess: false,
+      finalizeExhausted: true,
+      reasonCode: FINALIZE_EXHAUSTED_CODE,
+      artifacts, mediaIds,
+      finalizedAt: null,
+      retryCount: snap.retryCount,
+      retryAfterMs: null, // 终态：不再自动重试；仅人工重放
+      results: artifacts.map((a, i) => ({
+        ...a,
+        mediaId: mediaIds[i] != null ? mediaIds[i] : null,
+        landed: mediaIds[i] != null,
+        replayed: mediaIds[i] != null,
+        status: mediaIds[i] != null ? 'success' : 'failed',
+        error: mediaIds[i] != null ? undefined : 'finalize retries exhausted',
+      })),
+    };
+  }
+
   // 2. 逐件拉取落库：已落库（mediaIds[i] 非 null）跳过（快照重放），只补拉缺失项
   for (let i = 0; i < artifacts.length; i++) {
     const a = artifacts[i];
@@ -617,16 +783,44 @@ async function finalizeOutputManifest(pgPool, opts) {
       continue;
     }
     const type = deriveArtifactMediaType(a.kind, a.mimeType);
-    const pendingId = Array.isArray(pendingIds) ? pendingIds[i] : undefined;
+    // L28 确定性 media id：并发双 finalize 同 (jobId, idx) → 同 id → ON CONFLICT 幂等锚点（绝不随机）。
+    const mediaId = deterministicMediaId(jobId, i, Array.isArray(pendingIds) ? pendingIds[i] : undefined);
+
+    // L28 并发单拉取（可选原子认领）：仅 winner 真正拉字节；loser 读回已落库或跳过（ON CONFLICT 幂等）。
+    if (atomicClaim) {
+      const claim = await claimMediaSlot(pgPool, { mediaId, userId, taskId: jobId, type, providerUrl: a.url })
+        .catch(() => ({ claimed: false }));
+      if (!claim.claimed) {
+        const existing = await readMediaSlot(pgPool, mediaId).catch(() => null);
+        if (existing && existing.status === 'success') {
+          mediaIds[i] = mediaId;
+          if (existing.oss_url) a.ossUrl = existing.oss_url;
+          results[i] = { ...a, mediaId, ossUrl: existing.oss_url || null, landed: true, replayed: false, claimedByOther: true, status: 'success' };
+        } else {
+          allLanded = false;
+          results[i] = { ...a, mediaId, landed: false, replayed: false, claimedByOther: true, status: 'finalizing' };
+        }
+        continue;
+      }
+    }
+
     try {
       const r = await finalizeUrl(pgPool, {
         userId, taskId: jobId, idx: i, providerUrl: a.url, type,
-        prompt, model, ratio, pendingId,
+        prompt, model, ratio, pendingId: mediaId,
+        captureChecksum: true,           // L29 §82 checksum 完整性：恒计算 sha256（缺则补）
+        expectedChecksum: a.checksum || undefined, // 有 provider checksum 则核验（§79 VERIFY 闸）
+        probe,                            // L29 元数据探针（可注入；缺省走 ffprobe）
       });
       if (r && r.status === 'success') {
         mediaIds[i] = r.mediaId;
         a.mimeType = r.contentType || a.mimeType;
         a.sizeBytes = r.fileSize != null ? r.fileSize : a.sizeBytes;
+        // L29 — checksum 回填（缺则补 sha256 计算；有则已核验通过）
+        if (r.sha256) a.checksum = r.sha256;
+        // L29 — 元数据回填（宽容归一；空对象不落键，保持 artifacts 干净）
+        const meta = normalizeOutputMetadata(r.meta || {}, { thumbnailUrl: r.thumbnail });
+        if (Object.keys(meta).length) a.metadata = meta;
         results[i] = { ...a, mediaId: r.mediaId, ossUrl: r.ossUrl, landed: true, replayed: false, status: 'success' };
       } else {
         // 拉取/落库失败：media_ids 保持 null（未落库），Job 未成功，仍处 retry 域（§79）
@@ -639,23 +833,30 @@ async function finalizeOutputManifest(pgPool, opts) {
     }
   }
 
-  // 3. 回填 artifacts（sizeBytes/mimeType 已拉取成功者更新）+ media_ids + finalized_at（全落才置值）
+  // 3. 回填 artifacts（sizeBytes/mimeType 已拉取成功者更新）+ media_ids + finalized_at（全落才置值）。
+  //    atomicClaim 并发路径走 merge-safe（loser 不盲写覆盖 winner 已落库项）；默认路径快照重放已保证单调。
   const finalizedAt = allLanded ? new Date().toISOString() : null;
+  const finalMediaIds = atomicClaim ? await mergeManifestMediaIds(pgPool, jobId, mediaIds) : mediaIds.slice();
   await pgPool.query(
     `UPDATE generation_output_manifests
      SET artifacts = $2, media_ids = $3, finalized_at = $4, updated_at = NOW()
      WHERE job_id = $1`,
-    [jobId, JSON.stringify(artifacts), mediaIds, finalizedAt ? finalizedAt : null],
+    [jobId, JSON.stringify(artifacts), finalMediaIds, finalizedAt ? finalizedAt : null],
   ).catch(() => ({ rows: [] }));
 
-  const mediaIdsComplete = artifacts.length > 0 && mediaIds.every((m) => m != null);
+  const mediaIdsComplete = artifacts.length > 0 && finalMediaIds.every((m) => m != null);
+  const jobSuccess = allLanded && mediaIdsComplete;
   return {
     jobId, attemptId,
     providerSuccess: true, // 快照已落 = provider 成功产出 manifest（§79 与 Job Success 严格区分）
-    jobSuccess: allLanded && mediaIdsComplete,
-    artifacts, mediaIds,
-    finalizedAt,
+    jobSuccess,
+    finalizeExhausted: false,
+    reasonCode: jobSuccess ? null : 'FINALIZE_FAILED',
+    artifacts, mediaIds: finalMediaIds,
+    finalizedAt: jobSuccess ? finalizedAt : null,
     retryCount: snap.retryCount,
+    // L28 退避只由 FINALIZE retry_count 决定（独立于 Job 总重试 attempt_count）；成功则无需重试。
+    retryAfterMs: jobSuccess ? null : computeFinalizeBackoffMs(snap.retryCount, retryBaseDelayMs, retryMaxDelayMs),
     results,
   };
 }
@@ -679,4 +880,10 @@ module.exports = {
   deriveArtifactMediaType,
   snapshotOutputManifest,
   finalizeOutputManifest,
+  // L28 Finalize 独立重试（§80 续）
+  deterministicMediaId,
+  computeFinalizeBackoffMs,
+  claimMediaSlot,
+  readMediaSlot,
+  mergeManifestMediaIds,
 };

@@ -108,4 +108,29 @@ async function runWorkerTick(pg, options = {}, injected = {}) {
   return { claimed:items.length };
 }
 
-module.exports = { defaultRecordAttempt, processItem, runWorkerTick };
+// ---- Activity runner mount (§138 渐进上线) ----
+// 默认 OFF：不设置 env / options.enabled 时 runActivityTick 直接返回 no-op。
+// 显式开启（任一）：env GENERATION_V2_ACTIVITY_RUNNER=1，或 options.enabled=true。
+// 真库待 0060 迁移合入后再容器验证；此处仅挂载点，不改动现有 tick 装配。
+async function runActivityTick(pg, options = {}, injected = {}) {
+  const enabled = options.enabled === true || process.env.GENERATION_V2_ACTIVITY_RUNNER === '1';
+  if (!enabled) return { claimed: 0, enabled: false, note: 'activity runner disabled (§138 default off)' };
+  const { createActivityRunner, createPgActivityStore } = require('./activity-runner.cjs');
+  const workerId = options.workerId || injected.workerId;
+  if (!workerId) throw new TypeError('workerId is required');
+  const store = injected.store || createPgActivityStore(pg);
+  const worker = injected.activityWorker;
+  if (typeof worker !== 'function') throw new TypeError('activityWorker is required when enabled');
+  const runner = injected.runner || createActivityRunner({
+    store, worker, workerId,
+    maxAttempts: options.maxAttempts,
+    timeoutMs: options.timeoutMs,
+    backoffMs: options.backoffMs,
+    leaseSeconds: options.leaseSeconds || 120,
+    concurrency: options.concurrency || 1,
+    onError: options.onError,
+  });
+  return runner.runOnce({ limit: options.limit });
+}
+
+module.exports = { defaultRecordAttempt, processItem, runWorkerTick, runActivityTick };

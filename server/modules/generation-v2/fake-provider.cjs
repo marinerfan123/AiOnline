@@ -1,6 +1,24 @@
 'use strict';
 // Fake Provider — TEST ONLY. Never contacts external services.
 // Deterministic outcomes for failure injection testing.
+const { GOLDEN_FIXTURES } = require('./fixtures/driver-golden-fixtures.cjs');
+
+// L26 §125 golden 一致路径：以 fixtures 为单一来源，(driverKind,state) → 第一条 result 样本 raw。
+// contract tests 用 goldenRaw 做 round-trip（raw→normalizeResult→expected）防 drift。
+const _goldenIndex = (() => {
+  const idx = Object.create(null);
+  for (const f of GOLDEN_FIXTURES) {
+    if (f.fn !== 'result') continue;
+    const key = `${f.driverKind}:${f.state}`;
+    if (!(key in idx)) idx[key] = f.raw;
+  }
+  return idx;
+})();
+
+function _deepClone(v) {
+  if (v == null || typeof v !== 'object') return v;
+  return JSON.parse(JSON.stringify(v));
+}
 
 class FakeProvider {
   constructor(opts = {}) {
@@ -15,6 +33,13 @@ class FakeProvider {
   _nextId() {
     this.counter++;
     return `fake-pr-${this.counter}`;
+  }
+
+  // L26：返回与 golden fixture.raw 完全一致的 raw provider 响应（独立深拷贝）。
+  // 未命中返回 null。仅供 contract tests 做 round-trip 防 drift。
+  goldenRaw(driverKind, state) {
+    const raw = _goldenIndex[`${driverKind}:${state}`];
+    return raw == null ? null : _deepClone(raw);
   }
 
   // Simulates dispatchSingle({ ...payload })
@@ -100,6 +125,38 @@ class FakeProvider {
           providerId: 'fake-provider',
           httpStatus: 200,
         };
+        entry.result = result;
+        this.calls.push(entry);
+        return result;
+      }
+      // ── L26：契约态 outcome（与 golden fixtures 一致，供 contract round-trip） ──
+      case 'failed': {
+        // §22 契约 failed 终态：status 词 + FAILED_CODES 中的 errorCode
+        const result = {
+          status: 'failed',
+          errorCode: scenario?.errorCode || 'PROVIDER_FAILED',
+          errorMessage: scenario?.errorMessage || 'provider failed',
+          providerId: 'fake-provider',
+          providerTaskId: this._nextId(),
+        };
+        entry.result = result;
+        this.calls.push(entry);
+        return result;
+      }
+      case 'contract_pending': {
+        // §22 契约 pending 态（区别于 legacy 'pending' 的 status:'error' 形状）
+        const result = {
+          status: 'pending',
+          providerId: 'fake-provider',
+          providerTaskId: this._nextId(),
+        };
+        entry.result = result;
+        this.calls.push(entry);
+        return result;
+      }
+      case 'unknown_status': {
+        // §22 契约 unknown 态：无法归类的状态词
+        const result = { status: 'weird' };
         entry.result = result;
         this.calls.push(entry);
         return result;

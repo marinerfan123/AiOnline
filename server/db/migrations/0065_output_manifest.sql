@@ -74,3 +74,26 @@ COMMENT ON COLUMN generation_output_manifests.retry_count IS
 -- 后续 L28（Finalize 独立重试——reconciler/activity 接线 + 快照重放循环）与
 --   L29（Media Metadata 扩展——checksum/codec/width/height/duration/fps 等）追加于下方，勿改写上方 L27 内容。
 -- ═══════════════════════════════════════════════════════════════════════════════
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- L29 段（Media Metadata 扩展，§82）—— 纯 JSONB 扩展，无新列/无新 DDL。
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- 裁决（实查后）：metadata 落 `artifacts[].metadata`（JSONB 宽容），checksum 落
+--   `artifacts[].checksum`（sha256 hex）。理由：
+--   - `artifacts` 已是 `JSONB NOT NULL DEFAULT '[]'`（L27 段），纯 JSONB 扩展零迁移成本；
+--   - media 表(0001) 无 width/height/duration/codec 专属列；media_derived_artifacts(0050)
+--     是「派生产物按 (asset_id,kind) 台账」（承载 stitch/frame_extract 等派生 kind），
+--     与「主产物元数据」语义不贴 → 不加列。
+--
+-- artifacts[].metadata 形状（宽容：缺字段 drop，未知 codec 原样保留，绝不炸）：
+--   { codec, audioCodec, durationMs, width, height, thumbnailUrl }
+--   durationMs 统一整数毫秒（float 秒绝不进 DB 主时间单位）。
+-- artifacts[].checksum：
+--   provider 有 checksum（sha256/md5-hex/md5-base64）→ 拉取后核验（§79 VERIFY 闸），
+--     mismatch 判该 artifact 未落库（Job 仍 retry 域）；
+--   无 → 补 sha256 计算并落库（权威锚点）。opaque etag（不可识别算法）→ 宽容跳过校验。
+--
+-- 实现：server/modules/media/outputMeta.cjs（纯函数）+ server/assetFinalize.cjs
+--   （finalizeUrl 1.5 段 checksum 计算/核验 + 元数据探针；finalizeOutputManifest 回填）。
+-- 无 DDL：本段仅注释文档，不改、不删任何表/列/数据。
+-- ═══════════════════════════════════════════════════════════════════════════════
