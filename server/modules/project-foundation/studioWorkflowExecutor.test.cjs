@@ -11,6 +11,11 @@
  *   6. continue 跳 failed：失败步标 failed，其下游 skipped，独立分支继续执行。
  *   7. pin 快照（§95）：run 落库后改写 revision.dag → run.dag_snapshot 不变（物化副本）。
  *   8. 并发重入单跑：同 revision+project+inputs 并发两次 → 单 run、submitJob 每步只派发一次。
+ *   9. L52 Gate 20 强制 pin：latest/head/未指定 → 400 WORKFLOW_REVISION_REQUIRED 拒。
+ *  10. L52 resolvePinnedRevision：未给 revision → ACTIVE workflow 当前 ACTIVE revision 显式物化（禁存 latest）。
+ *  11. L52 workflowCode+revision 经 run() 物化为具体 revision id 并 pin 落库。
+ *  12. L52 并发：运行中追加新 ACTIVE revision → 新 run 用新 revision、旧 run 快照互不影响。
+ *  13. L52 运行后改 def（追加 revision/改名）不波及既有 run 的 pin 与快照。
  *
  * 运行：TEST_PG_PORT=54329 node --test server/modules/project-foundation/studioWorkflowExecutor.test.cjs
  * （throwaway PG；本测试应用 0071 + 0072 两文件，自包含。）
@@ -21,7 +26,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { Pool } = require('pg');
-const { createWorkflowExecutor, validateWorkflowDag, resolveWorkflowFailureMode } = require('./studioRunEngine.cjs');
+const { createWorkflowExecutor, validateWorkflowDag, resolveWorkflowFailureMode, resolvePinnedRevision } = require('./studioRunEngine.cjs');
 
 const MIGRATIONS = [
   path.join(__dirname, '..', '..', 'db', 'migrations', '0071_workflow_definitions.sql'),
@@ -90,6 +95,30 @@ function makeSubmitJob({ failSteps = [], failCode = 'MOCK_STEP_FAILED' } = {}) {
   };
   job.calls = [];
   return job;
+}
+
+/** 门控 submitJob：在第一步挂起，直到调用 job.release() —— 用于构造「运行中」态。 */
+function makeGatedSubmitJob() {
+  let release;
+  const gate = new Promise((res) => { release = res; });
+  const job = async (ctx) => {
+    job.calls.push(ctx.stepKey);
+    await gate;
+    return { ok: true, jobId: `job-${ctx.stepKey}` };
+  };
+  job.calls = [];
+  job.release = release;
+  return job;
+}
+
+/** 轮询等待谓词成立（有限超时），用于并发测试的确定性同步。 */
+async function waitFor(predicate, timeoutMs = 5000) {
+  const start = Date.now();
+  for (;;) {
+    if (await predicate()) return;
+    if (Date.now() - start > timeoutMs) throw new Error('waitFor timeout');
+    await new Promise((r) => setTimeout(r, 10));
+  }
 }
 
 const DIAMOND = {
@@ -315,4 +344,136 @@ test('run 拒绝不存在的 revision；runtime_contract latest 被 DB CHECK 拒
        VALUES ('rev-latest-x', 'wf-latest', 99, '{}'::jsonb, 'latest')`),
     (e) => e.code === '23514'
   );
+});
+
+// ── L52 Gate 20：强制 pin（禁 latest/head/未指定）─────────────────────────
+test('L52 Gate 20：latest/head/未指定 pin → WORKFLOW_REVISION_REQUIRED', async () => {
+  const ex = createWorkflowExecutor({ pg, submitJob: makeSubmitJob() });
+  const cases = [
+    { params: { projectId: 'p' }, label: '未指定 pin（无 revision）' },
+    { params: { workflowRevisionId: 'latest', projectId: 'p' }, label: 'workflowRevisionId=latest' },
+    { params: { workflowRevisionId: 'head', projectId: 'p' }, label: 'workflowRevisionId=head' },
+    { params: { workflowRevisionId: 'LATEST', projectId: 'p' }, label: 'workflowRevisionId=LATEST（大小写）' },
+    { params: { workflowCode: 'CODE_X', projectId: 'p' }, label: 'workflowCode 无 revision' },
+    { params: { workflowCode: 'CODE_X', revision: 'latest', projectId: 'p' }, label: 'revision=latest' },
+    { params: { workflowCode: 'CODE_X', revision: 'head', projectId: 'p' }, label: 'revision=head' },
+    { params: { workflowCode: 'CODE_X', revision: 0, projectId: 'p' }, label: 'revision=0' },
+    { params: { workflowCode: 'CODE_X', revision: -1, projectId: 'p' }, label: 'revision=-1' },
+  ];
+  for (const c of cases) {
+    await assert.rejects(ex.run(c.params), (e) => e.code === 'WORKFLOW_REVISION_REQUIRED', c.label);
+  }
+});
+
+// ── L52：resolvePinnedRevision 显式物化（禁存 latest 引用）────────────────
+test('L52 resolvePinnedRevision：未给 revision → ACTIVE 当前 ACTIVE revision 显式物化', async () => {
+  await seedRevision({ defId: 'wf-rs', revId: 'rev-rs-1', dag: DIAMOND, revNo: 1 });
+  await seedRevision({ defId: 'wf-rs', revId: 'rev-rs-2', dag: CHAIN, revNo: 2 });
+
+  const cur = await resolvePinnedRevision({ pg, workflowCode: 'CODE_WF-RS' });
+  assert.equal(cur.workflowRevisionId, 'rev-rs-2', '应物化为当前 ACTIVE revision 的具体 id');
+  assert.equal(cur.revision, 2);
+  assert.notEqual(cur.workflowRevisionId, 'latest', '绝不返回 latest 引用');
+  assert.notEqual(cur.workflowRevisionId, 'head', '绝不返回 head 引用');
+  assert.deepEqual(cur.dag, CHAIN, 'dag 应为当前 ACTIVE revision 的 DAG');
+
+  const v1 = await resolvePinnedRevision({ pg, workflowCode: 'CODE_WF-RS', revision: 1 });
+  assert.equal(v1.workflowRevisionId, 'rev-rs-1', '显式 revision=1 应物化 rev-rs-1');
+  assert.deepEqual(v1.dag, DIAMOND);
+
+  await assert.rejects(
+    resolvePinnedRevision({ pg, workflowCode: 'CODE_WF-RS', revision: 99 }),
+    (e) => e.code === 'WORKFLOW_REVISION_NOT_FOUND'
+  );
+  await assert.rejects(
+    resolvePinnedRevision({ pg, workflowCode: 'CODE_NOPE' }),
+    (e) => e.code === 'WORKFLOW_REVISION_NOT_FOUND'
+  );
+  await assert.rejects(
+    resolvePinnedRevision({ pg, workflowCode: 'CODE_WF-RS', revision: 'latest' }),
+    (e) => e.code === 'WORKFLOW_REVISION_REQUIRED'
+  );
+});
+
+// ── L52：workflowCode+revision 经 run() 物化并 pin ────────────────────────
+test('L52 run(workflowCode+revision)：物化并 pin 具体 revision', async () => {
+  await seedRevision({ defId: 'wf-wc', revId: 'rev-wc-1', dag: DIAMOND, revNo: 1 });
+  await seedRevision({ defId: 'wf-wc', revId: 'rev-wc-2', dag: CHAIN, revNo: 2 });
+  const submitJob = makeSubmitJob();
+  const ex = createWorkflowExecutor({ pg, submitJob });
+
+  const res = await ex.run({ workflowCode: 'CODE_WF-WC', revision: 1, projectId: 'proj-wc', inputs: {} });
+  assert.equal(res.ok, true);
+  assert.equal(res.status, 'succeeded');
+  assert.equal(res.stepCount, 4, 'rev-1 为 DIAMOND（4 步）');
+
+  const run = await pg.query(`SELECT workflow_revision_id, dag_snapshot FROM workflow_runs WHERE id = $1`, [res.runId]);
+  assert.equal(run.rows[0].workflow_revision_id, 'rev-wc-1', 'run 应 pin rev-wc-1');
+  assert.deepEqual(run.rows[0].dag_snapshot, DIAMOND);
+});
+
+// ── L52：运行中并发追加新 ACTIVE revision，新/旧 run 互不影响 ────────────
+test('L52 并发：运行中追加新 ACTIVE revision → 新 run 用新 revision、旧 run 快照不受影响', async () => {
+  await seedRevision({ defId: 'wf-cc', revId: 'rev-cc-1', dag: DIAMOND, revNo: 1 });
+
+  // run A（rev-1）：第一步挂起 → run 处于 running
+  const submitA = makeGatedSubmitJob();
+  const exA = createWorkflowExecutor({ pg, submitJob: submitA });
+  const pA = exA.run({ workflowRevisionId: 'rev-cc-1', projectId: 'proj-cc-a', inputs: { tag: 'A' } });
+
+  // 等 run A 第一步进入 running（已派发但挂起）
+  await waitFor(async () => {
+    const r = await pg.query(`SELECT count(*)::int AS c FROM workflow_step_runs WHERE status = 'running'`);
+    return r.rows[0].c >= 1;
+  });
+
+  // 运行中追加新 revision（rev-2 成为当前 ACTIVE）
+  await seedRevision({ defId: 'wf-cc', revId: 'rev-cc-2', dag: CHAIN, revNo: 2 });
+
+  // 新 run B 用当前 ACTIVE revision（resolvePinnedRevision 未给 revision → rev-2 物化）
+  const resolved = await resolvePinnedRevision({ pg, workflowCode: 'CODE_WF-CC' });
+  assert.equal(resolved.workflowRevisionId, 'rev-cc-2', '运行中追加后当前 ACTIVE 应为 rev-cc-2');
+
+  const submitB = makeSubmitJob();
+  const exB = createWorkflowExecutor({ pg, submitJob: submitB });
+  const rB = await exB.run({ workflowRevisionId: resolved.workflowRevisionId, projectId: 'proj-cc-b', inputs: { tag: 'B' } });
+  assert.equal(rB.status, 'succeeded');
+
+  // 释放 run A → 完成
+  submitA.release();
+  const rA = await pA;
+  assert.equal(rA.status, 'succeeded');
+
+  // 快照互不影响
+  const a = await pg.query(`SELECT workflow_revision_id, dag_snapshot FROM workflow_runs WHERE id = $1`, [rA.runId]);
+  const b = await pg.query(`SELECT workflow_revision_id, dag_snapshot FROM workflow_runs WHERE id = $1`, [rB.runId]);
+  assert.equal(a.rows[0].workflow_revision_id, 'rev-cc-1', '旧 run 仍 pin rev-cc-1');
+  assert.deepEqual(a.rows[0].dag_snapshot, DIAMOND, '旧 run 快照仍为 DIAMOND（rev-1）');
+  assert.equal(b.rows[0].workflow_revision_id, 'rev-cc-2', '新 run pin rev-cc-2');
+  assert.deepEqual(b.rows[0].dag_snapshot, CHAIN, '新 run 快照为 CHAIN（rev-2）');
+
+  const stepsA = await pg.query(`SELECT step_key FROM workflow_step_runs WHERE workflow_run_id = $1 ORDER BY step_key`, [rA.runId]);
+  const stepsB = await pg.query(`SELECT step_key FROM workflow_step_runs WHERE workflow_run_id = $1 ORDER BY step_key`, [rB.runId]);
+  assert.deepEqual(stepsA.rows.map((x) => x.step_key), ['s1', 's2', 's3', 's4'], '旧 run 按 DIAMOND 4 步');
+  assert.deepEqual(stepsB.rows.map((x) => x.step_key), ['s1', 's2', 's3'], '新 run 按 CHAIN 3 步');
+});
+
+// ── L52：运行后改 def（追加 revision/改名）不波及既有 run ─────────────────
+test('L52 运行后改 def（追加 revision/改名）不波及既有 run 的 pin 与快照', async () => {
+  await seedRevision({ defId: 'wf-def', revId: 'rev-def-1', dag: DIAMOND, revNo: 1 });
+  const ex = createWorkflowExecutor({ pg, submitJob: makeSubmitJob() });
+  const res = await ex.run({ workflowRevisionId: 'rev-def-1', projectId: 'proj-def', inputs: {} });
+  assert.equal(res.status, 'succeeded');
+
+  // 运行后：追加新 revision（成为新 ACTIVE）+ 改写定义名称
+  await seedRevision({ defId: 'wf-def', revId: 'rev-def-2', dag: CHAIN, revNo: 2 });
+  await pg.query(`UPDATE workflow_definitions SET name = 'WF renamed' WHERE id = 'wf-def'`);
+
+  const run = await pg.query(`SELECT workflow_revision_id, dag_snapshot FROM workflow_runs WHERE id = $1`, [res.runId]);
+  assert.equal(run.rows[0].workflow_revision_id, 'rev-def-1', '既有 run 仍 pin rev-def-1');
+  assert.deepEqual(run.rows[0].dag_snapshot, DIAMOND, '既有 run 快照仍为 DIAMOND（不随 ACTIVE 前移漂移）');
+
+  // 新解析取到新 ACTIVE revision
+  const cur = await resolvePinnedRevision({ pg, workflowCode: 'CODE_WF-DEF' });
+  assert.equal(cur.workflowRevisionId, 'rev-def-2', '新增后当前 ACTIVE 应为 rev-def-2');
 });

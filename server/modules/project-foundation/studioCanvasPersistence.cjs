@@ -6,6 +6,11 @@ const crypto = require('crypto');
 const { createCommandLogStore } = require('../collaboration/commandLogStore.cjs');
 const { decomposeCanvasPatch, REASONS, KIND_BUCKET_BY_COMMAND } = require('./canvasCommandDecomposer.cjs');
 const { validateCanvasGraph, projectCanvasGraph } = require('./canvasGraphValidator.cjs');
+// L44/L46 — 视频节点参数迁移(semantic/parked)与 Parked State 持久化(0069 表)。
+// 复用 L5 semanticMap 纯函数(readOperationSemantics/projectParams)做三态迁移; L43
+// projectDirector.direct() 的四态裁决(含 dropped)在「模型切换」层使用, 本叶只落
+// parked 持久化(exact/adjusted → node.data.semantic_state, parked → semantic_parked_state)。
+const { readOperationSemantics, projectParams } = require('../modelhub/semanticMap.cjs');
 
 const PREFIX_RE = /^\/api\/v2\/projects\/([^/]+)\/studio\/canvas(?:\/([^/]+)(?:\/([^/]+))?)?$/;
 const CANVAS_SCHEMA_VERSION = 1;
@@ -18,6 +23,17 @@ const LIMITS = Object.freeze({
   maxSnapshotBytes: Number(process.env.STUDIO_CANVAS_MAX_SNAPSHOT_BYTES || 8 * 1024 * 1024),
 });
 const FORBIDDEN_DATA_KEYS = new Set(['temporaryPreviewUrl', 'tempPreviewUrl', 'signedUrl', 'signedURL', 'apiKey', 'api_key', 'credential', 'credentials', 'jwt', 'token', 'cookie', 'localPath']);
+// §119 Canvas Video Node 字段白名单。[snake_case(§119 词表), camelCase(canonical data_json)]。
+const VIDEO_NODE_FIELD_ALIASES = Object.freeze([
+  ['operation', 'operation'],
+  ['logical_model', 'logicalModel'],
+  ['model_revision', 'modelRevision'],
+  ['semantic_state', 'semanticState'],
+  ['input_state', 'inputState'],
+  ['parked_state', 'parkedState'],
+  ['job_id', 'jobId'],
+  ['output_asset_ids', 'outputAssetIds'],
+]);
 
 // G22 Phase-2 — dual-mode 开关: STUDIO_CANVAS_KIND_SCOPED=1 时, 仅 node.update(data-only)
 // 走 kind-scoped LWW 直写(不改画布 revision); 其余 kind 与开关未设/非 '1' 时保持整画布 CAS。
@@ -57,6 +73,18 @@ function durableNodeData(raw) {
   // W2-06: authoritative structure/Shot binding survives durability.
   if (typeof d.shotId === 'string' || d.shotId === null) out.shotId = d.shotId;
   if (typeof d.structureNodeId === 'string' || d.structureNodeId === null) out.structureNodeId = d.structureNodeId;
+  // §119 Canvas Video Node 字段白名单(仅这些视频节点专属字段可落 data_json, 禁 Provider
+  // Secret/request payload/endpoint)。canonical = camelCase(与 data_json 既有 assetId/shotId
+  // 约定一致); 输入兼容 snake_case(§119 词表) 与 camelCase 双写。job_id 裁决: 存 data_json
+  // 不新增 studio_canvas_nodes 列(见 persistVideoNodeSemantics 上方注释)。semantic_state/
+  // parked_state 由服务端 persistSemanticsForNodes 每次重算覆写, 此处仅保真 round-trip。
+  for (const [snake, camel] of VIDEO_NODE_FIELD_ALIASES) {
+    const v = d[snake] !== undefined ? d[snake] : d[camel];
+    if (v === undefined) continue;
+    if (Array.isArray(v)) out[camel] = v;
+    else if (v !== null && typeof v === 'object') out[camel] = safeJson(v, v);
+    else out[camel] = v;
+  }
   return stripForbiddenData(out);
 }
 function normalizeNode(raw) {
@@ -182,6 +210,186 @@ async function insertMutation(client, { canvasId, cmid, baseRevision, resultingR
   return prior.rows[0] ? prior.rows[0].response_json : null;
 }
 
+// ── L44/L46 — 视频节点语义迁移 + Parked State 持久化(0069) ─────────────────────
+// §15 Projection Report 三态(复用 L5 projectParams) + §16「不静默丢参数」:
+//   - exact/adjusted  → 写回 node.data.semanticState(参数可路由, 值可转换)。
+//   - parked          → 写 semantic_parked_state(原值入 params JSONB) + node.data.parkedState 摘要。
+//   - 重试 exact 后清理: syncParkedState 每次「以当前 parked 集合为准」做全量 reconcile——
+//     不在本次 parked 集合里的旧 parked 行(已变 exact/adjusted 或参数已删)被 DELETE。
+// job_id 裁决: 存 data_json.jobId(§119 白名单字段, camelCase 与既有 data_json 约定一致),
+//   不新增 studio_canvas_nodes 列——job_id 是单节点可变状态, 无跨表查询需求, 加列属过度设计。
+
+/**
+ * 纯函数: 以操作 semantic_map 为目标语义, 对节点参数跑 L5 projectParams 三态迁移。
+ * from = 内置先例语义(§10 视频规范表面, 识别 duration/seed/camera 等); to = 操作
+ * semantic_map 覆盖在同样先例之上(per-operation surface 覆盖)。返回三态 + semanticState。
+ * @returns {{report:{exact:string[],adjusted:Array,parked:Array}, semanticState:object}}
+ */
+function computeVideoNodeSemantics({ params, operationSemanticMap }) {
+  const from = readOperationSemantics(); // 源表面 = 内置先例(节点参数 surface key)
+  const to = readOperationSemantics([{ semantic_map: operationSemanticMap || {} }]); // 目标 = 操作语义
+  const { report } = projectParams({ fromSemantics: from, toSemantics: to, params: params || {} });
+  const semanticState = {};
+  for (const key of report.exact) {
+    const desc = from.bySurface[key];
+    semanticState[key] = { status: 'exact', semantic: desc && desc.semantic ? desc.semantic : key, value: (params || {})[key] };
+  }
+  for (const a of report.adjusted) {
+    const desc = from.bySurface[a.key];
+    semanticState[a.key] = { status: 'adjusted', semantic: desc && desc.semantic ? desc.semantic : a.key, value: a.to, from: a.from, reason: a.reason };
+  }
+  const parked = (report.parked || []).map((p) => {
+    const desc = from.bySurface[p.key];
+    const fromSem = desc && desc.semantic ? desc.semantic : null;
+    const valueLevel = /^(duration-|enum-)/.test(String(p.reason || ''));
+    const toSem = valueLevel && fromSem ? (to.bySemantic[fromSem] ? to.bySemantic[fromSem].semantic : fromSem) : null;
+    return { key: p.key, value: (params || {})[p.key], fromSemantics: fromSem, toSemantics: toSem, reason: p.reason };
+  });
+  return { report: { exact: report.exact, adjusted: report.adjusted, parked }, semanticState };
+}
+
+/** 解析操作 semantic_map: model_operations.code → 最新 ACTIVE model_operation_revisions.semantic_map。 */
+async function resolveOperationSemanticMap(client, operationCode) {
+  const opRes = await client.query('SELECT id FROM model_operations WHERE code=$1 LIMIT 1', [operationCode]);
+  const op = opRes.rows && opRes.rows[0];
+  if (!op) return null;
+  const revRes = await client.query(
+    "SELECT semantic_map FROM model_operation_revisions WHERE operation_id=$1 AND status='ACTIVE' ORDER BY revision DESC, created_at DESC, id DESC LIMIT 1",
+    [op.id],
+  );
+  if (!revRes.rows || !revRes.rows.length) return null;
+  return revRes.rows[0].semantic_map;
+}
+
+/**
+ * 以「当前 parked 集合」为准 reconcile 语义 parked 行(保存/覆写 + 重试 exact 后清理):
+ *   1) DELETE 该 (canvas_id,node_id) 下 param_key 不在本次集合里的旧行(已变 exact/adjusted 或删参)。
+ *   2) 逐条 ON CONFLICT (canvas_id,node_id,param_key) DO UPDATE 覆写(保留首次 created_at)。
+ */
+async function syncParkedState(client, { canvasId, nodeId, parked }) {
+  const keys = (parked || []).map((p) => p.key);
+  await client.query(
+    'DELETE FROM semantic_parked_state WHERE canvas_id=$1 AND node_id=$2 AND NOT (param_key = ANY($3::text[]))',
+    [canvasId, nodeId, keys],
+  );
+  for (const p of parked || []) {
+    await client.query(
+      `INSERT INTO semantic_parked_state (canvas_id,node_id,param_key,from_semantics,to_semantics,reason,params,created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())
+       ON CONFLICT (canvas_id,node_id,param_key)
+       DO UPDATE SET from_semantics=EXCLUDED.from_semantics, to_semantics=EXCLUDED.to_semantics,
+                     reason=EXCLUDED.reason, params=EXCLUDED.params, created_at=semantic_parked_state.created_at`,
+      [canvasId, nodeId, p.key, p.fromSemantics, p.toSemantics, p.reason, JSON.stringify({ value: p.value })],
+    );
+  }
+}
+
+/** 恢复: 读回单节点全部 parked 行(含原值 params.value)。 */
+async function loadParkedState(client, canvasId, nodeId) {
+  const r = await client.query(
+    'SELECT param_key, from_semantics, to_semantics, reason, params, created_at FROM semantic_parked_state WHERE canvas_id=$1 AND node_id=$2 ORDER BY param_key ASC',
+    [canvasId, nodeId],
+  );
+  return (r.rows || []).map((row) => ({
+    paramKey: row.param_key,
+    fromSemantics: row.from_semantics,
+    toSemantics: row.to_semantics,
+    reason: row.reason,
+    params: row.params || {},
+    value: row.params && typeof row.params === 'object' ? row.params.value : undefined,
+    createdAt: row.created_at,
+  }));
+}
+
+/** 恢复(整画布): 一次查询读回所有 parked 行, 归并为 { nodeId: [entries] }。 */
+async function loadParkedStateForCanvas(client, canvasId) {
+  const r = await client.query(
+    'SELECT node_id, param_key, from_semantics, to_semantics, reason, params, created_at FROM semantic_parked_state WHERE canvas_id=$1 ORDER BY node_id ASC, param_key ASC',
+    [canvasId],
+  );
+  const byNode = new Map();
+  for (const row of r.rows || []) {
+    if (!byNode.has(row.node_id)) byNode.set(row.node_id, []);
+    byNode.get(row.node_id).push({
+      paramKey: row.param_key,
+      fromSemantics: row.from_semantics,
+      toSemantics: row.to_semantics,
+      reason: row.reason,
+      params: row.params || {},
+      value: row.params && typeof row.params === 'object' ? row.params.value : undefined,
+      createdAt: row.created_at,
+    });
+  }
+  return Object.fromEntries(byNode);
+}
+
+/**
+ * 单个视频节点的语义持久化: 解析 operation_code → 三态迁移 → sync parked 行。
+ * 返回 { report, semanticState, parkedState } 供调用方写回 node.data; 非操作节点(无
+ * operation_code)返回 null。operation 无法解析时把全部参数 parked(operation-unresolved),
+ * 保证「迁移不了不丢」。
+ */
+async function persistVideoNodeSemantics(client, { canvasId, nodeId, data }) {
+  const operationCode = String((data && data.operation) || '').trim();
+  if (!operationCode) return null;
+  const params = safeJson(data && data.parameters, {});
+  const entries = Object.entries(params || {});
+  const opSemanticMap = await resolveOperationSemanticMap(client, operationCode);
+
+  let semanticState = {};
+  let report;
+  let parked;
+  if (opSemanticMap == null) {
+    parked = entries.map(([key, value]) => ({ key, value, fromSemantics: null, toSemantics: null, reason: 'operation-unresolved' }));
+    report = { exact: [], adjusted: [], parked };
+  } else {
+    const c = computeVideoNodeSemantics({ params, operationSemanticMap: opSemanticMap });
+    semanticState = c.semanticState;
+    parked = c.report.parked;
+    report = c.report;
+  }
+  await syncParkedState(client, { canvasId, nodeId, parked });
+  const parkedState = {};
+  for (const p of parked) parkedState[p.key] = { reason: p.reason, fromSemantics: p.fromSemantics, toSemantics: p.toSemantics };
+  return { report, semanticState, parkedState };
+}
+
+/** 遍历节点, 对带 operation_code 的视频节点跑语义持久化并写回 data.semanticState/parkedState。 */
+async function persistSemanticsForNodes(client, canvasId, nodes) {
+  for (const n of nodes || []) {
+    if (!n || !n.nodeId) continue;
+    const data = n.data || {};
+    const result = await persistVideoNodeSemantics(client, { canvasId, nodeId: n.nodeId, data });
+    if (result) {
+      n.data.semanticState = result.semanticState;
+      n.data.parkedState = result.parkedState;
+    }
+  }
+}
+
+/**
+ * 恢复(读路径): 把语义 parked 原值合并回 graph 各视频节点 data.parkedState[paramKey].value。
+ * warn-only——0069 未落库/旧 schema 无此表时优雅降级(不破 GET 主链), 与命令日志同哲学。
+ */
+async function restoreParkedIntoGraph(client, canvasId, graph) {
+  try {
+    const byNode = await loadParkedStateForCanvas(client, canvasId);
+    for (const n of (graph && graph.nodes) || []) {
+      const entries = byNode[n.nodeId];
+      if (!entries || !entries.length) continue;
+      n.data = n.data || {};
+      const ps = n.data.parkedState || {};
+      for (const e of entries) {
+        ps[e.paramKey] = { ...(ps[e.paramKey] || {}), reason: e.reason, fromSemantics: e.fromSemantics, toSemantics: e.toSemantics, value: e.value };
+      }
+      n.data.parkedState = ps;
+    }
+  } catch (e) {
+    console.warn('[studio-canvas] restoreParkedIntoGraph skipped:', e && e.message);
+  }
+  return graph;
+}
+
 function createStudioCanvasPersistence(deps) {
   const { pg, sessionUser, sendJSON, parseBody, logEvent } = deps;
   function requireUser(req, res) { const user = sessionUser(req); if (!user) { sendJSON(res, 401, { ok: false, error: '未登录' }); return null; } return user; }
@@ -254,6 +462,8 @@ function createStudioCanvasPersistence(deps) {
       normNodes.push({ nodeId: op.nodeId, data: durableNodeData(raw.data || raw) });
     }
     await assertBindingsValid(client, access.project.id, canvas.id, normNodes);
+    // L44/L46 — data-only node.update 同样走语义持久化(视频节点参数变更时 parked 态同步)。
+    await persistSemanticsForNodes(client, canvas.id, normNodes);
     let affected = 0;
     const applied = [];
     for (const op of lwwUpdateOps) {
@@ -322,6 +532,7 @@ function createStudioCanvasPersistence(deps) {
     const canvas = await getCanvas(pg, projectId);
     if (!canvas) return sendJSON(res, 200, { canvas: null, nodes: [], edges: [], viewport: null, permissions: access.permissions });
     const graph = await loadGraph(pg, canvas.id);
+    await restoreParkedIntoGraph(pg, canvas.id, graph);
     return sendJSON(res, 200, response(canvas, graph, canvas.viewport_json, { permissions: access.permissions }));
   }
   async function handleCreate(req, res, user, projectId) {
@@ -392,6 +603,10 @@ function createStudioCanvasPersistence(deps) {
       //   计划空间 id 在统一前会被 409 拒 —— canvas data.shotId 语义锁定 = 执行 shot。
       //   空串/纯空白视为"未绑定"(FE storyboard 默认 shotId:'' 占位), 不参与校验。
       const normNodes = upsertNodes.map(normalizeNode);
+      // L44/L46 — 视频节点语义持久化: 对带 operation_code 的节点跑三态迁移, 把迁移不了的
+      // 参数 parked 到 semantic_parked_state(0069, 不丢), 并写回 data.semanticState/parkedState。
+      // 与 0052 locked / 0054 dirty 行级机制无交集(独立表), 读锁/脏标记语义不回退。
+      await persistSemanticsForNodes(client, canvas.id, normNodes);
       await assertBindingsValid(client, access.project.id, canvas.id, normNodes);
       if (deleteEdgeIds.length) await client.query('DELETE FROM studio_canvas_edges WHERE canvas_id=$1 AND edge_id = ANY($2::text[])', [canvas.id, deleteEdgeIds]);
       if (deleteNodeIds.length) await client.query('DELETE FROM studio_canvas_nodes WHERE canvas_id=$1 AND node_id = ANY($2::text[])', [canvas.id, deleteNodeIds]);
@@ -492,4 +707,4 @@ function rebuildProjection({ current, logEntries }) {
   };
 }
 
-module.exports = { createStudioCanvasPersistence, normalizeNode, normalizeEdge, durableNodeData, bulkInsertNodes, bulkInsertEdges, validateAuthoritativeBindings, rebuildProjection, LIMITS };
+module.exports = { createStudioCanvasPersistence, normalizeNode, normalizeEdge, durableNodeData, bulkInsertNodes, bulkInsertEdges, validateAuthoritativeBindings, rebuildProjection, computeVideoNodeSemantics, resolveOperationSemanticMap, syncParkedState, loadParkedState, loadParkedStateForCanvas, persistVideoNodeSemantics, persistSemanticsForNodes, restoreParkedIntoGraph, VIDEO_NODE_FIELD_ALIASES, LIMITS };

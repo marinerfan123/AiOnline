@@ -1152,7 +1152,7 @@ function createStudioRunEngine(deps) {
 
 // ── SECTION:workflow-executor (L51/L52, §94-100) ──────────────────────────
 //
-// createWorkflowExecutor({ pg, submitJob }) → run({ workflowRevisionId, projectId, inputs?, idempotencyKey? })
+// createWorkflowExecutor({ pg, submitJob }) → run({ workflowRevisionId | (workflowCode+revision), projectId, inputs?, idempotencyKey? })
 //
 // 墨渊 V2.0 §94-100 — Workflow 执行引擎：DAG 拓扑序 + revision pin + 快照物化 +
 // 经 Generation V2 Job 概念接口执行（§98 不直连 Provider）。
@@ -1257,6 +1257,85 @@ function workflowStepError(err) {
   const code = (err && (err.code || (err.error && err.error.code))) || 'STEP_FAILED';
   const message = (err && (err.message || (err.error && err.error.message))) || 'step failed';
   return sanitizeError({ code, message });
+}
+
+/**
+ * L52 — 将 workflow 引用解析为「显式 pin 的具体 revision」（§95 / Gate 20）。
+ *
+ * 唯一解析点：run 必须引用具体 workflow_revisions 行，绝不默认 latest/head。
+ *   - `revision` 已给   → 解析 (workflowCode, revision) 到精确的 workflow_revisions 行。
+ *   - `revision` 未给   → 解析 ACTIVE workflow 的当前 ACTIVE revision（该定义下
+ *     `revision` 号最大的修订），并把其具体 id 物化返回。返回值永远是具体
+ *     `workflowRevisionId` —— 任何 latest 引用都不会流出本函数（禁存 latest）。
+ *
+ * §100/§95：runtime_contract_revision 若为 'latest' 在此双保险拒绝（DB CHECK 已兜底）。
+ *
+ * @param {{pg:Pool, workflowCode:string, revision?:number}} opts
+ * @returns {Promise<{workflowRevisionId:string, revision:number, workflowId:string,
+ *   workflowCode:string, dag:*, failurePolicy:*, runtimeContractRevision:string}>}
+ * @throws {code:'WORKFLOW_REVISION_REQUIRED'}  workflowCode 缺失 / revision 为 latest|head|非正整数
+ * @throws {code:'WORKFLOW_REVISION_NOT_FOUND'} (code[,revision]) 解析不到行
+ * @throws {code:'RUNTIME_CONTRACT_LATEST_FORBIDDEN'} 命中的 revision 契约 pin 为 'latest'
+ */
+async function resolvePinnedRevision({ pg, workflowCode, revision }) {
+  if (!pg || typeof pg.query !== 'function') {
+    throw Object.assign(new Error('EXECUTOR_NO_PG'), { code: 'EXECUTOR_NO_PG' });
+  }
+  if (typeof workflowCode !== 'string' || !workflowCode.trim()) {
+    throw Object.assign(new Error('WORKFLOW_REVISION_REQUIRED'), { code: 'WORKFLOW_REVISION_REQUIRED', reason: 'workflowCode required' });
+  }
+  const code = workflowCode.trim();
+
+  let row;
+  if (revision !== undefined && revision !== null) {
+    // 显式 revision 必须是具体正整数——latest/head/非整数一律拒（§95 禁默认 latest）。
+    if (!Number.isInteger(revision) || revision < 1) {
+      throw Object.assign(new Error('WORKFLOW_REVISION_REQUIRED'),
+        { code: 'WORKFLOW_REVISION_REQUIRED', workflowCode: code, revision, reason: 'revision must be a concrete integer >= 1 (latest/head forbidden)' });
+    }
+    const r = await pg.query(
+      `SELECT wr.id, wr.workflow_id, wr.revision, wr.dag, wr.failure_policy, wr.runtime_contract_revision,
+              wd.code AS workflow_code
+         FROM workflow_revisions wr
+         JOIN workflow_definitions wd ON wd.id = wr.workflow_id
+        WHERE wd.code = $1 AND wr.revision = $2`,
+      [code, revision]
+    );
+    row = r.rows[0];
+    if (!row) {
+      throw Object.assign(new Error('WORKFLOW_REVISION_NOT_FOUND'), { code: 'WORKFLOW_REVISION_NOT_FOUND', workflowCode: code, revision });
+    }
+  } else {
+    // 未给 revision → ACTIVE workflow 当前 ACTIVE revision（revision 号最大），显式物化。
+    const r = await pg.query(
+      `SELECT wr.id, wr.workflow_id, wr.revision, wr.dag, wr.failure_policy, wr.runtime_contract_revision,
+              wd.code AS workflow_code
+         FROM workflow_definitions wd
+         JOIN workflow_revisions wr ON wr.workflow_id = wd.id
+        WHERE wd.code = $1 AND wd.status = 'active'
+        ORDER BY wr.revision DESC
+        LIMIT 1`,
+      [code]
+    );
+    row = r.rows[0];
+    if (!row) {
+      throw Object.assign(new Error('WORKFLOW_REVISION_NOT_FOUND'), { code: 'WORKFLOW_REVISION_NOT_FOUND', workflowCode: code, reason: 'no ACTIVE workflow revision' });
+    }
+  }
+
+  if (row.runtime_contract_revision === 'latest') {
+    throw Object.assign(new Error('RUNTIME_CONTRACT_LATEST_FORBIDDEN'), { code: 'RUNTIME_CONTRACT_LATEST_FORBIDDEN', workflowRevisionId: row.id });
+  }
+
+  return {
+    workflowRevisionId: row.id,
+    revision: Number(row.revision),
+    workflowId: row.workflow_id,
+    workflowCode: row.workflow_code,
+    dag: row.dag,
+    failurePolicy: row.failure_policy || null,
+    runtimeContractRevision: row.runtime_contract_revision,
+  };
 }
 
 /**
@@ -1385,15 +1464,46 @@ function createWorkflowExecutor(deps) {
 
   /**
    * 创建并执行一次 Workflow run 到终态。
-   * @param {{workflowRevisionId:string, projectId:string, inputs?:*, idempotencyKey?:string}} params
+   *
+   * L52 Gate 20 强制 pin（§95）：仅接受
+   *   - `workflowRevisionId`（具体 revision id，禁 latest/head），或
+   *   - `workflowCode` + `revision`（具体修订号，禁 latest/head）。
+   * 任何 latest / head / 未指定 pin → 400 WORKFLOW_REVISION_REQUIRED（绝不默认 latest）。
+   * `workflowCode`+`revision` 经 resolvePinnedRevision 物化为具体 id 后再建 run。
+   *
+   * @param {{workflowRevisionId?:string, workflowCode?:string, revision?:number,
+   *   projectId:string, inputs?:*, idempotencyKey?:string}} params
    * @returns {{ok:true, runId, status, idempotent:boolean, stepCount:number, stepResults:Array}}
    */
   async function run(params) {
-    const { workflowRevisionId, projectId, inputs } = params || {};
-    if (!workflowRevisionId) throw Object.assign(new Error('INVALID_WORKFLOW_REVISION'), { code: 'INVALID_WORKFLOW_REVISION' });
+    const { workflowRevisionId: revIdIn, workflowCode, revision, projectId, inputs } = params || {};
     if (!projectId) throw Object.assign(new Error('INVALID_PROJECT_ID'), { code: 'INVALID_PROJECT_ID' });
     if (!pg) throw Object.assign(new Error('EXECUTOR_NO_PG'), { code: 'EXECUTOR_NO_PG' });
     if (!submitJob) throw Object.assign(new Error('EXECUTOR_NO_SUBMIT_JOB'), { code: 'EXECUTOR_NO_SUBMIT_JOB' });
+
+    // L52: 强制 pin（§95/Gate 20）。只认「具体 workflowRevisionId」或「workflowCode+revision」；
+    // latest/head/未指定一律 400 WORKFLOW_REVISION_REQUIRED。
+    let workflowRevisionId;
+    if (revIdIn != null && String(revIdIn).trim() !== '') {
+      const raw = String(revIdIn).trim();
+      if (/^(latest|head)$/i.test(raw)) {
+        throw Object.assign(new Error('WORKFLOW_REVISION_REQUIRED'),
+          { code: 'WORKFLOW_REVISION_REQUIRED', workflowRevisionId: raw, reason: 'latest/head forbidden — pin a concrete revision' });
+      }
+      workflowRevisionId = raw;
+    } else if (workflowCode != null && String(workflowCode).trim() !== '') {
+      const code = String(workflowCode).trim();
+      if (!Number.isInteger(revision) || revision < 1) {
+        throw Object.assign(new Error('WORKFLOW_REVISION_REQUIRED'),
+          { code: 'WORKFLOW_REVISION_REQUIRED', workflowCode: code, revision, reason: 'revision must be a concrete integer >= 1 (latest/head forbidden)' });
+      }
+      const resolved = await resolvePinnedRevision({ pg, workflowCode: code, revision });
+      workflowRevisionId = resolved.workflowRevisionId;
+    } else {
+      throw Object.assign(new Error('WORKFLOW_REVISION_REQUIRED'),
+        { code: 'WORKFLOW_REVISION_REQUIRED', reason: 'workflowRevisionId or workflowCode+revision required' });
+    }
+
     const explicitKey = params && params.idempotencyKey != null ? String(params.idempotencyKey).trim() : '';
     const idempotencyKey = explicitKey || `wf:${workflowRevisionId}:${projectId}:${stableStringify(inputs === undefined ? null : inputs)}`;
 
@@ -1479,4 +1589,4 @@ function createWorkflowExecutor(deps) {
   return { run, validateWorkflowDag, resolveWorkflowFailureMode };
 }
 
-module.exports = { createStudioRunEngine, createWorkflowExecutor, validateWorkflowDag, resolveWorkflowFailureMode, stableStringify, sanitizeError, retryDelayMs, leaseToken, RUN_STATUSES, TERMINAL_RUN, ACTIVE_NODE, TERMINAL_NODE, WORKFLOW_RUN_STATUSES, WORKFLOW_STEP_STATUSES, LIMITS };
+module.exports = { createStudioRunEngine, createWorkflowExecutor, validateWorkflowDag, resolveWorkflowFailureMode, resolvePinnedRevision, stableStringify, sanitizeError, retryDelayMs, leaseToken, RUN_STATUSES, TERMINAL_RUN, ACTIVE_NODE, TERMINAL_NODE, WORKFLOW_RUN_STATUSES, WORKFLOW_STEP_STATUSES, LIMITS };

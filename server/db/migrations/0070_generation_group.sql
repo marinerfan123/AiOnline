@@ -86,3 +86,64 @@ COMMENT ON COLUMN generation_groups.finished_at IS
   'set when the group reaches a terminal status (succeeded/failed/canceled).';
 COMMENT ON COLUMN generation_group_items.position IS
   'in-group ordering for sequential advancement (0-based). Tie-breakers: created_at, item_id.';
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- L47 段（Generation Lineage 链接，§83）—— 追加于 L45 段之后，勿改写上方 L45 内容。
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- 背景（§83）：Job.parent_job_id + Asset.source_asset_ids，形成
+--   A → image_to_video → B → extend → C → lip_sync → D 的生成链路。
+--   每个「生成 Job」是产出资产的 lineage 锚点：child_job_id 唯一标识一个 Job 的
+--   lineage 行（PK），parent_job_id 指向上游 Job（无显式 parent → NULL），
+--   source_asset_ids 记录本 Job 消费的源资产（media/asset id），relation 表达边语义。
+--
+-- 裁决（实查后）：
+--   - assetLineage.cjs 是纯函数模块（buildLineageGraph/resolveLineage 操作
+--     asset_versions 的 derived_from 边，无自有表）；shotLineage.cjs 是只读 trace
+--     查询服务（无表）。故 Job 级 lineage 无既有表可加列 → 新建 additive 表
+--     generation_lineage（本段），而非给 assetLineage 加列。
+--   - asset_versions.origin_asset_id（0032）是「asset-version 级」溯源，与「Job 级」
+--     parent 链语义不同（一个 Job 可产出多个 version；一个 version 可由 retry 重写），
+--     二者并存不冲突：asset-version 级追版本派生，Job 级追生成链路，§83 落在后者。
+--   - project_id 不落列（与 0070 generation_groups 同款裁决：Job 生命周期先于/独立于
+--     project 行，additive 叶不挂 FK）。
+--   - 幂等锚点 = child_job_id（PK）：同 Job 重放/重复 finalize 写同一条边，
+--     ON CONFLICT (child_job_id) DO NOTHING 幂等（首写胜出、不重复写）。
+--
+-- relation 三态 CHECK：
+--   child_of_job       子 Job 由父 Job 触发（连续镜头/工作流步骤，parent 由调用方注入）；
+--   derived_from_asset 本 Job 由源资产派生（img→video / extend / lip_sync，source_asset_ids 承载）；
+--   retry_of           本 Job 是对父 Job 的重试（retry 链）。
+-- 额外自引用守卫：parent_job_id 不得等于 child_job_id（self-parent 永非法，防最显然环）。
+--
+-- 幂等/回滚：纯 additive（CREATE TABLE IF NOT EXISTS + INDEX IF NOT EXISTS），
+--   不改、不删既有表/列/数据；可安全重放。回滚仅需移除本表。
+
+CREATE TABLE IF NOT EXISTS generation_lineage (
+  child_job_id     TEXT PRIMARY KEY,
+  parent_job_id    TEXT,
+  source_asset_ids TEXT[] NOT NULL DEFAULT '{}',
+  relation         TEXT NOT NULL DEFAULT 'child_of_job',
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CONSTRAINT generation_lineage_relation_check
+    CHECK (relation IN ('child_of_job','derived_from_asset','retry_of')),
+  CONSTRAINT generation_lineage_no_self_parent_check
+    CHECK (parent_job_id IS NULL OR parent_job_id <> child_job_id)
+);
+
+-- 下游扫描/反查上游：由 child 反查 parent（getAncestors 级联查询起点）。
+CREATE INDEX IF NOT EXISTS ix_generation_lineage_parent
+  ON generation_lineage (parent_job_id)
+  WHERE parent_job_id IS NOT NULL;
+
+COMMENT ON TABLE generation_lineage IS
+  '墨渊 V2.0 §83: Job-level Generation Lineage edges. child_job_id (PK) is the idempotency anchor for one Job''s lineage; parent_job_id points upstream (NULL when no explicit parent); source_asset_ids carries the Job''s consumed source assets; relation is child_of_job/derived_from_asset/retry_of. Chain A->image_to_video->B->extend->C->lip_sync->D is walkable via parent_job_id.';
+COMMENT ON COLUMN generation_lineage.child_job_id IS
+  '§83: the Job whose lineage this row describes (generation-v2 batch_id/item_id semantics). PK = one row per Job; ON CONFLICT (child_job_id) DO NOTHING makes repeat writes idempotent.';
+COMMENT ON COLUMN generation_lineage.parent_job_id IS
+  '§83: upstream Job id. NULL = provider gave no explicit parent (or caller injected none); continuous-shot / workflow-step parents are injected by the caller. Self-parent forbidden by CHECK.';
+COMMENT ON COLUMN generation_lineage.source_asset_ids IS
+  '§83: TEXT[] of consumed source asset ids (media/asset id). Populated for derived_from_asset edges (img->video/extend/lip_sync); empty for child_of_job/retry_of.';
+COMMENT ON COLUMN generation_lineage.relation IS
+  '§83: edge semantics, CHECK (child_of_job | derived_from_asset | retry_of). Default child_of_job.';
+COMMENT ON COLUMN generation_lineage.created_at IS
+  'when the lineage edge was first written (first-write-wins; repeat writes are no-ops).';
