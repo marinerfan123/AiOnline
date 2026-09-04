@@ -81,6 +81,19 @@ function bulkInsertRunEdges(client, rows) {
   );
 }
 
+/**
+ * Extract the priced cost (credits) a caller attached to a completed node's
+ * result. The engine does NOT price: the executor / M05-E generation bridge
+ * must put the actual billed amount on the result — in CREDITS, the same unit
+ * as project_budgets.budget/spent and L5 creditPrice (accounting.getModelPrice).
+ * Returns a finite number > 0, else null (unpriced → no spend is recorded).
+ */
+function pricedNodeCost(result) {
+  if (!result || typeof result !== 'object') return null;
+  const c = Number(result.cost);
+  return Number.isFinite(c) && c > 0 ? c : null;
+}
+
 function createStudioRunEngine(deps) {
   const { pg, workerId } = deps;
   // G21: optional run_events relay (createRunEventRelay from runEventRelay.cjs).
@@ -96,6 +109,53 @@ function createStudioRunEngine(deps) {
   const nowFn = deps.now || (() => Date.now());
   const emitLog = deps.onLog || null;
   const log = (tag, payload) => { try { if (emitLog) emitLog(tag, payload); } catch (_) {} };
+
+  // V2.0 must#2 — optional budget-spend persistence backstop (see recordNodeSpend).
+  // Null by default → the engine records NOTHING (zero behaviour change). The
+  // production caller (server.js / studio-worker.cjs) must inject the real
+  // budgetSpentStore to enable it:
+  //   budgetSpentStore: require('./budgetSpentStore.cjs')
+  // (alongside the existing pg / workerId / relay deps).
+  const budgetSpentStore = deps.budgetSpentStore || null;
+
+  /**
+   * V2.0 must#2 — post-completion budget spend persistence (the "true ledger").
+   *
+   * Gate vs. spend (two different layers, never interchangeable):
+   *   - GATE (studioRunApi.runBudgetGate)  = pre-flight ESTIMATE check at create
+   *     time (estimate → remaining). Conservative, and fail-OPEN on budget-read
+   *     errors — an added guardrail, NOT settlement. It cannot close the
+   *     estimate→create race nor the multi-node concurrent-completion window.
+   *   - SPEND (this function)              = post-completion PERSISTENT truth.
+   *     budgetSpentStore.recordSpend is the guarded UPDATE (idempotent by key)
+   *     — the real concurrency backstop. It fires ONLY after a node is durably
+   *     SUCCEEDED and its result carries a priced cost, so the ledger never
+   *     charges a failed/rolled-back/cancelled node.
+   *
+   * Idempotency key = the node's own PK (runNodeId = studio_run_nodes.id),
+   * globally unique, so a completion retry / duplicate delivery can never
+   * double-deduct (the store also replays the same key as a no-op).
+   *
+   * Best-effort ONLY: any throw (store down, pg down) is logged and swallowed —
+   * a spend failure can never fail or roll back an already-committed run.
+   */
+  async function recordNodeSpend(runNodeId, projectId, result) {
+    if (!budgetSpentStore || typeof budgetSpentStore.recordSpend !== 'function') return;
+    const amount = pricedNodeCost(result);
+    if (amount == null) return; // unpriced → nothing to record
+    try {
+      const r = await budgetSpentStore.recordSpend(pg, {
+        projectId,
+        amount,
+        idempotencyKey: String(runNodeId),
+      });
+      if (!r || r.ok !== true) {
+        log('run.node.spend_not_recorded', { runNodeId, projectId, code: r && r.error && r.error.code });
+      }
+    } catch (e) {
+      log('run.node.spend_failed', { runNodeId, projectId, error: e && e.message ? e.message : String(e) });
+    }
+  }
 
   /**
    * Durable domain event (sanitized payload only) + structured log + optional
@@ -673,10 +733,16 @@ function createStudioRunEngine(deps) {
    */
   async function completeRunNode(runNodeId, { owner, token, result }) {
     const client = await pg.connect();
+    let released = false;
+    const releaseOnce = () => { if (!released) { released = true; client.release(); } };
     try {
       await client.query('BEGIN');
       const fr = await client.query(
-        'SELECT * FROM studio_run_nodes WHERE id=$1 FOR UPDATE',
+        `SELECT n.*, r.project_id AS run_project_id
+           FROM studio_run_nodes n
+           JOIN studio_runs r ON r.id = n.run_id
+          WHERE n.id = $1
+          FOR UPDATE OF n`,
         [runNodeId]
       );
       const node = fr.rows[0];
@@ -740,12 +806,18 @@ function createStudioRunEngine(deps) {
       await aggregateRun(client, node.run_id, { runNodeId: runNodeId, workerId: owner });
       await client.query('COMMIT');
       await flushRelayQueue(client);
+      // Release BEFORE the spend: budgetSpentStore.recordSpend opens its OWN pool
+      // connection (pg.connect), so holding ours — even idle — could deadlock a
+      // maxed-out pool. The spend is best-effort and runs after the run is
+      // durably committed; it can never throw or roll back the run.
+      releaseOnce();
+      await recordNodeSpend(runNodeId, node.run_project_id, result);
       log('run.node.succeeded', { runId: node.run_id, studioNodeId: node.studio_node_id, attempt: node.attempt, unlocked: unlockedRows.map((r) => r.studio_node_id), workerId: owner });
       return { ok: true, runId: node.run_id, unlocked: unlockedRows.map((r) => r.studio_node_id) };
     } catch (e) {
       try { await client.query('ROLLBACK'); } catch (_) {}
       throw e;
-    } finally { client._relayQueue = null; client.release(); }
+    } finally { client._relayQueue = null; releaseOnce(); }
   }
 
   /**

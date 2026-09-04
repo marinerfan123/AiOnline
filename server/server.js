@@ -71,6 +71,7 @@ import studioShotApiMod from './modules/project-foundation/studioShotApi.cjs';
 import studioStructureApiMod from './modules/project-foundation/studioStructureApi.cjs';
 import studioRunApiMod from './modules/project-foundation/studioRunApi.cjs';
 import studioRunEngineMod from './modules/project-foundation/studioRunEngine.cjs';
+import budgetSpentStoreMod from './modules/project-foundation/budgetSpentStore.cjs';
 import generationV2Shadow from './modules/generation-v2/shadow.cjs';
 // ModelHub V3 Phase 1 — 唯一模型身份 resolver（server.js 仅在此一处调用，不再散落处理 display_name）
 import modelHubResolver from './modules/modelhub/resolver.cjs';
@@ -1697,6 +1698,16 @@ const studioRunEngine = studioRunEngineMod.createStudioRunEngine({
       : Promise.reject(Object.assign(new Error('数据库未就绪'), { status: 503 })),
   },
   workerId: `${NODE_ID || 'api'}-runapi`,
+  budgetSpentStore: budgetSpentStoreMod.createBudgetSpentStore({
+    pg: {
+      query: (sql, params) => pgPool
+        ? pgPool.query(sql, params)
+        : Promise.reject(Object.assign(new Error('数据库未就绪'), { status: 503 })),
+      connect: () => pgPool
+        ? pgPool.connect()
+        : Promise.reject(Object.assign(new Error('数据库未就绪'), { status: 503 })),
+    },
+  }),
 });
 const studioRunApi = studioRunApiMod.createStudioRunApi({
   pg: {
