@@ -50,4 +50,4 @@ COMMENT ON COLUMN community_works.media_asset_id IS
 COMMENT ON COLUMN community_works.creator_user_id IS
   'app-side author id, NOT NULL, no FK (ownership/attribution graph lands in Phase-4)';
 COMMENT ON COLUMN community_works.status IS
-  "state machine DRAFT -> PUBLISHED -> TAKEDOWN; transition guards live in worksStore, this CHECK only bounds values";
+  'state machine DRAFT -> PUBLISHED -> TAKEDOWN; transition guards live in worksStore, this CHECK only bounds values';
