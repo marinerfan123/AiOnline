@@ -5,6 +5,7 @@ const crypto = require('crypto');
 // 本模块用同一个注入 pg 自建 store; 合成根日后可经 deps.commandLogStore 注入共享实例。
 const { createCommandLogStore } = require('../collaboration/commandLogStore.cjs');
 const { decomposeCanvasPatch, REASONS, KIND_BUCKET_BY_COMMAND } = require('./canvasCommandDecomposer.cjs');
+const { validateCanvasGraph, projectCanvasGraph } = require('./canvasGraphValidator.cjs');
 
 const PREFIX_RE = /^\/api\/v2\/projects\/([^/]+)\/studio\/canvas(?:\/([^/]+)(?:\/([^/]+))?)?$/;
 const CANVAS_SCHEMA_VERSION = 1;
@@ -92,6 +93,20 @@ async function loadGraph(client, canvasId) {
   return { nodes: nr.rows.map(formatNode), edges: er.rows.map(formatEdge) };
 }
 function response(canvas, graph, viewport, extra = {}) { return { canvas: formatCanvas(canvas), nodes: graph.nodes, edges: graph.edges, viewport: viewport || null, permissions: extra.permissions, ...extra.extra }; }
+function graphInvalid(sendJSON, res, verdict) {
+  return sendErr(sendJSON, res, 400, 'INVALID_CANVAS_GRAPH', { reasons: verdict.reasons });
+}
+function validateProjectedGraph(current, ops) {
+  const projected = projectCanvasGraph(current, ops);
+  return validateCanvasGraph({ ...projected, ops });
+}
+function hasStructuralGraphPayload(graph) {
+  return (graph.nodes || []).some((n) => {
+    const kind = String(n?.data?.nodeKind ?? n?.nodeType ?? '').trim();
+    const version = Number(n?.data?.schemaVersion ?? n?.nodeSchemaVersion);
+    return Boolean(kind) && Number.isInteger(version);
+  }) && (graph.edges || []).every((e) => e.sourceHandle != null && e.targetHandle != null);
+}
 // Commercial hardening (A): set-based bulk restore — one INSERT...SELECT per table,
 // NOT one round trip per node/edge. Snapshot JSONB is normalized then hydrated in one shot.
 function bulkInsertNodes(client, canvasId, rawNodes) {
@@ -330,6 +345,17 @@ function createStudioCanvasPersistence(deps) {
       const canvas = await ensureCanvas(client, access.project, user);
       const prior = await client.query('SELECT response_json FROM studio_canvas_mutations WHERE canvas_id=$1 AND client_mutation_id=$2', [canvas.id, cmid]);
       if (prior.rows.length) { await client.query('COMMIT'); return sendJSON(res, 200, { ...prior.rows[0].response_json, idempotent: true }); }
+      // Validate the final projected graph before either kind-scoped writes or
+      // the revision CAS. Invalid requests leave revision/log/mutations untouched.
+      const graphBefore = await loadGraph(client, canvas.id);
+      const projectedGraph = projectCanvasGraph(graphBefore, { upsertNodes, deleteNodeIds, upsertEdges, deleteEdgeIds });
+      // Legacy rows written before the server registry contract may lack handles
+      // or nodeKind. Keep those canvases operable, but every structurally typed
+      // graph (all current clients) is validated fail-closed.
+      if (hasStructuralGraphPayload(projectedGraph)) {
+        const graphVerdict = validateCanvasGraph({ ...projectedGraph, ops: { upsertNodes, deleteNodeIds, upsertEdges, deleteEdgeIds } });
+        if (!graphVerdict.ok) { await client.query('ROLLBACK'); return graphInvalid(sendJSON, res, graphVerdict); }
+      }
       // G22 Phase-2 — kind-scoped 灰度: env 开时拆解 PATCH, 纯 node.update(data-only) 走
       // kind-scoped LWW 直写(不改 revision); 其余 kind 与混合 kind 一律回落下方面整画布 CAS。
       if (kindScopedEnabled()) {
@@ -386,7 +412,7 @@ function createStudioCanvasPersistence(deps) {
   async function handleVersionCreate(req, res, user, projectId) { const body = (await parseBody(req)) || {}; const client = await pg.connect(); try { await client.query('BEGIN'); const access = await requireProject(client, res, user, projectId); if (!access) { await client.query('ROLLBACK'); return; } if (!access.permissions.canUpdate) { await client.query('ROLLBACK'); return sendErr(sendJSON, res, 403, '无权编辑该项目'); } const canvas = await ensureCanvas(client, access.project, user); // Commercial hardening (B): serialize concurrent version creates per canvas.
       // The MAX(version_number)+1 read below is only race-free while we hold this row lock.
       await client.query('SELECT id FROM studio_canvases WHERE id=$1 FOR UPDATE', [canvas.id]); const graph = await loadGraph(client, canvas.id); const snap = { schemaVersion: canvas.schema_version, revision: canvas.revision, nodes: graph.nodes, edges: graph.edges, viewport: canvas.viewport_json || null }; if (Buffer.byteLength(JSON.stringify(snap)) > LIMITS.maxSnapshotBytes) { await client.query('ROLLBACK'); return sendErr(sendJSON, res, 413, 'SNAPSHOT_TOO_LARGE'); } const nr = await client.query('SELECT COALESCE(MAX(version_number),0)+1 AS n FROM studio_canvas_versions WHERE canvas_id=$1', [canvas.id]); const vr = await client.query('INSERT INTO studio_canvas_versions (id,canvas_id,revision,version_number,name,description,snapshot_json,created_by,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW()) RETURNING *', [`scv-${crypto.randomUUID()}`,canvas.id,canvas.revision,nr.rows[0].n,cleanText(body.name,LIMITS.maxNameLength),cleanText(body.description,LIMITS.maxDescriptionLength),JSON.stringify(snap),user.id]); await client.query('COMMIT'); const v=vr.rows[0]; return sendJSON(res,201,{version:{id:v.id,canvasId:v.canvas_id,revision:v.revision,versionNumber:v.version_number,name:v.name,description:v.description,createdBy:v.created_by,createdAt:toIso(v.created_at),nodeCount:graph.nodes.length,edgeCount:graph.edges.length}}); } catch(e){ try{await client.query('ROLLBACK');}catch(_){} throw e;} finally{client.release();} }
-  async function handleRestore(req, res, user, projectId, versionId) { const body = (await parseBody(req)) || {}; const base = Number(body.baseRevision); if (!Number.isInteger(base)) return sendErr(sendJSON,res,400,'INVALID_RESTORE'); const client = await pg.connect(); try { await client.query('BEGIN'); const access = await requireProject(client,res,user,projectId); if(!access){await client.query('ROLLBACK'); return;} if(!access.permissions.canUpdate){await client.query('ROLLBACK'); return sendErr(sendJSON,res,403,'无权恢复版本');} const canvas = await ensureCanvas(client, access.project, user); const vr = await client.query('SELECT * FROM studio_canvas_versions WHERE id=$1 AND canvas_id=$2', [versionId, canvas.id]); if(!vr.rows.length){ await client.query('ROLLBACK'); return sendErr(sendJSON,res,404,'版本不存在'); } const cas = await client.query('UPDATE studio_canvases SET revision=revision+1, viewport_json=$3, restored_from_version_id=$4, updated_by=$5, updated_at=NOW() WHERE id=$1 AND revision=$2 RETURNING *', [canvas.id, base, JSON.stringify(vr.rows[0].snapshot_json.viewport || null), versionId, user.id]); if(!cas.rows.length){ const cur=await client.query('SELECT revision FROM studio_canvases WHERE id=$1',[canvas.id]); await client.query('ROLLBACK'); return sendErr(sendJSON,res,409,'CONFLICT',{serverRevision:cur.rows[0]?.revision||canvas.revision,canvasId:canvas.id}); } await client.query('DELETE FROM studio_canvas_edges WHERE canvas_id=$1',[canvas.id]); await client.query('DELETE FROM studio_canvas_nodes WHERE canvas_id=$1',[canvas.id]); await bulkInsertNodes(client,canvas.id,vr.rows[0].snapshot_json.nodes || []); await bulkInsertEdges(client,canvas.id,vr.rows[0].snapshot_json.edges || []); const fresh=cas.rows[0]; const graph=await loadGraph(client,canvas.id); await client.query('COMMIT'); return sendJSON(res,200,response(fresh,graph,fresh.viewport_json,{permissions:access.permissions,extra:{restoredFromVersionId:versionId}})); } catch(e){ try{await client.query('ROLLBACK');}catch(_){} throw e;} finally{client.release();} }
+  async function handleRestore(req, res, user, projectId, versionId) { const body = (await parseBody(req)) || {}; const base = Number(body.baseRevision); if (!Number.isInteger(base)) return sendErr(sendJSON,res,400,'INVALID_RESTORE'); const client = await pg.connect(); try { await client.query('BEGIN'); const access = await requireProject(client,res,user,projectId); if(!access){await client.query('ROLLBACK'); return;} if(!access.permissions.canUpdate){await client.query('ROLLBACK'); return sendErr(sendJSON,res,403,'无权恢复版本');} const canvas = await ensureCanvas(client, access.project, user); const vr = await client.query('SELECT * FROM studio_canvas_versions WHERE id=$1 AND canvas_id=$2', [versionId, canvas.id]); if(!vr.rows.length){ await client.query('ROLLBACK'); return sendErr(sendJSON,res,404,'版本不存在'); } const snapGraph = { nodes: vr.rows[0].snapshot_json.nodes || [], edges: vr.rows[0].snapshot_json.edges || [] }; const graphVerdict = hasStructuralGraphPayload(snapGraph) ? validateCanvasGraph(snapGraph) : { ok: true }; if (!graphVerdict.ok) { await client.query('ROLLBACK'); return graphInvalid(sendJSON, res, graphVerdict); } const cas = await client.query('UPDATE studio_canvases SET revision=revision+1, viewport_json=$3, restored_from_version_id=$4, updated_by=$5, updated_at=NOW() WHERE id=$1 AND revision=$2 RETURNING *', [canvas.id, base, JSON.stringify(vr.rows[0].snapshot_json.viewport || null), versionId, user.id]); if(!cas.rows.length){ const cur=await client.query('SELECT revision FROM studio_canvases WHERE id=$1',[canvas.id]); await client.query('ROLLBACK'); return sendErr(sendJSON,res,409,'CONFLICT',{serverRevision:cur.rows[0]?.revision||canvas.revision,canvasId:canvas.id}); } await client.query('DELETE FROM studio_canvas_edges WHERE canvas_id=$1',[canvas.id]); await client.query('DELETE FROM studio_canvas_nodes WHERE canvas_id=$1',[canvas.id]); await bulkInsertNodes(client,canvas.id,vr.rows[0].snapshot_json.nodes || []); await bulkInsertEdges(client,canvas.id,vr.rows[0].snapshot_json.edges || []); const fresh=cas.rows[0]; const graph=await loadGraph(client,canvas.id); await client.query('COMMIT'); return sendJSON(res,200,response(fresh,graph,fresh.viewport_json,{permissions:access.permissions,extra:{restoredFromVersionId:versionId}})); } catch(e){ try{await client.query('ROLLBACK');}catch(_){} throw e;} finally{client.release();} }
 
   async function handle(req, res, urlPath, method) {
     const restore = urlPath.match(/^\/api\/v2\/projects\/([^/]+)\/studio\/canvas\/versions\/([^/]+)\/restore$/);

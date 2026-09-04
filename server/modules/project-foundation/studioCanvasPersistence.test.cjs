@@ -304,6 +304,22 @@ function captureWarn() {
 
 /* ─────────────────────────────────────────────────────────────── */
 
+test('server graph gate: typed invalid edge returns 400 before CAS/log/mutation', async () => {
+  const db = createCanvasDb();
+  const p = makePersistence(db);
+  const prompt = mkNode('p');
+  const imageBase = mkNode('i');
+  const image = { ...imageBase, nodeType: 'image', data: { ...imageBase.data, nodeKind: 'image' } };
+  const bad = { edgeId: 'bad', sourceNodeId: 'p', sourceHandle: 'text', targetNodeId: 'i', targetHandle: 'image', edgeType: 'data', data: {} };
+  const r = await doPatch(p, { clientMutationId: 'm-invalid-graph', baseRevision: 1, upsertNodes: [prompt, image], upsertEdges: [bad], deleteNodeIds: [], deleteEdgeIds: [] });
+  assert.equal(r.status, 400);
+  assert.equal(r.body.error, 'INVALID_CANVAS_GRAPH');
+  assert.ok(r.body.reasons.some((x) => x.code === 'TYPE_INCOMPATIBLE'));
+  assert.equal(db.canvasRow().revision, 1);
+  assert.equal(db.mutationRows().length, 0);
+  assert.equal(db.logRows().length, 0);
+});
+
 test('G22 PATCH成功(CAS通过+COMMIT)→ canvas_command_log 落一行 canvas.patch, 含 canvasId/commandId/actor/baseRevision/ops摘要', async () => {
   const db = createCanvasDb();
   const p = makePersistence(db);
