@@ -1229,6 +1229,145 @@ async function resumeRunningTasks(pgPool) {
   }
 }
 
+// ─── G21 crash-recovery 死区：review_required 人工处置面 + statusById 自动对账钩子 ───
+// 死区实况（2026-09-04 真链）：任务被 provider 接受后进程崩溃 → 结果丢失；waiting/resume-image 卫拦
+// 之后既无自动对账、也无 review 处置 API → 任务永卡 review_required（用户单已 reserve held）。
+// 处置口径：
+//   ·「真提交」唯一权威标记 = provider_task_id（onSubmitted → persistProviderTaskId 在 provider 接受后写入，
+//     或 resume_meta.submittedAt）。client_request_id 在 provider 调用前（generateAsync 入队时）就已持久化，
+//     只是「本进程曾准备提交」的痕迹，不是上游接受的证据 —— P1-04 曾用它拦 waiting/resume-image，
+//     把大量从未触达 provider 的任务误标 review_required 永卡（实况双任务确认，本轮修正）。
+//   · 真提交且结果丢失 → 优先自动对账（statusById 钩子拉终态补 result，不重提不双计费）；不支持 → review_required
+//     等人工（error 文案注明处置端点）。
+//   · 处置动作：retry_new（运营确认上游未实际计费 → 清提交标记重排队/重驱）；discard（释放 held 积分 → failed 终态）。
+const REVIEW_ENDPOINT = '/api/admin/generate/review';
+const REVIEW_RESOLVE_ENDPOINT = '/api/admin/generate/review/resolve';
+
+// 上游「按外部任务标识查询结果」能力钩子（缺省 null = 上游不支持）。
+// 现有三家图像适配器（agnes / gpt-image / openai-compat）均为同步 POST images/generations：
+//   请求体不接收 client_request_id、响应只含图片无异步任务 id、无按外部任务查询结果的端点 → 不支持对账。
+// 未来某适配器若支持异步提交 + 按 id 查询，应在适配器模块实现 queryById（providers/image/index.cjs
+// 的能力面 queryById 已预留）并在接线处 setStatusByIdHook 注册；resume/waiting 对账路径将自动启用。
+// 钩子契约：fn({ provider, model, providerTaskId, clientRequestId }) →
+//   { status:'done', images?:string[], videoUrl?:string, consumption?:Array }
+// | { status:'failed', error:string }
+// | { status:'pending' } | { status:'unknown', error? }（非终态 → 维持 review_required）
+let statusByIdHook = null;
+function setStatusByIdHook(fn) { statusByIdHook = (typeof fn === 'function') ? fn : null; return statusByIdHook; }
+function getStatusByIdHook() { return statusByIdHook; }
+
+// review_required 任务的 error 文案统一附上处置端点（人工处置唯一入口提示）。
+function reviewErrorSuffix() {
+  return `处置端点：GET ${REVIEW_ENDPOINT}（列队）｜ POST ${REVIEW_RESOLVE_ENDPOINT} {taskId, action:'retry_new'|'discard', reason}（需管理员）。retry_new=确认上游未实际计费后清提交标记重排队；discard=释放 held 积分并终态 failed（退款）。`;
+}
+
+// 标记 review_required（仅 running 可被标记：与并发终态写覆盖竞态互斥）。row 需含 task_id/provider_task_id/client_request_id。
+async function flagReviewRequired(pgPool, row, source) {
+  try {
+    await pgPool.query(
+      `UPDATE generation_tasks
+         SET status='review_required',
+             error='crash_recovery: provider already accepted (provider_task_id=' || COALESCE($1, '') ||
+                   ', client_request_id=' || COALESCE($2, '') || '), result lost in crash before completion; automatic resubmit blocked to prevent duplicate provider charge. ' || $3,
+             updated_at=NOW()
+       WHERE task_id=$4 AND status='running'`,
+      [row.provider_task_id || null, row.client_request_id || null, reviewErrorSuffix(), row.task_id],
+    );
+    console.warn(`[${source}] 阻塞重提 taskId=${row.task_id} provider_task_id=${row.provider_task_id || ''} → review_required（无 statusById 可自动对账，等人工处置）`);
+  } catch (e) {
+    console.warn(`[${source}] review_required 写入失败:`, row.task_id, e.message);
+  }
+}
+
+// 自动对账：真提交（provider_task_id 已持久化）但结果丢失的任务，先尝试经 statusById 钩子拉上游终态。
+// 计费核对：原 accept 只 reserve 一次（提交时按 idempotency_key held 预扣）；本函数绝不重提、绝不重扣 ——
+//   对账成功 done = completeViaQueue 内 commitCredits 幂等落账（真实扣费发生在 provider 返回后，reserve
+//   仅是 held 预扣，commit 不再动余额 → 无双计费）；上游明确 failed = releaseCredits 释放 held（退款）。
+// 返回 true = 已达终态处理（done 已交上传队列 / failed 已释放），调用方不应再标 review；false = 维持 review_required。
+async function reconcileSubmittedTask(pgPool, row, info) {
+  const source = (info && info.source) || 'reconcile';
+  if (!statusByIdHook) return false; // 上游不支持按外部标识查询 → 无法对账，留人工
+  let provider = null;
+  let model = null;
+  try {
+    if (row.provider_id) {
+      const pr = await pgPool.query('SELECT * FROM providers WHERE id=$1', [row.provider_id]);
+      provider = (pr.rows && pr.rows[0]) || null;
+    }
+    if (row.model_id) {
+      const mr = await pgPool.query('SELECT * FROM models WHERE model_id=$1 LIMIT 1', [row.model_id]);
+      model = (mr.rows && mr.rows[0]) || null;
+    }
+  } catch (e) {
+    console.warn(`[reconcile] 加载 provider/model 失败 taskId=${row.task_id}:`, (e && e.message) || e);
+    return false;
+  }
+  if (!provider || !model) {
+    console.warn(`[reconcile] provider/model 缺失（provider_id=${row.provider_id || ''} model_id=${row.model_id || ''}），无法对账 taskId=${row.task_id}`);
+    return false;
+  }
+  let st;
+  try {
+    st = await statusByIdHook({ provider, model, providerTaskId: row.provider_task_id, clientRequestId: row.client_request_id || null });
+  } catch (e) {
+    console.warn(`[reconcile] statusById 查询异常 taskId=${row.task_id}:`, (e && e.message) || e);
+    return false; // 查询失败不冒险：维持 review_required
+  }
+  if (!st || typeof st !== 'object' || !st.status) return false;
+  if (st.status === 'done') {
+    const res = st.result || st;
+    const images = Array.isArray(st.images) ? st.images : (Array.isArray(res.images) ? res.images : []);
+    const videoUrl = st.videoUrl || res.videoUrl || null;
+    if (!images.length && !videoUrl) {
+      console.warn(`[reconcile] statusById done 但无图片/视频资产，不冒险终态化，留人工 taskId=${row.task_id}`);
+      return false;
+    }
+    const waitOpts = (row.resume_meta && row.resume_meta.waitingOpts) || {};
+    try {
+      await completeViaQueue(pgPool, {
+        userId: row.user_id,
+        taskId: row.task_id,
+        cost: row.cost || 0,
+        costPool: row.cost_pool || 'recharge',
+        idempotencyKey: row.idempotency_key,
+        ctx: {
+          userId: row.user_id, taskId: row.task_id,
+          prompt: waitOpts.prompt || row.prompt || '',
+          model: waitOpts.canonicalModelId || row.model_id || row.model || '',
+          ratio: waitOpts.ratio || '1:1',
+          contentType: row.content_type || 'image',
+          pendingIds: Array.isArray(row.pending_ids) ? row.pending_ids : (Array.isArray(waitOpts.pendingIds) ? waitOpts.pendingIds : []),
+        },
+        providerImages: images,
+        providerVideoUrl: videoUrl,
+        originalResult: { status: 'success', images, videoUrl, source: 'crash-reconcile', consumption: st.consumption || res.consumption || [] },
+      });
+      console.log(`[reconcile] 对账成功 taskId=${row.task_id} provider_task_id=${row.provider_task_id} → 结果已补（done 终态由上传队列发出；单次 reserve 结算，无双计费）`);
+      return true;
+    } catch (e) {
+      console.warn(`[reconcile] 对账终态处理失败 taskId=${row.task_id}:`, (e && e.message) || e);
+      return false;
+    }
+  }
+  if (st.status === 'failed') {
+    const err = String((st && st.error) || '上游任务失败（crash 对账）');
+    try {
+      await billing.releaseCredits(pgPool, row.user_id, row.cost || 0, row.idempotency_key, row.cost_pool || 'recharge');
+      await updateTaskStatus(pgPool, row.task_id, 'failed',
+        { status: 'failed', error: err, source: 'crash-reconcile' },
+        `crash_recovery 对账：上游任务已失败 — ${err}`, row.user_id);
+      realtime.emitTaskUpdate(row.user_id, { taskId: row.task_id, status: 'failed', error: `crash_recovery 对账：${err}` });
+      console.warn(`[reconcile] 对账确认上游失败 taskId=${row.task_id} → failed + 释放 held（退款）`);
+      return true;
+    } catch (e) {
+      console.warn(`[reconcile] 对账失败终态处理异常 taskId=${row.task_id}:`, (e && e.message) || e);
+      return false;
+    }
+  }
+  // pending / unknown：上游尚无终态，本进程无该任务的轮询器 → 留 review_required 等人工或下次重启再对账
+  return false;
+}
+
 // ─── 等待区崩溃恢复：重启/崩溃后，内存 WAITING_AREA 队列已丢失，但 DB 中仍有 status='running'
 // 且处于等待区的孤儿任务（error 含"等待区"或已持久化 waitingOpts）。重新入队并启动泵重试，
 // 避免任务永久卡 running（原仅 >3h 看门狗兜底，体验差且积压）。 ───
@@ -1236,7 +1375,8 @@ async function resumeWaitingArea(pgPool) {
   if (!pgPool) return { resumed: 0 };
   try {
     const r = await pgPool.query(
-      `SELECT task_id, model, prompt, count, content_type, user_id, cost, cost_pool, idempotency_key, resume_meta, client_request_id
+      `SELECT task_id, model, model_id, prompt, count, content_type, user_id, cost, cost_pool, idempotency_key,
+              resume_meta, client_request_id, provider_id, provider_key, provider_task_id
          FROM generation_tasks
         WHERE status='running'
           AND (resume_meta->'waitingOpts' IS NOT NULL OR error LIKE '%等待区%')
@@ -1245,21 +1385,17 @@ async function resumeWaitingArea(pgPool) {
     let resumed = 0;
     let reviewCount = 0;
     for (const row of r.rows) {
-      // P1-04: if client_request_id is set, provider was already called — do not re-enqueue for resubmit
-      if (row.client_request_id) {
-        try {
-          await pgPool.query(
-            `UPDATE generation_tasks
-               SET status='review_required',
-                   error='crash_recovery: provider already accepted (client_request_id=' || $1 || '). Waiting-area resubmit blocked to prevent duplicate provider charge. Requires manual review.',
-                   updated_at=NOW()
-             WHERE task_id=$2 AND status='running'`,
-            [row.client_request_id, row.task_id],
-          );
+      // G21 修正：真提交标记 = provider_task_id（provider 接受后由 onSubmitted → persistProviderTaskId 写入），
+      // 而非 client_request_id（它在 provider 调用前就已持久化，只是「曾准备提交」的痕迹，不是上游接受的证据）。
+      // 仅真提交才拦（自动重提会双计费）；cr-only 任务从未触达 provider → 可安全重提。
+      const trulySubmitted = !!(row.provider_task_id && String(row.provider_task_id).trim() !== '');
+      if (trulySubmitted) {
+        // 已提交但结果在崩溃中丢失：先尝试自动对账（statusById 钩子拉终态补 result，不重提不双计费）；
+        // 上游不支持查询或仍在处理 → 维持 review_required 等人工（error 已注明处置端点）。
+        const settled = await reconcileSubmittedTask(pgPool, row, { source: 'waiting-area' });
+        if (!settled) {
+          await flagReviewRequired(pgPool, row, 'waiting-area');
           reviewCount++;
-          console.warn('[waiting] 阻塞等待区重提 taskId=%s client_request_id=%s → review_required', row.task_id, row.client_request_id);
-        } catch (e) {
-          console.warn('[waiting] review_required 写入失败:', row.task_id, e.message);
         }
         continue;
       }
@@ -1277,7 +1413,13 @@ async function resumeWaitingArea(pgPool) {
       }
       if (!opts || !opts.model) continue;
       const taskId = row.task_id;
-      const runOpts = { ...opts, taskId, onSubmitted: (info) => persistProviderTaskId(pgPool, taskId, info) };
+      // G21：cr-only（无 provider_task_id）= 从未触达 provider → 安全重提。复用原 client_request_id
+      // （不清不换）：供支持幂等的上游以同一 cr 关联，防未来异步适配器场景下的重复计费。
+      const runOpts = {
+        ...opts, taskId,
+        clientRequestId: row.client_request_id || undefined,
+        onSubmitted: (info) => persistProviderTaskId(pgPool, taskId, info),
+      };
       enqueueWaiting(taskId, runOpts, row.resume_meta && row.resume_meta.waitingState);
       resumed++;
     }
@@ -1285,7 +1427,7 @@ async function resumeWaitingArea(pgPool) {
       console.log(`[waiting] 恢复等待区孤儿任务 ${resumed} 个（重启后重试）`);
       runWaitingPump(pgPool).catch((e) => console.warn('[waiting] pump error:', e.message));
     }
-    return { resumed };
+    return { resumed, reviewBlocked: reviewCount };
   } catch (e) {
     console.warn('[waiting] 扫描等待区孤儿失败:', e.message);
     return { resumed: 0, error: e.message };
@@ -1300,17 +1442,21 @@ async function resumeWaitingArea(pgPool) {
 //       重新驱动一遍 generate()，并做与 generateAsync 一致的终态处理（成功 commit + 资产最终化
 //       落 OSS/media、超时/限流保留待复核或入等待区、失败释放 held 积分），与视频恢复口径对齐。
 // 选择条件：status='running' AND content_type='image'
-// P1-04 修复：区分「从未提交到 provider」和「已提交但未完成」两种崩溃恢复场景。
-//   - client_request_id IS NOT NULL：provider 可能已接受，禁止自动重提 → review_required
-//   - client_request_id IS NULL：确认从未提交，安全重驱
+// G21 修正（替代 P1-04 口径）：区分「从未提交到 provider」和「已提交但未完成」两种崩溃恢复场景。
+//   - provider_task_id IS NOT NULL（真提交，provider 接受后 onSubmitted 写入）：禁止自动重提（防双计费）
+//     → 自动对账（statusById 钩子）或 review_required 等人工（error 注明处置端点）。现网同步图像不写
+//     provider_task_id，此分支为未来异步图像适配器崩溃的防御。
+//   - 仅 client_request_id（provider 调用前入队时持久化，非提交证据）：从未确认触达 provider → 安全重驱
+//     （复用同一 cr id，供幂等上游防双计费）。
 //   - resume_meta->'waitingOpts' IS NULL（排除等待区任务，避免与 resumeWaitingArea 重复入队）
 //   - created_at < NOW() - INTERVAL '1 minute'（避免与刚提交、本进程正在处理的任务竞态）
 async function resumeRunningImageTasks(pgPool) {
   if (!pgPool) return { resumed: 0 };
   try {
     const r = await pgPool.query(
-      `SELECT task_id, model, prompt, count, content_type, user_id, cost, cost_pool,
-              idempotency_key, pending_ids, client_meta, created_at, client_request_id
+      `SELECT task_id, model, model_id, prompt, count, content_type, user_id, cost, cost_pool,
+              idempotency_key, pending_ids, client_meta, created_at, client_request_id,
+              provider_id, provider_key, provider_task_id
          FROM generation_tasks
         WHERE status='running'
           AND content_type='image'
@@ -1322,22 +1468,13 @@ async function resumeRunningImageTasks(pgPool) {
     let resumed = 0;
     let reviewCount = 0;
     for (const row of r.rows) {
-      // P1-04: 如果 client_request_id 已持久化，说明 provider 调用已发出，
-      // 自动重提可能导致 provider 端重复计费。进入 review_required 等待人工处理。
-      if (row.client_request_id) {
-        try {
-          await pgPool.query(
-            `UPDATE generation_tasks
-               SET status='review_required',
-                   error='crash_recovery: provider already accepted (client_request_id=' || $1 || '). Automatic resubmit blocked to prevent duplicate provider charge. Requires manual review.',
-                   updated_at=NOW()
-             WHERE task_id=$2 AND status='running'`,
-            [row.client_request_id, row.task_id],
-          );
+      // G21 修正：真提交标记 = provider_task_id；仅真提交才拦。
+      // （WHERE 已排除 provider_task_id 行 —— 现网同步图像永不写它 —— 本分支为防御性守卫，保语义一致。）
+      if (row.provider_task_id && String(row.provider_task_id).trim() !== '') {
+        const settled = await reconcileSubmittedTask(pgPool, row, { source: 'resume-image' });
+        if (!settled) {
+          await flagReviewRequired(pgPool, row, 'resume-image');
           reviewCount++;
-          console.warn('[resume-image] 阻塞重提 taskId=%s client_request_id=%s → review_required (防重复计费)', row.task_id, row.client_request_id);
-        } catch (e) {
-          console.warn('[resume-image] review_required 写入失败:', row.task_id, e.message);
         }
         continue;
       }
@@ -1357,7 +1494,9 @@ async function resumeRunningImageTasks(pgPool) {
         idempotencyKey: row.idempotency_key,
         pendingIds: Array.isArray(row.pending_ids) ? row.pending_ids : [],
         taskId: row.task_id,
-        canonicalModelId: '',
+        canonicalModelId: row.model_id || '',
+        // G21：复用原 client_request_id（cr-only = 从未确认触达 provider，安全重驱；不清不换供幂等上游关联）
+        clientRequestId: row.client_request_id || undefined,
       };
       // 后台 fire-and-forget 重驱，不阻塞启动
       resumeOneImageTask(pgPool, row, opts).catch((e) => console.warn('[resume-image] 重驱异常:', row.task_id, e.message));
@@ -1656,6 +1795,164 @@ async function listActiveTasks(pgPool, userId) {
   }
 }
 
+// ─── G21 review 处置面（人工解除 crash 死区）──────────────────────
+// review_required = 真提交（provider_task_id 已持久化）但结果在崩溃中丢失，且无 statusById 可自动对账。
+// 处置只允许对 review_required 任务执行（防对已结算/终态任务误释放/误退款）：
+//   · retry_new — 运营核实上游未实际计费 → 清 provider_task_id / client_request_id 提交标记，
+//     任务回到「从未提交」口径重排队/重驱（有 waitingOpts 走等待区泵；图片走 resumeOneImageTask 重驱）。
+//   · discard — 释放 held 积分（按池回退，幂等）+ failed 终态（退款给用户）。
+async function listReviewTasks(pgPool) {
+  if (!pgPool) return { tasks: [], error: '数据库不可用' };
+  try {
+    const r = await pgPool.query(
+      `SELECT task_id, model, model_id, content_type, user_id, cost, cost_pool, idempotency_key,
+              client_request_id, provider_task_id, provider_id, provider_key,
+              prompt, error, created_at, updated_at, resume_meta
+         FROM generation_tasks
+        WHERE status='review_required'
+        ORDER BY updated_at DESC
+        LIMIT 200`,
+    );
+    return {
+      endpoint: REVIEW_ENDPOINT,
+      resolveEndpoint: REVIEW_RESOLVE_ENDPOINT,
+      tasks: r.rows.map((row) => ({
+        taskId: row.task_id,
+        model: row.model,
+        modelId: row.model_id || '',
+        contentType: row.content_type || 'image',
+        userId: row.user_id,
+        cost: row.cost || 0,
+        costPool: row.cost_pool || 'recharge',
+        idempotencyKey: row.idempotency_key,
+        clientRequestId: row.client_request_id,
+        providerTaskId: row.provider_task_id,
+        providerId: row.provider_id,
+        providerKey: row.provider_key,
+        prompt: row.prompt || '',
+        error: row.error || '',
+        createdAt: row.created_at,
+        updatedAt: row.updated_at,
+        hasWaitingOpts: !!(row.resume_meta && row.resume_meta.waitingOpts),
+      })),
+    };
+  } catch (e) {
+    return { tasks: [], error: e.message };
+  }
+}
+
+async function resolveReviewTask(pgPool, body) {
+  const actor = (body && body.actor) || '';
+  if (!pgPool) return { ok: false, code: 503, error: '数据库不可用' };
+  const taskId = String(((body && body.taskId) || '')).trim();
+  const action = body && body.action;
+  const reason = String(((body && body.reason) || '')).trim();
+  if (!taskId) return { ok: false, code: 400, error: '缺少 taskId' };
+  if (action !== 'retry_new' && action !== 'discard') {
+    return { ok: false, code: 400, error: "action 必须为 'retry_new' 或 'discard'" };
+  }
+  let sel;
+  try {
+    sel = await pgPool.query(
+      `SELECT task_id, status, model, model_id, prompt, count, content_type, user_id, cost, cost_pool,
+              idempotency_key, pending_ids, client_meta, client_request_id, provider_task_id, resume_meta
+         FROM generation_tasks WHERE task_id=$1`,
+      [taskId],
+    );
+  } catch (e) {
+    return { ok: false, code: 500, error: `查询失败：${(e && e.message) || e}` };
+  }
+  if (!sel.rows.length) return { ok: false, code: 404, error: '任务不存在' };
+  const row = sel.rows[0];
+  if (row.status !== 'review_required') {
+    return { ok: false, code: 409, error: `任务当前状态为 ${row.status}，非 review_required，不可处置` };
+  }
+  try { dequeueWaiting(taskId); } catch (_) { /* 不在等待区则忽略 */ }
+  if (action === 'discard') {
+    const msg = `人工处置 discard${actor ? `（${actor}）` : ''}${reason ? `：${reason}` : ''}`;
+    try {
+      // 释放 held 积分（按池回退，幂等：credit_transactions ON CONFLICT 防双退）；failed 置 completed_at（updateTaskStatus CASE）
+      await billing.releaseCredits(pgPool, row.user_id, row.cost || 0, row.idempotency_key, row.cost_pool || 'recharge');
+      await updateTaskStatus(pgPool, taskId, 'failed',
+        { status: 'failed', discarded: true, action: 'discard', reason: reason || null },
+        msg, row.user_id);
+      realtime.emitTaskUpdate(row.user_id, { taskId, status: 'failed', error: msg });
+      console.log(`[review] 任务 ${taskId} 已 discard（释放 held 积分 → failed 终态）userId=${row.user_id || ''} actor=${actor || 'admin'}`);
+      return { ok: true, action: 'discard' };
+    } catch (e) {
+      return { ok: false, code: 500, error: `discard 失败：${(e && e.message) || e}` };
+    }
+  }
+  // retry_new：运营确认上游未被实际计费 → 清除提交标记，回到「从未提交」口径重新排队/重驱。
+  const msg = `人工处置 retry_new${actor ? `（${actor}）` : ''}${reason ? `：${reason}` : ''}，已清提交标记重新排队/重驱（运营确认上游未实际计费）`;
+  let resetRes;
+  try {
+    resetRes = await pgPool.query(
+      `UPDATE generation_tasks
+         SET provider_task_id=NULL, client_request_id=NULL, provider_key=NULL,
+             status='running',
+             error=$2, updated_at=NOW()
+       WHERE task_id=$1 AND status='review_required'`,
+      [taskId, msg],
+    );
+  } catch (e) {
+    return { ok: false, code: 500, error: `retry_new 重置失败：${(e && e.message) || e}` };
+  }
+  // 并发护栏：SELECT 后若任务已被其它处置动作移出 review_required（0 行更新），不得再重排队/重驱
+  if (resetRes && typeof resetRes.rowCount === 'number' && resetRes.rowCount === 0) {
+    return { ok: false, code: 409, error: '任务状态已变化（非 review_required），retry_new 未执行，请刷新后重试' };
+  }
+  // 有 waitingOpts → 走等待区泵重试（覆盖视频与图片的等待区路径）
+  const waitOpts = (row.resume_meta && row.resume_meta.waitingOpts) || null;
+  if (waitOpts && waitOpts.model) {
+    try {
+      const runOpts = { ...waitOpts, taskId, onSubmitted: (info) => persistProviderTaskId(pgPool, taskId, info) };
+      enqueueWaiting(taskId, runOpts, (row.resume_meta && row.resume_meta.waitingState) || null);
+      persistWaitingOpts(pgPool, taskId, waitOpts, (row.resume_meta && row.resume_meta.waitingState) || null).catch(() => {});
+      realtime.emitTaskUpdate(row.user_id, { taskId, status: 'running', error: msg });
+      runWaitingPump(pgPool).catch((e) => console.warn('[review] pump error:', e.message));
+      console.log(`[review] 任务 ${taskId} retry_new → 已重入等待区（清提交标记）`);
+      return { ok: true, action: 'retry_new', requeued: true };
+    } catch (e) {
+      return { ok: false, code: 500, error: `retry_new 重排队失败：${(e && e.message) || e}` };
+    }
+  }
+  // 无 waitingOpts：仅图片可最小重建重驱（同步 images/generations）；其它（缺完整参数的视频）无法重建 → 拒
+  if ((row.content_type || 'image') === 'image') {
+    const cm = row.client_meta || {};
+    const opts = {
+      model: row.model,
+      prompt: row.prompt || '',
+      count: row.count || 1,
+      contentType: 'image',
+      ratio: cm.ratio || '1:1',
+      resolution: cm.resolution || '1k',
+      referenceImages: Array.isArray(cm.referenceImages) ? cm.referenceImages : [],
+      negative: cm.negative || '',
+      user_id: row.user_id,
+      cost: row.cost || 0,
+      costPool: row.cost_pool || 'recharge',
+      idempotencyKey: row.idempotency_key,
+      pendingIds: Array.isArray(row.pending_ids) ? row.pending_ids : [],
+      taskId,
+      canonicalModelId: row.model_id || '',
+    };
+    try {
+      // 与 resumeRunningImageTasks 同一重驱终态处理（成功 commit+上传队列 / throttled 入等待区 / failed 释放）
+      realtime.emitTaskUpdate(row.user_id, { taskId, status: 'running', error: msg });
+      resumeOneImageTask(pgPool, row, opts).catch((e) => console.warn('[review] 图片重驱异常:', taskId, e.message));
+      console.log(`[review] 任务 ${taskId} retry_new → 已重驱图片任务（清提交标记）`);
+      return { ok: true, action: 'retry_new', redriven: true };
+    } catch (e) {
+      return { ok: false, code: 500, error: `retry_new 图片重驱失败：${(e && e.message) || e}` };
+    }
+  }
+  return {
+    ok: false, code: 409,
+    error: '无法自动重驱：非图片且无等待区参数（waitingOpts）。请人工核对上游后选择 discard，或经运营后台恢复。',
+  };
+}
+
 // 导出内部调度函数（供测试 / 调试断言 RPM 门控与均匀分配用）
 module.exports = {
   generate, generateAsync, getTaskStatus, listActiveTasks, callEndpoint, getByPath, getArrayByPath,
@@ -1676,6 +1973,9 @@ module.exports = {
   allResourcesDown, waitingAreaTriggered, setWaitingThreshold, getWaitingThreshold,
   refreshWaitingThreshold, runWaitingPump, updateTaskStatus, planPriority, cancelTask,
   startUploadQueue,
+  // ── G21 crash-recovery 死区（review_required 处置面 + statusById 自动对账钩子）──
+  setStatusByIdHook, getStatusByIdHook, flagReviewRequired, reconcileSubmittedTask,
+  listReviewTasks, resolveReviewTask,
 };
 
 // ─── 等待区（资源全不可用时积压请求；超阈值触发前台"资源不足"）───

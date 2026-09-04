@@ -2809,6 +2809,27 @@ async function handleAPI(req, res) {
     if (await projectFoundation.handle(req, res, url.split('?')[0], method)) return;
   }
 
+  // ── G21 crash-recovery 死区：review_required 任务的人工处置面（admin，需在通用 /api/admin/* 委托前）──
+  // 崩溃后「真提交（provider_task_id 已持久化）但结果丢失」的任务进 review_required 等人工：
+  //   GET  /api/admin/generate/review           → 列队（含 cost/提交标记/可处置端点）
+  //   POST /api/admin/generate/review/resolve   → {taskId, action:'retry_new'|'discard', reason}
+  //       retry_new = 运营确认上游未实际计费 → 清提交标记重排队/重驱（防双计费护栏内）
+  //       discard   = 释放 held 积分 + failed 终态（退款给用户）
+  if (url === '/api/admin/generate/review' && method === 'GET') {
+    if (!pgPool) return sendJSON(res, 503, { error: '数据库不可用' });
+    if (!admin.requireAdmin(req)) return sendJSON(res, 403, { error: '需要管理员权限' });
+    return sendJSON(res, 200, await dispatcher.listReviewTasks(pgPool));
+  }
+  if (url === '/api/admin/generate/review/resolve' && method === 'POST') {
+    if (!pgPool) return sendJSON(res, 503, { ok: false, error: '数据库不可用' });
+    if (!admin.requireAdmin(req)) return sendJSON(res, 403, { ok: false, error: '需要管理员权限' });
+    const body = await parseBody(req);
+    if (!body || typeof body !== 'object') return sendJSON(res, 400, { ok: false, error: 'Invalid JSON' });
+    const actor = (req.user && req.user.id) || '';
+    const r = await dispatcher.resolveReviewTask(pgPool, { ...body, actor });
+    return sendJSON(res, r.ok ? 200 : (r.code || 400), r);
+  }
+
   if (url.startsWith('/api/admin/') && method !== 'OPTIONS') return admin.handleAdmin(req, res, url.split('?')[0], method);
 
   // ── 电商模块（AI 市集 / 技能注册表 / 试用台）── 命中即处理（内部自行鉴权：目录/商品公开，试用/获取/我的技能需登录）

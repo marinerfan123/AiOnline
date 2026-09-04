@@ -49,4 +49,33 @@ async function generate(ctx) {
   return ad.call(ctx);
 }
 
-module.exports = { adapters, resolveKey, generate };
+// 可选能力面：按外部任务标识查询结果（crash-recovery 自动对账用，statusById 钩子）。
+// ctx：{ provider, model, providerTaskId?, clientRequestId? }（payload 由具体适配器按需）
+// 现有三家适配器（agnes / gpt-image / openai-compat）均为同步 POST images/generations：
+//   - 请求体不接收 client_request_id（无法以外部标识幂等/关联上游）
+//   - 响应只含图片、无异步任务 id
+//   - 无「按 client_request_id / 外部 task 查询结果」的端点
+// → queryById 统一返 UNSUPPORTED（statusById 能力缺省 null = 上游不支持，dispatcher 侧钩子保持 null）。
+// 未来某适配器若支持异步提交 + 按 id 查询，在该模块导出 queryById(ctx)（与视频适配层 poll 同构）即自动启用：
+//   返回 { ok:true, result:{ status:'done'|'pending'|'failed', images?, videoUrl?, consumption?, error? } }
+//   或 { ok:false, code, retryable, message? }
+async function queryById(ctx) {
+  if (!ctx || !ctx.provider || !ctx.model) {
+    return { ok: false, code: 'UNSUPPORTED', retryable: false, message: '图像适配层缺失 ctx（provider/model）' };
+  }
+  const key = resolveKey(ctx.provider, ctx.model);
+  const ad = Object.prototype.hasOwnProperty.call(adapters, key) ? adapters[key] : null;
+  if (ad && typeof ad.queryById === 'function') {
+    try {
+      return await ad.queryById(ctx);
+    } catch (e) {
+      return { ok: false, code: 'UNSUPPORTED', retryable: false, message: `queryById 异常：${(e && e.message) || e}` };
+    }
+  }
+  return {
+    ok: false, code: 'UNSUPPORTED', retryable: false,
+    message: `图像适配器 '${key || '?'}' 不支持按外部任务标识查询结果（同步 images/generations，无查询端点）`,
+  };
+}
+
+module.exports = { adapters, resolveKey, generate, queryById };
