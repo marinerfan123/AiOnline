@@ -38,7 +38,7 @@ const presenceTtlMs = 30_000;
 /**
  * 客户端心跳上报间隔（ms）。与 presenceTtlMs 同源（= presenceTtlMs / 2，即 15_000）：
  * interval < ttl 且 2×interval = ttl —— 允许客户端漏报一次心跳（连续两次上报
- * 间隔 = ttl）而不被误判过期；接入层 presenceBus.cjs 的 HEARTBEAT_TTL_MS(=15_000)
+ * 间隔 = ttl）而不被误判过期；接入层 presenceBus.cjs 的 HEARTBEAT_TTL_MS(=30_000)
  * 与之一致（客户端发送节奏 = 服务端记录 TTL，同源同一 presence 协议设计）。
  */
 const HEARTBEAT_INTERVAL_MS = presenceTtlMs / 2;

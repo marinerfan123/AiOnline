@@ -16,7 +16,7 @@
 --   * 无 TTL 触发器/无 FK：过期清理是应用层策略 —— presenceBus.peers 读时惰性
 --     过滤，presencePgStore.sweep 按调度（如每 5s）DELETE last_seen_ms < 截止点；
 --     DB 侧不加触发器，保持地基表单纯可移植。
---   * sweep 的 last_seen_ms < (nowMs - 15000) 为严格小于：age 恰为 TTL(15000ms)
+--   * sweep 的 last_seen_ms < (nowMs - 30000) 为严格小于：age 恰为 TTL(30000ms)
 --     的记录本次保留、下一拍清扫 —— 与 peers 的「age >= TTL 即过期」同语义上界，
 --     方向安全（略晚清理不产生错误在线判定，peers 已惰性排除）。
 --   * 复合主键左前缀 (canvas_id) 已覆盖按画布 list 的索引需求；last_seen_ms 无
