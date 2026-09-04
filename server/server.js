@@ -1499,6 +1499,11 @@ const studioModelsApi = studioModelsApiMod.createStudioModelsApi({
   sendJSON,
 });
 
+// G19 — periodic expiry sweep for pending approvals (best-effort, non-blocking).
+if (typeof aiControlRouter.sweepExpired === 'function') {
+  setInterval(() => { try { aiControlRouter.sweepExpired(); } catch (_) {} }, 60000);
+}
+
 // G18 — Project timeline (/api/v2/timelines): ordered shot/asset-version clips,
 // integer-ms timing, immutable source (clips bind asset VERSION ids).
 const timelineApi = timelineApiMod.createTimelineApi({
@@ -2621,9 +2626,9 @@ async function handleAPI(req, res) {
       return sendJSON(res, 500, { error: '查询模型参与度失败：' + (e?.message || e) });
     }
   }
-  // ── M02-B AI Control Plane（/api/v2/ai-control/*）── 管理面 provider/key pool；
-  // 必须早于 /api/admin/* 委托。未命中前缀 → 继续后续路由。
-  if (url.startsWith('/api/v2/ai-control/') && method !== 'OPTIONS') {
+  // ── M02-B AI Control Plane（/api/v2/ai-control/* + /api/v2/ai-admin/approvals/*）──
+  // 管理面 provider/key pool 与 G19 pending 审批。必须早于 /api/admin/* 委托。
+  if ((url.startsWith('/api/v2/ai-control/') || url.startsWith('/api/v2/ai-admin/')) && method !== 'OPTIONS') {
     if (await aiControlRouter.handle(req, res, url.split('?')[0], method)) return;
   }
 

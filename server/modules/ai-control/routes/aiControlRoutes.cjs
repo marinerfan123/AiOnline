@@ -3,11 +3,16 @@
  * M02-B — V2 AI Control Plane HTTP routes (provider + key pool management)
  *
  * Prefix: /api/v2/ai-control/*
+ * Admin approval surface: /api/v2/ai-admin/approvals/*
  * Mounted in server.js BEFORE the legacy /api/admin/* delegation.
  *
  * Authorization: every *** requires a session user; EVERY route
  * (read and mutation) additionally requires admin — key-pool metadata
- * (masked) and provider config are admin surfaces in M02-B.
+ * (masked) and provider config are admin surfaces in M02-B. The admin
+ * approval surface (list/approve/deny) also rides the SAME route guard
+ * below: adminRequire is injected by server.js (admin.requireAdmin), but the
+ * enforcement lives HERE (guard()) — any prefix this module's handle()
+ * serves is covered as long as server.js dispatches it to this router.
  *
  * Security: read responses are built exclusively from the masked projections
  * in domain/keypool.cjs. The full secret appears only in request bodies
@@ -33,17 +38,47 @@
  * 500 (fail closed — a dry-run must never touch the DB). dryRun defaults to
  * false: existing behavior is byte-for-byte unchanged.
  *
- * G19 (approval 门接线) — approvalGate 决策接入 5 个高危写 kind 的真实执行路径：
- *   POST /providers → provider.create；POST …/enable → provider.enable；
- *   POST …/keys → provider.key.create；DELETE …/keys/:keyId → provider.key.delete；
- *   POST …/keys/:keyId/cooldown → provider.cooldown。
- *   dryRun 恒定放行（只校验不落库，无审批语义）。decision 'deny' → 403
- *   APPROVAL_DENIED（无审批路径，allowlist 不可覆盖）；'required' 且
- *   requiresApproval && !shouldAutoApprove → 402 APPROVAL_REQUIRED 不执行
- *   （无 pending 表：响应 message 指引客户端走人工确认；TODO(pending_actions)
- *   落地后应建待批记录并回 pendingId）。'auto' / allowlist 预授权 → 放行。
- *   PATCH 类元数据写（provider 字段 / key 元数据）不在 APPROVAL_REQUIRED_KINDS
- *   → 不入门，行为维持现状。
+ * G19 (approval 门收口，pending_actions 闭环) — approvalGate 决策接入 5 个高危
+ * 写 kind 的真实执行路径：POST /providers → provider.create；POST …/enable →
+ * provider.enable；POST …/keys → provider.key.create；DELETE …/keys/:keyId →
+ * provider.key.delete；POST …/keys/:keyId/cooldown → provider.cooldown。
+ *   - decision 'deny' → 403 APPROVAL_DENIED（无审批路径，allowlist 不可覆盖）。
+ *   - decision 'required' 且 requiresApproval && !shouldAutoApprove → 入待批：
+ *     以「净化写参数快照 payload」（{providerId/…/body 字段}，见下）调用
+ *     pendingActionStore.create 落一条 PENDING，回 202 {ok,pendingId,kind,
+ *     expiresAt}，不执行（代替历史裸 402）。入队前先对 payload 跑一次真实
+ *     校验（noWritePg 只读包装）——格式/存在性/409 在入队时即拦住，待批队列
+ *     不收纳注定失败的写。dryRun 恒定放行（只校验不落库，无审批语义）。
+ *   - 'auto' / allowlist 预授权 → 放行执行。
+ *   各 gated kind 的真实执行收敛到 APPLY[kind](payload)（gate 放行路径与
+ *   approve 重放路径共用同一入口，见下）。
+ *
+ *   管理员审批面（/api/v2/ai-admin/approvals/*，同样过本路由 guard）：
+ *     GET  …/pending                     → pendingActionStore.listPending
+ *     POST …/:id/approve                 → 先重放、成功后再 decide(APPROVED)
+ *     POST …/:id/deny                    → decide(DENIED)
+ *   approve 重放语义（本叶选定方案）：
+ *     - 重放 = 以行内 payload 重跑 APPLY[kind](payload)（approver 即执行人），
+ *       重放前不重复入队校验 —— service 自身的存在性/409（乐观锁 revision /
+ *       key 归属 / provider 存在）在重放时重新求值，404/409 语义与首次写一致；
+ *     - 重放成功 → decide(id, approve:true)（落 APPROVED 终态）；
+ *     - 重放失败 → decide(id, approve:false, note:'execution-error: <err>')
+ *       （落 DENIED 终态，不做无 executionError 列的折衷），响应 402
+ *       EXECUTION_ERROR 携带原因。故 approve 的 200 响应恒意味着「已执行且
+ *       APPROVED」，402 恒意味着「已驳回」——不会出现 APPROVED 但未执行的
+ *       悬空态。
+ *     - decide 仅 PENDING 可迁出（store CAS + 本面显式 status 预检），终态
+ *       （APPROVED/DENIED/EXPIRED）再审批 → 409 TERMINAL_STATE。
+ *     - 竞态注记：approve「先重放后 decide」在极端并发（他人已终态化本行）
+ *       下可能重复执行一次写（重放已落库而 decide 落空 → 409 并回带 applied）；
+ *       待批 id 随机且审批面为人工单点，风险可接受并显式暴露。
+ *   过期清扫：createAiControlRouter 返回值带 sweepExpired(now?)（封装
+ *   store.expireOverdue）供 server.js 定时调用 —— 本叶只导出、不挂定时器。
+ *
+ *   生产可达性：server.js 目前只把 /api/v2/ai-control/ 前缀 dispatch 到本
+ *   router.handle()。admin 审批面 /api/v2/ai-admin/* 需 server.js 追加同款
+ *   dispatch（url.startsWith('/api/v2/ai-admin/') → aiControlRouter.handle），
+ *   guard 随之覆盖 —— 本叶不改 server.js，仅在本模块内实现好该面。
  *
  * 角色来源（写路径在 admin 门后）：guard() 放行的会话用户（cookie sid）是唯一
  * 可达写面的身份。users.role 只有 'admin'|'user'（注册/登录签发）；API_TOKEN 的
@@ -58,8 +93,11 @@ const service = require('../services/providerService.cjs');
 const catalogService = require('../services/aiControlService.cjs');
 const keypool = require('../domain/keypool.cjs');
 const approvalGate = require('../approvalGate.cjs');
+const { createPendingActionStore } = require('../pendingActionStore.cjs');
 
 const PREFIX = '/api/v2/ai-control';
+/** admin 审批面前缀（server.js 追加 dispatch 后生效，guard 与本面同源）。 */
+const ADMIN_PREFIX = '/api/v2/ai-admin';
 
 // Provider PATCH allowed columns (mirrors providerService.allowed keys) — used
 // only to describe "what would change" in dry-run summaries, never to validate.
@@ -156,6 +194,62 @@ async function dryRunAddKeysDigest(pg, providerId, keys) {
   };
 }
 
+// ── G19 待批 payload（净化写参数快照）──
+// 每个 gated kind 入队时把「重放所需的最小写参数」归一化快照进 payload；
+// 不含 dryRun/内部字段；密钥类值（apiKey / keys）保留完整（重放必需），
+// 只在 admin 面响应里经 approvalRowForResponse 脱敏回显。
+
+/** provider.create：POST /providers body 的净化快照。 */
+function providerCreatePayload(body) {
+  return {
+    providerId: body.id,
+    name: body.name,
+    type: body.type,
+    baseUrl: body.baseUrl,
+    protocol: body.protocol,
+    enabled: body.enabled !== false,
+    supportedTypes: body.supportedTypes,
+    remark: body.remark,
+    apiKey: body.apiKey,
+  };
+}
+
+/** provider.create 重放入参对象（与 createProvider 消费的字段一致）。 */
+function providerInput(p) {
+  return {
+    id: p.providerId,
+    name: p.name,
+    type: p.type,
+    baseUrl: p.baseUrl,
+    protocol: p.protocol,
+    enabled: p.enabled !== false,
+    supportedTypes: p.supportedTypes,
+    remark: p.remark,
+  };
+}
+
+/** provider.key.create：与 addKeysBatch 内部一致的归一化（trim + ≥6 + 去重）。 */
+function normalizeApiKeyList(keys) {
+  const lines = Array.isArray(keys)
+    ? keys.map((k) => String(k ?? '').trim())
+    : String(keys ?? '').split(/\r?\n/).map((s) => s.trim());
+  return [...new Set(lines.filter((s) => s && s.length >= 6))];
+}
+
+/** 管理面响应副本：payload 密钥字段脱敏回显（DB 行保持完整供重放）。 */
+function approvalRowForResponse(pa) {
+  if (!pa) return pa;
+  const out = { ...pa };
+  if (pa.payload && typeof pa.payload === 'object' && !Array.isArray(pa.payload)) {
+    const p = { ...pa.payload };
+    if (typeof p.apiKey === 'string') p.apiKey = keypool.maskKey(p.apiKey);
+    if (Array.isArray(p.apiKeys)) p.apiKeys = p.apiKeys.map((k) => (typeof k === 'string' ? keypool.maskKey(k) : k));
+    if (Array.isArray(p.keys)) p.keys = p.keys.map((k) => (typeof k === 'string' ? keypool.maskKey(k) : k));
+    out.payload = p;
+  }
+  return out;
+}
+
 /**
  * @param {object} deps {
  *   pg,                       // { query(sql, params) }
@@ -170,6 +264,8 @@ function createAiControlRouter(deps) {
   const { pg, adminRequire, sessionUser, onPoolChanged, sendJSON, parseBody } = deps;
   const sync = onPoolChanged ? { onPoolChanged } : {};
   const noWritePg = () => makeNoWritePg(pg);
+  // G19 — 待批存储（pendingActionStore，迁移 0056；只读消费其 API）。
+  const pendingStore = createPendingActionStore({ pg });
 
   async function guard(req, res, method) {
     const user = sessionUser(req);
@@ -183,48 +279,219 @@ function createAiControlRouter(deps) {
    * 角色枚举映射（见文件头「角色来源」）：写面可达身份 = 会话用户 role
    * ∈ {admin, user}；admin → DEFAULT_POLICY 全 auto（放行）；user → 全 deny；
    * agent/system 为未来内部调用面。词表外角色 fail-closed deny。
-   * @returns {{allow:true}|{allow:false, code:402|403, error:string, kind:string}}
+   * @returns {{allow:true}|{deny:true}|{queue:true}}
    */
-  function approvalVerdict(kind, user) {
+  function approvalDecision(kind, user) {
     if (!user || !approvalGate.ACTOR_ROLES.includes(user.role)) {
-      return { allow: false, code: 403, error: 'APPROVAL_DENIED', kind };
+      return { deny: true };
     }
     const ctx = { kind, actorRole: user.role, actorId: user.id };
     const d = approvalGate.decisionFor(ctx);
-    if (d === 'deny') return { allow: false, code: 403, error: 'APPROVAL_DENIED', kind };
+    if (d === 'deny') return { deny: true };
     if (d === 'required'
         && approvalGate.requiresApproval(ctx)
         && !approvalGate.shouldAutoApprove({ kind, actorRole: user.role })) {
-      // TODO(pending_actions)：接入 pending 表后此处应创建待批记录并回 pendingId，
-      // 人工批准后再执行；当前无表 → 402 拒绝并指引客户端走人工确认流程。
-      return { allow: false, code: 402, error: 'APPROVAL_REQUIRED', kind };
+      // 无 allowlist 预授权 → 入待批队列等待真人审批（代替历史裸 402）。
+      return { queue: true };
     }
     return { allow: true }; // auto；或 required 但被 allowlist 预授权
   }
 
-  /** G19 — 门不通过则 sendJSON 拒绝并返回 false（调用方直接 return true）。 */
-  function gateWrite(res, kind, user) {
-    const v = approvalVerdict(kind, user);
+  /**
+   * G19 — 真实写执行表：gate 放行路径与 approve 重放共用同一入口。
+   * payload 为入队时的净化写参数快照（形状见上方 payload 构造器）。
+   */
+  const APPLY = {
+    'provider.create': (payload, actor) => service.createProvider(
+      pg, providerInput(payload), payload.apiKey, actor || '',
+    ),
+    'provider.enable': (payload) => service.setProviderEnabled(
+      pg, payload.providerId, payload.enabled !== false, payload.revision,
+    ),
+    'provider.key.create': (payload) => service.addKeysBatch(pg, payload.providerId, payload.keys, sync),
+    'provider.key.delete': (payload) => service.deleteKey(pg, payload.providerId, payload.keyId, sync),
+    'provider.cooldown': (payload) => service.setKeyCooldown(pg, payload.providerId, payload.keyId, payload.cooldownMs, sync),
+  };
+
+  /**
+   * G19 — 写门。allow → 返回 true（调用方继续执行 APPLY）；deny → 403；
+   * queue（required 且未预授权）→ 先对 payload 跑只读校验（可选 validate，
+   * 拦住注定失败的写），再落一条 PENDING 并回 202 {ok,pendingId,kind,expiresAt}，
+   * 不执行。任何入队失败 fail-closed：绝不执行、回 4xx/5xx。
+   */
+  async function gateWrite(res, kind, user, payload, validate) {
+    const v = approvalDecision(kind, user);
     if (v.allow) return true;
-    sendJSON(res, v.code, {
-      ok: false,
-      error: v.error,
-      kind: v.kind,
-      message: v.code === 402
-        ? '高危写操作需人工审批：当前服务端未接入待批队列（pending_actions 未落地），请客户端走人工确认流程、经人工批准后重放本请求。'
-        : '该身份无此写操作权限（deny，无审批路径）。',
-    });
+    if (v.deny) {
+      sendJSON(res, 403, {
+        ok: false,
+        error: 'APPROVAL_DENIED',
+        kind,
+        message: '该身份无此写操作权限（deny，无审批路径）。',
+      });
+      return false;
+    }
+    // queue：required → 入待批（代替裸 402；approve 后重放执行）。
+    try {
+      if (typeof validate === 'function') await validate();
+      const created = await pendingStore.create({
+        kind,
+        actorId: user.id,
+        actorRole: user.role,
+        payload,
+      });
+      if (!created.ok) {
+        throw Object.assign(new Error(`pendingActionStore.create: ${created.error.message}`), { status: 500 });
+      }
+      const pa = created.pendingAction;
+      sendJSON(res, 202, {
+        ok: true,
+        pendingId: pa.id,
+        kind,
+        status: 'PENDING',
+        expiresAt: pa.expiresAt,
+        message: '高危写操作已入待批队列（/api/v2/ai-admin/approvals/pending），待管理员审批后重放执行。',
+      });
+    } catch (e) {
+      const status = e && e.status ? e.status : 500;
+      if (status >= 500) console.error('[ai-control] 待批入队失败（fail-closed，未执行）:', e && e.message);
+      sendJSON(res, status, { ok: false, error: e && e.message ? e.message : '待批入队失败' });
+    }
     return false;
   }
 
+  /** admin 面 decide 结果（store 错误码）→ HTTP。 */
+  function decideStoreError(res, dec) {
+    const map = {
+      PENDING_ACTION_NOT_FOUND: 404,
+      INVALID_ACTION_ID: 400,
+      TERMINAL_STATE: 409,
+    };
+    const code = map[dec.error.code] || 500;
+    return finish(res, code, { ok: false, error: dec.error.code, message: dec.error.message });
+  }
+
+  /** 审批行预检：不存在 → 404；非 PENDING（终态）→ 409 TERMINAL_STATE。 */
+  function terminalGuard(pa) {
+    if (!pa) {
+      return { code: 404, body: { ok: false, error: 'PENDING_ACTION_NOT_FOUND', message: '待批记录不存在' } };
+    }
+    if (pa.status !== 'PENDING') {
+      return {
+        code: 409,
+        body: {
+          ok: false,
+          error: 'TERMINAL_STATE',
+          status: pa.status,
+          message: `待批记录 ${pa.id} 已是 ${pa.status}（终态），不可再审批`,
+        },
+      };
+    }
+    return null;
+  }
+
+  /**
+   * G19 — admin 审批面：/approvals/pending GET、/approvals/:id/approve|deny POST。
+   * 调用方已过 guard（session + adminRequire），approver 标识 = 会话用户 id。
+   * approve = 先重放（APPLY[kind](payload)）成功再 decide(APPROVED)；重放失败 →
+   * decide(DENIED, note='execution-error: …') + 402 EXECUTION_ERROR。
+   */
+  async function handleApprovals(req, res, sub, method, approver) {
+    if (sub === '/approvals/pending' && method === 'GET') {
+      const list = await pendingStore.listPending();
+      if (!list.ok) throw Object.assign(new Error(list.error.message), { status: 500 });
+      const pendingActions = list.pendingActions.map(approvalRowForResponse);
+      return finish(res, 200, { ok: true, pendingActions, count: pendingActions.length });
+    }
+    const m = sub.match(/^\/approvals\/([^/]+)\/(approve|deny)$/);
+    if (!m || method !== 'POST') {
+      return finish(res, 404, { ok: false, error: 'Not Found' });
+    }
+    const id = m[1];
+    const action = m[2];
+
+    const got = await pendingStore.get(id);
+    if (!got.ok) throw Object.assign(new Error(got.error.message), { status: 500 });
+    const blocked = terminalGuard(got.pendingAction);
+    if (blocked) return finish(res, blocked.code, blocked.body);
+    const pa = got.pendingAction;
+
+    if (action === 'deny') {
+      const body = (await parseBody(req)) || {};
+      const note = body && typeof body.note === 'string' && body.note.trim() ? body.note : undefined;
+      const dec = await pendingStore.decide({ id, decidedBy: approver.id, approve: false, note });
+      if (!dec.ok) return decideStoreError(res, dec);
+      return finish(res, 200, {
+        ok: true,
+        pendingId: id,
+        pendingAction: approvalRowForResponse(dec.pendingAction),
+      });
+    }
+
+    // approve：先重放，成功才 decide(APPROVED)；失败 → decide(DENIED, execution-error) + 402。
+    let applied;
+    try {
+      applied = await APPLY[pa.kind](pa.payload, approver.id);
+    } catch (e) {
+      const note = `execution-error: ${e && e.message ? e.message : String(e)}`;
+      const dec = await pendingStore.decide({ id, decidedBy: approver.id, approve: false, note });
+      const body = {
+        ok: false,
+        error: 'EXECUTION_ERROR',
+        kind: pa.kind,
+        status: e && e.status ? e.status : 500,
+        message: `审批重放执行失败（HTTP ${e && e.status ? e.status : 500}）：${e && e.message ? e.message : e}`
+          + ' —— 决定已落 DENIED（decision_note=execution-error），该写未生效。',
+      };
+      if (dec.ok) body.pendingAction = approvalRowForResponse(dec.pendingAction);
+      else {
+        const cur = await pendingStore.get(id);
+        if (cur.ok && cur.pendingAction) body.pendingAction = approvalRowForResponse(cur.pendingAction);
+      }
+      return finish(res, 402, body);
+    }
+    const dec = await pendingStore.decide({ id, decidedBy: approver.id, approve: true });
+    if (!dec.ok) {
+      // 竞态：重放已落库但记录已被并发终态化（decide CAS 落空）。写可能已重复执行一次。
+      return finish(res, 409, {
+        ok: false,
+        error: dec.error.code,
+        message: dec.error.message,
+        note: '重放已成功执行；决定未落库（并发终态锁），该写可能已重复执行一次',
+        applied,
+      });
+    }
+    return finish(res, 200, {
+      ok: true,
+      pendingId: id,
+      kind: pa.kind,
+      applied,
+      pendingAction: approvalRowForResponse(dec.pendingAction),
+    });
+  }
+
   async function handle(req, res, urlPath, method) {
-    if (!urlPath.startsWith(PREFIX)) return false;
+    let sub = null;
+    let adminSub = null;
+    if (urlPath.startsWith(PREFIX)) {
+      sub = urlPath.slice(PREFIX.length).replace(/\/+$/, '');
+    } else if (urlPath.startsWith(ADMIN_PREFIX)) {
+      adminSub = urlPath.slice(ADMIN_PREFIX.length).replace(/\/+$/, '');
+    } else {
+      return false;
+    }
     if (method === 'OPTIONS') return true;
-    const sub = urlPath.slice(PREFIX.length).replace(/\/+$/, '');
     const session = sessionUser(req);
     if (!session) { sendJSON(res, 401, { ok: false, error: '未登录' }); return true; }
 
     try {
+      // ── admin 审批面（/api/v2/ai-admin/approvals/*）：同样经本路由 guard ──
+      if (adminSub !== null) {
+        const approver = await guard(req, res, method);
+        if (!approver) return true;
+        return handleApprovals(req, res, adminSub, method, approver);
+      }
+
       // ── User-safe logical model catalog (M02 authority; no provider secrets) ──
       if (sub === '/models' && method === 'GET') {
         const models = await catalogService.listModelsForUser(pg, session);
@@ -267,8 +534,11 @@ function createAiControlRouter(deps) {
             },
           });
         }
-        if (!gateWrite(res, 'provider.create', user)) return true;
-        const out = await service.createProvider(pg, body, body.apiKey, user.id);
+        // G19：payload 快照 → 写门（required 入队 / deny 403 / allow 放行）→ APPLY。
+        const payload = providerCreatePayload(body);
+        const validate = () => service.createProvider(noWritePg(), providerInput(payload), payload.apiKey, '');
+        if (!(await gateWrite(res, 'provider.create', user, payload, validate))) return true;
+        const out = await APPLY['provider.create'](payload, user.id);
         return finish(res, 201, out);
       }
       let m = sub.match(/^\/providers\/([^/]+)$/);
@@ -313,8 +583,9 @@ function createAiControlRouter(deps) {
             },
           });
         }
-        if (!gateWrite(res, 'provider.enable', user)) return true;
-        const out = await service.setProviderEnabled(pg, m[1], enabled, cur.revision);
+        const payload = { providerId: m[1], enabled, revision: cur.revision };
+        if (!(await gateWrite(res, 'provider.enable', user, payload))) return true;
+        const out = await APPLY['provider.enable'](payload);
         return finish(res, 200, out);
       }
       m = sub.match(/^\/providers\/([^/]+)\/keys$/);
@@ -340,8 +611,11 @@ function createAiControlRouter(deps) {
           const would = await dryRunAddKeysDigest(pg, m[1], keys);
           return finish(res, 201, { ok: true, dryRun: true, would });
         }
-        if (!gateWrite(res, 'provider.key.create', user)) return true;
-        const out = await service.addKeysBatch(pg, m[1], keys, sync);
+        const payload = { providerId: m[1], keys: normalizeApiKeyList(keys) };
+        if (!payload.keys.length) return finish(res, 400, { ok: false, error: '没有有效的 key（每把至少6位）' });
+        const validate = () => service.addKeysBatch(noWritePg(), m[1], payload.keys, {});
+        if (!(await gateWrite(res, 'provider.key.create', user, payload, validate))) return true;
+        const out = await APPLY['provider.key.create'](payload);
         return finish(res, 201, out);
       }
       m = sub.match(/^\/providers\/([^/]+)\/keys\/([^/]+)$/);
@@ -373,8 +647,10 @@ function createAiControlRouter(deps) {
             would: { action: 'deleteKey', provider_id: m[1], key_id: m[2] },
           });
         }
-        if (!gateWrite(res, 'provider.key.delete', user)) return true;
-        const out = await service.deleteKey(pg, m[1], m[2], sync);
+        const payload = { providerId: m[1], keyId: m[2] };
+        const validate = () => service.deleteKey(noWritePg(), m[1], m[2], {});
+        if (!(await gateWrite(res, 'provider.key.delete', user, payload, validate))) return true;
+        const out = await APPLY['provider.key.delete'](payload);
         return finish(res, 200, out);
       }
       m = sub.match(/^\/providers\/([^/]+)\/keys\/([^/]+)\/cooldown$/);
@@ -394,8 +670,10 @@ function createAiControlRouter(deps) {
             },
           });
         }
-        if (!gateWrite(res, 'provider.cooldown', user)) return true;
-        const out = await service.setKeyCooldown(pg, m[1], m[2], body.cooldownMs, sync);
+        const payload = { providerId: m[1], keyId: m[2], cooldownMs: body.cooldownMs };
+        const validate = () => service.setKeyCooldown(noWritePg(), m[1], m[2], body.cooldownMs, {});
+        if (!(await gateWrite(res, 'provider.cooldown', user, payload, validate))) return true;
+        const out = await APPLY['provider.cooldown'](payload);
         return finish(res, 200, out);
       }
       return finish(res, 404, { ok: false, error: 'Not Found' });
@@ -411,7 +689,17 @@ function createAiControlRouter(deps) {
     return true;
   }
 
-  return { handle, PREFIX };
+  /**
+   * G19 — 过期清扫钩子：把 PENDING 且已过期的行置 EXPIRED（幂等）。
+   * 导出供 server.js 定时调用（如 setInterval(() => aiControlRouter.sweepExpired(), …)）；
+   * 本叶不挂定时器。
+   * @param {Date|number|string} [now] 测试注入；缺省当前时刻。
+   */
+  async function sweepExpired(now) {
+    return pendingStore.expireOverdue(now);
+  }
+
+  return { handle, PREFIX, ADMIN_PREFIX, sweepExpired };
 }
 
-module.exports = { createAiControlRouter, PREFIX };
+module.exports = { createAiControlRouter, PREFIX, ADMIN_PREFIX };
