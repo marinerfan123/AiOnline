@@ -8,6 +8,11 @@
  *   - getBudgetSpent(pg, projectId)   读模型：budget / spent / remaining / 阈值
  *   - recordSpend(pg, {...})          受上限保护的幂等累计（ledger 风格防双扣）
  *
+ * balance_after 审计快照（0057 迁移）: recordSpend 成功路径在同一事务内把
+ * project_budgets.balance_after 写成最新余量（budget - 新 spent），使最近一次
+ * 记录 spend 后的余量可直读可对账。该列是【审计快照，非真源】——budget/spent
+ * 仍为权威列，balance_after 只随成功扣减推进，拒绝/已记重放绝不改写它。
+ *
  * recordSpend 不是结算引擎。它只「烧」项目预算上限并凭幂等键去重；真实资金移动
  * （用户余额扣减、credit 流水、退款）归 FinGate-7，本模块刻意不触及、不新造结算语义。
  *
@@ -107,11 +112,15 @@ async function recordSpend(pg, { projectId, amount, idempotencyKey } = {}) {
 
     // 2. 带守卫的原子累计：仅当 amount <= remaining (budget - spent) 时才加。
     //    WHERE 在 UPDATE 内 → PG 行锁下重估条件，并发扣减被串行化，绝不超卖。
+    //    balance_after = budget - (spent + $2)：同事务写审计快照 = 扣减后的最新
+    //    余量（RHS 列引用为旧值，故等价于 budget - 新 spent）。audit 快照非真源。
     const upd = await q.query(
       `UPDATE project_budgets
-          SET spent = spent + $2, updated_at = NOW()
+          SET spent = spent + $2,
+              updated_at = NOW(),
+              balance_after = budget - (spent + $2)
         WHERE project_id = $1 AND budget - spent >= $2
-        RETURNING project_id, budget, spent`,
+        RETURNING project_id, budget, spent, balance_after`,
       [projectId, amt],
     );
     const row = upd && upd.rows && upd.rows[0];
@@ -143,6 +152,7 @@ async function recordSpend(pg, { projectId, amount, idempotencyKey } = {}) {
       projectId: row.project_id,
       spent: toNum(row.spent),
       remaining: toNum(row.budget) - toNum(row.spent),
+      balanceAfter: toNum(row.balance_after),
     };
   } catch (e) {
     if (begun) await q.query('ROLLBACK').catch(() => {});

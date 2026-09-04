@@ -25,6 +25,11 @@
  *        decide(APPROVED)）、重放失败 → decide(DENIED, note=execution-error)
  *        + 402 EXECUTION_ERROR、deny、终态（APPROVED/DENIED/EXPIRED）再审批
  *        → 409 TERMINAL_STATE、sweepExpired 过期清扫。
+ *        - approve 策略复验（LOW 收口）：决策前以审批人自身角色重跑
+ *          approvalGate.decisionFor；非 auto（required/deny，假 gate 注入）→
+ *          409 POLICY_ESCALATION、不落决定、行保持 PENDING。DEFAULT_POLICY 下
+ *          admin 全 kind auto → 既有 approve 用例全绿回归（零行为变化）；deny
+ *          面不需复验。kind 词表外（DB 篡改）跳过复验 → 仍 402 + DENIED。
  *   No real DB is used.
  */
 const test = require('node:test');
@@ -278,7 +283,7 @@ function fakePg() {
 }
 
 // ── router harness ─────────────────────────────────────────────────────────
-function harness({ authed = true, admin = true, role = 'admin', id = 'admin-1' } = {}) {
+function harness({ authed = true, admin = true, role = 'admin', id = 'admin-1', gate } = {}) {
   const db = fakePg();
   let last = null;
   // 可变会话用户：gate 测试先以 agent 入队、再以 admin 走审批面，只需 setUser 切换。
@@ -290,6 +295,8 @@ function harness({ authed = true, admin = true, role = 'admin', id = 'admin-1' }
     onPoolChanged: async () => { db.fired.push('onPoolChanged'); },
     sendJSON: (_res, code, data) => { last = { code, data }; },
     parseBody: async (req) => (req.__hasBody ? req.__body : null),
+    // 测试注入的 approvalGate 替身（approve 策略复验升级路径）；缺省 → 真 gate。
+    ...(gate ? { approvalGate: gate } : {}),
   });
 
   async function call(method, path, { body, query } = {}) {
@@ -688,6 +695,25 @@ test('real GET /providers still lists (reads untouched)', async () => {
 // 面接入后的行为。admin 审批面（approvals/*）用 setUser('admin') 切换审批人。
 const AGENT = { role: 'agent', id: 'agent-1' };
 
+/**
+ * 可注入的假 approvalGate：整体委托真 gate（ACTOR_ROLES / requiresApproval /
+ * shouldAutoApprove 等均走真实现，入队路径行为与生产一致），仅对 force() 指定的
+ * `${kind}:${role}` 格让 decisionFor 返回注入决策 —— 用于压 approve 策略复验的
+ * required/deny 升级路径。生产不注入 → 恒真 gate。
+ */
+function fakeGate() {
+  const real = require('../approvalGate.cjs');
+  const forced = new Map(); // `${kind}:${role}` → 'auto'|'required'|'deny'
+  return {
+    ...real,
+    decisionFor(ctx) {
+      const key = `${ctx.kind}:${ctx.actorRole}`;
+      return forced.has(key) ? forced.get(key) : real.decisionFor(ctx);
+    },
+    force(kind, role, decision) { forced.set(`${kind}:${role}`, decision); return this; },
+  };
+}
+
 function assertPendingQueued(r, kind) {
   assert.equal(r.code, 202, 'required → 入队回 202（代替裸 402）');
   assert.equal(r.data.ok, true);
@@ -1065,6 +1091,68 @@ test('terminal state: deny after DENIED → 409 TERMINAL_STATE', async () => {
   assert.equal(again.code, 409);
   assert.equal(again.data.error, 'TERMINAL_STATE');
   assert.equal(again.data.status, 'DENIED');
+});
+
+// ── 4c2) approve 策略复验（LOW 收口）：决策前以审批人自身角色重跑 decisionFor ──
+// DEFAULT_POLICY 下 admin 全 kind auto → 上方所有 approve 用例恒通过（回归）；
+// 假 gate 注入 required/deny → 409 POLICY_ESCALATION、不落决定、行保持 PENDING。
+
+test('approve 策略复验: gate 对 approver(admin) 返回 required → 409 POLICY_ESCALATION, 不落决定; 权限方(auto)仍可批准', async () => {
+  const gate = fakeGate().force('provider.create', 'admin', 'required');
+  const h = harness({ role: AGENT.role, id: 'agent-1', gate });
+  const r1 = await h.call('POST', `${U}/providers`, {
+    body: { id: 'p-es1', name: 'Esc1', apiKey: SECRET_A },
+  });
+  assertPendingQueued(r1, 'provider.create');
+  const id = r1.data.pendingId;
+  h.setUser('admin', 'admin-1');
+  const app = await h.call('POST', `${A}/approvals/${id}/approve`, {});
+  assert.equal(app.code, 409);
+  assert.equal(app.data.ok, false);
+  assert.equal(app.data.error, 'POLICY_ESCALATION');
+  assert.equal(app.data.kind, 'provider.create');
+  assert.equal(app.data.decision, 'required');
+  const row = h.pending(id);
+  assert.equal(row.status, 'PENDING', '不落决定：行保持 PENDING');
+  assert.equal(row.decided_by, null, '未写决定人');
+  assert.equal(row.decided_at, null, '未写决定时刻');
+  assertNoRealWrite(h);
+  assert.equal(h.db.providers.some((p) => p.id === 'p-es1'), false, '未重放执行');
+  // 复验以 approver 角色为准：策略对 admin 恢复 auto 后，同一条仍可正常 approve。
+  gate.force('provider.create', 'admin', 'auto');
+  const ok = await h.call('POST', `${A}/approvals/${id}/approve`, {});
+  assert.equal(ok.code, 200, '权限方(auto)可批准，升级不烧行');
+  assert.equal(ok.data.pendingAction.status, 'APPROVED');
+  assert.equal(h.pending(id).status, 'APPROVED');
+  assert.ok(h.db.providers.some((p) => p.id === 'p-es1'), '批准后重放执行');
+});
+
+test('approve 策略复验: gate 对 approver 返回 deny → 409 POLICY_ESCALATION 行保持 PENDING; deny 动作不需复验', async () => {
+  const gate = fakeGate().force('provider.key.create', 'admin', 'deny');
+  const h = harness({ role: AGENT.role, id: 'agent-1', gate });
+  const r1 = await h.call('POST', `${U}/providers/p1/keys`, { body: { apiKeys: [KEY_A] } });
+  assertPendingQueued(r1, 'provider.key.create');
+  const id = r1.data.pendingId;
+  assert.equal(h.pending(id).status, 'PENDING');
+  h.setUser('admin', 'admin-1');
+  const before = h.db.apiKeys.length;
+  const app = await h.call('POST', `${A}/approvals/${id}/approve`, {});
+  assert.equal(app.code, 409);
+  assert.equal(app.data.ok, false);
+  assert.equal(app.data.error, 'POLICY_ESCALATION');
+  assert.equal(app.data.decision, 'deny');
+  const row = h.pending(id);
+  assert.equal(row.status, 'PENDING', 'deny 决策同样升级（非 auto 即拦），不落决定');
+  assert.equal(row.decided_by, null);
+  assert.equal(h.db.apiKeys.length, before, '未重放');
+  assertNoRealWrite(h);
+  // deny 面不触发复验：审批人仍可终结该行（负向操作恒允许）。
+  const den = await h.call('POST', `${A}/approvals/${id}/deny`, { body: { note: 'escalated-tier denial' } });
+  assert.equal(den.code, 200);
+  assert.equal(den.data.ok, true);
+  assert.equal(h.pending(id).status, 'DENIED');
+  assert.equal(h.pending(id).decided_by, 'admin-1');
+  assert.equal(h.pending(id).decision_note, 'escalated-tier denial');
 });
 
 test('sweepExpired marks overdue PENDING → EXPIRED (idempotent); approve after expiry → 409', async () => {

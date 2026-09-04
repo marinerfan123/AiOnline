@@ -69,6 +69,14 @@
  *       悬空态。
  *     - decide 仅 PENDING 可迁出（store CAS + 本面显式 status 预检），终态
  *       （APPROVED/DENIED/EXPIRED）再审批 → 409 TERMINAL_STATE。
+ *     - approve 决策前策略复验（审计 LOW 收口）：以审批人自身角色重跑
+ *       approvalGate.decisionFor({ kind, actorRole: approver.role })，结果非
+ *       auto（该 kind 对 approver 角色仍 required/deny —— 如未来 admin→required
+ *       的二人制配置，防同级 admin 自批绕过「本人写需他人批」）→ 409
+ *       POLICY_ESCALATION，不重放、不落决定，行保持 PENDING 转交更高权限。
+ *       DEFAULT_POLICY 下 admin 全 kind auto → 恒通过，零行为变化；deny 为负向
+ *       终结操作，不需复验。kind 词表外（DB 篡改）decisionFor 抛错 → 跳过复验，
+ *       落回下方重放路径按未知 kind fail-closed（402 + DENIED，零真实写）。
  *     - 竞态注记：approve「先重放后 decide」在极端并发（他人已终态化本行）
  *       下可能重复执行一次写（重放已落库而 decide 落空 → 409 并回带 applied）；
  *       待批 id 随机且审批面为人工单点，风险可接受并显式暴露。
@@ -258,10 +266,15 @@ function approvalRowForResponse(pa) {
  *   onPoolChanged(providerId, rows), // dispatcher.syncKeyPool (may be null)
  *   sendJSON(res, code, data),
  *   parseBody(req),           // -> object|undefined
+ *   approvalGate?,            // 可选：决策单例替身（测试注入用；缺省 = ../approvalGate.cjs）
  * }
  */
 function createAiControlRouter(deps) {
   const { pg, adminRequire, sessionUser, onPoolChanged, sendJSON, parseBody } = deps;
+  // approvalGate 决策单例注入点：默认取本模块 require 的真 gate；deps.approvalGate
+  // 仅供测试注入替身（approve 策略复验升级路径以假 gate 压 required/deny），
+  // 生产不传 → 恒真 gate，DEFAULT_POLICY 下行为零变化。
+  const gate = (deps && deps.approvalGate) || approvalGate;
   const sync = onPoolChanged ? { onPoolChanged } : {};
   const noWritePg = () => makeNoWritePg(pg);
   // G19 — 待批存储（pendingActionStore，迁移 0056；只读消费其 API）。
@@ -282,15 +295,15 @@ function createAiControlRouter(deps) {
    * @returns {{allow:true}|{deny:true}|{queue:true}}
    */
   function approvalDecision(kind, user) {
-    if (!user || !approvalGate.ACTOR_ROLES.includes(user.role)) {
+    if (!user || !gate.ACTOR_ROLES.includes(user.role)) {
       return { deny: true };
     }
     const ctx = { kind, actorRole: user.role, actorId: user.id };
-    const d = approvalGate.decisionFor(ctx);
+    const d = gate.decisionFor(ctx);
     if (d === 'deny') return { deny: true };
     if (d === 'required'
-        && approvalGate.requiresApproval(ctx)
-        && !approvalGate.shouldAutoApprove({ kind, actorRole: user.role })) {
+        && gate.requiresApproval(ctx)
+        && !gate.shouldAutoApprove({ kind, actorRole: user.role })) {
       // 无 allowlist 预授权 → 入待批队列等待真人审批（代替历史裸 402）。
       return { queue: true };
     }
@@ -425,6 +438,30 @@ function createAiControlRouter(deps) {
         ok: true,
         pendingId: id,
         pendingAction: approvalRowForResponse(dec.pendingAction),
+      });
+    }
+
+    // approve 策略复验（审计 LOW 收口）：决策前以审批人自身角色重跑
+    // gate.decisionFor({ kind, actorRole: approver.role })。结果非 auto ——
+    // required/deny（该 kind 对 approver 角色仍要求审批，如未来 admin→required
+    // 的二人制配置）→ 同级自批会绕过「本人写需他人批」→ 409 POLICY_ESCALATION，
+    // 不重放、不落决定，行保持 PENDING 转交更高权限审批。DEFAULT_POLICY 下
+    // admin 全 kind auto → 恒通过，零行为变化；deny 为负向终结操作不需复验
+    // （走上方独立分支）。kind 词表外（DB 篡改）decisionFor 抛 RangeError →
+    // 跳过本闸，落回下方重放路径按未知 kind fail-closed（402 + DENIED，零真实写）。
+    let approverDecision = null;
+    try {
+      approverDecision = gate.decisionFor({ kind: pa.kind, actorRole: approver.role });
+    } catch (e) { /* 词表外 kind：不在此拦截，交重放路径 fail-closed */ }
+    if (approverDecision !== null && approverDecision !== 'auto') {
+      return finish(res, 409, {
+        ok: false,
+        error: 'POLICY_ESCALATION',
+        kind: pa.kind,
+        decision: approverDecision,
+        pendingId: id,
+        message: '策略复验：该待批 kind 对审批人角色仍要求审批（required/deny），'
+          + '不可自行批准 —— 请移交更高权限审批（决定未落，行保持 PENDING）。',
       });
     }
 
