@@ -12,6 +12,7 @@ const test = require('node:test');
 const assert = require('node:assert');
 const dispatcher = require('../../dispatcher.cjs');
 const videoIndex = require('../../providers/video/index.cjs');
+const imageIndex = require('../../providers/image/index.cjs');
 const uploadQueue = require('../../uploadQueue.cjs');
 const billingMod = require('../../billing.cjs');
 const accountingMod = require('../../accounting.cjs');
@@ -279,6 +280,99 @@ test('imageGenerate: custom 端点（protocol custom + imageFieldPath）成功',
   assert.strictEqual(r.status, 'success');
   assert.deepStrictEqual(r.images, ['https://cdn/c1.png', 'https://cdn/c2.png']);
   assert.strictEqual(calls.length, 1);
+});
+
+test('imageGenerate: 委托 imageIndex.generate（index 被调用，ctx 透传正确）', async () => {
+  const orig = imageIndex.generate;
+  const seen = [];
+  imageIndex.generate = async (ctx) => { seen.push(ctx); return orig(ctx); };
+  try {
+    const provider = { base_url: 'https://gen.example.com/v1', api_key: 'sk-route' };
+    const model = { model_id: 'm1', upstreamModelName: 'flux-img' };
+    const { result: r } = await withFetch((url) =>
+      url.includes('/images/generations') ? IMG_OK('https://cdn/routed.png') : IMG_401,
+      async () => dispatcher.imageGenerate(provider, model, imageInput(), 'sk-route'));
+    assert.strictEqual(r.status, 'success');
+    assert.deepStrictEqual(r.images, ['https://cdn/routed.png']);
+    assert.strictEqual(seen.length, 1);
+    assert.strictEqual(seen[0].apiKey, 'sk-route');
+    assert.strictEqual(seen[0].provider, provider);
+    assert.strictEqual(seen[0].model, model);
+    assert.deepStrictEqual(seen[0].payload, imageInput());
+  } finally {
+    imageIndex.generate = orig;
+  }
+});
+
+test('imageGenerate: 按 provider 路由到适配器（gpt-image 名 / agnes base_url / openai-compat 兜底 wire 差异）', async () => {
+  // gpt-image：size 走官方枚举，请求体不含 ratio / negative_prompt
+  let body;
+  let rg = await withFetch((url, init) => {
+    if (url.includes('/images/generations')) { body = JSON.parse(init.body); return IMG_OK('https://cdn/g.png'); }
+    return IMG_401;
+  }, async () => dispatcher.imageGenerate(
+    { base_url: 'https://api.openai.com/v1', api_key: 'sk-g' },
+    { model_id: 'gpt-image-1', upstreamModelName: 'gpt-image-1' },
+    imageInput({ ratio: '16:9', negative: 'nsfw' }), 'sk-g'));
+  assert.strictEqual(rg.result.status, 'success');
+  assert.strictEqual(body.size, '1536x1024');
+  assert.ok(!('ratio' in body) && !('negative_prompt' in body));
+
+  // agnes base_url：size 走分辨率档位（1K），发送 ratio、不发 negative_prompt
+  rg = await withFetch((url, init) => {
+    if (url.includes('/images/generations')) { body = JSON.parse(init.body); return IMG_OK('https://cdn/a.png'); }
+    return IMG_401;
+  }, async () => dispatcher.imageGenerate(
+    { base_url: 'https://api.agnes-ai.cn/v1', api_key: 'sk-a' },
+    { model_id: 'flux-1-dev', upstreamModelName: 'flux-1-dev' },
+    imageInput({ ratio: '16:9', resolution: '1k', negative: 'nsfw' }), 'sk-a'));
+  assert.strictEqual(rg.result.status, 'success');
+  assert.strictEqual(body.size, '1K');
+  assert.strictEqual(body.ratio, '16:9');
+  assert.ok(!('negative_prompt' in body));
+
+  // openai-compat 兜底：size 走标准尺寸表 + resolution 倍增，发送 ratio + negative_prompt
+  rg = await withFetch((url, init) => {
+    if (url.includes('/images/generations')) { body = JSON.parse(init.body); return IMG_OK('https://cdn/o.png'); }
+    return IMG_401;
+  }, async () => dispatcher.imageGenerate(
+    { base_url: 'https://relay.example.com/v1', api_key: 'sk-o' },
+    { model_id: 'flux-1-dev', upstreamModelName: 'flux-1-dev' },
+    imageInput({ ratio: '16:9', resolution: '1k', negative: 'nsfw' }), 'sk-o'));
+  assert.strictEqual(rg.result.status, 'success');
+  assert.strictEqual(body.size, '1792x1024');
+  assert.strictEqual(body.ratio, '16:9');
+  assert.strictEqual(body.negative_prompt, 'nsfw');
+});
+
+test('imageGenerate: 适配层错误码归一为 dispatcher 失败语义（RATE_LIMITED/TIMEOUT/UNKNOWN_PROVIDER/EMPTY_RESPONSE）', async () => {
+  const orig = imageIndex.generate;
+  const provider = { base_url: 'https://e.example.com/v1', api_key: 'sk-e' };
+  const model = { model_id: 'm1', upstreamModelName: 'flux-img' };
+  const cases = [
+    [{ ok: false, code: 'RATE_LIMITED', retryable: true, message: 'rate limited', retryAfterMs: 2000 },
+      { rateLimited: true, retryAfterMs: 2000, prefix: '图片生成失败：' }],
+    [{ ok: false, code: 'TIMEOUT', retryable: true, message: '图片生成超时(60s)' },
+      { rateLimited: false, retryAfterMs: undefined, prefix: '图片生成超时(60s)' }],
+    [{ ok: false, code: 'UNKNOWN_PROVIDER', retryable: false, message: '未知图像服务商（adapter=foo）' },
+      { rateLimited: false, retryAfterMs: undefined, prefix: '图片生成失败：' }],
+    [{ ok: false, code: 'EMPTY_RESPONSE', retryable: false, message: '响应中无图片数据' },
+      { rateLimited: false, retryAfterMs: undefined, prefix: '响应中无图片数据' }],
+  ];
+  try {
+    for (const [outcome, exp] of cases) {
+      imageIndex.generate = async () => outcome;
+      const r = await dispatcher.imageGenerate(provider, model, imageInput(), 'sk-e');
+      assert.strictEqual(r.status, 'error');
+      assert.deepStrictEqual(r.images, []);
+      assert.strictEqual(r.videoUrl, '');
+      assert.strictEqual(r.rateLimited, exp.rateLimited);
+      assert.strictEqual(r.retryAfterMs, exp.retryAfterMs);
+      assert.ok(r.error.startsWith(exp.prefix), `期望 '${exp.prefix}' 前缀，实际 '${r.error}'`);
+    }
+  } finally {
+    imageIndex.generate = orig;
+  }
 });
 
 // ─── 4) videoGenerate ─────────────────────────────

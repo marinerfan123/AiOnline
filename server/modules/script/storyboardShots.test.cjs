@@ -5,6 +5,9 @@ const {
   persistStoryboardShots,
   validatePersistArgs,
   buildShotRows,
+  setLocked,
+  lockShot,
+  lockShots,
 } = require('./storyboardShots.cjs');
 const { buildStoryboardPlan } = require('./storyboardPlan.cjs');
 
@@ -72,13 +75,42 @@ function makePg(opts = {}) {
         .reduce((m, s) => Math.max(m, s.version), 0);
       return { rows: [{ v }] };
     }
+    if (/SELECT shot_id FROM project_shots_rows WHERE script_id = \$1/.test(sql)) {
+      // LOCKED_SHOT_IDS_SQL：返回锁定 shot_id（不记日志，避免污染既有事务断言）
+      return {
+        rows: state.shots
+          .filter((s) => s.script_id === params[0] && s.project_id === params[1] && s.locked)
+          .map((s) => ({ shot_id: s.shot_id })),
+      };
+    }
     if (/DELETE FROM project_shots_rows WHERE script_id = \$1/.test(sql)) {
       state.log.push('delete');
       const before = state.shots.length;
       state.shots = state.shots.filter(
-        (s) => !(s.script_id === params[0] && s.project_id === params[1]),
+        (s) => !(s.script_id === params[0] && s.project_id === params[1] && !s.locked),
       );
       return { rowCount: before - state.shots.length };
+    }
+    if (/UPDATE project_shots_rows SET locked/.test(sql) && /ANY\(\$3::text\[\]\)/.test(sql)) {
+      // SET_LOCKED_BATCH_SQL：script_id=$1, project_id=$2, shot_ids=$3, locked=$4
+      const ids = params[2];
+      const updated = [];
+      for (const s of state.shots) {
+        if (s.script_id === params[0] && s.project_id === params[1] && ids.includes(s.shot_id)) {
+          s.locked = params[3];
+          updated.push({ shot_id: s.shot_id });
+        }
+      }
+      return { rows: updated };
+    }
+    if (/UPDATE project_shots_rows SET locked/.test(sql)) {
+      // SET_LOCKED_SQL：script_id=$1, shot_id=$2, project_id=$3, locked=$4
+      const target = state.shots.find(
+        (s) => s.script_id === params[0] && s.shot_id === params[1] && s.project_id === params[2],
+      );
+      if (!target) return { rows: [] };
+      target.locked = params[3];
+      return { rows: [{ shot_id: target.shot_id, locked: target.locked }] };
     }
     if (/INSERT INTO project_shots_rows/.test(sql)) {
       state.insertCount += 1;
@@ -92,6 +124,7 @@ function makePg(opts = {}) {
         shot_index: params[6], kind: params[7], intent: params[8],
         subject_refs: JSON.parse(params[9]), duration_ms: params[10],
         ordering: params[11], version: params[12],
+        locked: params[13], source_trace: JSON.parse(params[14]),
       });
       return { rowCount: 1 };
     }
@@ -538,5 +571,155 @@ test('G13 CRITICAL: advisory lock is acquired before the MAX(version) read (mech
   await persistStoryboardShots({ pg, projectId: P_ID, scriptId: S_ID, plan });
   assert.equal(calls[0], 'lock', 'advisory lock must precede the version read');
   assert.ok(calls.indexOf('lock') < calls.indexOf('max'), 'lock before MAX(version)');
+});
+
+// ------------------------------------------------------ locked semantics (0052)
+test('G13 V2.0: locked shot survives re-apply — row preserved, replaced/inserted exclude it, skippedLocked returned', async () => {
+  const { plan } = samplePlan();
+  const pg = makePg();
+  const first = await callPersist(pg, { plan });
+  assert.equal(first.ok, true);
+  assert.equal(first.version, 1);
+  assert.deepEqual(first.skippedLocked, []);
+  assert.equal(pg.state.shots.length, 4);
+
+  const locked = await lockShot({ pg, projectId: P_ID, scriptId: S_ID, shotId: 's0:b0:k0', locked: true });
+  assert.equal(locked.ok, true);
+  assert.equal(locked.locked, true);
+
+  const second = await callPersist(pg, { plan });
+  assert.equal(second.ok, true);
+  assert.equal(second.version, 2);
+  assert.deepEqual(second.skippedLocked, ['s0:b0:k0']); // 锁定 shot_id 被跳过并上报
+  assert.equal(second.replaced, 3);                     // 只删 3 行 unlocked
+  assert.equal(second.inserted, 3);                     // 跳过锁定的 1 行
+  assert.equal(pg.state.shots.length, 4);               // 锁定行保留 + 3 新行
+
+  const lockedRow = pg.state.shots.find((s) => s.shot_id === 's0:b0:k0');
+  assert.equal(lockedRow.locked, true);
+  assert.equal(lockedRow.version, 1, 'locked row keeps its old version (never overwritten)');
+  const unlocked = pg.state.shots.filter((s) => s.shot_id !== 's0:b0:k0');
+  assert.ok(unlocked.every((s) => s.locked === false && s.version === 2));
+});
+
+test('G13 V2.0: a locked shot no longer in the plan is still preserved (DELETE skips it)', async () => {
+  const { plan: planA } = samplePlan();
+  const pg = makePg();
+  await callPersist(pg, { plan: planA });
+  // 锁定一个将要从修订版 plan 中消失的 shot（s1 场景的 s1:b0:k0）
+  await lockShot({ pg, projectId: P_ID, scriptId: S_ID, shotId: 's1:b0:k0', locked: true });
+
+  // 修订版 plan：仅场景 0 一个 beat（2 shots），不再包含 s1:b0:* 
+  const rows = [D('MAYA', 'Revised.', { scene_index: 0 })];
+  const planB = buildStoryboardPlan({ rows, characters: [MAYA] });
+  const res = await callPersist(pg, { plan: planB });
+  assert.equal(res.ok, true);
+  assert.equal(res.version, 2);
+  assert.deepEqual(res.skippedLocked, ['s1:b0:k0']);
+  assert.equal(res.replaced, 3);              // 3 个 unlocked 被删
+  assert.equal(res.inserted, 2);              // 新 plan 2 shots
+  assert.equal(pg.state.shots.length, 3);     // 2 新 + 1 锁定保留
+  assert.ok(pg.state.shots.some((s) => s.shot_id === 's1:b0:k0' && s.locked && s.version === 1));
+  assert.deepEqual(new Set(pg.state.shots.filter((s) => !s.locked).map((s) => s.shot_id)), new Set(['s0:b0:k0', 's0:b0:k1']));
+});
+
+// ------------------------------------------------------ source trace (0053)
+test('G13 V2.0: source_trace lands per row with scriptRowIds + fixed appliedAtMs', async () => {
+  const { plan, rows } = samplePlan();
+  const pg = makePg();
+  await callPersist(pg, { plan });
+
+  const s0k0 = pg.state.shots.find((s) => s.shot_id === 's0:b0:k0');
+  assert.deepEqual(s0k0.source_trace, {
+    scriptRowIds: plan.beats[0].scriptRowIds,
+    sceneIndex: 0,
+    beatIndex: 0,
+    shotIndex: 0,
+    appliedAtMs: 0,
+  });
+  assert.ok(s0k0.source_trace.scriptRowIds.length > 0);
+  assert.deepEqual(s0k0.source_trace.scriptRowIds, plan.beats[0].scriptRowIds);
+  for (const id of s0k0.source_trace.scriptRowIds) {
+    assert.ok(rows.some((r) => r.id === id), `trace scriptRowId ${id} must reference a source row`);
+  }
+  // 不可变时间戳 = 固定值 0（apply 确定性，不随系统时钟漂移）
+  assert.ok(pg.state.shots.every((s) => s.source_trace.appliedAtMs === 0));
+  assert.equal(s0k0.locked, false, 'new rows are never locked on write');
+  // 每个 shot 的 trace 映射到自身 beat/scene 上下文
+  const s1k0 = pg.state.shots.find((s) => s.shot_id === 's1:b0:k0');
+  assert.equal(s1k0.source_trace.sceneIndex, 1);
+  assert.equal(s1k0.source_trace.beatIndex, 0);
+  assert.deepEqual(s1k0.source_trace.scriptRowIds, plan.beats[1].scriptRowIds);
+});
+
+// ------------------------------------------------------ lock/unlock + 404
+test('G13 V2.0: lockShot/setLocked toggle the locked boolean; unlock clears protection', async () => {
+  const { plan } = samplePlan();
+  const pg = makePg();
+  await callPersist(pg, { plan });
+
+  const on = await lockShot({ pg, projectId: P_ID, scriptId: S_ID, shotId: 's1:b0:k0', locked: true });
+  assert.equal(on.ok, true);
+  assert.equal(on.locked, true);
+  assert.equal(pg.state.shots.find((s) => s.shot_id === 's1:b0:k0').locked, true);
+
+  const off = await setLocked({ pg, projectId: P_ID, scriptId: S_ID, shotId: 's1:b0:k0', locked: false });
+  assert.equal(off.ok, true);
+  assert.equal(off.locked, false);
+  assert.equal(pg.state.shots.find((s) => s.shot_id === 's1:b0:k0').locked, false);
+});
+
+test('G13 V2.0: lockShot on a foreign project / unknown shot → 404 (row untouched)', async () => {
+  const { plan } = samplePlan();
+  const pg = makePg();
+  await callPersist(pg, { plan }); // rows belong to p-1
+
+  const foreign = await lockShot({ pg, projectId: 'p-OTHER', scriptId: S_ID, shotId: 's0:b0:k0', locked: true });
+  assert.equal(foreign.ok, false);
+  assert.equal(foreign.status, 404);
+  assert.match(foreign.error, /shot 不存在或不属于该项目/);
+
+  const missing = await lockShot({ pg, projectId: P_ID, scriptId: S_ID, shotId: 'nope', locked: true });
+  assert.equal(missing.ok, false);
+  assert.equal(missing.status, 404);
+
+  assert.equal(pg.state.shots.find((s) => s.shot_id === 's0:b0:k0').locked, false, 'cross-project lock must not touch the row');
+});
+
+test('G13 V2.0: lockShots batch-toggles multiple shot ids under one script', async () => {
+  const { plan } = samplePlan();
+  const pg = makePg();
+  await callPersist(pg, { plan });
+
+  const res = await lockShots({ pg, projectId: P_ID, scriptId: S_ID, shotIds: ['s0:b0:k0', 's1:b0:k1'], locked: true });
+  assert.equal(res.ok, true);
+  assert.deepEqual(res.updated.sort(), ['s0:b0:k0', 's1:b0:k1']);
+  assert.equal(res.locked, true);
+  assert.equal(pg.state.shots.find((s) => s.shot_id === 's0:b0:k0').locked, true);
+  assert.equal(pg.state.shots.find((s) => s.shot_id === 's1:b0:k1').locked, true);
+  assert.equal(pg.state.shots.find((s) => s.shot_id === 's0:b0:k1').locked, false);
+
+  const off = await lockShots({ pg, projectId: P_ID, scriptId: S_ID, shotIds: ['s0:b0:k0', 's1:b0:k1'], locked: false });
+  assert.equal(off.ok, true);
+  assert.ok(pg.state.shots.every((s) => s.locked === false));
+});
+
+test('G13 V2.0: lockShot/lockShots validate bad input (400)', async () => {
+  const pg = makePg();
+  const cases = [
+    () => lockShot({ pg: null, projectId: P_ID, scriptId: S_ID, shotId: 'x', locked: true }),
+    () => lockShot({ pg, projectId: '', scriptId: S_ID, shotId: 'x', locked: true }),
+    () => lockShot({ pg, projectId: P_ID, scriptId: '', shotId: 'x', locked: true }),
+    () => lockShot({ pg, projectId: P_ID, scriptId: S_ID, shotId: '', locked: true }),
+    () => lockShot({ pg, projectId: P_ID, scriptId: S_ID, shotId: 'x', locked: 'yes' }),
+    () => lockShots({ pg, projectId: P_ID, scriptId: S_ID, shotIds: [], locked: true }),
+    () => lockShots({ pg, projectId: P_ID, scriptId: S_ID, shotIds: ['x', 42], locked: true }),
+  ];
+  for (const fn of cases) {
+    const res = await fn();
+    assert.equal(res.ok, false);
+    assert.equal(res.status, 400);
+    assert.ok(Array.isArray(res.errors) && res.errors.length > 0);
+  }
 });
 

@@ -42,6 +42,34 @@ function createUploadApi({ pg, sessionUser, sendJSON, parseBody, signPutUrl }) {
     return { ...r.rows[0], role: m.rows[0].role };
   }
 
+  // Membership role lookup WITHOUT leaking existence (returns null both when the
+  // project is missing and when the user is not a member — callers map that to 404).
+  async function userProjectRole(user, projectId) {
+    const r = await pg.query(`SELECT workspace_id FROM projects WHERE id = $1`, [projectId]);
+    if (!r.rows.length) return null;
+    const m = await pg.query(
+      `SELECT role FROM workspace_members WHERE workspace_id = $1 AND user_id = $2`,
+      [r.rows[0].workspace_id, user.id],
+    );
+    return m.rows.length ? m.rows[0].role : null;
+  }
+
+  // asset_versions row → public version shape (camelCase; storageKey is redacted
+  // unless the caller has write-level project access — owner/editor only).
+  function mapVersion(r, includeStorageKey) {
+    const v = {
+      versionId: r.version_id,
+      kind: r.kind,
+      status: r.status,
+      sizeBytes: r.size_bytes == null ? 0 : Number(r.size_bytes),
+      createdAt: r.created_at,
+    };
+    if (r.model) v.model = r.model;
+    if (r.provider) v.provider = r.provider;
+    if (includeStorageKey && r.storage_key) v.storageKey = r.storage_key;
+    return v;
+  }
+
   async function handle(req, res, urlPath, method) {
     if (!urlPath.startsWith('/api/v2/uploads')) return false;
     if (method === 'OPTIONS') { sendJSON(res, 204, {}); return true; }
@@ -126,6 +154,44 @@ function createUploadApi({ pg, sessionUser, sendJSON, parseBody, signPutUrl }) {
           jobs.push(j.job ? j.job.id : null);
         }
         return sendJSON(res, 200, { ok: true, probeJobId: jobs[0], plannedJobs: jobs });
+      }
+
+      // ── G-v2.0 must#6 — asset version read (list) ──
+      // Project membership gate (same requireProject helper as uploads): asset's
+      // owning project must exist (404) and the user must be a member (403).
+      const listVersionsMatch = urlPath.match(/^\/api\/v2\/uploads\/([^/]+)\/versions$/);
+      if (listVersionsMatch && method === 'GET') {
+        const assetId = decodeURIComponent(listVersionsMatch[1]);
+        const media = await pg.query(`SELECT project_id FROM media WHERE id = $1`, [assetId]);
+        if (!media.rows.length) return sendJSON(res, 404, { ok: false, error: '资产不存在' });
+        const project = await requireProject(res, user, media.rows[0].project_id);
+        if (!project) return true;
+        const r = await pg.query(
+          `SELECT version_id, kind, status, model, provider, size_bytes, storage_key, created_at
+             FROM asset_versions
+            WHERE media_id = $1 AND project_id = $2
+            ORDER BY created_at DESC, version_id DESC`,
+          [assetId, media.rows[0].project_id],
+        );
+        const canSeeStorageKey = ['owner', 'editor'].includes(project.role);
+        return sendJSON(res, 200, { ok: true, versions: r.rows.map((row) => mapVersion(row, canSeeStorageKey)) });
+      }
+
+      // ── G-v2.0 must#6 — asset version read (single) ──
+      // Ownership check returns 404 (not 403) so a foreign/missing version id is
+      // indistinguishable — never leaks that a version exists in another project.
+      const singleVersionMatch = urlPath.match(/^\/api\/v2\/uploads\/versions\/([^/]+)$/);
+      if (singleVersionMatch && method === 'GET') {
+        const versionId = decodeURIComponent(singleVersionMatch[1]);
+        const r = await pg.query(
+          `SELECT version_id, kind, status, model, provider, size_bytes, storage_key, created_at, project_id
+             FROM asset_versions WHERE version_id = $1`,
+          [versionId],
+        );
+        if (!r.rows.length) return sendJSON(res, 404, { ok: false, error: '版本不存在' });
+        const role = await userProjectRole(user, r.rows[0].project_id);
+        if (!role) return sendJSON(res, 404, { ok: false, error: '版本不存在' });
+        return sendJSON(res, 200, { ok: true, version: mapVersion(r.rows[0], ['owner', 'editor'].includes(role)) });
       }
 
       return sendJSON(res, 404, { ok: false, error: 'Not Found' });

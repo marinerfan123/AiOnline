@@ -174,3 +174,179 @@ test('G06 upload: viewer role cannot create (403) — audit M1 fix', async () =>
   await api.handle({}, {}, '/api/v2/uploads', 'POST');
   assert.equal(responses[0].code, 403);
 });
+
+// ─── G-v2.0 must#6 — asset version read endpoints ─────────────────────────────
+
+function verRow({ versionId = 'av-1', kind = 'generated', status = 'ready', model = 'model-x', provider = 'openai', sizeBytes = '2048', storageKey = 'img/k1.png', projectId = 'p1', createdAt = new Date('2026-09-04T01:00:00Z') } = {}) {
+  return { version_id: versionId, kind, status, model, provider, size_bytes: sizeBytes, storage_key: storageKey, project_id: projectId, created_at: createdAt };
+}
+
+function makeVersionApi(pg, responses, user = { id: 'u1' }) {
+  return createUploadApi({
+    pg,
+    sessionUser: () => user,
+    sendJSON: (res, code, body) => responses.push({ code, body }),
+    parseBody: async (r) => r.body || {},
+    signPutUrl: async () => 'x',
+  });
+}
+
+test('G-v2.0 #6: GET /uploads/:assetId/versions returns versions sorted desc + camelCase mapping (owner)', async () => {
+  const responses = [];
+  const rows = [verRow({ versionId: 'av-new' }), verRow({ versionId: 'av-old', model: '', provider: '' })];
+  const queries = [];
+  const pg = {
+    async query(sql, params) {
+      queries.push({ sql, params });
+      if (sql.includes('FROM media WHERE id')) return { rows: [{ project_id: 'p1' }] };
+      if (sql.includes('FROM projects p') && sql.includes('JOIN workspaces')) return { rows: [{ id: 'p1', workspace_id: 'ws-1' }] };
+      if (sql.includes('FROM workspace_members')) return { rows: [{ role: 'owner' }] };
+      if (sql.includes('FROM asset_versions')) return { rows };
+      return { rows: [] };
+    },
+  };
+  const api = makeVersionApi(pg, responses);
+  await api.handle({}, {}, '/api/v2/uploads/m-1/versions', 'GET');
+  assert.equal(responses[0].code, 200);
+  assert.equal(responses[0].body.ok, true);
+  assert.equal(responses[0].body.versions.length, 2);
+  const [a, b] = responses[0].body.versions;
+  assert.equal(a.versionId, 'av-new');
+  assert.equal(a.kind, 'generated');
+  assert.equal(a.status, 'ready');
+  assert.equal(a.model, 'model-x');
+  assert.equal(a.provider, 'openai');
+  assert.equal(a.sizeBytes, 2048); // BIGINT string → number
+  assert.equal(a.storageKey, 'img/k1.png');
+  assert.ok(a.createdAt);
+  // older row: empty model/provider omitted
+  assert.equal(b.model, undefined);
+  assert.equal(b.provider, undefined);
+  // list query is ordered created_at desc
+  const listQ = queries.find((q) => q.sql.includes('FROM asset_versions'));
+  assert.ok(listQ.sql.includes('ORDER BY created_at DESC'), 'list must order by created_at DESC');
+  assert.deepEqual(listQ.params, ['m-1', 'p1']);
+});
+
+test('G-v2.0 #6: GET /uploads/versions/:versionId returns single version (owner)', async () => {
+  const responses = [];
+  const pg = {
+    async query(sql) {
+      if (sql.includes('FROM asset_versions WHERE version_id')) return { rows: [verRow({ versionId: 'av-9' })] };
+      if (sql.includes('FROM projects WHERE id')) return { rows: [{ workspace_id: 'ws-1' }] };
+      if (sql.includes('FROM workspace_members')) return { rows: [{ role: 'owner' }] };
+      return { rows: [] };
+    },
+  };
+  const api = makeVersionApi(pg, responses);
+  await api.handle({}, {}, '/api/v2/uploads/versions/av-9', 'GET');
+  assert.equal(responses[0].code, 200);
+  assert.equal(responses[0].body.version.versionId, 'av-9');
+  assert.equal(responses[0].body.version.kind, 'generated');
+  assert.equal(responses[0].body.version.storageKey, 'img/k1.png');
+});
+
+test('G-v2.0 #6: cross-project single version → 404 (no existence leak)', async () => {
+  const responses = [];
+  const pg = {
+    async query(sql) {
+      if (sql.includes('FROM asset_versions WHERE version_id')) return { rows: [verRow({ versionId: 'av-x', projectId: 'p-other' })] };
+      if (sql.includes('FROM projects WHERE id')) return { rows: [{ workspace_id: 'ws-other' }] };
+      if (sql.includes('FROM workspace_members')) return { rows: [] }; // user not a member
+      return { rows: [] };
+    },
+  };
+  const api = makeVersionApi(pg, responses);
+  await api.handle({}, {}, '/api/v2/uploads/versions/av-x', 'GET');
+  assert.equal(responses[0].code, 404);
+  assert.equal(responses[0].body.ok, false);
+});
+
+test('G-v2.0 #6: list versions denied when not a project member → 403', async () => {
+  const responses = [];
+  const pg = {
+    async query(sql) {
+      if (sql.includes('FROM media WHERE id')) return { rows: [{ project_id: 'p1' }] };
+      if (sql.includes('FROM projects p') && sql.includes('JOIN workspaces')) return { rows: [{ id: 'p1', workspace_id: 'ws-9' }] };
+      if (sql.includes('FROM workspace_members')) return { rows: [] }; // not a member
+      return { rows: [] };
+    },
+  };
+  const api = makeVersionApi(pg, responses);
+  await api.handle({}, {}, '/api/v2/uploads/m-1/versions', 'GET');
+  assert.equal(responses[0].code, 403);
+});
+
+test('G-v2.0 #6: no versions → 200 []', async () => {
+  const responses = [];
+  const pg = {
+    async query(sql) {
+      if (sql.includes('FROM media WHERE id')) return { rows: [{ project_id: 'p1' }] };
+      if (sql.includes('FROM projects p') && sql.includes('JOIN workspaces')) return { rows: [{ id: 'p1', workspace_id: 'ws-1' }] };
+      if (sql.includes('FROM workspace_members')) return { rows: [{ role: 'owner' }] };
+      if (sql.includes('FROM asset_versions')) return { rows: [] };
+      return { rows: [] };
+    },
+  };
+  const api = makeVersionApi(pg, responses);
+  await api.handle({}, {}, '/api/v2/uploads/m-1/versions', 'GET');
+  assert.equal(responses[0].code, 200);
+  assert.deepEqual(responses[0].body.versions, []);
+});
+
+test('G-v2.0 #6: viewer role gets storageKey redacted (脱敏)', async () => {
+  const responses = [];
+  const pg = {
+    async query(sql) {
+      if (sql.includes('FROM media WHERE id')) return { rows: [{ project_id: 'p1' }] };
+      if (sql.includes('FROM projects p') && sql.includes('JOIN workspaces')) return { rows: [{ id: 'p1', workspace_id: 'ws-1' }] };
+      if (sql.includes('FROM workspace_members')) return { rows: [{ role: 'viewer' }] };
+      if (sql.includes('FROM asset_versions')) return { rows: [verRow()] };
+      return { rows: [] };
+    },
+  };
+  const api = makeVersionApi(pg, responses);
+  await api.handle({}, {}, '/api/v2/uploads/m-1/versions', 'GET');
+  assert.equal(responses[0].code, 200);
+  assert.equal(responses[0].body.versions[0].storageKey, undefined);
+});
+
+test('G-v2.0 #6: list unknown asset → 404', async () => {
+  const responses = [];
+  const pg = {
+    async query(sql) {
+      if (sql.includes('FROM media WHERE id')) return { rows: [] };
+      return { rows: [] };
+    },
+  };
+  const api = makeVersionApi(pg, responses);
+  await api.handle({}, {}, '/api/v2/uploads/m-nope/versions', 'GET');
+  assert.equal(responses[0].code, 404);
+});
+
+test('G-v2.0 #6: single unknown version → 404', async () => {
+  const responses = [];
+  const pg = {
+    async query(sql) {
+      if (sql.includes('FROM asset_versions WHERE version_id')) return { rows: [] };
+      return { rows: [] };
+    },
+  };
+  const api = makeVersionApi(pg, responses);
+  await api.handle({}, {}, '/api/v2/uploads/versions/av-missing', 'GET');
+  assert.equal(responses[0].code, 404);
+});
+
+test('G-v2.0 #6: version read unauthenticated → 401', async () => {
+  const responses = [];
+  const api = createUploadApi({
+    pg: { query: async () => ({ rows: [] }) },
+    sessionUser: () => null,
+    sendJSON: (res, code, body) => responses.push({ code, body }),
+    parseBody: async () => ({}),
+    signPutUrl: async () => 'x',
+  });
+  await api.handle({}, {}, '/api/v2/uploads/m-1/versions', 'GET');
+  assert.equal(responses[0].code, 401);
+});
+

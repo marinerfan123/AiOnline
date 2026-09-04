@@ -6,7 +6,7 @@
  * （buildStoryboardPlan 的 { beats, totalShots } 输出，单一真源）逐 beat.shot 落为
  * project_shots_rows（迁移 0045）行。端点挂载（鉴权/角色）由主线在 server.js 完成；
  * 本模块是纯 DB 服务，返回 { ok, ... }，HTTP 语义以 status 字段表达：
- *   200 → { ok:true, projectId, scriptId, version, inserted, replaced }
+ *   200 → { ok:true, projectId, scriptId, version, inserted, replaced, skippedLocked }
  *   400 → { ok:false, status:400, errors:[...] }          （入参/计划形状非法）
  *   404 → { ok:false, status:404, error }                 （项目或 script 不属于该项目）
  *   DB 异常原样抛出（已回滚）。
@@ -23,8 +23,10 @@
  *
  * ── 幂等 / 版本 ────────────────────────────────────────────────────────
  * 同一 script 重跑：单事务内先 SELECT MAX(version) → nextVersion = +1（1..N），
- * DELETE 该 script 全部旧行（replaced=rowCount），再整体 INSERT 新行（version 相同），
- * COMMIT —— 同 script 重跑原子替换，最终行集恒等于本次 plan。
+ * DELETE 该 script 全部 unlocked 旧行（replaced=rowCount），再整体 INSERT 新行
+ * （version 相同），COMMIT —— 同 script 重跑原子替换，最终 unlocked 行集恒等于
+ * 本次 plan。locked=true 的行保留（DELETE 不命中、覆写被跳过），replaced 与
+ * inserted 计数均不含它们，persist 返回 skippedLocked=[锁定 shot_id 列表]。
  *
  * ── 事务 ───────────────────────────────────────────────────────────────
  * pg.connect 存在时（node-postgres Pool/Client）取专属 client，BEGIN…COMMIT/
@@ -42,13 +44,29 @@ const OWNER_PROJECT_SQL = 'SELECT 1 AS ok FROM projects WHERE id = $1';
 const OWNER_ROWS_SQL = 'SELECT id FROM script_rows WHERE project_id = $1 AND id = ANY($2::text[])';
 const MAX_VERSION_SQL =
   'SELECT COALESCE(MAX(version), 0)::int AS v FROM project_shots_rows WHERE script_id = $1 AND project_id = $2';
-const DELETE_SCRIPT_SQL =
-  'DELETE FROM project_shots_rows WHERE script_id = $1 AND project_id = $2';
+// locked 行保留：先查锁定 shot_id 用于跳过覆写；DELETE 只作用于 unlocked 行。
+const LOCKED_SHOT_IDS_SQL =
+  'SELECT shot_id FROM project_shots_rows WHERE script_id = $1 AND project_id = $2 AND locked = true';
+const DELETE_UNLOCKED_SQL =
+  'DELETE FROM project_shots_rows WHERE script_id = $1 AND project_id = $2 AND locked = false';
 const INSERT_SHOT_SQL =
   `INSERT INTO project_shots_rows
      (project_id, script_id, shot_id, beat_id, scene_index, beat_index,
-      shot_index, kind, intent, subject_refs, duration_ms, ordering, version)
-   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`;
+      shot_index, kind, intent, subject_refs, duration_ms, ordering, version,
+      locked, source_trace)
+   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`;
+// 锁定/解锁（lockShot/lockShots/setLocked）：按 (project_id, script_id, shot_id)
+// 作用域更新 locked —— 跨项目/不存在 → 0 行 → 404。
+const SET_LOCKED_SQL =
+  `UPDATE project_shots_rows SET locked = $4, updated_at = NOW()
+   WHERE script_id = $1 AND shot_id = $2 AND project_id = $3
+   RETURNING shot_id, locked`;
+const SET_LOCKED_BATCH_SQL =
+  `UPDATE project_shots_rows SET locked = $4, updated_at = NOW()
+   WHERE script_id = $1 AND project_id = $2 AND shot_id = ANY($3::text[])
+   RETURNING shot_id`;
+// 不可变时间戳语义：appliedAtMs 固定值，apply 输出确定（不随系统时钟漂移）。
+const APPLIED_AT_MS = 0;
 
 /** 非空字符串判定。 */
 function isNonEmptyString(v) {
@@ -157,6 +175,14 @@ function buildShotRows({ plan, projectId, scriptId, version }) {
         duration_ms: durationMs,
         ordering,
         version,
+        locked: false, // 新行恒为未锁定；锁定只经 lockShot/lockShots 置位
+        source_trace: {
+          scriptRowIds: beat.scriptRowIds,
+          sceneIndex: beat.sceneIndex,
+          beatIndex: beat.beatIndex,
+          shotIndex: shot.shotIndex,
+          appliedAtMs: APPLIED_AT_MS, // 固定值 — 不可变时间戳语义
+        },
       });
       ordering += 1;
     }
@@ -210,20 +236,26 @@ async function persistStoryboardShots({ pg, projectId, scriptId, plan }) {
     // 3) 版本号 = 1..N（同 script 重跑递增）
     const ver = await q.query(MAX_VERSION_SQL, [scriptId, projectId]);
     const version = (ver.rows && ver.rows[0] && ver.rows[0].v != null ? Number(ver.rows[0].v) : 0) + 1;
-    // 4) 幂等替换：DELETE + INSERT 同事务
-    const del = await q.query(DELETE_SCRIPT_SQL, [scriptId, projectId]);
+    // 4) 锁定 shot 保留：先查锁定 shot_id；DELETE 仅删 unlocked 行（replaced 不含 locked）。
+    const lockedRes = await q.query(LOCKED_SHOT_IDS_SQL, [scriptId, projectId]);
+    const skippedLocked = (lockedRes.rows || []).map((r) => String(r.shot_id));
+    const lockedSet = new Set(skippedLocked);
+    const del = await q.query(DELETE_UNLOCKED_SQL, [scriptId, projectId]);
     const replaced = del && Number.isInteger(del.rowCount) ? del.rowCount : 0;
 
-    const rows = buildShotRows({ plan, projectId, scriptId, version });
+    // 覆写跳过 locked shot_id（其行保留），inserted / replaced 均不含它们。
+    const rows = buildShotRows({ plan, projectId, scriptId, version })
+      .filter((row) => !lockedSet.has(row.shot_id));
     for (const row of rows) {
       await q.query(INSERT_SHOT_SQL, [
         row.project_id, row.script_id, row.shot_id, row.beat_id,
         row.scene_index, row.beat_index, row.shot_index, row.kind,
         row.intent, JSON.stringify(row.subject_refs), row.duration_ms,
-        row.ordering, row.version,
+        row.ordering, row.version, row.locked,
+        JSON.stringify(row.source_trace),
       ]);
     }
-    return { ok: true, projectId, scriptId, version, inserted: rows.length, replaced };
+    return { ok: true, projectId, scriptId, version, inserted: rows.length, replaced, skippedLocked };
     });
   } catch (e) {
     if (e && Number.isInteger(e.status)) return { ok: false, status: e.status, error: e.message };
@@ -232,9 +264,50 @@ async function persistStoryboardShots({ pg, projectId, scriptId, plan }) {
   return result;
 }
 
+/**
+ * 单个 shot 锁定/解锁（显式布尔置位）。按 (project_id, script_id, shot_id)
+ * 作用域更新 —— 跨项目/不存在 → 0 行 → 404。纯 DB 服务，与 persist 同款返回约定。
+ * @returns { ok:true, projectId, scriptId, shotId, locked }
+ *        | { ok:false, status:404, error } | { ok:false, status:400, errors }
+ */
+async function setLocked({ pg, projectId, scriptId, shotId, locked }) {
+  if (!pg || typeof pg.query !== 'function') return { ok: false, status: 400, errors: ['pg (query) required'] };
+  if (!isNonEmptyString(projectId)) return { ok: false, status: 400, errors: ['projectId must be a non-empty string'] };
+  if (!isNonEmptyString(scriptId)) return { ok: false, status: 400, errors: ['scriptId must be a non-empty string'] };
+  if (!isNonEmptyString(shotId)) return { ok: false, status: 400, errors: ['shotId must be a non-empty string'] };
+  if (typeof locked !== 'boolean') return { ok: false, status: 400, errors: ['locked must be a boolean'] };
+  const r = await pg.query(SET_LOCKED_SQL, [scriptId, shotId, projectId, locked]);
+  if (!r.rows || r.rows.length === 0) {
+    return { ok: false, status: 404, error: 'shot 不存在或不属于该项目' };
+  }
+  return { ok: true, projectId, scriptId, shotId, locked: !!r.rows[0].locked };
+}
+
+/** 单 shot 锁定/解锁（setLocked 别名，布尔置位）。 */
+async function lockShot(args) {
+  return setLocked(args);
+}
+
+/** 批量锁定/解锁：同一 script 下多个 shot_id 一次置位；部分命中只回命中集。 */
+async function lockShots({ pg, projectId, scriptId, shotIds, locked }) {
+  if (!pg || typeof pg.query !== 'function') return { ok: false, status: 400, errors: ['pg (query) required'] };
+  if (!isNonEmptyString(projectId)) return { ok: false, status: 400, errors: ['projectId must be a non-empty string'] };
+  if (!isNonEmptyString(scriptId)) return { ok: false, status: 400, errors: ['scriptId must be a non-empty string'] };
+  if (!Array.isArray(shotIds) || shotIds.length === 0 || shotIds.some((s) => !isNonEmptyString(s))) {
+    return { ok: false, status: 400, errors: ['shotIds must be a non-empty array of shot ids'] };
+  }
+  if (typeof locked !== 'boolean') return { ok: false, status: 400, errors: ['locked must be a boolean'] };
+  const r = await pg.query(SET_LOCKED_BATCH_SQL, [scriptId, projectId, shotIds, locked]);
+  const updated = (r.rows || []).map((row) => String(row.shot_id));
+  return { ok: true, projectId, scriptId, updated, locked };
+}
+
 module.exports = {
   persistStoryboardShots,
   validatePersistArgs,
   buildShotRows,
-  SQL: { LOCK_SQL, OWNER_PROJECT_SQL, OWNER_ROWS_SQL, MAX_VERSION_SQL, DELETE_SCRIPT_SQL, INSERT_SHOT_SQL },
+  setLocked,
+  lockShot,
+  lockShots,
+  SQL: { LOCK_SQL, OWNER_PROJECT_SQL, OWNER_ROWS_SQL, MAX_VERSION_SQL, LOCKED_SHOT_IDS_SQL, DELETE_UNLOCKED_SQL, INSERT_SHOT_SQL, SET_LOCKED_SQL, SET_LOCKED_BATCH_SQL },
 };
