@@ -110,11 +110,12 @@ function createStudioRunEngine(deps) {
    * FK to studio_runs.
    *
    * Relay bridge is best-effort ONLY and can never disturb run execution:
-   *   - it runs on the RELAY's own pool connection (autocommit), never on this
-   *     transaction `client` — a run_events row may become visible before the
-   *     surrounding tx commits and survives a later ROLLBACK (accepted for an
-   *     append-only log; see runEventRelay.cjs header) — so it adds no
-   *     write coupling to the engine transaction;
+   *   - relay events are QUEUED inside the tx and flushed only AFTER COMMIT on
+   *     the relay's own pool connection (autocommit) — the relay's run_events
+   *     INSERT FK-checks studio_runs FOR KEY SHARE, so it must never run while
+   *     the engine tx still holds its uncommitted studio_runs row
+   *     (self-deadlock, drill 2026-09-04); a ROLLBACK drops the queue,
+   *     mirroring studio_run_events' own rollback semantics;
    *   - failures are logged ('event.relay_failed') and never thrown.
    *   - the relay allocates seq itself (lastSequence+1); (run_id, seq) PK
    *     absorbs duplicate delivery (idempotent no-op).
@@ -128,23 +129,49 @@ function createStudioRunEngine(deps) {
     } catch (e) { log('event.insert_failed', { runId, eventType, error: e.message }); }
 
     if (relay) {
+      const body = payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : {};
+      // Bridge shape documented in runEventRelay.cjs: fold the positional
+      // runNodeId into the payload as run_node_id (payload wins if it already
+      // carried one — every engine site passes the same value) so replayed
+      // events carry node identity like studio_run_events does. `type` is the
+      // engine eventType verbatim; the relay treats it as opaque.
+      // QUEUED, not sent: the relay writes run_events on its own autocommit
+      // connection and that INSERT FK-checks studio_runs (FOR KEY SHARE);
+      // sending it inside this transaction would deadlock against our own
+      // uncommitted studio_runs row (drill 2026-09-04). Flushed only after
+      // COMMIT (flushRelayQueue) and dropped on ROLLBACK.
+      const evt = {
+        runId,
+        type: eventType,
+        payload: runNodeId ? { run_node_id: runNodeId, ...body } : body,
+      };
+      if (!client._relayQueue) client._relayQueue = [];
+      client._relayQueue.push(evt);
+    }
+  }
+
+  /**
+   * Flush events queued during a just-committed transaction to the relay.
+   * MUST run only AFTER COMMIT (never before — see emitEvent): the relay
+   * writes run_events on its own autocommit connection and a run_events
+   * INSERT FK-checks studio_runs FOR KEY SHARE; while the engine tx is still
+   * open it holds that studio_runs row and the relay insert would deadlock
+   * (drill 2026-09-04). Best-effort: sequential, warn-only on failure
+   * ('event.relay_failed', never thrown), and the queue is cleared
+   * unconditionally so a reused pooled client can never re-send stale events.
+   */
+  async function flushRelayQueue(client) {
+    const q = client._relayQueue;
+    client._relayQueue = null;
+    if (!q || !q.length || !relay) return;
+    for (const evt of q) {
       try {
-        const body = payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : {};
-        // Bridge shape documented in runEventRelay.cjs: fold the positional
-        // runNodeId into the payload as run_node_id (payload wins if it already
-        // carried one — every engine site passes the same value) so replayed
-        // events carry node identity like studio_run_events does. `type` is the
-        // engine eventType verbatim; the relay treats it as opaque.
-        const result = await relay.relayRunEvent({
-          runId,
-          type: eventType,
-          payload: runNodeId ? { run_node_id: runNodeId, ...body } : body,
-        });
+        const result = await relay.relayRunEvent(evt);
         if (!result || result.ok !== true) {
-          log('event.relay_failed', { runId, eventType, error: (result && result.errors) || 'relayRunEvent returned a non-ok result' });
+          log('event.relay_failed', { runId: evt.runId, eventType: evt.type, error: (result && result.errors) || 'relayRunEvent returned a non-ok result' });
         }
       } catch (e) {
-        log('event.relay_failed', { runId, eventType, error: e && e.message ? e.message : String(e) });
+        log('event.relay_failed', { runId: evt.runId, eventType: evt.type, error: e && e.message ? e.message : String(e) });
       }
     }
   }
@@ -407,11 +434,12 @@ function createStudioRunEngine(deps) {
         }
       }
       await client.query('COMMIT');
+      await flushRelayQueue(client);
       return r.rows;
     } catch (e) {
       try { await client.query('ROLLBACK'); } catch (_) {}
       throw e;
-    } finally { client.release(); }
+    } finally { client._relayQueue = null; client.release(); }
   }
 
   /** Convenience wrapper: lease exactly one READY node (or null). */
@@ -525,10 +553,11 @@ function createStudioRunEngine(deps) {
         );
       }
       await client.query('COMMIT');
+      await flushRelayQueue(client);
     } catch (e) {
       try { await client.query('ROLLBACK'); } catch (_) {}
       throw e;
-    } finally { client.release(); }
+    } finally { client._relayQueue = null; client.release(); }
     log('reaper.tick', { reaped, failed, cancelled, workerId });
     return { reaped, failed, cancelled };
   }
@@ -710,12 +739,13 @@ function createStudioRunEngine(deps) {
       }
       await aggregateRun(client, node.run_id, { runNodeId: runNodeId, workerId: owner });
       await client.query('COMMIT');
+      await flushRelayQueue(client);
       log('run.node.succeeded', { runId: node.run_id, studioNodeId: node.studio_node_id, attempt: node.attempt, unlocked: unlockedRows.map((r) => r.studio_node_id), workerId: owner });
       return { ok: true, runId: node.run_id, unlocked: unlockedRows.map((r) => r.studio_node_id) };
     } catch (e) {
       try { await client.query('ROLLBACK'); } catch (_) {}
       throw e;
-    } finally { client.release(); }
+    } finally { client._relayQueue = null; client.release(); }
   }
 
   /**
@@ -773,6 +803,7 @@ function createStudioRunEngine(deps) {
         await emitEvent(client, node.run_id, runNodeId, 'studio.run_node.cancelled', { run_node_id: runNodeId, code: 'RUN_CANCELLED' });
         const agg = await aggregateRun(client, node.run_id, { runNodeId: runNodeId, workerId: owner });
         await client.query('COMMIT');
+        await flushRelayQueue(client);
         log('run.node.cancelled', { runId: node.run_id, studioNodeId: node.studio_node_id, runStatus: agg && agg.status, workerId: owner });
         return { ok: true, cancelled: true, nodeStatus: 'CANCELLED', runStatus: agg && agg.status, runId: node.run_id };
       }
@@ -791,6 +822,7 @@ function createStudioRunEngine(deps) {
         await emitEvent(client, node.run_id, runNodeId, 'studio.run_node.retry', { run_node_id: runNodeId, attempt: node.attempt, code, delayMs });
         await aggregateRun(client, node.run_id, { runNodeId: runNodeId, workerId: owner });
         await client.query('COMMIT');
+        await flushRelayQueue(client);
         log('run.node.retry', { runId: node.run_id, studioNodeId: node.studio_node_id, attempt: node.attempt, delayMs, workerId: owner });
         return { ok: true, retried: true, nodeStatus: 'READY', delayMs, runId: node.run_id };
       }
@@ -807,12 +839,13 @@ function createStudioRunEngine(deps) {
       await emitEvent(client, node.run_id, runNodeId, 'studio.run_node.failed', { run_node_id: runNodeId, code, final: true });
       const agg = await aggregateRun(client, node.run_id, { runNodeId: runNodeId, workerId: owner });
       await client.query('COMMIT');
+      await flushRelayQueue(client);
       log('run.node.failed', { runId: node.run_id, studioNodeId: node.studio_node_id, code, runStatus: agg && agg.status, workerId: owner });
       return { ok: true, failed: true, nodeStatus: 'FAILED', runStatus: agg && agg.status, runId: node.run_id };
     } catch (e) {
       try { await client.query('ROLLBACK'); } catch (_) {}
       throw e;
-    } finally { client.release(); }
+    } finally { client._relayQueue = null; client.release(); }
   }
   // ── SECTION:worker ─────────────────────────────────────────────────────
 
@@ -848,12 +881,13 @@ function createStudioRunEngine(deps) {
       await emitEvent(client, runId, null, 'studio.run.cancel_requested', { status: r.rows[0].status });
       await aggregateRun(client, runId, { workerId });
       await client.query('COMMIT');
+      await flushRelayQueue(client);
       log('run.cancel_requested', { runId, cancelledNodes: cr.rowCount, workerId });
       return { ok: true, status: r.rows[0].status, cancelledNodes: cr.rowCount };
     } catch (e) {
       try { await client.query('ROLLBACK'); } catch (_) {}
       throw e;
-    } finally { client.release(); }
+    } finally { client._relayQueue = null; client.release(); }
   }
 
   /**
@@ -936,7 +970,8 @@ function createStudioRunEngine(deps) {
         await emitEvent(client, node.run_id, node.id, 'studio.run_node.waiting', { run_node_id: node.id, code: code || 'EXECUTOR_NOT_AVAILABLE' });
         await aggregateRun(client, node.run_id, { runNodeId: node.id, workerId });
         await client.query('COMMIT');
-      } catch (e) { try { await client.query('ROLLBACK'); } catch (_) {} throw e; } finally { client.release(); }
+        await flushRelayQueue(client);
+      } catch (e) { try { await client.query('ROLLBACK'); } catch (_) {} throw e; } finally { client._relayQueue = null; client.release(); }
     }
     return r.rows.length > 0;
   }

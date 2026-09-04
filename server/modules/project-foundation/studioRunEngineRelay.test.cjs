@@ -92,16 +92,28 @@ function createRunEventsMockPg() {
  * studio_run_events INSERT). leaseBatches is consumed one array-of-node-rows
  * per leaseReadyNodes call — like real READY rows RETURNING n.*.
  */
-function createEngineMockPg(leaseBatches) {
+function createEngineMockPg(leaseBatches, opts = {}) {
   const studioEvents = []; // {runId, runNodeId, eventType, payload} (durable INSERTs)
   const issued = []; // every SQL issued on the tx client (assertion aid)
+  const order = opts.order || null; // shared sequence log for tx/relay ordering assertions
   let batchIndex = 0;
+  let commitCount = 0;
   const nextBatch = () => (batchIndex < leaseBatches.length ? leaseBatches[batchIndex] : []);
   const client = {
     async query(text, params = []) {
       const sql = String(text).trim();
       issued.push(sql);
-      if (sql === 'BEGIN' || sql === 'COMMIT' || sql === 'ROLLBACK') return { rows: [], rowCount: 0 };
+      if (sql === 'BEGIN') return { rows: [], rowCount: 0 };
+      if (sql === 'COMMIT') {
+        commitCount += 1;
+        if (order) order.push('engine:COMMIT');
+        if (opts.failFirstCommit && commitCount === 1) throw new Error('commit failed (injected)');
+        return { rows: [], rowCount: 0 };
+      }
+      if (sql === 'ROLLBACK') {
+        if (order) order.push('engine:ROLLBACK');
+        return { rows: [], rowCount: 0 };
+      }
       if (sql.startsWith('WITH picked AS')) {
         const rows = nextBatch();
         batchIndex += 1;
@@ -260,4 +272,56 @@ test('relay failure (throw or {ok:false}) only logs event.relay_failed — execu
   const fails2 = logs2.filter((l) => l.tag === 'event.relay_failed');
   assert.equal(fails2.length, 1);
   assert.equal(fails2[0].payload.error[0].code, 'LAST_SEQ_FAILED');
+});
+
+test('relay events flushed only AFTER COMMIT, in enqueue order (sequential)', async () => {
+  const order = [];
+  const relayCalls = [];
+  const engineMock = createEngineMockPg([
+    [leasedNode({ id: 'rn-a', runId: 'run-1', studioNodeId: 'A' }), leasedNode({ id: 'rn-b', runId: 'run-1', studioNodeId: 'B' })],
+  ], { order });
+  const relay = {
+    relayRunEvent: async (evt) => {
+      order.push(`relay:${evt.type}:${evt.payload.run_node_id}`);
+      relayCalls.push(evt);
+      return { ok: true, seq: relayCalls.length };
+    },
+  };
+  const { engine } = makeEngine(engineMock.pg, { relay });
+
+  const leased = await engine.leaseReadyNodes({ limit: 2 });
+  assert.deepEqual(leased.map((n) => n.id), ['rn-a', 'rn-b']);
+
+  // The relay must never fire inside the tx: only after engine:COMMIT, and in
+  // the exact enqueue order (rn-a before rn-b) — sequential flush.
+  assert.deepEqual(order, [
+    'engine:COMMIT',
+    'relay:studio.run_node.started:rn-a',
+    'relay:studio.run_node.started:rn-b',
+  ], 'relay called only AFTER COMMIT, in enqueue order');
+  assert.equal(relayCalls.length, 2);
+  // studio_run_events (engine-side durable) still written inside the tx, as before.
+  assert.equal(engineMock.studioEvents.length, 2);
+});
+
+test('rollback drops the relay queue — zero relay calls, no stale flush on a later tx', async () => {
+  const relayCalls = [];
+  const engineMock = createEngineMockPg([
+    [leasedNode({ id: 'rn-a', runId: 'run-1', studioNodeId: 'A' })],
+    [leasedNode({ id: 'rn-b', runId: 'run-1', studioNodeId: 'B' })],
+  ], { failFirstCommit: true });
+  const relay = {
+    relayRunEvent: async (evt) => { relayCalls.push(evt); return { ok: true, seq: relayCalls.length }; },
+  };
+  const { engine } = makeEngine(engineMock.pg, { relay });
+
+  // First tx emits (queues rn-a) then COMMIT throws → ROLLBACK → queue dropped.
+  await assert.rejects(() => engine.leaseReadyNodes({ limit: 1 }), /commit failed/);
+  assert.equal(relayCalls.length, 0, 'rollback must not flush the relay queue');
+
+  // Second tx (mock reuses the same client object) must NOT leak rn-a.
+  const leased = await engine.leaseReadyNodes({ limit: 1 });
+  assert.equal(leased.length, 1);
+  assert.equal(relayCalls.length, 1, 'only the second tx event flushed — first-tx queue cleared on rollback');
+  assert.equal(relayCalls[0].payload.run_node_id, 'rn-b', 'no stale rn-a event re-sent');
 });
