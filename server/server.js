@@ -1367,14 +1367,22 @@ function serveStatic(req, res) {
 }
 
 // ─── 本地静态文件（/media/ 上传 & /samples/ 公共示例，非 /api 路由，必须早于 SPA fallback）───
+// 安全：rel 必须经路径包含校验（禁 ../ 段/反斜杠/绝对），穿越即 404 —— 审计 2026-09-04 升级面。
+function safeLocalRel(rawRel) {
+  const rel = String(rawRel || '').replace(/\\/g, '/').replace(/\/+/g, '/');
+  if (rel.startsWith('/') || rel.split('/').includes('..') || rel.includes('\0')) return null;
+  return rel;
+}
 function serveLocalFiles(req, res) {
   const url = req.url.replace(/\/$/, '');
   const method = req.method;
 
   // ── 本地上传文件读取 ──
   if (url.startsWith('/media/') && method === 'GET') {
-    const rel = url.slice('/media/'.length).replace(/[^a-zA-Z0-9._/-]/g, '_');
+    const rel = safeLocalRel(url.slice('/media/'.length));
+    if (!rel) return sendJSON(res, 404, { error: 'Not Found' });
     const file = path.join(DATA_DIR, 'media-uploads', rel);
+    if (!file.startsWith(path.join(DATA_DIR, 'media-uploads') + path.sep)) return sendJSON(res, 404, { error: 'Not Found' });
     if (fs.existsSync(file)) {
       const ext = path.extname(file).toLowerCase();
       const ct = ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg' : ext === '.png' ? 'image/png' : ext === '.webp' ? 'image/webp' : 'application/octet-stream';
@@ -1389,8 +1397,11 @@ function serveLocalFiles(req, res) {
 
   // ── 公共示例素材（默认资产 SVG 占位，dev/prod 均可直出）──
   if (url.startsWith('/samples/') && method === 'GET') {
-    const rel = url.slice('/samples/'.length).replace(/[^a-zA-Z0-9._/-]/g, '_');
-    const file = path.join(__dirname, '..', 'public', 'samples', rel);
+    const rel = safeLocalRel(url.slice('/samples/'.length));
+    if (!rel) return sendJSON(res, 404, { error: 'Not Found' });
+    const samplesDir = path.join(__dirname, '..', 'public', 'samples');
+    const file = path.join(samplesDir, rel);
+    if (!file.startsWith(samplesDir + path.sep)) return sendJSON(res, 404, { error: 'Not Found' });
     if (fs.existsSync(file)) {
       const ext = path.extname(file).toLowerCase();
       const ct = ext === '.svg' ? 'image/svg+xml' : ext === '.png' ? 'image/png' : ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg' : ext === '.webp' ? 'image/webp' : 'application/octet-stream';
@@ -4950,8 +4961,12 @@ app.use((req, res, next) => {
   next();
 });
 
-// API token（网关探针）
-app.get('/api/token', (req, res) => sendJSON(res, 200, { token: API_TOKEN }));
+// API token（网关探针）—— 审计 2026-09-04：公开泄露即 system 提权面；仅当 GATEWAY_TOKEN 匹配 x-gateway-token 才回。
+app.get('/api/token', (req, res) => {
+  const gw = process.env.GATEWAY_TOKEN;
+  if (!gw || req.headers['x-gateway-token'] !== gw) return sendJSON(res, 403, { error: 'Forbidden' });
+  return sendJSON(res, 200, { token: API_TOKEN });
+});
 
 // API 路由 → handleAPI（含流量采样）
 app.use((req, res, next) => {

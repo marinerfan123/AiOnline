@@ -1123,9 +1123,12 @@ async function generateAsync(pgPool, opts) {
           // 资源全不可用（该任务所有可用供应商都冷却/限流）→ 进入等待区后台重试，
           // 不立即判失败、不释放积分（仍持有，等待真正生成或超时再释放）。
           // 前台是否提示"资源不足"由等待区积压 + 平台全冷状态决定（见 getWaitingAreaStatus）。
-          enqueueWaiting(taskId, opts);
+          // 入队必须是 runOpts（含 taskId + onSubmitted），而非原始 opts：
+          // 否则视频任务经等待区泵重试时 onSubmitted 丢失 → 提交成功后 provider_task_id 不落库，
+          // 崩溃恢复（resumeRunningTasks 按 provider_task_id 续轮询）拿不回这笔结果，held 积分 90min 后看门狗误释放。
+          enqueueWaiting(taskId, runOpts);
           // 持久化 opts 到 resume_meta，供后端重启/崩溃后恢复等待区（避免内存队列丢失导致任务永久卡 running）
-          persistWaitingOpts(pgPool, taskId, opts).catch(() => {});
+          persistWaitingOpts(pgPool, taskId, runOpts).catch(() => {});
           await updateTaskStatus(pgPool, taskId, 'running', null, '资源紧张，已进入等待区排队重试', user_id);
           realtime.emitTaskUpdate(user_id, { taskId, status: 'running', error: '资源紧张，已进入等待区排队重试' });
           runWaitingPump(pgPool).catch((e) => console.warn('[waiting] pump error:', e.message));

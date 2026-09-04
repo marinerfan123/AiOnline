@@ -379,3 +379,86 @@ test('resolveReviewTask: 缺 taskId / 非法 action / 404 / 非 review 态 → �
   assert.strictEqual(r.code, 409);
   assert.strictEqual(r.ok, false);
 });
+
+// ─── 12) generateAsync throttled → 等待区入队 runOpts（含 taskId + onSubmitted）───
+// 修复面：generateAsync 的 throttled 分支原先 enqueueWaiting(taskId, opts) 用原始 genOpts（无 taskId/onSubmitted），
+// 导致视频任务经等待区泵重试时 onSubmitted 丢失 → 提交成功后 provider_task_id 不落库 → 崩溃恢复拿不回结果。
+const videoIndex = require('../../providers/video/index.cjs');
+async function waitFor(predicate, timeoutMs, label) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return true;
+    await sleep(50);
+  }
+  throw new Error(`waitFor 超时: ${label || ''}`);
+}
+
+test('generateAsync throttled → 等待区 opts=runOpts（含 taskId）；泵重试视频 → onSubmitted 落 provider_task_id', async () => {
+  const commits = [];
+  stubAll({
+    commitCredits: async (pg, userId, amount, ref) => commits.push({ userId, amount, ref }),
+    releaseCredits: async () => {},
+    recordConsumption: async () => {},
+    enqueueFinalize: async () => {},
+    finalizeAndEmit: async () => {},
+    emitTaskUpdate: async () => {},
+  });
+  // 视频适配器 stub：泵重试时 submit 成功 + poll 终态 success（不触网）
+  const savedSubmit = videoIndex.submit;
+  const savedPoll = videoIndex.poll;
+  videoIndex.submit = async () => ({ status: 'submitted', taskId: 'pt-v', providerTaskId: 'pt-v', videoUrl: '' });
+  videoIndex.poll = async () => ({ status: 'success', videoUrl: 'https://cdn/v.mp4' });
+  // provider 首次查询返回 cold（→ 首次 generate throttled 入等待区），后续返回 warm（→ 泵重试成功）
+  const pool = makePool([
+    { match: /INSERT INTO generation_tasks/, rows: [] },
+    { match: /UPDATE generation_tasks SET client_request_id/, rows: [] },
+    { match: /SELECT value FROM settings WHERE key='app'/, rows: [{ value: {} }] },
+    { match: /SELECT DISTINCT model_id FROM models WHERE model_id = ANY/, rows: [{ model_id: 'm-vid' }] },
+    { match: /FROM provider_model_bindings/, rows: [] },
+    { match: /SELECT model_id, provider_id\s+FROM models/, rows: [{ model_id: 'm-vid', provider_id: 'provV' }] },
+    { match: /SELECT \* FROM models WHERE model_id = ANY/, rows: [{ model_id: 'm-vid', provider_id: 'provV', enabled: true }] },
+    {
+      match: /FROM providers WHERE id = ANY/,
+      rows: (sql, params, calls) => {
+        const n = calls.filter((c) => /FROM providers WHERE id = ANY/.test(c.sql)).length;
+        if (n <= 1) return [{ id: 'provV', api_key: 'sk-legacy123456', enabled: true, max_concurrent: 2, base_url: 'https://api.agnes-ai.cn/v1', rate_limits: { bucket_units_per_min: 20, ops: { '1k': 1 }, manual_state: 'cold' } }];
+        return [{ id: 'provV', api_key: 'sk-legacy123456', enabled: true, max_concurrent: 2, base_url: 'https://api.agnes-ai.cn/v1', rate_limits: { bucket_units_per_min: 20, ops: { '1k': 1 } } }];
+      },
+    },
+    { match: /FROM api_keys WHERE provider_id = ANY/, rows: [] },
+  ]);
+  let taskId = '';
+  try {
+    const genOpts = {
+      model: 'm-vid', prompt: '一只猫', count: 1, contentType: 'video', user_id: 'u1',
+      cost: 5, costPool: 'recharge', idempotencyKey: 'ik-v', userPlan: 'free',
+      ratio: '16:9', resolution: '1k', durationSec: 3, referenceImages: [], negative: '',
+    };
+    ({ taskId } = await dispatcher.generateAsync(pool, genOpts));
+    assert.ok(taskId, '应返回 taskId');
+
+    // 等首次 generate 因 provider cold → throttled 分支落 resume_meta（persistWaitingOpts）
+    // 注意：不轮询 waitingAreaSize（泵会立即重试并快速 drain，窗口 <50ms 会漏）；以 resume_meta 落库为准（确定性）。
+    await waitFor(() => has(pool, /resume_meta = COALESCE/), 5000, 'throttled 分支持久化 waitingOpts');
+
+    // 断言持久化的 waitingOpts 为 runOpts（含 taskId；修复前为 opts，无 taskId）
+    const persist = lastMatch(pool, /resume_meta = COALESCE/);
+    assert.ok(persist, '应持久化 waitingOpts 到 resume_meta');
+    const json = JSON.parse(persist.params[1]);
+    assert.strictEqual(json.waitingOpts.taskId, taskId, '等待区 opts 应为 runOpts（含 taskId）');
+    assert.strictEqual(json.waitingOpts.canonicalModelId, 'm-vid', 'waitingOpts 应含 canonicalModelId（runOpts）');
+
+    // 等泵重试（warm provider + submit/poll stub）成功完成 → 等待区清空
+    await waitFor(() => dispatcher.waitingAreaSize() === 0, 8000, '泵重试完成清空等待区');
+
+    // 关键：泵重试的视频提交成功必须触发 onSubmitted → persistProviderTaskId 落 provider_task_id
+    assert.ok(has(pool, /SET provider_task_id=/), '泵重试视频应触发 onSubmitted → provider_task_id 落库（修复后不丢）');
+    assert.strictEqual(commits.length, 1, '成功后 commit 恰好一次');
+    assert.deepStrictEqual(commits[0], { userId: 'u1', amount: 5, ref: 'ik-v' });
+  } finally {
+    videoIndex.submit = savedSubmit;
+    videoIndex.poll = savedPoll;
+    if (taskId) dispatcher.dequeueWaiting(taskId);
+  }
+});
+
