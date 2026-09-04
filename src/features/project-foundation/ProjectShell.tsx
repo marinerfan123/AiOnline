@@ -8,6 +8,7 @@ import { cn } from '@/lib/utils';
 import { Button } from '@/shared/ui/v2/Button';
 import { StatusBadge } from '@/shared/ui/v2/StatusBadge';
 import { ProjectProvider, useProjectContext } from './ProjectContext';
+import { ExportMenu } from './ExportMenu';
 import {
   LayoutDashboard,
   BookOpen,
@@ -100,7 +101,10 @@ function ProjectShellInner({ children, bareContent = false }: { children?: React
               </div>
             </div>
           </div>
-          <div className="text-xs text-ml2-text-3">ID: {ctx.projectId}</div>
+          <div className="flex items-center gap-3">
+            <ExportMenu projectId={ctx.projectId} />
+            <div className="text-xs text-ml2-text-3">ID: {ctx.projectId}</div>
+          </div>
         </div>
 
         {/* Sub-navigation */}

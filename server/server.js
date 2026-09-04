@@ -59,6 +59,8 @@ import uploadApiMod from './modules/media/uploadApi.cjs';
 import timelineApiMod from './modules/media/timelineApi.cjs';
 import timelineExportMod from './modules/media/timelineExport.cjs';
 import projectExportMod from './modules/project-foundation/projectExport.cjs';
+import canvasCommandLogApiMod from './modules/project-foundation/canvasCommandLogApi.cjs';
+import runEventsApiMod from './modules/project-foundation/runEventsApi.cjs';
 import mediaWorkerMod from './modules/media/mediaWorker.cjs';
 import mediaExecMod from './modules/media/executors.cjs';
 import bibleApiMod from './modules/project-foundation/bibleApi.cjs';
@@ -1523,6 +1525,30 @@ const timelineApi = timelineApiMod.createTimelineApi({
 });
 
 // G24 — Timeline JSON bundle export service (/api/v2/timelines/:id/export).
+async function projectMembershipOk(projectId, user) {
+  if (!user || !projectId) return false;
+  const a = await pgPool.query(
+    `SELECT 1 FROM projects p JOIN workspaces w ON w.id = p.workspace_id
+      LEFT JOIN workspace_members wm ON wm.workspace_id = w.id AND wm.user_id = $2
+     WHERE p.id = $1 AND (wm.user_id IS NOT NULL OR w.owner_id = $2)`,
+    [projectId, user.id],
+  ).catch(() => ({ rows: [] }));
+  return a.rows.length > 0;
+}
+const canvasCommandLogApi = canvasCommandLogApiMod.createCanvasCommandLogApi({
+  pg: {
+    query: (sql, params) => pgPool ? pgPool.query(sql, params) : Promise.reject(Object.assign(new Error('数据库未就绪'), { status: 503 })),
+  },
+  authProject: async (req, projectId) => projectMembershipOk(projectId, session.getUserFromCookie(req)),
+});
+const runEventsApi = runEventsApiMod.createRunEventsApi({
+  pg: {
+    query: (sql, params) => pgPool ? pgPool.query(sql, params) : Promise.reject(Object.assign(new Error('数据库未就绪'), { status: 503 })),
+  },
+  sessionUser: (req) => session.getUserFromCookie(req),
+  authProject: async (req, projectId) => projectMembershipOk(projectId, session.getUserFromCookie(req)),
+  sendJSON,
+});
 const projectExport = projectExportMod.createProjectExport({
   pg: {
     query: (sql, params) => pgPool ? pgPool.query(sql, params) : Promise.reject(Object.assign(new Error('数据库未就绪'), { status: 503 })),
@@ -2657,6 +2683,11 @@ async function handleAPI(req, res) {
   }
 
   // ── M05-C Studio Canvas Persistence（/api/v2/projects/:id/studio/canvas）──
+  // G22 命令日志只读面（/canvas/commands）先于 persistence handle 判定。
+  const cmdMatch = url.split('?')[0].match(/^\/api\/v2\/projects\/([^/]+)\/studio\/canvas\/commands$/);
+  if (cmdMatch) {
+    if (await canvasCommandLogApi.handle(req, res, { projectId: decodeURIComponent(cmdMatch[1]) })) return;
+  }
   if (/\/api\/v2\/projects\/[^/]+\/studio\/canvas/.test(url)) {
     if (await studioCanvasPersistence.handle(req, res, url.split('?')[0], method)) return;
   }
@@ -2677,8 +2708,15 @@ async function handleAPI(req, res) {
   }
 
   // ── M05-E Studio Run API（/api/v2/projects/:id/studio/runs）──
+  // G21 run_events JSON 读面：仅非 SSE 客户端（EventSource 恒带 text/event-stream
+  // Accept）→ JSON 翻页；SSE 仍归 studioRunApi.handle（原 /events 流不破坏）。
   if (/\/api\/v2\/projects\/[^/]+\/studio\/runs/.test(url)) {
-    if (await studioRunApi.handle(req, res, url.split('?')[0], method)) return;
+    const acc = String(req.headers.accept || '');
+    const pathOnly = url.split('?')[0];
+    if (!acc.includes('text/event-stream') && /\/runs\/[^/]+\/events/.test(pathOnly)) {
+      if (await runEventsApi.handle(req, res, pathOnly, method)) return;
+    }
+    if (await studioRunApi.handle(req, res, pathOnly, method)) return;
   }
 
   // ── M04-S Asset Foundation（/api/v2/assets, /api/v2/projects/:id/assets）──
