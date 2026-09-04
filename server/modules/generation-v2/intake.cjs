@@ -47,15 +47,19 @@ async function createBatchWithItems(pg, input) {
     await db.query('BEGIN');
     try {
     const existing = await db.query(
-      `SELECT batch_id, requested_count FROM generation_batches_v2
+      `SELECT batch_id, requested_count, model_id, content_type, unit_price FROM generation_batches_v2
         WHERE user_id=$1 AND idempotency_key=$2 FOR UPDATE`,
       [userId, idempotencyKey],
     );
     if (existing.rows && existing.rows.length) {
+      const row = existing.rows[0];
+      if (row.model_id !== modelId || Number(row.requested_count) !== count || row.content_type !== contentType || normalizeMoney(row.unit_price) !== priceUnits) {
+        throw new Error('idempotency key reused with different generation parameters');
+      }
       await db.query('COMMIT');
       return {
-        batchId: existing.rows[0].batch_id,
-        count: Number(existing.rows[0].requested_count),
+        batchId: row.batch_id,
+        count: Number(row.requested_count),
         idempotent: true,
       };
     }

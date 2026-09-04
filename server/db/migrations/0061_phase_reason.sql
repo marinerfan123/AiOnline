@@ -115,3 +115,66 @@ COMMENT ON COLUMN generation_items_v2.phase IS
   '墨渊 V2.0 §46: internal fine-grained phase (same 12-value vocabulary as generation_tasks.phase). NULL = not yet tracked; monotonic (reverse transition rejected by trigger, §62); DB CHECK bounds the vocabulary';
 COMMENT ON COLUMN generation_items_v2.reason IS
   '墨渊 V2.0 §47: internal wait/retry reason (PROVIDER_THROTTLED/RATE_LIMIT/WAITING_RETRY/ASSET_DOWNLOAD_RETRY/SUBMIT_UNKNOWN/...). Open vocabulary (no DB CHECK); NULL when not waiting';
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- 0061 追加段 B — L13 generation_events append-only 事件日志 + L15 Internal Idempotency 对齐
+-- （v4-pro 实施叶 L13+L15 合并；与上方 L12 phase/reason 同段串行，forward-only additive，
+--   纯 additive：CREATE TABLE/INDEX/TRIGGER/FUNCTION IF NOT EXISTS 均可安全重放）
+-- ═══════════════════════════════════════════════════════════════════════════════
+
+-- ── L13 generation_events（§132 append-only event log）────────────────────────
+-- 列 = §132 精确 8 列：event_id/job_id/attempt_id/type/source/provider_event_id/payload_hash/created_at。
+-- 无 payload 列——payload 只落 SHA-256 哈希（正文留 generation_outbox_v2），本表仅作 debug/audit/replay 索引。
+-- job_id/attempt_id 为跨 legacy(generation_tasks.task_id)/V2(batch_id+attempt_id) 的多态引用，
+-- 故不加 FK（避免与任一单表的强绑定歧义；与 run_events(0043) 的 run_id 同源但跨表），仅建索引供 replay 查找。
+CREATE TABLE IF NOT EXISTS generation_events (
+  event_id          TEXT PRIMARY KEY,
+  job_id            TEXT NOT NULL,
+  attempt_id        TEXT,
+  type              TEXT NOT NULL,
+  source            TEXT NOT NULL,
+  provider_event_id TEXT,
+  payload_hash      TEXT NOT NULL,
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS ix_generation_events_job
+  ON generation_events (job_id, created_at);
+CREATE INDEX IF NOT EXISTS ix_generation_events_provider_event
+  ON generation_events (provider_event_id) WHERE provider_event_id IS NOT NULL;
+
+-- ── L13 append-only 强制（裁决）────────────────────────────────────────────────
+-- 裁决：取「BEFORE UPDATE OR DELETE 触发器拒改」而非「REVOKE 权限」。理由：REVOKE 只约束特定 role、
+-- 可被更高权限/owner 重授权，且仍可被 owner 直改；DB 内核触发器则无条件拒绝任何连接/角色/旁路直改
+-- （最强制约），与 §132「追加不删改」语义一致。表级清空类 DDL 不触发行级触发器，属 DBA 运维域，不在本约束范围。
+CREATE OR REPLACE FUNCTION fn_generation_events_append_only()
+RETURNS TRIGGER AS $$
+BEGIN
+  RAISE EXCEPTION 'generation_events is append-only: % rejected (§132)', TG_OP
+    USING ERRCODE = 'check_violation';
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_generation_events_append_only ON generation_events;
+CREATE TRIGGER trg_generation_events_append_only
+  BEFORE UPDATE OR DELETE ON generation_events
+  FOR EACH ROW
+  EXECUTE FUNCTION fn_generation_events_append_only();
+
+-- ── L15 Internal Idempotency 对齐（§55/§131，裁决）─────────────────────────────
+-- 裁决：§55/§131 的 UNIQUE(tenant_id + endpoint_scope + idempotency_key) 在本库无多租户模型。
+-- 实查 0002/0003 generation_items_v2 列：无 tenant_id、无 endpoint_scope、无 idempotency_key；
+-- 而 generation_batches_v2（0002）已持有 idempotency_key 及 UNIQUE(user_id, idempotency_key)
+-- （0040 已将 0003 的 PARTIAL 唯一索引改为 FULL，intake.cjs 的 ON CONFLICT (user_id,idempotency_key)
+--  依赖该 FULL 索引）。故裁决：**不加 tenant_id 列、不把幂等键迁到 items 表**。
+--   user_id 即本库的 tenant 维度（单用户单租户，全库无 tenant_id 概念）；
+--   endpoint_scope 无对应列（本库按 model_id+content_type 表达路由范围，不属幂等范围）。
+-- 幂等唯一索引沿用现有组合 (user_id, idempotency_key)，目标表 = generation_batches_v2（非 items）。
+-- 「重复返回原 Job」由 intake.cjs 的 SELECT FOR UPDATE + ON CONFLICT 双路径实现（§55/Gate 4）。
+-- 此处仅 IF NOT EXISTS 幂等断言（与 0040 同名索引，已在库则为 no-op），确保 0061 段自洽可单读。
+CREATE UNIQUE INDEX IF NOT EXISTS uq_generation_batches_v2_user_idempotency
+  ON generation_batches_v2 (user_id, idempotency_key);
+
+-- ── 注释 ──────────────────────────────────────────────────────────────────────
+COMMENT ON TABLE generation_events IS
+  '墨渊 V2.0 §132: append-only generation event log (event_id/job_id/attempt_id/type/source/provider_event_id/payload_hash/created_at). Debug/audit/replay. UPDATE/DELETE rejected by trigger trg_generation_events_append_only';

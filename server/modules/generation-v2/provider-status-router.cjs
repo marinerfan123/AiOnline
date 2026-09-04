@@ -314,6 +314,141 @@ async function queryGenericVideoStatus(provider, model, taskId) {
   };
 }
 
+// ─── Event Reducer: applyProviderEvent — 唯一状态入口（webhook + poll 同汇）──────
+// §57-60：poll 路径（queryProviderStatus 的一 shot HTTP 结果）与 webhook 路径
+// （webhook_inbox 异步队列）都必须经 applyProviderEvent 这一个入口落到
+// generation_items_v2，禁止两处各自直接 UPDATE（防双 reduce / 乱序回归）。
+// 归一化状态 normalizedStatus 与 queryProviderStatus 返回值同形：
+//   { status: 'success'|'failed'|'pending'|'unknown', providerUrl?, errorCode?, errorMessage? }
+
+const TERMINAL_ITEM_STATUSES = new Set(['done', 'failed', 'canceled']);
+const REDUCIBLE_FROM = new Set(['reconciling', 'generating']);
+
+// 归一化状态 → 单调状态机决策（纯函数，无 I/O）。from 收敛于 reconciling；
+// 仅「早期 webhook」落在 generating 时允许 generating>generated 直边。
+function reduceDecision(item, normalizedStatus) {
+  const from = item.status || 'reconciling';
+  const st = (normalizedStatus && normalizedStatus.status) || 'unknown';
+  const now = Date.now();
+  if (st === 'success' && normalizedStatus.providerUrl) {
+    return {
+      from, to: 'generated',
+      patch: {
+        provider_url: normalizedStatus.providerUrl,
+        provider_request_id: item.provider_request_id,
+        lease_expires_at: null,
+      },
+    };
+  }
+  if (st === 'failed') {
+    return {
+      from: 'reconciling', to: 'retry_wait',
+      patch: {
+        last_error_code: 'PROVIDER_FAILED',
+        last_error: normalizedStatus.errorMessage || 'provider reported failure',
+        next_attempt_at: new Date(now + 30000),
+        lease_expires_at: null,
+      },
+    };
+  }
+  if (st === 'pending') {
+    return {
+      from: 'reconciling', to: 'reconcile_wait',
+      patch: {
+        last_error_code: 'PROVIDER_PENDING',
+        last_error: 'still processing; reconciliation only',
+        next_attempt_at: new Date(now + 15000),
+        lease_expires_at: null,
+      },
+    };
+  }
+  return {
+    from: 'reconciling', to: 'review_required',
+    patch: {
+      last_error_code: 'RECONCILE_UNKNOWN',
+      last_error: normalizedStatus.errorMessage || 'provider status unknown',
+      lease_expires_at: null,
+    },
+  };
+}
+
+/**
+ * 唯一状态入口：把一个 provider 事件（webhook inbox 行或 poll 归一化结果）reduce 到 item 状态。
+ *
+ * @param {object} opts
+ * @param {{transitionItem: Function, findItemByProviderRequestId: Function}} opts.store
+ *   transitionItem({itemId,leaseVersion,from,to,patch}) → row|null（CAS 单写，null=被并发/陈旧）
+ *   findItemByProviderRequestId(providerId, providerRequestId) → item|null
+ * @param {{complete: Function, fail: Function}|null} opts.inbox  webhook 路径传 {complete,fail}（已绑定 pg）；poll 路径 null
+ * @param {object} opts.event            inbox 行（含 id/signature_state/status/provider_id/payload）；poll 路径为虚拟事件
+ * @param {object} opts.normalizedStatus 与 queryProviderStatus 返回值同形
+ * @param {string} [opts.providerRequestId] 提供方任务 ID（未传时回退 event.payload.provider_request_id）
+ * @returns {{outcome:string, to?:string, reason?:string, itemStatus?:string}}
+ *   outcome ∈ reduced | duplicate | out_of_order | rejected | concurrent_noop
+ */
+async function applyProviderEvent({ store, inbox, event, normalizedStatus, providerRequestId } = {}) {
+  if (!store || typeof store.transitionItem !== 'function' || typeof store.findItemByProviderRequestId !== 'function') {
+    throw new TypeError('applyProviderEvent: store.transitionItem and store.findItemByProviderRequestId required');
+  }
+  const status = (normalizedStatus && normalizedStatus.status) || 'unknown';
+
+  // Guard 1 — 验签失败：绝不 reduce（§57 verify 先行）。
+  if (event && event.signature_state === 'failed') {
+    if (inbox && event.id) await inbox.fail({ id: event.id, errorCode: 'SIGNATURE_FAILED' });
+    return { outcome: 'rejected', reason: 'signature_failed' };
+  }
+
+  // Guard 2 — 重复/已处理：幂等 no-op（同事件二次投递只 reduce 一次）。
+  if (event && (event.status === 'reduced' || event.status === 'failed')) {
+    return { outcome: 'duplicate', reason: `already_${event.status}` };
+  }
+
+  // 定位 item（provider_request_id 唯一键，见 uq_generation_items_v2_provider_request）。
+  const reqId = providerRequestId || (event && event.payload && event.payload.provider_request_id) || null;
+  const item = await store.findItemByProviderRequestId(event ? event.provider_id : null, reqId);
+  if (!item) {
+    if (inbox && event.id) await inbox.fail({ id: event.id, errorCode: 'ITEM_NOT_FOUND' });
+    return { outcome: 'rejected', reason: 'item_not_found' };
+  }
+
+  // Guard 3 — 终态回归：拒（done/failed/canceled 不再回退）。
+  if (TERMINAL_ITEM_STATUSES.has(item.status)) {
+    if (inbox && event.id) await inbox.complete({ id: event.id });
+    return { outcome: 'rejected', reason: 'terminal_regression', itemStatus: item.status };
+  }
+
+  // Guard 4 — 乱序（stale）：item 已 generated（provider_url 已就绪）又来 pending/failed/unknown
+  //           或同形陈旧回执 → 不回归，降级为 reconcile_wait 语义（poll 权威对账，§59 单调）。
+  if (item.status === 'generated' || (item.provider_url && status !== 'success')) {
+    if (inbox && event.id) await inbox.complete({ id: event.id });
+    return { outcome: 'out_of_order', reason: 'reconcile_wait', itemStatus: item.status };
+  }
+
+  // Guard 5 — 源状态不在收敛态（非 reconciling/generating，如 reconcile_wait/uploading/queued）→
+  //           早期/错位 webhook，降级 reconcile_wait 语义（交 poll 路径，禁直改）。
+  if (item.status && !REDUCIBLE_FROM.has(item.status)) {
+    if (inbox && event.id) await inbox.complete({ id: event.id });
+    return { outcome: 'out_of_order', reason: 'reconcile_wait', itemStatus: item.status };
+  }
+
+  // 唯一 reduce：CAS 单写（store.transitionItem 内部 status+lease_version 双 CAS）。
+  const decision = reduceDecision(item, normalizedStatus);
+  const row = await store.transitionItem({
+    itemId: item.item_id,
+    leaseVersion: Number(item.lease_version),
+    from: decision.from,
+    to: decision.to,
+    patch: decision.patch,
+  });
+  if (!row) {
+    // 并发 delivery / 双 reduce 被 CAS 拦截：吞掉，标记消费，避免重放。
+    if (inbox && event.id) await inbox.complete({ id: event.id });
+    return { outcome: 'concurrent_noop', reason: 'stale_lease', itemStatus: item.status };
+  }
+  if (inbox && event.id) await inbox.complete({ id: event.id });
+  return { outcome: 'reduced', to: decision.to, itemStatus: item.status };
+}
+
 // ─── Sanitize error messages (prevent secret leakage) ───
 function sanitizeErrorMessage(msg) {
   if (typeof msg !== 'string') return String(msg);
@@ -334,6 +469,8 @@ function parseJson(val) {
 
 module.exports = {
   queryProviderStatus,
+  applyProviderEvent,
+  reduceDecision,
   loadProviderById,
   loadModelById,
   resolveProviderType,

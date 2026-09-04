@@ -2,18 +2,28 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { normalizeCount, createBatchWithItems } = require('./intake.cjs');
+const { normalizeCount, normalizeMoney, moneyUnitsToDecimal, createBatchWithItems } = require('./intake.cjs');
 
 function makeFakePg() {
   const calls = [];
-  let existing = null;
+  let existing = null;      // row returned by the idempotency SELECT
+  let selectCount = 0;
+  let race = null;          // { winner } → simulate concurrent first-time ON CONFLICT race
   return {
     calls,
     setExisting(row) { existing = row; },
+    setRace(winner) { race = { winner }; },
     async query(sql, params = []) {
       calls.push({ sql, params });
       if (/SELECT batch_id.*generation_batches_v2/s.test(sql)) {
-        return { rows: existing ? [existing] : [], rowCount: existing ? 1 : 0 };
+        selectCount += 1;
+        if (race && selectCount === 1) return { rows: [], rowCount: 0 }; // 首次 SELECT 落空（并发窗口）
+        const row = race ? race.winner : existing;
+        return { rows: row ? [row] : [], rowCount: row ? 1 : 0 };
+      }
+      if (/INSERT INTO generation_batches_v2/.test(sql)) {
+        if (race) return { rows: [], rowCount: 0 }; // ON CONFLICT DO NOTHING → 竞态败者
+        return { rows: [{ batch_id: params[0] }], rowCount: 1 };
       }
       return { rows: [], rowCount: 1 };
     },
@@ -46,16 +56,43 @@ test('createBatchWithItems 在单事务创建父批次、N个单图item、每图
   assert.match(pg.calls.at(-1).sql, /COMMIT/);
 });
 
-test('createBatchWithItems 命中幂等键时不再创建item或hold', async () => {
+test('createBatchWithItems 命中幂等键时返回原 Job 且不再创建 item 或 hold（单次 reserve）', async () => {
   const pg = makeFakePg();
-  pg.setExisting({ batch_id: 'gb-existing', requested_count: 4 });
+  pg.setExisting({ batch_id: 'gb-existing', requested_count: 4, model_id: 'm1', content_type: 'image', unit_price: 50 });
   const result = await createBatchWithItems(pg, {
     batchId: 'gb-new', userId: 'u1', idempotencyKey: 'idem-same', modelId: 'm1',
     contentType: 'image', count: 4, unitPrice: 50, pool: 'reward',
   });
-  assert.deepEqual(result, { batchId: 'gb-existing', count: 4, idempotent: true });
-  assert.equal(pg.calls.some((c) => /INSERT INTO generation_items_v2/.test(c.sql)), false);
+  assert.deepEqual(result, { batchId: 'gb-existing', count: 4, idempotent: true }, '二次请求返回原 batchId');
+  assert.equal(pg.calls.some((c) => /INSERT INTO generation_items_v2/.test(c.sql)), false, '不二次建 item');
+  assert.equal(pg.calls.some((c) => /INSERT INTO generation_credit_holds_v2/.test(c.sql)), false, '不二次 reserve（hold）');
+  assert.equal(pg.calls.some((c) => /INSERT INTO generation_outbox_v2/.test(c.sql)), false);
   assert.match(pg.calls.at(-1).sql, /COMMIT/);
+});
+
+test('createBatchWithItems 同 key 不同参数（model/price）→ 拒绝复用', async () => {
+  const pg = makeFakePg();
+  pg.setExisting({ batch_id: 'gb-existing', requested_count: 4, model_id: 'm1', content_type: 'image', unit_price: 50 });
+  await assert.rejects(() => createBatchWithItems(pg, {
+    batchId: 'gb-new', userId: 'u1', idempotencyKey: 'idem-same', modelId: 'm2',
+    contentType: 'image', count: 4, unitPrice: 50, pool: 'reward',
+  }), /idempotency key reused with different generation parameters/);
+  assert.ok(pg.calls.some((c) => /ROLLBACK/.test(c.sql)));
+});
+
+test('createBatchWithItems ON CONFLICT 竞态败者返回原 Job 且不二次 reserve', async () => {
+  const pg = makeFakePg();
+  // 并发：首次 SELECT 落空，INSERT ON CONFLICT 返回 0 行（胜者已插入），re-SELECT 拿到胜者
+  pg.setRace({ batch_id: 'gb-winner', requested_count: 2, model_id: 'm1', content_type: 'image', unit_price: 50 });
+  const result = await createBatchWithItems(pg, {
+    batchId: 'gb-race', userId: 'u1', idempotencyKey: 'idem-race', modelId: 'm1',
+    contentType: 'image', count: 2, unitPrice: '50.0000', pool: 'reward',
+  });
+  assert.deepEqual(result, { batchId: 'gb-winner', count: 2, idempotent: true });
+  const insert = pg.calls.find((c) => /INSERT INTO generation_batches_v2/.test(c.sql));
+  assert.match(insert.sql, /ON CONFLICT \(user_id,idempotency_key\) DO NOTHING/i);
+  assert.equal(pg.calls.some((c) => /INSERT INTO generation_items_v2/.test(c.sql)), false);
+  assert.equal(pg.calls.some((c) => /INSERT INTO generation_credit_holds_v2/.test(c.sql)), false);
 });
 
 test('createBatchWithItems 对Pool使用同一client完成事务并release', async () => {
@@ -74,7 +111,6 @@ test('createBatchWithItems 对Pool使用同一client完成事务并release', asy
 });
 
 test('normalizeMoney严格拒绝非法金额并转换为万分之一整数', () => {
-  const { normalizeMoney } = require('./intake.cjs');
   assert.equal(normalizeMoney('50'), 500000);
   assert.equal(normalizeMoney('0.1234'), 1234);
   assert.throws(() => normalizeMoney('bad'), /unitPrice/);
@@ -86,9 +122,9 @@ test('normalizeMoney严格拒绝非法金额并转换为万分之一整数', () 
 test('createBatchWithItems 使用ON CONFLICT处理并发首次幂等', async () => {
   const pg = makeFakePg();
   await createBatchWithItems(pg, {
-    batchId:'gb-race',userId:'u1',idempotencyKey:'idem-race',modelId:'m1',contentType:'image',count:2,unitPrice:'50.0000',pool:'reward',
+    batchId: 'gb-race', userId: 'u1', idempotencyKey: 'idem-race', modelId: 'm1', contentType: 'image', count: 2, unitPrice: '50.0000', pool: 'reward',
   });
-  const insert = pg.calls.find(c => /INSERT INTO generation_batches_v2/.test(c.sql));
+  const insert = pg.calls.find((c) => /INSERT INTO generation_batches_v2/.test(c.sql));
   assert.match(insert.sql, /ON CONFLICT \(user_id,idempotency_key\) DO NOTHING/i);
   assert.match(insert.sql, /RETURNING batch_id/i);
 });
@@ -105,4 +141,9 @@ test('createBatchWithItems 中途失败会ROLLBACK', async () => {
     contentType: 'image', count: 2, unitPrice: 50, pool: 'reward',
   }), /boom/);
   assert.ok(pg.calls.some((c) => /ROLLBACK/.test(c.sql)));
+});
+
+test('moneyUnitsToDecimal 万分之一整数转回小数', () => {
+  assert.equal(moneyUnitsToDecimal(500000), '50.0000');
+  assert.equal(moneyUnitsToDecimal(1234), '0.1234');
 });

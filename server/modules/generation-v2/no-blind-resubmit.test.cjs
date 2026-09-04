@@ -1,7 +1,7 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { resolveReconcilingItem, claimReconciling } = require('./reconciler.cjs');
+const { resolveReconcilingItem, claimReconciling, recoverSubmitUnknown } = require('./reconciler.cjs');
 
 function fakePgWithRows(rows = []) {
   const calls = [];
@@ -73,4 +73,81 @@ test('unknown-after-submit goes to review_required and never schedules fresh sub
   assert.equal(result.status, 'review_required');
   assert.equal(transitions[0].to, 'review_required');
   assert.notEqual(transitions[0].to, 'retry_wait');
+});
+
+// ─── §52-54/§152: SUBMIT_UNKNOWN 六步恢复序 (Gate7) ───
+
+function submitUnknownDeps(overrides = {}) {
+  const calls = { resubmit: 0, transition: [] };
+  return {
+    calls,
+    checkClientRequestTokenSupport: async () => true,
+    lookupSubmitPayload: async () => ({ prompt: 'a cat' }),
+    searchProviderTask: async () => ({ found: false }),
+    withinDecidableWindow: async () => false,
+    resubmit: async () => { calls.resubmit++; return 'provider-new-1'; },
+    transitionItem: async (_pg, action) => { calls.transition.push(action); return { item_id: action.itemId, status: action.to }; },
+    ...overrides,
+  };
+}
+
+test('SUBMIT_UNKNOWN: submit 响应丢失 → 窗口内不重提, 不建第二任务 (Gate7)', async () => {
+  const deps = submitUnknownDeps({ withinDecidableWindow: async () => false });
+  const result = await recoverSubmitUnknown({}, {
+    item_id: 'i-submit-unknown', lease_version: 1, provider_request_id: null, client_request_id: 'client-original',
+  }, deps);
+
+  assert.equal(result.status, 'reconcile_wait');
+  assert.equal(deps.calls.resubmit, 0, 'must NOT resubmit within decidable window (§152)');
+  assert.equal(deps.calls.transition.length, 1);
+  assert.equal(deps.calls.transition[0].to, 'reconcile_wait');
+  assert.notEqual(deps.calls.transition[0].to, 'generating', 'must not dispatch a second task');
+});
+
+test('SUBMIT_UNKNOWN: 确认未创建 + 窗口已过 → 以同一 client_request_id 重提一次', async () => {
+  let resubmittedItem = null;
+  let resubmittedPayload = null;
+  const deps = submitUnknownDeps({
+    withinDecidableWindow: async () => true,
+    searchProviderTask: async () => ({ found: false }),
+    resubmit: async (item, payload) => { deps.calls.resubmit++; resubmittedItem = item; resubmittedPayload = payload; return 'provider-new-1'; },
+  });
+  const result = await recoverSubmitUnknown({}, {
+    item_id: 'i-confirm-not-created', lease_version: 1, provider_request_id: null, client_request_id: 'client-original',
+  }, deps);
+
+  assert.equal(result.status, 'resubmitted');
+  assert.equal(deps.calls.resubmit, 1, 'exactly one resubmit');
+  assert.equal(resubmittedItem.client_request_id, 'client-original', 'same client_request_id');
+  assert.deepEqual(resubmittedPayload, { prompt: 'a cat' });
+  assert.equal(deps.calls.transition[0].to, 'generating');
+  assert.equal(deps.calls.transition[0].patch.provider_request_id, 'provider-new-1');
+});
+
+test('SUBMIT_UNKNOWN: 搜到已存在 provider task → 采纳并交还 reconcile, 不重提', async () => {
+  const deps = submitUnknownDeps({
+    searchProviderTask: async () => ({ found: true, providerRequestId: 'provider-existing' }),
+  });
+  const result = await recoverSubmitUnknown({}, {
+    item_id: 'i-adopt', lease_version: 1, provider_request_id: null, client_request_id: 'client-original',
+  }, deps);
+
+  assert.equal(result.status, 'adopted');
+  assert.equal(deps.calls.resubmit, 0, 'must not resubmit when task already exists');
+  assert.equal(deps.calls.transition[0].to, 'reconcile_wait');
+  assert.equal(deps.calls.transition[0].patch.provider_request_id, 'provider-existing');
+});
+
+test('SUBMIT_UNKNOWN: 窗口已过但 provider 不支持 token → 转人工复核, 不盲目重提', async () => {
+  const deps = submitUnknownDeps({
+    checkClientRequestTokenSupport: async () => false,
+    withinDecidableWindow: async () => true,
+  });
+  const result = await recoverSubmitUnknown({}, {
+    item_id: 'i-no-token', lease_version: 1, provider_request_id: null, client_request_id: 'client-original',
+  }, deps);
+
+  assert.equal(result.status, 'review_required');
+  assert.equal(deps.calls.resubmit, 0, 'no token support → never blind resubmit (§52-53)');
+  assert.equal(deps.calls.transition[0].to, 'review_required');
 });
