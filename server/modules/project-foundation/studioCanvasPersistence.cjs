@@ -4,6 +4,7 @@ const crypto = require('crypto');
 // 反向依赖安全: commandLogStore.cjs 零 require(纯地基叶), 无环。server.js 未改动时
 // 本模块用同一个注入 pg 自建 store; 合成根日后可经 deps.commandLogStore 注入共享实例。
 const { createCommandLogStore } = require('../collaboration/commandLogStore.cjs');
+const { decomposeCanvasPatch, REASONS } = require('./canvasCommandDecomposer.cjs');
 
 const PREFIX_RE = /^\/api\/v2\/projects\/([^/]+)\/studio\/canvas(?:\/([^/]+)(?:\/([^/]+))?)?$/;
 const CANVAS_SCHEMA_VERSION = 1;
@@ -16,6 +17,11 @@ const LIMITS = Object.freeze({
   maxSnapshotBytes: Number(process.env.STUDIO_CANVAS_MAX_SNAPSHOT_BYTES || 8 * 1024 * 1024),
 });
 const FORBIDDEN_DATA_KEYS = new Set(['temporaryPreviewUrl', 'tempPreviewUrl', 'signedUrl', 'signedURL', 'apiKey', 'api_key', 'credential', 'credentials', 'jwt', 'token', 'cookie', 'localPath']);
+
+// G22 Phase-2 — dual-mode 开关: STUDIO_CANVAS_KIND_SCOPED=1 时, 仅 node.update(data-only)
+// 走 kind-scoped LWW 直写(不改画布 revision); 其余 kind 与开关未设/非 '1' 时保持整画布 CAS。
+// 每 PATCH 读取一次(非模块加载期), 便于测试在用例间切换。开关关 ⇒ 全量整画布 CAS(零行为变化)。
+function kindScopedEnabled() { return process.env.STUDIO_CANVAS_KIND_SCOPED === '1'; }
 
 function isAdmin(user) { return user && (user.role === 'admin' || user.role === 'system'); }
 function sendErr(sendJSON, res, status, error, extra = {}) { return sendJSON(res, status, { ok: false, error, ...extra }); }
@@ -157,17 +163,49 @@ function createStudioCanvasPersistence(deps) {
             return null;
           }
         })();
-  async function recordCanvasPatch({ canvasId, commandId, actorId, baseRevision, ops }) {
-    if (!commandLog) return;
+  async function recordCanvasPatch({ canvasId, commandId, actorId, baseRevision, ops, mode }) {
+    if (!commandLog) return null;
     try {
+      const payload = { baseRevision, ops };
+      if (mode) payload.mode = mode;
       const r = await commandLog.appendCommand({
         canvasId, commandId, type: 'canvas.patch', actorId, baseRevision,
-        payload: { baseRevision, ops },
+        payload,
       });
-      if (r && r.ok === false) console.warn('[studio-canvas] appendCommand rejected:', JSON.stringify(r.errors || r));
+      if (r && r.ok === false) { console.warn('[studio-canvas] appendCommand rejected:', JSON.stringify(r.errors || r)); return null; }
+      return r || null;
     } catch (e) {
       console.warn('[studio-canvas] appendCommand failed after commit (PATCH unaffected):', e && e.message);
+      return null;
     }
+  }
+
+  // G22 Phase-2 — node.update(data-only) 的 kind-scoped LWW 直写路径(单文件垂直)。
+  // 只改 data_json、不动画布 revision; appendCommand 幂等(UNIQUE command_id=clientMutationId)
+  // 防重放双写, seq 由 DB 自增回填 commandSeq。任一行 UPDATE 0 行(节点消失)→ 返回 false
+  // 回落整画布 CAS 兜底(409 语义)。命令日志写于 COMMIT 后(warn-only, 与主链同哲学)。
+  async function applyKindScopedLww(client, res, access, user, canvas, body, base, cmid, lwwUpdateOps) {
+    const byId = new Map();
+    for (const raw of body.upsertNodes) byId.set(String((raw && raw.nodeId) || (raw && raw.id) || '').trim(), raw);
+    let affected = 0;
+    for (const op of lwwUpdateOps) {
+      const raw = byId.get(op.nodeId);
+      if (!raw) { await client.query('ROLLBACK'); sendErr(sendJSON, res, 400, 'INVALID_NODE'); return true; }
+      const data = durableNodeData(raw.data || raw);
+      const ur = await client.query('UPDATE studio_canvas_nodes SET data_json=$2, updated_at=NOW() WHERE canvas_id=$1 AND node_id=$3', [canvas.id, JSON.stringify(data), op.nodeId]);
+      affected += (ur && ur.rowCount) || 0;
+    }
+    if (affected < lwwUpdateOps.length) return false; // 节点消失 → 回落整画布 CAS(409 语义)
+    const graph = await loadGraph(client, canvas.id);
+    const fresh = (await client.query('SELECT * FROM studio_canvases WHERE id=$1', [canvas.id])).rows[0];
+    const resp = { ...response(fresh, graph, fresh.viewport_json, { permissions: access.permissions, extra: { applied: true, clientMutationId: cmid } }), ok: true, mode: 'kind-scoped-lww', revision: fresh.revision };
+    await client.query('INSERT INTO studio_canvas_mutations (canvas_id,client_mutation_id,base_revision,resulting_revision,response_json,created_by) VALUES ($1,$2,$3,$4,$5,$6)', [canvas.id, cmid, base, fresh.revision, JSON.stringify(resp), user.id]);
+    await client.query('COMMIT');
+    const logged = await recordCanvasPatch({ canvasId: canvas.id, commandId: cmid, actorId: user.id, baseRevision: base, mode: 'kind-scoped-lww', ops: lwwUpdateOps.map((o) => ({ op: o.op, kind: o.kind, nodeId: o.nodeId, fields: o.fields, reason: o.reason })) });
+    if (logged && logged.ok !== false && logged.idempotent === false && logged.seq != null) resp.commandSeq = logged.seq;
+    await emit('canvas.updated', { canvas_id: canvas.id, project_id: access.project.id, workspace_id: fresh.workspace_id, revision: fresh.revision, actor_id: user.id, timestamp: new Date().toISOString() });
+    sendJSON(res, 200, resp);
+    return true;
   }
 
   async function handleGet(req, res, user, projectId) {
@@ -198,6 +236,20 @@ function createStudioCanvasPersistence(deps) {
       const canvas = await ensureCanvas(client, access.project, user);
       const prior = await client.query('SELECT response_json FROM studio_canvas_mutations WHERE canvas_id=$1 AND client_mutation_id=$2', [canvas.id, cmid]);
       if (prior.rows.length) { await client.query('COMMIT'); return sendJSON(res, 200, { ...prior.rows[0].response_json, idempotent: true }); }
+      // G22 Phase-2 — kind-scoped 灰度: env 开时拆解 PATCH, 纯 node.update(data-only) 走
+      // kind-scoped LWW 直写(不改 revision); 其余 kind 与混合 kind 一律回落下方面整画布 CAS。
+      if (kindScopedEnabled()) {
+        const graph0 = await loadGraph(client, canvas.id);
+        const d = decomposeCanvasPatch(body, { existingNodes: graph0.nodes, existingEdges: graph0.edges });
+        if (!d.ok) { await client.query('ROLLBACK'); return sendErr(sendJSON, res, 400, 'INVALID_PATCH', { errors: d.errors }); }
+        const lwwUpdateOps = d.buckets.lww.filter((o) => o.op === 'upsertNode' && o.kind === 'node.update' && o.reason === REASONS.NODE_UPDATE_DATA_ONLY);
+        const otherCount = d.summary.total - lwwUpdateOps.length;
+        if (lwwUpdateOps.length > 0 && otherCount === 0) {
+          const handled = await applyKindScopedLww(client, res, access, user, canvas, body, base, cmid, lwwUpdateOps);
+          if (handled) return;
+        }
+        // 否则: 混合 kind / 非 data-only / 无 lww-update op → 回落整画布 CAS。
+      }
       const cas = await client.query('UPDATE studio_canvases SET revision=revision+1, viewport_json=COALESCE($3, viewport_json), updated_by=$4, updated_at=NOW() WHERE id=$1 AND revision=$2 RETURNING *', [canvas.id, base, body.viewport === undefined ? null : JSON.stringify(safeJson(body.viewport, {})), user.id]);
       if (!cas.rows.length) { const cur = await client.query('SELECT revision FROM studio_canvases WHERE id=$1', [canvas.id]); await client.query('ROLLBACK'); return sendErr(sendJSON, res, 409, 'CONFLICT', { serverRevision: cur.rows[0]?.revision || canvas.revision, canvasId: canvas.id }); }
       // W2-06 — 权威绑定校验接线(三视图叶2)。CAS 通过后、任何写入(delete/upsert)之前,
@@ -228,7 +280,7 @@ function createStudioCanvasPersistence(deps) {
       if (deleteNodeIds.length) await client.query('DELETE FROM studio_canvas_nodes WHERE canvas_id=$1 AND node_id = ANY($2::text[])', [canvas.id, deleteNodeIds]);
       for (const n of normNodes) { await client.query(`INSERT INTO studio_canvas_nodes (canvas_id,node_id,node_type,node_schema_version,position_x,position_y,width,height,z_index,data_json,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW(),NOW()) ON CONFLICT (canvas_id,node_id) DO UPDATE SET node_type=EXCLUDED.node_type,node_schema_version=EXCLUDED.node_schema_version,position_x=EXCLUDED.position_x,position_y=EXCLUDED.position_y,width=EXCLUDED.width,height=EXCLUDED.height,z_index=EXCLUDED.z_index,data_json=EXCLUDED.data_json,updated_at=NOW()`, [canvas.id,n.nodeId,n.nodeType,n.nodeSchemaVersion,n.positionX,n.positionY,n.width,n.height,n.zIndex,JSON.stringify(n.data)]); }
       for (const raw of upsertEdges) { const e = normalizeEdge(raw); await client.query(`INSERT INTO studio_canvas_edges (canvas_id,edge_id,source_node_id,source_handle,target_node_id,target_handle,edge_type,data_json,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW(),NOW()) ON CONFLICT (canvas_id,edge_id) DO UPDATE SET source_node_id=EXCLUDED.source_node_id,source_handle=EXCLUDED.source_handle,target_node_id=EXCLUDED.target_node_id,target_handle=EXCLUDED.target_handle,edge_type=EXCLUDED.edge_type,data_json=EXCLUDED.data_json,updated_at=NOW()`, [canvas.id,e.edgeId,e.sourceNodeId,e.sourceHandle,e.targetNodeId,e.targetHandle,e.edgeType,JSON.stringify(e.data)]); }
-      const graph = await loadGraph(client, canvas.id); const fresh = (await client.query('SELECT * FROM studio_canvases WHERE id=$1', [canvas.id])).rows[0]; const resp = response(fresh, graph, fresh.viewport_json, { permissions: access.permissions, extra: { applied: true, clientMutationId: cmid } });
+      const graph = await loadGraph(client, canvas.id); const fresh = (await client.query('SELECT * FROM studio_canvases WHERE id=$1', [canvas.id])).rows[0]; const extra = { applied: true, clientMutationId: cmid }; if (kindScopedEnabled()) extra.mode = 'canvas-cas'; const resp = response(fresh, graph, fresh.viewport_json, { permissions: access.permissions, extra });
       await client.query('INSERT INTO studio_canvas_mutations (canvas_id,client_mutation_id,base_revision,resulting_revision,response_json,created_by) VALUES ($1,$2,$3,$4,$5,$6)', [canvas.id, cmid, base, fresh.revision, JSON.stringify(resp), user.id]);
       await client.query('COMMIT');
       // G22 — mutation 已提交(CAS 通过)后写 canvas.patch 命令日志。commandId=clientMutationId,

@@ -191,6 +191,15 @@ function createCanvasDb(seed = {}) {
       for (const id of ids) if (m.delete(id)) n++;
       return { rows: [], rowCount: n };
     }
+    if (sql.includes('UPDATE studio_canvas_nodes SET data_json')) {
+      const [cid, dataJson, nodeId] = p;
+      const m = nodeMap(cid);
+      if (!m.has(nodeId)) return { rows: [], rowCount: 0 }; // 节点不存在 → 0 行(回落整画布 CAS)
+      const row = m.get(nodeId);
+      row.data_json = JSON.parse(dataJson);
+      row.updated_at = new Date();
+      return { rows: [{ node_id: nodeId }], rowCount: 1 };
+    }
     if (sql.includes('INSERT INTO studio_canvas_nodes')) {
       const [cid, nodeId, nodeType, nodeSchemaVersion, posX, posY, width, height, zIndex, dataJson] = p;
       nodeMap(cid).set(nodeId, { canvas_id: cid, node_id: nodeId, node_type: nodeType,
@@ -531,4 +540,154 @@ test('W2-06 非法 structureNodeId 同样 409 BINDING_INVALID 并点名该字段
   assert.equal(r.body.error, 'BINDING_INVALID');
   assert.ok(r.body.errors[0].includes('structureNodeId sn-not-exist'), `明细=${r.body.errors[0]}`);
   assert.equal(db.nodesOf().length, 0);
+});
+
+/* ─────────────────────────────────────────────────────────────── */
+/* G22 Phase-2 — kind-scoped 灰度(node.update data-only LWW 垂直): env 开关          */
+/* STUDIO_CANVAS_KIND_SCOPED=1 时, 仅 node.update(data-only) 走 LWW 直写(不改        */
+/* revision), 其余 kind / 混合 kind / 不存在 id 一律回落整画布 CAS; 幂等重放与      */
+/* malformed 拒绝; 每用例自行设/清 env, 不污染其它用例。                           */
+/* ─────────────────────────────────────────────────────────────── */
+
+test('G22-Phase2 env ON: node.update(data-only) → kind-scoped LWW 直写, revision 不变, 命令日志有 node.update 行', async () => {
+  process.env.STUDIO_CANVAS_KIND_SCOPED = '1';
+  try {
+    const db = createCanvasDb();
+    const p = makePersistence(db);
+    // seed: 新节点 n1 → node.create → 整画布 CAS, revision 1→2
+    const seed = await doPatch(p, { clientMutationId: 'm-seed', baseRevision: 1, upsertNodes: [mkNode('n1')], upsertEdges: [], deleteNodeIds: [], deleteEdgeIds: [] });
+    assert.equal(seed.status, 200);
+    assert.equal(seed.body.mode, 'canvas-cas');
+    assert.equal(db.canvasRow().revision, 2);
+
+    // update: 仅 data 变更(title/parameters), position/size 不变
+    const updated = { ...mkNode('n1'), data: { nodeKind: 'prompt', schemaVersion: 1, title: 'T-n1-updated', status: 'IDLE', parameters: { p: 1 } } };
+    const r = await doPatch(p, { clientMutationId: 'm-upd', baseRevision: 2, upsertNodes: [updated], upsertEdges: [], deleteNodeIds: [], deleteEdgeIds: [] });
+    assert.equal(r.status, 200);
+    assert.equal(r.body.ok, true);
+    assert.equal(r.body.mode, 'kind-scoped-lww');
+    assert.equal(r.body.revision, 2);
+    assert.equal(db.canvasRow().revision, 2, 'kind-scoped LWW 不改画布 revision');
+    assert.equal(r.body.canvas.revision, 2);
+    const node = db.nodesOf()[0];
+    assert.equal(node.node_id, 'n1');
+    assert.equal(node.data_json.title, 'T-n1-updated', 'data_json 已更新');
+    assert.deepEqual(node.data_json.parameters, { p: 1 });
+
+    // 命令日志: seed 行(summary) + update 行(kind 分解 ops)
+    const rows = db.logRows();
+    assert.equal(rows.length, 2);
+    const updRow = rows.find((x) => x.command_id === 'm-upd');
+    assert.ok(updRow, '命令日志有 update 行');
+    assert.equal(updRow.type, 'canvas.patch');
+    assert.equal(updRow.base_revision, 2);
+    assert.equal(updRow.payload.mode, 'kind-scoped-lww');
+    assert.ok(Array.isArray(updRow.payload.ops), 'payload.ops 为 kind 分解数组');
+    const op = updRow.payload.ops.find((o) => o.nodeId === 'n1');
+    assert.equal(op.op, 'upsertNode');
+    assert.equal(op.kind, 'node.update');
+    assert.deepEqual(op.fields, ['data']);
+  } finally {
+    delete process.env.STUDIO_CANVAS_KIND_SCOPED;
+  }
+});
+
+test('G22-Phase2 env ON: node.create(新 id) 仍走整画布 CAS, revision+1', async () => {
+  process.env.STUDIO_CANVAS_KIND_SCOPED = '1';
+  try {
+    const db = createCanvasDb();
+    const p = makePersistence(db);
+    const r = await doPatch(p, { clientMutationId: 'm-create', baseRevision: 1, upsertNodes: [mkNode('n-new')], upsertEdges: [], deleteNodeIds: [], deleteEdgeIds: [] });
+    assert.equal(r.status, 200);
+    assert.equal(r.body.mode, 'canvas-cas');
+    assert.equal(db.canvasRow().revision, 2, 'create 仍 CAS 推进 revision');
+    assert.equal(db.nodesOf().length, 1);
+    assert.equal(db.nodesOf()[0].node_id, 'n-new');
+  } finally {
+    delete process.env.STUDIO_CANVAS_KIND_SCOPED;
+  }
+});
+
+test('G22-Phase2 env ON: node.delete 仍走整画布 CAS, revision+1', async () => {
+  process.env.STUDIO_CANVAS_KIND_SCOPED = '1';
+  try {
+    const db = createCanvasDb();
+    const p = makePersistence(db);
+    await doPatch(p, { clientMutationId: 'm-seed', baseRevision: 1, upsertNodes: [mkNode('n1')], upsertEdges: [], deleteNodeIds: [], deleteEdgeIds: [] });
+    assert.equal(db.canvasRow().revision, 2);
+    const r = await doPatch(p, { clientMutationId: 'm-del', baseRevision: 2, upsertNodes: [], upsertEdges: [], deleteNodeIds: ['n1'], deleteEdgeIds: [] });
+    assert.equal(r.status, 200);
+    assert.equal(r.body.mode, 'canvas-cas');
+    assert.equal(db.canvasRow().revision, 3, 'delete 仍 CAS 推进 revision');
+    assert.equal(db.nodesOf().length, 0, '节点已删除');
+  } finally {
+    delete process.env.STUDIO_CANVAS_KIND_SCOPED;
+  }
+});
+
+test('G22-Phase2 env ON: 不存在 id → 拆解为 node.create → 整画布 CAS 兜底(陈旧 base 409)', async () => {
+  process.env.STUDIO_CANVAS_KIND_SCOPED = '1';
+  try {
+    const db = createCanvasDb();
+    const p = makePersistence(db);
+    // 先推进画布到 revision 2(seed n1)
+    await doPatch(p, { clientMutationId: 'm-seed', baseRevision: 1, upsertNodes: [mkNode('n1')], upsertEdges: [], deleteNodeIds: [], deleteEdgeIds: [] });
+    assert.equal(db.canvasRow().revision, 2);
+    // 对不存在 id 发 upsert + 陈旧 baseRevision=1 → node.create → CAS → 409(而非 lww 静默)
+    const r = await doPatch(p, { clientMutationId: 'm-ghost', baseRevision: 1, upsertNodes: [mkNode('n-ghost')], upsertEdges: [], deleteNodeIds: [], deleteEdgeIds: [] });
+    assert.equal(r.status, 409);
+    assert.equal(r.body.error, 'CONFLICT');
+    assert.equal(r.body.serverRevision, 2);
+    assert.equal(db.nodesOf().length, 1, '不存在 id 未落库');
+    assert.equal(db.canvasRow().revision, 2, '409 不推进 revision');
+  } finally {
+    delete process.env.STUDIO_CANVAS_KIND_SCOPED;
+  }
+});
+
+test('G22-Phase2 env ON: 幂等重放同 clientMutationId → idempotent:true, 命令日志不双写, revision 不变', async () => {
+  process.env.STUDIO_CANVAS_KIND_SCOPED = '1';
+  try {
+    const db = createCanvasDb();
+    const p = makePersistence(db);
+    await doPatch(p, { clientMutationId: 'm-seed', baseRevision: 1, upsertNodes: [mkNode('n1')], upsertEdges: [], deleteNodeIds: [], deleteEdgeIds: [] });
+    const updated = { ...mkNode('n1'), data: { nodeKind: 'prompt', schemaVersion: 1, title: 'T-n1-updated', status: 'IDLE', parameters: {} } };
+    const body = { clientMutationId: 'm-upd', baseRevision: 2, upsertNodes: [updated], upsertEdges: [], deleteNodeIds: [], deleteEdgeIds: [] };
+
+    const first = await doPatch(p, body);
+    assert.equal(first.status, 200);
+    assert.equal(first.body.mode, 'kind-scoped-lww');
+    assert.equal(db.canvasRow().revision, 2);
+
+    const dup = await doPatch(p, body);
+    assert.equal(dup.status, 200);
+    assert.equal(dup.body.idempotent, true, '重放返回 idempotent:true');
+    assert.equal(db.canvasRow().revision, 2, '重放不 bump revision');
+    assert.equal(db.mutationRows().length, 2, 'seed + update 各一行 mutation(重放不新增)');
+
+    // 命令日志不双写: m-upd 只一行; INSERT 尝试仅 seed + update 两次
+    assert.equal(db.logRows().filter((x) => x.command_id === 'm-upd').length, 1, '命令日志 m-upd 不双写');
+    assert.equal(db.logInsertAttempts(), 2, '重放不触发第二次命令日志 INSERT');
+  } finally {
+    delete process.env.STUDIO_CANVAS_KIND_SCOPED;
+  }
+});
+
+test('G22-Phase2 env ON: malformed PATCH(upsertNodes 缺 nodeId) → 400 拒, 零写入', async () => {
+  process.env.STUDIO_CANVAS_KIND_SCOPED = '1';
+  try {
+    const db = createCanvasDb();
+    const p = makePersistence(db);
+    const r = await doPatch(p, { clientMutationId: 'm-bad', baseRevision: 1, upsertNodes: [{ nodeType: 'prompt', position: { x: 1, y: 2 } }], upsertEdges: [], deleteNodeIds: [], deleteEdgeIds: [] });
+    assert.equal(r.status, 400);
+    assert.equal(r.body.ok, false);
+    assert.equal(r.body.error, 'INVALID_PATCH');
+    assert.ok(Array.isArray(r.body.errors) && r.body.errors.length >= 1, '带明细 errors');
+    assert.equal(db.canvasRow().revision, 1, 'malformed 不推进 revision');
+    assert.equal(db.nodesOf().length, 0, '零节点写入');
+    assert.equal(db.logCount(), 0, '零命令日志');
+    assert.equal(db.mutationRows().length, 0, '零 mutation 行');
+  } finally {
+    delete process.env.STUDIO_CANVAS_KIND_SCOPED;
+  }
 });
