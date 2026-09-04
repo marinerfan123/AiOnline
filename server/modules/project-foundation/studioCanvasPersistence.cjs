@@ -4,7 +4,7 @@ const crypto = require('crypto');
 // 反向依赖安全: commandLogStore.cjs 零 require(纯地基叶), 无环。server.js 未改动时
 // 本模块用同一个注入 pg 自建 store; 合成根日后可经 deps.commandLogStore 注入共享实例。
 const { createCommandLogStore } = require('../collaboration/commandLogStore.cjs');
-const { decomposeCanvasPatch, REASONS } = require('./canvasCommandDecomposer.cjs');
+const { decomposeCanvasPatch, REASONS, KIND_BUCKET_BY_COMMAND } = require('./canvasCommandDecomposer.cjs');
 
 const PREFIX_RE = /^\/api\/v2\/projects\/([^/]+)\/studio\/canvas(?:\/([^/]+)(?:\/([^/]+))?)?$/;
 const CANVAS_SCHEMA_VERSION = 1;
@@ -188,12 +188,14 @@ function createStudioCanvasPersistence(deps) {
     const byId = new Map();
     for (const raw of body.upsertNodes) byId.set(String((raw && raw.nodeId) || (raw && raw.id) || '').trim(), raw);
     let affected = 0;
+    const applied = [];
     for (const op of lwwUpdateOps) {
       const raw = byId.get(op.nodeId);
       if (!raw) { await client.query('ROLLBACK'); sendErr(sendJSON, res, 400, 'INVALID_NODE'); return true; }
       const data = durableNodeData(raw.data || raw);
       const ur = await client.query('UPDATE studio_canvas_nodes SET data_json=$2, updated_at=NOW() WHERE canvas_id=$1 AND node_id=$3', [canvas.id, JSON.stringify(data), op.nodeId]);
       affected += (ur && ur.rowCount) || 0;
+      applied.push({ op, data });
     }
     if (affected < lwwUpdateOps.length) return false; // 节点消失 → 回落整画布 CAS(409 语义)
     const graph = await loadGraph(client, canvas.id);
@@ -201,7 +203,44 @@ function createStudioCanvasPersistence(deps) {
     const resp = { ...response(fresh, graph, fresh.viewport_json, { permissions: access.permissions, extra: { applied: true, clientMutationId: cmid } }), ok: true, mode: 'kind-scoped-lww', revision: fresh.revision };
     await client.query('INSERT INTO studio_canvas_mutations (canvas_id,client_mutation_id,base_revision,resulting_revision,response_json,created_by) VALUES ($1,$2,$3,$4,$5,$6)', [canvas.id, cmid, base, fresh.revision, JSON.stringify(resp), user.id]);
     await client.query('COMMIT');
-    const logged = await recordCanvasPatch({ canvasId: canvas.id, commandId: cmid, actorId: user.id, baseRevision: base, mode: 'kind-scoped-lww', ops: lwwUpdateOps.map((o) => ({ op: o.op, kind: o.kind, nodeId: o.nodeId, fields: o.fields, reason: o.reason })) });
+    const logged = await recordCanvasPatch({ canvasId: canvas.id, commandId: cmid, actorId: user.id, baseRevision: base, mode: 'kind-scoped-lww', ops: applied.map(({ op, data }) => ({ op: op.op, kind: op.kind, nodeId: op.nodeId, fields: op.fields, reason: op.reason, data })) });
+    if (logged && logged.ok !== false && logged.idempotent === false && logged.seq != null) resp.commandSeq = logged.seq;
+    await emit('canvas.updated', { canvas_id: canvas.id, project_id: access.project.id, workspace_id: fresh.workspace_id, revision: fresh.revision, actor_id: user.id, timestamp: new Date().toISOString() });
+    sendJSON(res, 200, resp);
+    return true;
+  }
+
+  // G22 Phase-3 — merge 桶(边 create/delete)kind-scoped 直写路径(单文件垂直)。
+  // 无整画布 CAS; 逐主键 upsert/delete + appendCommand(幂等)。边删除 0 行(不存在边)
+  // = 幂等成功; 边 upsert 0 行(防御) → 返回 false 回落整画布 CAS(409 语义)。
+  // 顺序对齐整画布 CAS 路径: 删除先、upsert 后。命令日志写于 COMMIT 后(warn-only)。
+  async function applyKindScopedMerge(client, res, access, user, canvas, body, base, cmid, mergeOps) {
+    const upsertById = new Map();
+    for (const raw of body.upsertEdges) upsertById.set(String((raw && raw.edgeId) || (raw && raw.id) || '').trim(), raw);
+    const deleteOps = mergeOps.filter((o) => o.op === 'deleteEdge');
+    const upsertOps = mergeOps.filter((o) => o.op === 'upsertEdge');
+
+    const fullOps = [];
+    if (deleteOps.length) {
+      const ids = deleteOps.map((o) => o.edgeId);
+      await client.query('DELETE FROM studio_canvas_edges WHERE canvas_id=$1 AND edge_id = ANY($2::text[])', [canvas.id, ids]);
+      for (const o of deleteOps) fullOps.push({ op: 'deleteEdge', kind: 'edge.delete', edgeId: o.edgeId, reason: o.reason });
+    }
+    for (const op of upsertOps) {
+      const raw = upsertById.get(op.edgeId);
+      if (!raw) { await client.query('ROLLBACK'); sendErr(sendJSON, res, 400, 'INVALID_EDGE'); return true; }
+      const e = normalizeEdge(raw);
+      const ir = await client.query(`INSERT INTO studio_canvas_edges (canvas_id,edge_id,source_node_id,source_handle,target_node_id,target_handle,edge_type,data_json,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW(),NOW()) ON CONFLICT (canvas_id,edge_id) DO UPDATE SET source_node_id=EXCLUDED.source_node_id,source_handle=EXCLUDED.source_handle,target_node_id=EXCLUDED.target_node_id,target_handle=EXCLUDED.target_handle,edge_type=EXCLUDED.edge_type,data_json=EXCLUDED.data_json,updated_at=NOW()`, [canvas.id, e.edgeId, e.sourceNodeId, e.sourceHandle, e.targetNodeId, e.targetHandle, e.edgeType, JSON.stringify(e.data)]);
+      if (!ir || !ir.rowCount) return false; // 0 行(防御) → 回落整画布 CAS(409 语义)
+      fullOps.push({ op: 'upsertEdge', kind: 'edge.create', edgeId: e.edgeId, reason: op.reason, edge: { edgeId: e.edgeId, sourceNodeId: e.sourceNodeId, sourceHandle: e.sourceHandle, targetNodeId: e.targetNodeId, targetHandle: e.targetHandle, edgeType: e.edgeType, data: e.data } });
+    }
+
+    const graph = await loadGraph(client, canvas.id);
+    const fresh = (await client.query('SELECT * FROM studio_canvases WHERE id=$1', [canvas.id])).rows[0];
+    const resp = { ...response(fresh, graph, fresh.viewport_json, { permissions: access.permissions, extra: { applied: true, clientMutationId: cmid } }), ok: true, mode: 'kind-scoped-merge', revision: fresh.revision };
+    await client.query('INSERT INTO studio_canvas_mutations (canvas_id,client_mutation_id,base_revision,resulting_revision,response_json,created_by) VALUES ($1,$2,$3,$4,$5,$6)', [canvas.id, cmid, base, fresh.revision, JSON.stringify(resp), user.id]);
+    await client.query('COMMIT');
+    const logged = await recordCanvasPatch({ canvasId: canvas.id, commandId: cmid, actorId: user.id, baseRevision: base, mode: 'kind-scoped-merge', ops: fullOps });
     if (logged && logged.ok !== false && logged.idempotent === false && logged.seq != null) resp.commandSeq = logged.seq;
     await emit('canvas.updated', { canvas_id: canvas.id, project_id: access.project.id, workspace_id: fresh.workspace_id, revision: fresh.revision, actor_id: user.id, timestamp: new Date().toISOString() });
     sendJSON(res, 200, resp);
@@ -243,12 +282,21 @@ function createStudioCanvasPersistence(deps) {
         const d = decomposeCanvasPatch(body, { existingNodes: graph0.nodes, existingEdges: graph0.edges });
         if (!d.ok) { await client.query('ROLLBACK'); return sendErr(sendJSON, res, 400, 'INVALID_PATCH', { errors: d.errors }); }
         const lwwUpdateOps = d.buckets.lww.filter((o) => o.op === 'upsertNode' && o.kind === 'node.update' && o.reason === REASONS.NODE_UPDATE_DATA_ONLY);
-        const otherCount = d.summary.total - lwwUpdateOps.length;
-        if (lwwUpdateOps.length > 0 && otherCount === 0) {
-          const handled = await applyKindScopedLww(client, res, access, user, canvas, body, base, cmid, lwwUpdateOps);
-          if (handled) return;
+        const mergeOps = d.buckets.merge.filter((o) => o.op === 'upsertEdge' || o.op === 'deleteEdge');
+        const otherCount = d.summary.total - lwwUpdateOps.length - mergeOps.length;
+        if (otherCount === 0) {
+          if (mergeOps.length > 0 && lwwUpdateOps.length === 0) {
+            // 纯 merge(边 create/delete) → kind-scoped-merge 直写(不改画布 revision)。
+            const handled = await applyKindScopedMerge(client, res, access, user, canvas, body, base, cmid, mergeOps);
+            if (handled) return;
+          } else if (lwwUpdateOps.length > 0 && mergeOps.length === 0) {
+            // 纯 data-only node.update → kind-scoped-lww 直写(Phase-2 语义)。
+            const handled = await applyKindScopedLww(client, res, access, user, canvas, body, base, cmid, lwwUpdateOps);
+            if (handled) return;
+          }
+          // 混合 lww+merge(无 reject409, 无对应 mode) → 回落整画布 CAS。
         }
-        // 否则: 混合 kind / 非 data-only / 无 lww-update op → 回落整画布 CAS。
+        // 否则: reject409 / 混合 kind / 非 data-only → 回落整画布 CAS。
       }
       const cas = await client.query('UPDATE studio_canvases SET revision=revision+1, viewport_json=COALESCE($3, viewport_json), updated_by=$4, updated_at=NOW() WHERE id=$1 AND revision=$2 RETURNING *', [canvas.id, base, body.viewport === undefined ? null : JSON.stringify(safeJson(body.viewport, {})), user.id]);
       if (!cas.rows.length) { const cur = await client.query('SELECT revision FROM studio_canvases WHERE id=$1', [canvas.id]); await client.query('ROLLBACK'); return sendErr(sendJSON, res, 409, 'CONFLICT', { serverRevision: cur.rows[0]?.revision || canvas.revision, canvasId: canvas.id }); }
@@ -328,4 +376,50 @@ function validateAuthoritativeBindings(nodes, { shotIds = [], structureNodeIds =
   return { ok: errors.length === 0, errors };
 }
 
-module.exports = { createStudioCanvasPersistence, normalizeNode, normalizeEdge, durableNodeData, bulkInsertNodes, bulkInsertEdges, validateAuthoritativeBindings, LIMITS };
+// G22 Phase-3 — 投影重建(纯函数, 独立导出供集成): 在快照 current 上重放命令日志里
+// lww/merge/append 类的 kind 分解 entries, 产出 { nodes, edges } 投影。
+//   不动 reject-409: 该桶(op 由整画布 CAS 路径执行)在日志里只有计数摘要(payload.ops
+//   为对象非数组)或本就未经 kind 日志, 其投影效果已直接落于快照 current —— 本函数跳过。
+//   收敛语义: 同实体多 entry 按传入顺序(调用方须 seq 升序)后写覆盖 → 单投影(并发同边
+//   双 append 归并为一条, 最后写入者胜)。
+//   纯函数: 无 DB/无随机/无隐式全局, 同输入恒同输出; 不抛(畸形 entry/op 静默跳过)。
+//   current.nodes/edges 为 loadGraph 的 formatNode/formatEdge 形状(camelCase)。
+//   logEntries[i].payload.ops 为 kind 分解数组(本切片 lww 携 data、merge 携 edge 载荷)。
+function rebuildProjection({ current, logEntries }) {
+  const nodes = new Map();
+  const edges = new Map();
+  const curNodes = current && Array.isArray(current.nodes) ? current.nodes : [];
+  const curEdges = current && Array.isArray(current.edges) ? current.edges : [];
+  for (const n of curNodes) if (n && n.nodeId != null) nodes.set(String(n.nodeId), { ...n });
+  for (const e of curEdges) if (e && e.edgeId != null) edges.set(String(e.edgeId), { ...e });
+
+  for (const entry of (Array.isArray(logEntries) ? logEntries : [])) {
+    const payload = entry && typeof entry === 'object' ? entry.payload : null;
+    const ops = payload && Array.isArray(payload.ops) ? payload.ops : [];
+    for (const op of ops) {
+      if (!op || typeof op !== 'object') continue;
+      const bucket = typeof op.kind === 'string' ? (KIND_BUCKET_BY_COMMAND[op.kind] || 'skip') : 'skip';
+      if (bucket === 'merge') {
+        if (op.op === 'deleteEdge' || op.kind === 'edge.delete') {
+          if (op.edgeId != null) edges.delete(String(op.edgeId));
+        } else if (op.op === 'upsertEdge' || op.kind === 'edge.create') {
+          const id = op.edgeId != null ? String(op.edgeId) : (op.edge && op.edge.edgeId != null ? String(op.edge.edgeId) : null);
+          if (id && op.edge && typeof op.edge === 'object') edges.set(id, { ...op.edge, edgeId: id });
+        }
+      } else if (bucket === 'lww') {
+        // 本切片 lww 日志仅 data-only node.update(携 data 载荷); move/resize/viewport 无结构变化。
+        if (op.op === 'upsertNode' && op.kind === 'node.update' && op.data !== undefined && op.nodeId != null) {
+          const existing = nodes.get(String(op.nodeId));
+          if (existing) existing.data = op.data;
+        }
+      }
+      // reject-409 / append / 未知 kind → skip(append 无投影结构影响; reject409 已在快照内)。
+    }
+  }
+  return {
+    nodes: [...nodes.values()].sort((a, b) => (a.nodeId < b.nodeId ? -1 : 1)),
+    edges: [...edges.values()].sort((a, b) => (a.edgeId < b.edgeId ? -1 : 1)),
+  };
+}
+
+module.exports = { createStudioCanvasPersistence, normalizeNode, normalizeEdge, durableNodeData, bulkInsertNodes, bulkInsertEdges, validateAuthoritativeBindings, rebuildProjection, LIMITS };
