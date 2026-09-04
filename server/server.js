@@ -58,6 +58,7 @@ import studioModelsApiMod from './modules/modelhub/studioModelsApi.cjs';
 import uploadApiMod from './modules/media/uploadApi.cjs';
 import timelineApiMod from './modules/media/timelineApi.cjs';
 import timelineExportMod from './modules/media/timelineExport.cjs';
+import projectExportMod from './modules/project-foundation/projectExport.cjs';
 import mediaWorkerMod from './modules/media/mediaWorker.cjs';
 import mediaExecMod from './modules/media/executors.cjs';
 import bibleApiMod from './modules/project-foundation/bibleApi.cjs';
@@ -1522,6 +1523,11 @@ const timelineApi = timelineApiMod.createTimelineApi({
 });
 
 // G24 — Timeline JSON bundle export service (/api/v2/timelines/:id/export).
+const projectExport = projectExportMod.createProjectExport({
+  pg: {
+    query: (sql, params) => pgPool ? pgPool.query(sql, params) : Promise.reject(Object.assign(new Error('数据库未就绪'), { status: 503 })),
+  },
+});
 const timelineExport = timelineExportMod.createTimelineExport({
   pg: {
     query: (sql, params) => pgPool
@@ -2741,6 +2747,26 @@ async function handleAPI(req, res) {
   }
 
   // ── M01-S Project / Workspace Foundation（/api/v2/workspaces, /api/v2/projects）──
+  // ── G24 整项目导出：GET /api/v2/projects/:id/export（membership 门，404 无泄漏）──
+  if (method === 'GET') {
+    const px = url.split('?')[0].match(/^\/api\/v2\/projects\/([^/]+)\/export$/);
+    if (px) {
+      const user = session.getUserFromCookie(req);
+      if (!user) return sendJSON(res, 401, { ok: false, error: '需要登录' });
+      const projectId = decodeURIComponent(px[1]);
+      const auth = await pgPool.query(
+        `SELECT 1 FROM projects p JOIN workspaces w ON w.id = p.workspace_id
+          LEFT JOIN workspace_members wm ON wm.workspace_id = w.id AND wm.user_id = $2
+         WHERE p.id = $1 AND (wm.user_id IS NOT NULL OR w.owner_id = $2)`,
+        [projectId, user.id],
+      ).catch(() => ({ rows: [] }));
+      if (!auth.rows.length) return sendJSON(res, 404, { ok: false, error: '项目不存在' });
+      const out = await projectExport.exportProject({ projectId });
+      if (!out.ok) return sendJSON(res, 404, { ok: false, error: out.error || '项目不存在' });
+      return sendJSON(res, 200, out.bundle);
+    }
+  }
+
   if (url.startsWith('/api/v2/workspaces') || url.startsWith('/api/v2/projects')) {
     if (await projectFoundation.handle(req, res, url.split('?')[0], method)) return;
   }
