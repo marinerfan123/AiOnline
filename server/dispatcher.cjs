@@ -18,6 +18,9 @@ const assetFinalize = require('./assetFinalize.cjs'); // Phase 1 主流化：服
 const uploadQueue = require('./uploadQueue.cjs'); // 搬运与 API 解耦：终态上传移出请求/SSE 关键路径，后台队列异步搬
 const rateLimit = require('./rateLimitRedis.cjs'); // Redis 共享限流（多 worker/多实例安全，#360 解法）
 const cpuMonitor = require('./cpuMonitor.cjs'); // CPU 自适应负载降级（80% 阈值进入 SHED，返 503）
+// L11 Outbox 接线：复用 V2 的 generation_outbox_v2 消费者（claim/lease/publish/标记 delivered），
+// 供 legacy 分发 relay（runGenerationRelayTick）消费崩溃恢复记录。
+const { publishOutbox } = require('./modules/generation-v2/reconciler.cjs');
 
 // ─── 日志总线注入（由 server.js 启动时 setLogSink(logbus) 注入）───
 // 生成失败 / 异常必须落到后台「核心错误日志 + 实时监控」(logbus.emit('ERROR') → syslog 持久化 + SSE 广播)，
@@ -1045,6 +1048,8 @@ async function startUploadQueue(pgPool) {
 }
 
 // ─── 异步生成：返回 taskId 立即让前端可轮询，状态写入 PG ───
+// L11 Outbox 接线：默认「事务内写 generation_outbox_v2」持久化入队（PG 权威，at-least-once），
+// 消除非原子 fire-and-forget dual-write；env LEGACY_FIRE_FORGET=1 回退旧进程内 Promise 链（kill-switch）。
 async function generateAsync(pgPool, opts) {
   // CPU 自适应降级：若本 worker CPU 持续 >80%（默认阈值），拒绝新任务（route 层转 503 + Retry-After）
   // in-flight 任务不受影响，SHED 只拒绝「准备入队的新请求」
@@ -1058,16 +1063,11 @@ async function generateAsync(pgPool, opts) {
   // 归一 canonical model_id：旧任务 / 遗留孤儿可能传 display_name，resolver 兜底；
   // model 列保留展示名（displayModelName || 原始 model 字符串），model_id 列写 canonical。
   let canonicalModelId = '';
+  let displayModel = '';
   try {
     const resolved = await resolveModelIdentity(pgPool, model);
     canonicalModelId = resolved[0] || model || '';
-    const displayModel = (typeof displayModelName === 'string' && displayModelName) ? displayModelName : (model || '');
-    await pgPool.query(
-      `INSERT INTO generation_tasks
-         (task_id, status, model, model_id, prompt, count, content_type, pending_ids, client_meta, user_id, idempotency_key, cost, cost_pool)
-       VALUES ($1, 'running', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
-      [taskId, displayModel, canonicalModelId, prompt || '', count || 1, contentType || 'image', pendingIds, clientMeta, user_id || null, idempotencyKey || null, cost || 0, costPool || 'recharge'],
-    );
+    displayModel = (typeof displayModelName === 'string' && displayModelName) ? displayModelName : (model || '');
   } catch (e) {
     return { taskId: null, error: `写入任务表失败：${e.message}` };
   }
@@ -1076,6 +1076,64 @@ async function generateAsync(pgPool, opts) {
   // P1-04: 生成并持久化 client_request_id，确保图片任务在 provider 调用前即有稳定提交标识。
   // 若进程在 provider 调用后崩溃，recovery 可据此判断 provider 已接受请求，不会盲目重提。
   const clientRequestId = `cr-${taskId}-${crypto.randomUUID().slice(0, 8)}`;
+  const runOpts = { ...opts, taskId, canonicalModelId, clientRequestId, onSubmitted: (info) => persistProviderTaskId(pgPool, taskId, info) };
+  const enq = { taskId, clientRequestId, displayModel, canonicalModelId, prompt, count, contentType, pendingIds, clientMeta, user_id, idempotencyKey, cost, costPool, runOpts };
+
+  // kill-switch 回退：LEGACY_FIRE_FORGET=1 → 旧进程内 Promise 链（不写 outbox），保持历史行为。
+  if (isLegacyFireForget()) {
+    const r = await legacyEnqueueTask(pgPool, enq);
+    if (r.error) return { taskId: null, error: r.error };
+    driveGenerateTask(pgPool, runOpts).catch((e) => console.warn('[dispatcher] 分发异常:', e.message));
+    return { taskId };
+  }
+
+  // 默认 outbox 路径：事务内写 generation_tasks + client_request_id + generation_outbox_v2（PG 权威）。
+  // fail-open：outbox 表不可用（未迁移等）→ 退回 legacy 顺序写，保证生成可用不硬断。
+  try {
+    await enqueueGenerationOutbox(pgPool, enq);
+  } catch (e) {
+    console.warn('[dispatcher] outbox 事务入队失败，退回 legacy 顺序写（fail-open）:', e.message);
+    const r = await legacyEnqueueTask(pgPool, enq);
+    if (r.error) return { taskId: null, error: r.error };
+  }
+  // dual-write 过渡：事务提交后仍进程内 fire-and-forget 直驱（保持单进程部署即时出图）；
+  // generation_outbox_v2 行是崩溃恢复权威记录，由 runGenerationRelayTick（生产另叶挂载）消费续投。
+  driveGenerateTask(pgPool, runOpts).catch((e) => console.warn('[dispatcher] outbox 内联分发异常:', e.message));
+  return { taskId };
+}
+
+// LEGACY_FIRE_FORGET kill-switch：惰性读取 env（运行时切换，便于测试）。
+function isLegacyFireForget(env = process.env) {
+  const v = String((env && env.LEGACY_FIRE_FORGET) || '').toLowerCase();
+  return v === '1' || v === 'true';
+}
+
+// 剔除不可序列化字段（函数 / Promise），供 outbox payload 持久化 run_opts。
+function serializableRunOpts(opts) {
+  const clean = {};
+  for (const k of Object.keys(opts || {})) {
+    const v = opts[k];
+    if (v === undefined || v === null) continue;
+    if (typeof v === 'function') continue;
+    if (typeof v === 'object' && typeof v.then === 'function') continue;
+    clean[k] = v;
+  }
+  return clean;
+}
+
+// legacy 顺序写（非事务，kill-switch / fail-open 共用）：INSERT task → UPDATE client_request_id。
+async function legacyEnqueueTask(pgPool, enq) {
+  const { taskId, clientRequestId, displayModel, canonicalModelId, prompt, count, contentType, pendingIds, clientMeta, user_id, idempotencyKey, cost, costPool } = enq;
+  try {
+    await pgPool.query(
+      `INSERT INTO generation_tasks
+         (task_id, status, model, model_id, prompt, count, content_type, pending_ids, client_meta, user_id, idempotency_key, cost, cost_pool)
+       VALUES ($1, 'running', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+      [taskId, displayModel, canonicalModelId, prompt || '', count || 1, contentType || 'image', pendingIds, clientMeta, user_id || null, idempotencyKey || null, cost || 0, costPool || 'recharge'],
+    );
+  } catch (e) {
+    return { error: `写入任务表失败：${e.message}` };
+  }
   try {
     await pgPool.query(
       `UPDATE generation_tasks SET client_request_id=$1 WHERE task_id=$2`,
@@ -1084,107 +1142,214 @@ async function generateAsync(pgPool, opts) {
   } catch (e) {
     console.warn('[dispatcher] 持久化 client_request_id 失败:', e.message);
   }
-  const runOpts = { ...opts, taskId, canonicalModelId, clientRequestId, onSubmitted: (info) => persistProviderTaskId(pgPool, taskId, info) };
+  return {};
+}
 
-  // 后台跑：完成后更新 PG（不再 await）
-  generate(pgPool, runOpts)
-    .then(async (result) => {
-      // 取消护栏（覆盖图片等无 poll 循环的路径）：若任务已被 cancelTask 取消（已释放积分+标记 canceled+推送），
-      // 无论生成结果如何（即便图片 provider 刚成功返回）都按取消处理，绝不 commit 覆盖 canceled、绝不重复结算。
-      if (cancelledTasks.has(taskId)) {
-        cancelledTasks.delete(taskId);
-        try {
-          await updateTaskStatus(pgPool, taskId, 'canceled', null, '用户已取消', user_id);
-          realtime.emitTaskUpdate(user_id, { taskId, status: 'canceled', error: '用户已取消' });
-        } catch (e) { console.warn('[dispatcher] 取消兜底失败:', e.message); }
-        return;
-      }
-      const ok = result && result.status === 'success' && Array.isArray(result.images) && result.images.length;
+// 事务内写 generation_tasks + generation_outbox_v2（PG 权威，at-least-once 地基）。
+// payload 含 client_request_id（稳定提交标识）+ provider_task_id（后续回填字段，入队时 null）。
+// 有 connect() 时走真事务（BEGIN/COMMIT）；无 connect（单测 fake pool）退化为顺序双写。
+async function enqueueGenerationOutbox(pgPool, enq) {
+  const { taskId, clientRequestId, displayModel, canonicalModelId, prompt, count, contentType, pendingIds, clientMeta, user_id, idempotencyKey, cost, costPool, runOpts } = enq;
+  const payload = {
+    client_request_id: clientRequestId,    // 稳定提交标识：provider 调用前即持久化，recovery 据此幂等
+    provider_task_id: null,                // 回填字段：provider 接受后由 onSubmitted → persistProviderTaskId 写入 generation_tasks
+    task_id: taskId,
+    run_opts: serializableRunOpts(runOpts), // 重建 runOpts 所需（已剔除 onSubmitted 等不可序列化字段）
+  };
+  const insertTask = (q) => q(
+    `INSERT INTO generation_tasks
+       (task_id, status, model, model_id, prompt, count, content_type, pending_ids, client_meta, user_id, idempotency_key, cost, cost_pool, client_request_id)
+     VALUES ($1, 'running', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+    [taskId, displayModel, canonicalModelId, prompt || '', count || 1, contentType || 'image', pendingIds, clientMeta, user_id || null, idempotencyKey || null, cost || 0, costPool || 'recharge', clientRequestId],
+  );
+  const insertOutbox = (q) => q(
+    `INSERT INTO generation_outbox_v2 (aggregate_type, aggregate_id, event_type, payload)
+     VALUES ('generation_task', $1, 'generate.requested', $2::jsonb)`,
+    [taskId, JSON.stringify(payload)],
+  );
+  if (typeof pgPool.connect === 'function') {
+    const client = await pgPool.connect();
+    try {
+      await client.query('BEGIN');
+      await insertTask(client.query.bind(client));
+      await insertOutbox(client.query.bind(client));
+      await client.query('COMMIT');
+    } catch (e) {
+      try { await client.query('ROLLBACK'); } catch (_) {}
+      throw e;
+    } finally {
+      try { client.release(); } catch (_) {}
+    }
+    return { taskId, clientRequestId, transactional: true };
+  }
+  // 无 connect：顺序双写（无事务原子性；仅单测 fake pool 与极端降级场景）
+  await insertTask(pgPool.query.bind(pgPool));
+  await insertOutbox(pgPool.query.bind(pgPool));
+  return { taskId, clientRequestId, transactional: false };
+}
+
+// ─── 终态处理（提取自原 generate().then().catch()，供三条分发路径复用）───
+// ① kill-switch 进程内 Promise 链 ② 默认 outbox 内联 dual-write 直驱 ③ relay worker 的 dispatchFromOutbox。
+async function driveGenerateTask(pgPool, runOpts) {
+  const taskId = runOpts.taskId;
+  const { user_id, cost = 0, costPool = 'recharge', idempotencyKey, model, canonicalModelId = '', contentType = 'image', prompt = '', clientMeta = {}, count = 1 } = runOpts;
+  let result;
+  try {
+    result = await generate(pgPool, runOpts);
+  } catch (e) {
+    // 异常：释放 held 积分（按池回退）
+    await billing.releaseCredits(pgPool, user_id, cost, idempotencyKey, costPool).catch(() => {});
+    await pgPool.query(
+      `UPDATE generation_tasks SET status='failed', error=$2, completed_at=NOW(), user_id=$3
+       WHERE task_id=$1`,
+      [taskId, String((e && e.message) || e), user_id],
+    ).catch(() => {});
+    realtime.emitTaskUpdate(user_id, { taskId, status: 'failed', error: String((e && e.message) || e) });
+    // 后台生成异常（非 provider 返回，而是代码/网络层异常）→ 同样落核心错误日志
+    logError('dispatcher.generate', `生成异常 taskId=${taskId} model=${model || ''} userId=${user_id || ''}: ${e && e.message}`, {
+      taskId,
+      model: model || '',
+      userId: user_id || '',
+      contentType: contentType || 'image',
+      stack: (e && e.stack) || null,
+    });
+    return { status: 'exception' };
+  }
+  try {
+    // 取消护栏（覆盖图片等无 poll 循环的路径）：若任务已被 cancelTask 取消（已释放积分+标记 canceled+推送），
+    // 无论生成结果如何（即便图片 provider 刚成功返回）都按取消处理，绝不 commit 覆盖 canceled、绝不重复结算。
+    if (cancelledTasks.has(taskId)) {
+      cancelledTasks.delete(taskId);
       try {
-        if (ok) {
-          // 搬运与 API 解耦：结算 + 异步入队（不 await OSS 上传）；
-          // done 事件由后台上传队列 worker 在 finalize 完成后发出（见 uploadQueue.cjs）。
-          await completeViaQueue(pgPool, {
-            userId: user_id, taskId,
-            cost, costPool, idempotencyKey,
-            ctx: {
-              userId: user_id, taskId,
-              prompt,
-              model: canonicalModelId,
-              ratio: (opts && opts.ratio) || (clientMeta && clientMeta.ratio) || '1:1',
-              contentType: contentType || 'image',
-              pendingIds: (opts && Array.isArray(opts.pendingIds)) ? opts.pendingIds : [],
-            },
-            providerImages: result.images || [],
-            providerVideoUrl: result.videoUrl || null,
-            originalResult: result,
-          });
-        } else if (result && result.status === 'throttled') {
-          // 资源全不可用（该任务所有可用供应商都冷却/限流）→ 进入等待区后台重试，
-          // 不立即判失败、不释放积分（仍持有，等待真正生成或超时再释放）。
-          // 前台是否提示"资源不足"由等待区积压 + 平台全冷状态决定（见 getWaitingAreaStatus）。
-          // 入队必须是 runOpts（含 taskId + onSubmitted），而非原始 opts：
-          // 否则视频任务经等待区泵重试时 onSubmitted 丢失 → 提交成功后 provider_task_id 不落库，
-          // 崩溃恢复（resumeRunningTasks 按 provider_task_id 续轮询）拿不回这笔结果，held 积分 90min 后看门狗误释放。
-          enqueueWaiting(taskId, runOpts);
-          // 持久化 opts 到 resume_meta，供后端重启/崩溃后恢复等待区（避免内存队列丢失导致任务永久卡 running）
-          persistWaitingOpts(pgPool, taskId, runOpts).catch(() => {});
-          await updateTaskStatus(pgPool, taskId, 'running', null, '资源紧张，已进入等待区排队重试', user_id);
-          realtime.emitTaskUpdate(user_id, { taskId, status: 'running', error: '资源紧张，已进入等待区排队重试' });
-          runWaitingPump(pgPool).catch((e) => console.warn('[waiting] pump error:', e.message));
-        } else if (result && result.status === 'canceled') {
-          // 用户已取消：权威终态（释放积分 + 标记 canceled + 推送 SSE）已由 cancelTask 完成；
-          // 此处仅做幂等兜底——若因竞态 poll 循环先返回 canceled 而 cancelTask 尚未写库，则补写。不重复释放积分。
-          cancelledTasks.delete(taskId);
-          await updateTaskStatus(pgPool, taskId, 'canceled', null, '用户已取消', user_id);
-          realtime.emitTaskUpdate(user_id, { taskId, status: 'canceled', error: '用户已取消' });
-        } else if (result && result.status === 'timeout') {
-          // 防僵尸安全线触发：生成端迟迟未给终态。绝不判失败、绝不释放积分，保留任务待复核（成败只听生成端回复）。
-          await updateTaskStatus(pgPool, taskId, 'waiting', null, '等待生成端回复超过安全线，任务保留待复核', user_id);
-          realtime.emitTaskUpdate(user_id, { taskId, status: 'waiting', error: '等待生成端回复超过安全线，任务保留待复核' });
-        } else {
-          // 生成失败：释放 held 积分（G3 释放点，按池回退）
-          await billing.releaseCredits(pgPool, user_id, cost, idempotencyKey, costPool);
-          await pgPool.query(
-            `UPDATE generation_tasks SET status=$2, result=$3, error=$4, completed_at=NOW(), user_id=$5
-             WHERE task_id=$1`,
-            [taskId, 'failed', JSON.stringify(result || {}), (result && result.error) || '', user_id],
-          );
-          realtime.emitTaskUpdate(user_id, { taskId, status: 'failed', error: (result && result.error) || '' });
-          // 持久化到核心错误日志 + 实时监控（前台出图失败后端可观测）
-          logError('dispatcher.generate', `生成失败 taskId=${taskId} model=${model || ''} userId=${user_id || ''}`, {
-            taskId,
-            model: model || '',
-            userId: user_id || '',
-            contentType: contentType || 'image',
-            count: count || 1,
-            providerError: (result && result.error) || '',
-            meta: (result && result.meta) || null,
-          });
-        }
-      } catch (e) {
-        console.warn('[dispatcher] 完成回调失败:', e.message);
-      }
-    })
-    .catch(async (e) => {
-      // 异常：释放 held 积分（按池回退）
-      await billing.releaseCredits(pgPool, user_id, cost, idempotencyKey, costPool).catch(() => {});
+        await updateTaskStatus(pgPool, taskId, 'canceled', null, '用户已取消', user_id);
+        realtime.emitTaskUpdate(user_id, { taskId, status: 'canceled', error: '用户已取消' });
+      } catch (e) { console.warn('[dispatcher] 取消兜底失败:', e.message); }
+      return { status: 'canceled' };
+    }
+    const ok = result && result.status === 'success' && Array.isArray(result.images) && result.images.length;
+    if (ok) {
+      // 搬运与 API 解耦：结算 + 异步入队（不 await OSS 上传）；
+      // done 事件由后台上传队列 worker 在 finalize 完成后发出（见 uploadQueue.cjs）。
+      await completeViaQueue(pgPool, {
+        userId: user_id, taskId,
+        cost, costPool, idempotencyKey,
+        ctx: {
+          userId: user_id, taskId,
+          prompt,
+          model: canonicalModelId,
+          ratio: runOpts.ratio || (clientMeta && clientMeta.ratio) || '1:1',
+          contentType: contentType || 'image',
+          pendingIds: Array.isArray(runOpts.pendingIds) ? runOpts.pendingIds : [],
+        },
+        providerImages: result.images || [],
+        providerVideoUrl: result.videoUrl || null,
+        originalResult: result,
+      });
+    } else if (result && result.status === 'throttled') {
+      // 资源全不可用（该任务所有可用供应商都冷却/限流）→ 进入等待区后台重试，
+      // 不立即判失败、不释放积分（仍持有，等待真正生成或超时再释放）。
+      // 前台是否提示"资源不足"由等待区积压 + 平台全冷状态决定（见 getWaitingAreaStatus）。
+      // 入队必须是 runOpts（含 taskId + onSubmitted），而非原始 opts：
+      // 否则视频任务经等待区泵重试时 onSubmitted 丢失 → 提交成功后 provider_task_id 不落库，
+      // 崩溃恢复（resumeRunningTasks 按 provider_task_id 续轮询）拿不回这笔结果，held 积分 90min 后看门狗误释放。
+      enqueueWaiting(taskId, runOpts);
+      // 持久化 opts 到 resume_meta，供后端重启/崩溃后恢复等待区（避免内存队列丢失导致任务永久卡 running）
+      persistWaitingOpts(pgPool, taskId, runOpts).catch(() => {});
+      await updateTaskStatus(pgPool, taskId, 'running', null, '资源紧张，已进入等待区排队重试', user_id);
+      realtime.emitTaskUpdate(user_id, { taskId, status: 'running', error: '资源紧张，已进入等待区排队重试' });
+      runWaitingPump(pgPool).catch((e) => console.warn('[waiting] pump error:', e.message));
+    } else if (result && result.status === 'canceled') {
+      // 用户已取消：权威终态（释放积分 + 标记 canceled + 推送 SSE）已由 cancelTask 完成；
+      // 此处仅做幂等兜底——若因竞态 poll 循环先返回 canceled 而 cancelTask 尚未写库，则补写。不重复释放积分。
+      cancelledTasks.delete(taskId);
+      await updateTaskStatus(pgPool, taskId, 'canceled', null, '用户已取消', user_id);
+      realtime.emitTaskUpdate(user_id, { taskId, status: 'canceled', error: '用户已取消' });
+    } else if (result && result.status === 'timeout') {
+      // 防僵尸安全线触发：生成端迟迟未给终态。绝不判失败、绝不释放积分，保留任务待复核（成败只听生成端回复）。
+      await updateTaskStatus(pgPool, taskId, 'waiting', null, '等待生成端回复超过安全线，任务保留待复核', user_id);
+      realtime.emitTaskUpdate(user_id, { taskId, status: 'waiting', error: '等待生成端回复超过安全线，任务保留待复核' });
+    } else {
+      // 生成失败：释放 held 积分（G3 释放点，按池回退）
+      await billing.releaseCredits(pgPool, user_id, cost, idempotencyKey, costPool);
       await pgPool.query(
-        `UPDATE generation_tasks SET status='failed', error=$2, completed_at=NOW(), user_id=$3
+        `UPDATE generation_tasks SET status=$2, result=$3, error=$4, completed_at=NOW(), user_id=$5
          WHERE task_id=$1`,
-        [taskId, String((e && e.message) || e), user_id],
-      ).catch(() => {});
-      realtime.emitTaskUpdate(user_id, { taskId, status: 'failed', error: String((e && e.message) || e) });
-      // 后台生成异常（非 provider 返回，而是代码/网络层异常）→ 同样落核心错误日志
-      logError('dispatcher.generate', `生成异常 taskId=${taskId} model=${model || ''} userId=${user_id || ''}: ${e && e.message}`, {
+        [taskId, 'failed', JSON.stringify(result || {}), (result && result.error) || '', user_id],
+      );
+      realtime.emitTaskUpdate(user_id, { taskId, status: 'failed', error: (result && result.error) || '' });
+      // 持久化到核心错误日志 + 实时监控（前台出图失败后端可观测）
+      logError('dispatcher.generate', `生成失败 taskId=${taskId} model=${model || ''} userId=${user_id || ''}`, {
         taskId,
         model: model || '',
         userId: user_id || '',
         contentType: contentType || 'image',
-        stack: (e && e.stack) || null,
+        count: count || 1,
+        providerError: (result && result.error) || '',
+        meta: (result && result.meta) || null,
       });
-    });
-  return { taskId };
+    }
+  } catch (e) {
+    console.warn('[dispatcher] 完成回调失败:', e.message);
+  }
+  return { status: 'handled' };
+}
+
+// ─── Outbox relay：消费 generation_outbox_v2（复用 reconciler.publishOutbox 的 claim/lease/publish/标记）───
+// 幂等护栏：任务已提交（provider_task_id）或已终态 → 不再重提（同 client_request_id 幂等，杜绝双提交）。
+// 生产挂载（tick 循环）为另叶；本函数即 relayWorker 单测面。
+async function checkTaskDispatchable(pgPool, taskId) {
+  let r;
+  try {
+    r = await pgPool.query(
+      `SELECT status, provider_task_id FROM generation_tasks WHERE task_id=$1`,
+      [taskId],
+    );
+  } catch (e) {
+    return { dispatchable: false, reason: 'guard_query_failed' };
+  }
+  const row = (r && r.rows && r.rows[0]) || null;
+  if (!row) return { dispatchable: false, reason: 'task_not_found' };
+  if (row.provider_task_id) return { dispatchable: false, reason: 'already_submitted' };
+  if (row.status !== 'running') return { dispatchable: false, reason: `terminal_status:${row.status}` };
+  return { dispatchable: true };
+}
+
+// 从 outbox payload 重建 runOpts：恢复 onSubmitted 回填 + 稳定 client_request_id（幂等键不变）。
+function rebuildRunOpts(storedRunOpts, taskId, clientRequestId, pgPool) {
+  const base = (storedRunOpts && typeof storedRunOpts === 'object') ? storedRunOpts : {};
+  return {
+    ...base,
+    taskId,
+    clientRequestId,
+    onSubmitted: (info) => persistProviderTaskId(pgPool, taskId, info),
+  };
+}
+
+// 单事件分发：guard 通过 → 重建 runOpts → drive。返回结果供 relay 决定是否标记已投递。
+async function dispatchFromOutbox(pgPool, ev, injected = {}) {
+  let payload = (ev && ev.payload) || {};
+  if (typeof payload === 'string') { try { payload = JSON.parse(payload); } catch (_) { payload = {}; } }
+  const taskId = payload.task_id || payload.taskId || (ev && ev.aggregate_id) || '';
+  const clientRequestId = payload.client_request_id || payload.clientRequestId || '';
+  const storedRunOpts = payload.run_opts || payload.runOpts || payload.opts || {};
+  if (!taskId) return { dispatched: false, skipped: true, reason: 'missing_task_id' };
+  const guard = injected.guard || checkTaskDispatchable;
+  const drive = injected.drive || driveGenerateTask;
+  const st = await guard(pgPool, taskId);
+  if (!st.dispatchable) return { dispatched: false, skipped: true, reason: st.reason };
+  const runOpts = rebuildRunOpts(storedRunOpts, taskId, clientRequestId, pgPool);
+  const out = await drive(pgPool, runOpts);
+  return { dispatched: true, taskId, clientRequestId, status: out && out.status };
+}
+
+// relayWorker 单测面：一个 tick 消费一批 outbox 事件（at-least-once + lease 由 publishOutbox 保证）。
+async function runGenerationRelayTick(pgPool, { workerId, limit = 20, leaseSeconds = 60 } = {}, injected = {}) {
+  const publish = injected.publish || ((ev) => dispatchFromOutbox(pgPool, ev, injected));
+  return publishOutbox(pgPool, {
+    workerId: workerId || `legacy-relay-${process.pid}`,
+    limit,
+    leaseSeconds,
+  }, { publish });
 }
 
 // 视频提交成功后立即持久化 provider task id + 供应商/模型标识（崩溃恢复续轮询依赖）。
@@ -2027,6 +2192,10 @@ module.exports = {
   // ── G21 crash-recovery 死区（review_required 处置面 + statusById 自动对账钩子）──
   setStatusByIdHook, getStatusByIdHook, flagReviewRequired, reconcileSubmittedTask,
   listReviewTasks, resolveReviewTask,
+  // ── L11 Outbox 接线（legacy 分发事务内入队 + relay 消费面）──
+  enqueueGenerationOutbox, legacyEnqueueTask, driveGenerateTask,
+  dispatchFromOutbox, runGenerationRelayTick, checkTaskDispatchable,
+  isLegacyFireForget, serializableRunOpts, rebuildRunOpts,
 };
 
 // ─── 等待区（资源全不可用时积压请求；超阈值触发前台"资源不足"）───
