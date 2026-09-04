@@ -14,13 +14,16 @@ const fs = require('fs');
 const path = require('path');
 const { Pool } = require('pg');
 const { spawnTestServer } = require('../helpers/test-app.cjs');
-const { initTestSchema } = require('../helpers/test-db.cjs');
 const { register, authRequest } = require('../helpers/auth.cjs');
 
-const MIGRATION_0012 = fs.readFileSync(
-  path.resolve(__dirname, '..', '..', 'db', 'migrations', '0012_project_workspace_foundation.sql'),
-  'utf-8',
-);
+/** 全量迁移链 0001..head（G15 同配方）——陈旧快照缺列已两度致集成 500。 */
+async function applyFullMigrations(pg) {
+  const migDir = path.resolve(__dirname, '..', '..', 'db', 'migrations');
+  const files = fs.readdirSync(migDir).filter((f) => /^\d{4}_.*\.sql$/.test(f)).sort();
+  for (const f of files) {
+    await pg.query(fs.readFileSync(path.join(migDir, f), 'utf8'));
+  }
+}
 
 const ADMIN_HOST = process.env.TEST_PG_HOST || process.env.PG_HOST || 'localhost';
 const ADMIN_PORT = Number(process.env.TEST_PG_PORT || process.env.PG_PORT || '5432');
@@ -72,8 +75,7 @@ test('M01-S Project / Workspace Foundation API', { concurrency: 1 }, async (t) =
       database: dbName,
       max: 5,
     });
-    await initTestSchema(pg);
-    await pg.query(MIGRATION_0012);
+    await applyFullMigrations(pg);
     process.env.TEST_PG_DATABASE = dbName;
     server = await spawnTestServer();
   });

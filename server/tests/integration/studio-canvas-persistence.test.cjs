@@ -11,11 +11,6 @@ const path = require('path');
 const { Pool } = require('pg');
 const { spawnTestServer } = require('../helpers/test-app.cjs');
 const { register, authRequest } = require('../helpers/auth.cjs');
-const { initTestSchema } = require('../helpers/test-db.cjs');
-
-const MIGRATION_0012 = fs.readFileSync(path.resolve(__dirname, '..', '..', 'db', 'migrations', '0012_project_workspace_foundation.sql'), 'utf8');
-const MIGRATION_0013 = fs.readFileSync(path.resolve(__dirname, '..', '..', 'db', 'migrations', '0013_asset_foundation.sql'), 'utf8');
-const MIGRATION_0014 = fs.readFileSync(path.resolve(__dirname, '..', '..', 'db', 'migrations', '0014_studio_canvas_persistence.sql'), 'utf8');
 
 const ADMIN_HOST = process.env.TEST_PG_HOST || process.env.PG_HOST || 'localhost';
 const ADMIN_PORT = Number(process.env.TEST_PG_PORT || process.env.PG_PORT || '5432');
@@ -32,10 +27,12 @@ async function dropDb(name) { try { const admin = adminPool(); await admin.query
 async function bootstrapDb() {
   const dbName = await createDb();
   const pg = new Pool(poolConfig(dbName, 8));
-  await initTestSchema(pg);
-  await pg.query(MIGRATION_0012);
-  await pg.query(MIGRATION_0013);
-  await pg.query(MIGRATION_0014);
+  // 全量迁移链 0001..head（G15 同配方）——陈旧快照缺列（如 0035 folder_id）已两度致 500。
+  const migDir = path.resolve(__dirname, '..', '..', 'db', 'migrations');
+  const files = fs.readdirSync(migDir).filter((f) => /^\d{4}_.*\.sql$/.test(f)).sort();
+  for (const f of files) {
+    await pg.query(fs.readFileSync(path.join(migDir, f), 'utf8'));
+  }
   return { dbName, pg };
 }
 
