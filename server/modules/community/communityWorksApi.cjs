@@ -19,8 +19,10 @@
  *   前缀外 → 返回 false（交由宿主路由链继续尝试）。
  *
  * 与 store 的分工（真源在 worksStore）：
- *   - 本层只做 会话(401) → 路由匹配 → 参数/输入校验（create 的 title≤120、tags≤20×≤40
- *     属 HTTP 面契约，store 只保证非空）→ 委托 store → 结果状态码映射。
+ *   - 本层只做 会话(401) → 路由匹配 → 参数/输入校验（create 的 title≤120、tags≤20×≤40、
+ *     description≤4000（按 code point 计）属 HTTP 面契约，store 只保证非空/类型）→ 委托
+ *     store → 结果状态码映射。description 超长拒绝语义等价 store 契约码
+ *     INVALID_DESCRIPTION_LENGTH（INVALID_* 一律 400）。
  *   - create 成功即 DRAFT（Phase-0 不做发布审核/自动发布）；title/tags 在转发前先 trim，
  *     由 store 落库（store 对 tags 会再 trim+去重）。
  *   - 404 语义“无泄露”：detail/view 对 非 PUBLISHED 一律 404；publish 仅 未知 id 才 404
@@ -31,9 +33,15 @@ const API_PREFIX = '/api/v2/community/works';
 /** /api/v2/community/works/:id[/publish|/view] —— id 为单段（可 encodeURIComponent）。 */
 const ITEM_RE = /^\/api\/v2\/community\/works\/([^/]+)(?:\/(publish|view))?$/;
 
-const TITLE_MAX = 120; // create：title 必填且 ≤120 字符（trim 后计量）
-const TAGS_MAX = 20;    // create：tags 数组 ≤20 项
-const TAG_MAX = 40;     // create：每项 tag（trim 后）≤40 字符
+const TITLE_MAX = 120;          // create：title 必填且 ≤120 字符（trim 后计量）
+const DESCRIPTION_MAX = 4000;   // create：description（若提供）≤4000 字符，按 Unicode code point 计
+const TAGS_MAX = 20;            // create：tags 数组 ≤20 项
+const TAG_MAX = 40;             // create：每项 tag（trim 后）≤40 字符
+
+/** 按 Unicode code point 计数（代理对 emoji 计 1，与 PG char_length 同语义；String#length 为 UTF-16 码元数）。 */
+function codePointLength(s) {
+  return Array.from(s).length;
+}
 
 function createWorksApi({ store, sessionUser, sendJSON, parseBody }) {
   if (!store || typeof store.listPublic !== 'function'
@@ -196,6 +204,11 @@ function createWorksApi({ store, sessionUser, sendJSON, parseBody }) {
     if (title.trim().length > TITLE_MAX) return `title 最长 ${TITLE_MAX} 字`;
     if (body.description !== undefined && body.description !== null && typeof body.description !== 'string') {
       return 'description 须为字符串';
+    }
+    if (typeof body.description === 'string'
+      && codePointLength(body.description) > DESCRIPTION_MAX) {
+      // 语义等价 store 契约错误码 INVALID_DESCRIPTION_LENGTH（HTTP 面一律 400）。
+      return `description 最长 ${DESCRIPTION_MAX} 字`;
     }
     if (body.mediaAssetId !== undefined && body.mediaAssetId !== null) {
       if (typeof body.mediaAssetId !== 'string' || body.mediaAssetId.trim().length === 0) {

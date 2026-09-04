@@ -30,6 +30,12 @@
  *          persistStoryboardShots; the request body is ignored (empty OK), so
  *          a client can never forge persisted beats/shots. rows 空 → 400.
  *          Success 200 { ok:true, applied:{ version, shotCount, replaced } }.
+ *          (audit MEDIUM — 空 apply 脏卡死) apply 前若本次全部待写行均 locked 且计划
+ *          dirty（rows 写后）→ 409 { ok:false, error:'PLAN_DIRTY_ALL_LOCKED',
+ *          lockedShotIds }：空 apply 落不下任何 clean 新行，锁行 dirty 永不复位
+ *          （GET 永久 STALE / batch 永久 409 PLAN_DIRTY）—— 解锁任意目标 shot 后
+ *          重试 apply 才能清脏。存在未锁待写行或非 dirty 时语义不变（含锁排除
+ *          skippedLocked 既有行为、重复 apply 幂等空写 200）。
  *   POST   /api/v2/script/:scriptId/storyboard/batch  (or
  *          /api/v2/script/storyboard/batch?scriptId=) V2.0 must#4 — enqueue an
  *          image_gen BATCH for the storyboard plan. Same dual spelling, same
@@ -539,6 +545,40 @@ function createScriptApi({ pg, sessionUser, sendJSON, parseBody }) {
         });
       }
       if (storyboard.kind === 'apply') {
+        // ── 空 apply 脏卡死防护（audit MEDIUM: storyboardShots 报告）─────────
+        // 全部计划 shot 均 locked 时，persist 的 DELETE(仅 unlocked) + INSERT(跳过
+        // locked) 双双落空（inserted:0），没有任何 clean 新行落地；锁行钉在旧代且
+        // dirty=true（rows 写 markDirty 置位）将永远无人清除 → GET 永久 STALE、
+        // batch 永久 409 PLAN_DIRTY，直到解锁再 apply。若此时仍回 200 空，客户端
+        // 无从得知「apply 白做」、卡死不可自愈，故 409 显式报因：
+        //   ① 前置门：计划已 dirty（readPlanStaleness —— 与 GET 视图/batch 前置
+        //      门同口径）且本次待写行全锁 → 拒发空 apply（不做无谓的 0 行 persist）。
+        //      非 dirty 的全锁重放仍走原 200（无脏/重复 apply 语义不变）。
+        //   ② 后置兜底：persist 落 0 行后复查仍 dirty → 捕获「前置读后、persist
+        //      提交前」并发 rows 写把计划写脏的竞态 → 同 409，绝不放行会卡死的空 200。
+        const applyFp = computePlanFingerprint(plan);
+        const staleBefore = await readPlanStaleness(projectId, scriptId, applyFp);
+        const plannedShotIds = [];
+        for (const beat of plan.beats) {
+          for (const shot of beat.shots) plannedShotIds.push(String(shot.shotId));
+        }
+        const applyLockRes = await pg.query(LOCKED_SHOT_IDS_SQL, [scriptId, projectId]);
+        const applyLockedSet = new Set((applyLockRes.rows || []).map((r) => String(r.shot_id)));
+        // 按计划序回报真正挡住 apply 的锁定 shot（全锁时即计划 shot 全集）。
+        const lockedShotIds = plannedShotIds.filter((id) => applyLockedSet.has(id));
+        const allToWriteLocked = plannedShotIds.length > 0
+          && lockedShotIds.length === plannedShotIds.length;
+        const sendAllLocked409 = (message) => sendJSON(res, 409, {
+          ok: false,
+          error: 'PLAN_DIRTY_ALL_LOCKED',
+          message,
+          lockedShotIds,
+        });
+        if (staleBefore.dirty && allToWriteLocked) {
+          return sendAllLocked409(
+            '全部待写 shot 均已锁定：apply 无可写行、无法清除脏标记 —— 请先解锁至少一个目标 shot 后重试 apply',
+          );
+        }
         const persisted = await persistStoryboardShots({ pg, projectId, scriptId, plan });
         if (!persisted || persisted.ok !== true) {
           const status = persisted && Number.isInteger(persisted.status) ? persisted.status : 400;
@@ -547,6 +587,14 @@ function createScriptApi({ pg, sessionUser, sendJSON, parseBody }) {
             error: persisted && typeof persisted.error === 'string' ? persisted.error : '计划持久化失败',
             errors: persisted && Array.isArray(persisted.errors) ? persisted.errors : undefined,
           });
+        }
+        if (Number(persisted.inserted) === 0) {
+          const staleAfter = await readPlanStaleness(projectId, scriptId, applyFp);
+          if (staleAfter.dirty) {
+            return sendAllLocked409(
+              'apply 无可写行（全部待写 shot 均已锁定）且计划仍脏 —— 请先解锁至少一个目标 shot 后重试 apply',
+            );
+          }
         }
         return sendJSON(res, 200, {
           ok: true,

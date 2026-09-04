@@ -409,6 +409,97 @@ test('api: POST create 201 —— 落 DRAFT、title trim、tags 上限合法、c
   assert.equal(h.m.allRows().length, 3);
 });
 
+/* ── create：description 应用层上限 4000（超 → 400 INVALID_DESCRIPTION_LENGTH）── */
+test('api: POST create description 上限 —— ASCII 边界 4000 过 / 4001 拒（400 不落库）', async (t) => {
+  const h = makeHarness();
+
+  // 恰 4000 字符 → 合法（boundary inclusive）
+  const ok = await h.call('POST', '/api/v2/community/works', {
+    body: { title: '边界4000', description: 'a'.repeat(4000) },
+  });
+  assert.equal(ok.status, 201);
+  assert.equal(ok.body.work.description, 'a'.repeat(4000));
+
+  // 4001 字符 → 400，语义 = store 契约错误码 INVALID_DESCRIPTION_LENGTH（INVALID_* 一律 400）
+  const over = await h.call('POST', '/api/v2/community/works', {
+    body: { title: '越界4001', description: 'a'.repeat(4001) },
+  });
+  assert.equal(over.status, 400);
+  assert.equal(over.body.ok, false);
+  assert.equal(over.body.error, 'description 最长 4000 字');
+
+  assert.equal(h.m.allRows().length, 1, '超限 create 一律不落库');
+});
+
+test('api: POST create description —— 中文按 code point 计（4000 过 / 4001 拒）', async (t) => {
+  const h = makeHarness();
+  const cjk = '简介'.repeat(2000); // 4000 个 BMP 中文（code unit == code point）
+  assert.equal(cjk.length, 4000);
+
+  const ok = await h.call('POST', '/api/v2/community/works', {
+    body: { title: '中文4000', description: cjk },
+  });
+  assert.equal(ok.status, 201, '中文恰 4000 code points → 放行');
+
+  const over = await h.call('POST', '/api/v2/community/works', {
+    body: { title: '中文4001', description: `${cjk}好` }, // 4001 code points
+  });
+  assert.equal(over.status, 400);
+  assert.equal(over.body.error, 'description 最长 4000 字');
+  assert.equal(h.m.allRows().length, 1);
+});
+
+test('api: POST create description —— emoji/代理对按 code point 计（非 UTF-16 码元）', async (t) => {
+  const h = makeHarness();
+
+  // 😀 U+1F600 为代理对：code unit 计 2、code point 计 1。若误按 UTF-16 会误拒：
+  // 2001 个 emoji → 4002 码元但仅 2001 code points（≤4000 → 合法）
+  const emojiUnder = '😀'.repeat(2001);
+  assert.equal(emojiUnder.length, 4002, '前置：String#length 按 UTF-16 码元计（区分度有效）');
+  assert.equal(Array.from(emojiUnder).length, 2001);
+  const r1 = await h.call('POST', '/api/v2/community/works', {
+    body: { title: 'emoji 合法', description: emojiUnder },
+  });
+  assert.equal(r1.status, 201, '4002 码元 / 2001 code points → 按 code point 放行');
+  assert.equal(h.m.row(r1.body.work.id).description, emojiUnder, '原样落库');
+
+  // 中文+emoji 混排恰 4000 code points（码元数 6000 > 4000）→ 边界放行
+  const mixed = `${'😀'.repeat(2000)}${'汉'.repeat(2000)}`;
+  assert.equal(Array.from(mixed).length, 4000);
+  assert.ok(mixed.length > 4000, '前置：混排码元数超过 4000，若按 .length 计会误拒');
+  const r2 = await h.call('POST', '/api/v2/community/works', {
+    body: { title: '混排4000', description: mixed },
+  });
+  assert.equal(r2.status, 201, '混排恰 4000 code points → 放行');
+
+  // 4001 个 emoji（8002 码元）→ 拒绝
+  const over = await h.call('POST', '/api/v2/community/works', {
+    body: { title: 'emoji 越界', description: '😀'.repeat(4001) },
+  });
+  assert.equal(over.status, 400);
+  assert.equal(over.body.error, 'description 最长 4000 字');
+  assert.equal(h.m.allRows().length, 2);
+});
+
+test('api: POST create description —— 空缺（undefined/null）合法，落库 description 为 null', async (t) => {
+  const h = makeHarness();
+  const omitted = await h.call('POST', '/api/v2/community/works', { body: { title: '无描述' } });
+  assert.equal(omitted.status, 201, 'description 缺省 → 合法');
+  assert.equal(omitted.body.work.description, null);
+
+  const nullDesc = await h.call('POST', '/api/v2/community/works', {
+    body: { title: '显式 null', description: null },
+  });
+  assert.equal(nullDesc.status, 201, 'description:null → 合法');
+  assert.equal(nullDesc.body.work.description, null);
+
+  const empty = await h.call('POST', '/api/v2/community/works', {
+    body: { title: '空串', description: '' },
+  });
+  assert.equal(empty.status, 201, 'description 空串 → 合法（仅非空 title 为必填）');
+  assert.equal(empty.body.work.description, '');
+});
+
 /* ── publish：属主/状态机/404 ──────────────────────────────────────── */
 test('api: POST publish —— 属主 200 转 PUBLISHED；非属主 403；未知 404；重发 409', async () => {
   const h = makeHarness();

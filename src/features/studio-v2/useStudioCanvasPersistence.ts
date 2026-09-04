@@ -4,6 +4,7 @@ import { useStudioStore, type StudioEdge, type StudioNode } from './store';
 import { AUTOSAVE_DEBOUNCE_MS, DirtyOperationBuffer, deserializeStudioEdge, deserializeStudioNode, serializeStudioEdge, serializeStudioNode, type CanvasPatchRequest } from './persistence';
 import { v2studio, StudioCanvasApiError } from '@/shared/api/contract/studio-canvas-client';
 import type { StudioCanvasResponse } from '@/shared/api/contract/schemas';
+import { parseConflictInfo, type ConflictInfo } from './schemas';
 
 export type SaveStatus = 'Loading' | 'Saved' | 'Saving' | 'Unsaved' | 'Offline' | 'Save failed' | 'Conflict';
 
@@ -16,19 +17,22 @@ function nodeSig(n: StudioNode) { return JSON.stringify(serializeStudioNode(n));
 function edgeSig(e: StudioEdge) { return JSON.stringify(serializeStudioEdge(e)); }
 function viewportSig(v: Viewport) { return `${v.x}:${v.y}:${v.zoom}`; }
 
-type ConflictInfo = { serverRevision: number; canvasId: string };
+// serverRevision/canvasId are guaranteed present once a 409 is classified as a
+// conflict (parseConflict's gate below), so the hook-facing shape narrows the
+// wire type's optional serverRevision to the number rebase/retry actually uses.
+type ResolvedConflict = ConflictInfo & { serverRevision: number; canvasId: string };
 
 export function useStudioCanvasPersistence(projectId: string, enabled = true) {
   const [status, setStatus] = useState<SaveStatus>('Loading');
   const [revision, setRevision] = useState<number | null>(null);
   const [lastSavedAt, setLastSavedAt] = useState<string | null>(null);
-  const [conflict, setConflict] = useState<ConflictInfo | null>(null);
+  const [conflict, setConflict] = useState<ResolvedConflict | null>(null);
   const bufferRef = useRef(new DirtyOperationBuffer());
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const revisionRef = useRef<number | null>(null);
   const suppressRef = useRef(false);
   const blockedRef = useRef(false);
-  const conflictRef = useRef<ConflictInfo | null>(null);
+  const conflictRef = useRef<ResolvedConflict | null>(null);
   // F2: single-flight mutex + pending flag so concurrent flush requests are
   // serialized instead of racing with a stale baseRevision (self-inflicted 409).
   const inFlightRef = useRef(false);
@@ -54,6 +58,16 @@ export function useStudioCanvasPersistence(projectId: string, enabled = true) {
     markClean(useStudioStore.getState().nodes, useStudioStore.getState().edges, useStudioStore.getState().viewport);
   };
 
+  // Classifies a 409 as a canvas conflict only when it carries the core rebase
+  // fields — the same gate as before the G22 extension. kindPolicy/commandSeq
+  // are additive: parsed off the raw body, undefined when the server has not
+  // merged them yet (legacy body → behaviour unchanged).
+  const parseConflict = (e: StudioCanvasApiError): ResolvedConflict | null => {
+    if (e.status !== 409 || !e.serverRevision || !e.canvasId) return null;
+    const { kindPolicy, commandSeq } = parseConflictInfo(e.body);
+    return { serverRevision: e.serverRevision, canvasId: e.canvasId, kindPolicy, commandSeq };
+  };
+
   // One patch attempt against `baseRevision`. Returns the patch that was peeked
   // so the caller can commit exactly those ops on success.
   const attempt = async (baseRevision: number, cmid: string) => {
@@ -63,8 +77,9 @@ export function useStudioCanvasPersistence(projectId: string, enabled = true) {
       if (!res.canvas) throw new Error('missing canvas');
       return { ok: true as const, res, patch };
     } catch (e) {
-      if (e instanceof StudioCanvasApiError && e.status === 409 && e.serverRevision && e.canvasId) {
-        return { ok: false as const, conflict: { serverRevision: e.serverRevision, canvasId: e.canvasId } };
+      if (e instanceof StudioCanvasApiError) {
+        const conflict = parseConflict(e);
+        if (conflict) return { ok: false as const, conflict };
       }
       return { ok: false as const, error: e };
     }
@@ -83,6 +98,10 @@ export function useStudioCanvasPersistence(projectId: string, enabled = true) {
     if (first.conflict) {
       // F1: server has moved past our base. Keep the uncommitted buffer and
       // replay once on top of the server's revision.
+      // Kind policy routing today: 'lww'/'merge' → this same F1 retry (their
+      // incremental rebase semantics); 'reject409'/undefined (legacy body) →
+      // the whole-canvas reload semantics below (current logic, unchanged);
+      // 'append' has no client path yet (conflictClientMode() in ./schemas).
       const rebased = await attempt(first.conflict.serverRevision, mutationId());
       if (rebased.ok) { commitAndSave(rebased.res, rebased.patch); return; }
       if (rebased.conflict) {

@@ -57,8 +57,12 @@ function makeHarness({ memberFor = ['p-1'], role = 'editor', characters = [], lo
         return { rows: [{ v }] };
       }
       if (/DELETE FROM project_shots_rows/.test(sql)) {
+        // DELETE_UNLOCKED_SQL 语义: 只删 unlocked 行；locked 行钉在旧代保留
+        // （真实 SQL 的 WHERE … AND locked = false；apply 后锁行仍在、只是版本不变）。
         const before = state.shots.length;
-        state.shots = state.shots.filter((s) => !(s.script_id === params[0] && s.project_id === params[1]));
+        state.shots = state.shots.filter(
+          (s) => !(s.script_id === params[0] && s.project_id === params[1] && s.locked !== true),
+        );
         return { rowCount: before - state.shots.length };
       }
       // ── 0054 三视图收口 emulation（scriptApi rows 写标脏 + GET dirty/fp）──
@@ -1221,4 +1225,112 @@ test('batch 一致性: 全锁且无任务 → 200 空批 {enqueued:0, skippedLoc
   assert.equal(retry.body.total, 2);
   assert.deepEqual(retry.body.skippedLocked, ['s0:b0:k1']);
   assert.equal(retry.body.dirty, false);
+});
+
+// ══ audit MEDIUM(storyboardShots 报告) — 空 apply 脏卡死防护 ═══════════════
+// 全锁 + rows 写：计划 dirty 但 apply 待写行全锁 → persist 的 DELETE(仅 unlocked)+
+// INSERT(跳过 locked) 双双落空（inserted:0）→ 锁行 dirty 永不复位（GET 永久 STALE、
+// batch 永久 409 PLAN_DIRTY）。修复：apply 前置门/后置兜底 409 PLAN_DIRTY_ALL_LOCKED
+// + lockedShotIds（而非 200 空）；有未锁行或非 dirty 场景语义不变。
+const APPLY_PATH = '/api/v2/script/s-1/storyboard/apply';
+const LOCK_PATH = '/api/v2/script/s-1/storyboard/shots/lock';
+
+test('audit: 全锁 + rows 写 → apply 409 PLAN_DIRTY_ALL_LOCKED（不再 200 空）且不落空行', async () => {
+  const { api, state } = makeHarness();
+  state.rows.push(...batchRows2()); // 1 beat → k0/k1
+  const first = await callParams(api, 'POST', APPLY_PATH, { projectId: 'p-1' });
+  assert.equal(first.status, 200);
+  const ids = ['s0:b0:k0', 's0:b0:k1'];
+  const lock = await callBody(api, 'POST', { shotIds: ids, locked: true }, LOCK_PATH, { projectId: 'p-1' });
+  assert.equal(lock.status, 200);
+  // rows 写 → markDirty 置位全部计划行（含锁行）→ 卡死态
+  const patch = await call(api, 'PATCH', { text: 'A hesitates.' }, '/api/v2/script/rows/sb-a', 'p-1');
+  assert.equal(patch.status, 200);
+  const view = await callParams(api, 'GET', '/api/v2/script/s-1/storyboard', { projectId: 'p-1' });
+  assert.equal(view.body.dirty, true, '前置：rows 写后全锁计划行 dirty=true');
+  const before = JSON.parse(JSON.stringify(state.shots));
+  // apply → 409 新码（非 200 {shotCount:0}），无任何行被改动
+  const res = await callParams(api, 'POST', APPLY_PATH, { projectId: 'p-1' });
+  assert.equal(res.status, 409);
+  assert.equal(res.body.ok, false);
+  assert.equal(res.body.error, 'PLAN_DIRTY_ALL_LOCKED');
+  assert.deepEqual(res.body.lockedShotIds, ids, 'lockedShotIds = 挡住 apply 的全部计划 shot');
+  assert.ok(res.body.message.includes('解锁'), '提示解锁任意目标 shot 后重试');
+  assert.deepEqual(state.shots, before, '409 不得执行空 persist（无版本 bump / 无行变化）');
+  // batch 前置门语义不变：脏仍在 → batch 仍 409 PLAN_DIRTY（而非放行/空批）
+  const blocked = await callParams(api, 'POST', BATCH_PATH, { projectId: 'p-1' });
+  assert.equal(blocked.status, 409);
+  assert.equal(blocked.body.error, 'PLAN_DIRTY');
+});
+
+test('audit: 解锁一行后 apply → 200 清脏（GET dirty false、batch 放行 + skippedLocked 不变）', async () => {
+  const { api, state } = makeHarness();
+  state.rows.push(...batchRows2());
+  await callParams(api, 'POST', APPLY_PATH, { projectId: 'p-1' });
+  const ids = ['s0:b0:k0', 's0:b0:k1'];
+  await callBody(api, 'POST', { shotIds: ids, locked: true }, LOCK_PATH, { projectId: 'p-1' });
+  await call(api, 'PATCH', { text: 'A hesitates.' }, '/api/v2/script/rows/sb-a', 'p-1');
+  const stuck = await callParams(api, 'GET', '/api/v2/script/s-1/storyboard', { projectId: 'p-1' });
+  assert.equal(stuck.body.dirty, true, '前置：仍卡死（全锁 + dirty）');
+  // 解锁 k0 → apply 有可写行 → 200 原语义；锁行 k1 保留旧代
+  const unlock = await callBody(api, 'POST', { shotIds: ['s0:b0:k0'], locked: false }, LOCK_PATH, { projectId: 'p-1' });
+  assert.equal(unlock.status, 200);
+  const res = await callParams(api, 'POST', APPLY_PATH, { projectId: 'p-1' });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.ok, true);
+  assert.deepEqual(Object.keys(res.body.applied).sort(), ['replaced', 'shotCount', 'version']);
+  assert.equal(res.body.applied.version, 2);
+  assert.equal(res.body.applied.shotCount, 1, '只落解锁的 k0（k1 仍锁被跳过）');
+  assert.equal(res.body.applied.replaced, 1);
+  const clean = await callParams(api, 'GET', '/api/v2/script/s-1/storyboard', { projectId: 'p-1' });
+  assert.equal(clean.body.dirty, false, 'apply 落新行后 dirty 复位（清脏）');
+  // 锁行 k1 钉在旧代 v1（保留），k0 为最新代 v2 —— 与 GET 只按最新代报 dirty 一致
+  const lockedK1 = state.shots.find((s) => s.shot_id === 's0:b0:k1');
+  assert.ok(lockedK1 && lockedK1.locked === true && lockedK1.version === 1);
+  const freshK0 = state.shots.find((s) => s.shot_id === 's0:b0:k0');
+  assert.ok(freshK0 && freshK0.locked === false && freshK0.version === 2 && freshK0.dirty === false);
+  // batch 放行：建批成功、k1 锁排除（skippedLocked 既有语义不变）
+  const batch = await callParams(api, 'POST', BATCH_PATH, { projectId: 'p-1' });
+  assert.equal(batch.status, 200);
+  assert.equal(batch.body.enqueued, 1);
+  assert.equal(batch.body.total, 2);
+  assert.deepEqual(batch.body.skippedLocked, ['s0:b0:k1']);
+  assert.equal(batch.body.dirty, false);
+});
+
+test('audit: 部分锁 + rows 写 → apply 仍 200（有未锁待写行即清脏，锁排除行为不变）', async () => {
+  const { api, state } = makeHarness();
+  state.rows.push(...batchRows2());
+  await callParams(api, 'POST', APPLY_PATH, { projectId: 'p-1' });
+  // 只锁 k0 —— 仍有未锁待写行 k1
+  const lock = await callBody(api, 'POST', { shotIds: ['s0:b0:k0'], locked: true }, LOCK_PATH, { projectId: 'p-1' });
+  assert.equal(lock.status, 200);
+  await call(api, 'PATCH', { text: 'A hesitates.' }, '/api/v2/script/rows/sb-a', 'p-1');
+  const view = await callParams(api, 'GET', '/api/v2/script/s-1/storyboard', { projectId: 'p-1' });
+  assert.equal(view.body.dirty, true);
+  // 部分锁 → 非全锁 → 原 200 语义（无 409），锁排除只影响锁行自身
+  const res = await callParams(api, 'POST', APPLY_PATH, { projectId: 'p-1' });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.ok, true);
+  assert.equal(res.body.applied.shotCount, 1, '仅 k1 落新行（k0 锁跳过）');
+  assert.equal(res.body.applied.version, 2);
+  assert.ok(state.shots.some((s) => s.shot_id === 's0:b0:k0' && s.locked === true && s.version === 1));
+  assert.ok(state.shots.some((s) => s.shot_id === 's0:b0:k1' && s.locked === false && s.version === 2));
+  const clean = await callParams(api, 'GET', '/api/v2/script/s-1/storyboard', { projectId: 'p-1' });
+  assert.equal(clean.body.dirty, false, '有未锁行成功落新行 → dirty 正常复位');
+});
+
+test('audit: 全锁但非 dirty（无 rows 写、重复 apply 空写）→ 仍 200，语义不变', async () => {
+  const { api, state } = makeHarness();
+  state.rows.push(...batchRows2());
+  await callParams(api, 'POST', APPLY_PATH, { projectId: 'p-1' });
+  const ids = ['s0:b0:k0', 's0:b0:k1'];
+  await callBody(api, 'POST', { shotIds: ids, locked: true }, LOCK_PATH, { projectId: 'p-1' });
+  // 无 rows 写 → dirty=false：非卡死 → 不得 409（无脏场景不变，幂等重放空写 200）
+  const res = await callParams(api, 'POST', APPLY_PATH, { projectId: 'p-1' });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.ok, true);
+  assert.equal(res.body.applied.shotCount, 0, '全锁空写：无新行可落');
+  const view = await callParams(api, 'GET', '/api/v2/script/s-1/storyboard', { projectId: 'p-1' });
+  assert.equal(view.body.dirty, false, '非 dirty 场景 dirty 语义不变');
 });
