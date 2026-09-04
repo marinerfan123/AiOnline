@@ -35,7 +35,7 @@ const os = require('os');
 const crypto = require('crypto');
 const { Pool } = require('pg');
 const { createStudioRunEngine } = require('./modules/project-foundation/studioRunEngine.cjs');
-const { createBudgetSpentStore } = require('./modules/project-foundation/budgetSpentStore.cjs');
+const budgetSpentStoreMod = require('./modules/project-foundation/budgetSpentStore.cjs');
 const { createRunEventRelay } = require('./modules/project-foundation/runEventRelay.cjs');
 const { createWorkerDaemon } = require('./modules/generation-v2/worker-daemon.cjs');
 
@@ -112,7 +112,7 @@ async function main() {
     },
     workerId,
     relay,
-    budgetSpentStore: createBudgetSpentStore({ pg: pgPool }),
+    budgetSpentStore: budgetSpentStoreMod,
     onLog: (tag, payload) => { try { console.log(JSON.stringify({ tag: 'studio-run', event: tag, ...(payload || {}) })); } catch (_) {} },
   });
 

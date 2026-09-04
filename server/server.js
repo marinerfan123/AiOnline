@@ -1698,16 +1698,7 @@ const studioRunEngine = studioRunEngineMod.createStudioRunEngine({
       : Promise.reject(Object.assign(new Error('数据库未就绪'), { status: 503 })),
   },
   workerId: `${NODE_ID || 'api'}-runapi`,
-  budgetSpentStore: budgetSpentStoreMod.createBudgetSpentStore({
-    pg: {
-      query: (sql, params) => pgPool
-        ? pgPool.query(sql, params)
-        : Promise.reject(Object.assign(new Error('数据库未就绪'), { status: 503 })),
-      connect: () => pgPool
-        ? pgPool.connect()
-        : Promise.reject(Object.assign(new Error('数据库未就绪'), { status: 503 })),
-    },
-  }),
+  budgetSpentStore: budgetSpentStoreMod,
 });
 const studioRunApi = studioRunApiMod.createStudioRunApi({
   pg: {
