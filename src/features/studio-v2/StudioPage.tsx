@@ -19,6 +19,7 @@ import { BottomDock } from './BottomDock';
 import { TopToolbar } from './TopToolbar';
 import { AssetLibraryDrawer } from './AssetLibraryDrawer';
 import { useStudioCanvasPersistence } from './useStudioCanvasPersistence';
+import { CanvasConflictBanner } from './CanvasConflictBanner';
 import type { StudioNodeKind } from './types';
 import './studio.css';
 
@@ -56,13 +57,12 @@ function StudioLayout() {
           {assetLibraryOpen && projectId ? (
             <AssetLibraryDrawer projectId={projectId} onClose={() => setAssetLibraryOpen(false)} />
           ) : null}
-          {persistence.status === 'Conflict' && (
-            <div data-test="studio-conflict-panel" className="absolute right-3 top-3 z-50 max-w-xs rounded-lg border border-red-500/40 bg-ml2-surface-1/95 p-3 text-xs text-red-300 shadow-xl">
-              <p className="font-semibold">Server has newer revision</p>
-              <p className="mt-1 text-[11px] text-ml2-text-3">本地工作副本已保留。请重新加载服务器版本后再继续保存。</p>
-              <button data-test="studio-conflict-reload-panel" onClick={persistence.reloadFromServer} className="mt-2 rounded bg-red-500/20 px-2 py-1 text-[11px] text-red-200">Reload server version</button>
-            </div>
-          )}
+          {/* M05-D: kindPolicy-aware conflict banner inside the canvas root.
+              conflict is non-null exactly in the hook's blocked/'Conflict'
+              state, so this supersedes the old status-only red panel and adds
+              the strategy tones (reject409 red+reload / lww-merge amber /
+              append neutral). */}
+          <CanvasConflictBanner conflict={persistence.conflict} onReload={persistence.reloadFromServer} />
         </div>
         <Inspector projectId={projectId} />
       </div>
