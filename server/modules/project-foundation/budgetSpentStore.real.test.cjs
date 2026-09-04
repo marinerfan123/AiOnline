@@ -18,6 +18,7 @@ const USER = process.env.AUDIT_PG_USER || 'postgres';
 const MIG_DIR = path.resolve(__dirname, '..', '..', 'db', 'migrations');
 const M31 = fs.readFileSync(path.join(MIG_DIR, '0031_project_budgets.sql'), 'utf8');
 const M44 = fs.readFileSync(path.join(MIG_DIR, '0044_project_budget_spends.sql'), 'utf8');
+const M57 = fs.readFileSync(path.join(MIG_DIR, '0057_budget_spend_balance_after.sql'), 'utf8');
 
 const results = [];
 function check(name, cond, detail) {
@@ -44,6 +45,7 @@ async function main() {
   const pg = new Pool({ host: HOST, port: PORT, user: USER, database: db, max: 8 });
   await pg.query(M31);
   await pg.query(M44);
+  await pg.query(M57);
 
   async function resetBudget(pid, budget, spent = 0) {
     await pg.query(`DELETE FROM project_budget_spends WHERE project_id=$1`, [pid]);
@@ -147,6 +149,26 @@ async function main() {
   const p6b = await getBudgetSpent(pg, 'p6');
   check('G3 retry after rollback deducts correctly (no lost deduction)', gRetry.recorded === true && p6b.spent === 40,
     `recorded=${gRetry.recorded}, spent=${p6b.spent}`);
+
+  // ── H. balance_after audit snapshot (0057): written in-tx on success, untouched on reject. ──
+  await resetBudget('p7', 100);
+  const h1 = await recordSpend(pg, { projectId: 'p7', amount: 30, idempotencyKey: 'h1' });
+  const h1row = await pg.query(`SELECT budget, spent, balance_after FROM project_budgets WHERE project_id='p7'`);
+  check('H1 balance_after == budget - spent after success (SQL expression)',
+    Number(h1row.rows[0].balance_after) === 70,
+    `balance_after=${h1row.rows[0].balance_after}, budget=${h1row.rows[0].budget}, spent=${h1row.rows[0].spent}`);
+  check('H2 returned balanceAfter matches persisted snapshot', h1.balanceAfter === 70,
+    `balanceAfter=${h1.balanceAfter}`);
+  // 后续成功扣减把快照推进到更新后的余量。
+  await recordSpend(pg, { projectId: 'p7', amount: 20, idempotencyKey: 'h2' });
+  const h2row = await pg.query(`SELECT spent, balance_after FROM project_budgets WHERE project_id='p7'`);
+  check('H3 snapshot advances on later success', Number(h2row.rows[0].balance_after) === 50 && Number(h2row.rows[0].spent) === 50,
+    `balance_after=${h2row.rows[0].balance_after}, spent=${h2row.rows[0].spent}`);
+  // 拒绝不写 balance_after（快照保持上一次成功余量）。
+  const h3 = await recordSpend(pg, { projectId: 'p7', amount: 999, idempotencyKey: 'h3' });
+  const h3row = await pg.query(`SELECT balance_after FROM project_budgets WHERE project_id='p7'`);
+  check('H4 rejection does not write balance_after', h3.ok === false && Number(h3row.rows[0].balance_after) === 50,
+    `ok=${h3.ok}, code=${h3.error && h3.error.code}, balance_after=${h3row.rows[0].balance_after}`);
 
   await pg.end();
   const admin2 = new Pool({ host: HOST, port: PORT, user: USER, database: 'postgres', max: 1 });

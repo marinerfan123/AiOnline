@@ -60,3 +60,34 @@ test('loadDispatchPairs：服务商不可用 → 返回空数组', async () => {
   const pairs = await loadDispatchPairs(pool, ['flux-1']);
   assert.strictEqual(pairs.length, 0);
 });
+
+// 契约：binding 的 provider_id 可与 models 行的 provider_id 不同（多 provider 线路）。
+// models 表每逻辑模型一行（canonical 配置），bindings 提供 (模型 × 服务商) 线路。
+// 模型行须按 model_id（canonical）命中，而非 (model_id, provider_id) 组合——
+// 否则绑定到非模型主 provider 的线路会静默丢 pair（路由失效）。
+test('loadDispatchPairs：绑定到非模型主 provider（多 provider 线路）仍产出 pair', async () => {
+  const pool = {
+    async query(text, params = []) {
+      const T = text.toUpperCase();
+      if (T.includes('PROVIDER_MODEL_BINDINGS')) {
+        return { rows: [{ id: 'b-gpt', model_id: 'foo', provider_id: 'gpt-image', upstream_model_name: 'gpt-image-1', enabled: true, priority: 0, weight: 0 }] };
+      }
+      if (T.includes('FROM MODELS')) {
+        // 模型行 canonical provider_id = 'agnes'（主 provider），与绑定 provider_id 'gpt-image' 不同
+        return { rows: [{ model_id: 'foo', provider_id: 'agnes', enabled: true, endpoint: {}, capabilities: {} }] };
+      }
+      if (T.includes('FROM PROVIDERS')) {
+        return { rows: [{ id: 'gpt-image', enabled: true, api_key: 'sk-123456', base_url: 'https://sub.fan1.fun/v1' }] };
+      }
+      if (T.includes('FROM API_KEYS')) {
+        return { rows: [] };
+      }
+      return { rows: [] };
+    },
+  };
+  const pairs = await loadDispatchPairs(pool, ['foo']);
+  assert.strictEqual(pairs.length, 1);
+  assert.strictEqual(pairs[0].provider.id, 'gpt-image');
+  assert.strictEqual(pairs[0].model.upstreamModelName, 'gpt-image-1'); // wire name 来自 binding
+  assert.strictEqual(pairs[0].model.model_id, 'foo');                  // canonical model_id 保留
+});

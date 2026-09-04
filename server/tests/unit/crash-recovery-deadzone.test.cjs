@@ -35,7 +35,9 @@ function makePool(rules) {
       for (const rule of rules || []) {
         if (rule.match.test(s)) {
           const out = rule.rows;
-          return Promise.resolve(typeof out === 'function' ? { rows: out(s, params, calls) || [] } : { rows: out || [] });
+          const rows = typeof out === 'function' ? (out(s, params, calls) || []) : (out || []);
+          const rowCount = typeof rule.rowCount === 'function' ? rule.rowCount(s, params, calls) : rule.rowCount;
+          return Promise.resolve({ rows, rowCount });
         }
       }
       return Promise.resolve({ rows: [] });
@@ -281,27 +283,27 @@ function reviewRow(over = {}) {
   }, over);
 }
 
-test('resolveReviewTask discard: 释放 held 一次 + failed 终态（result 含 discarded）', async () => {
+test('resolveReviewTask discard: CAS 抢占终态 → 释放 held 一次 + failed 终态（result 含 discarded）', async () => {
   const releases = [];
   const emits = [];
   stubAll({ releaseCredits: async (pg, userId, amount, ref) => releases.push({ userId, amount, ref }), emitTaskUpdate: async (u, ev) => emits.push(ev) });
   let status = 'review_required';
   const pool = makePool([
-    {
-      match: TASK_SELECT,
-      rows: () => [reviewRow({ status })],
-    },
+    { match: TASK_SELECT, rows: () => [reviewRow({ status })] },
+    // CAS 抢占 UPDATE：状态仍 review_required → rowCount 1；已被移出 → rowCount 0
+    { match: /UPDATE generation_tasks[\s\S]*status='failed'[\s\S]*status='review_required'/, rows: [], rowCount: () => (status === 'review_required' ? 1 : 0) },
   ]);
   const r = await dispatcher.resolveReviewTask(pool, { taskId: 'rv-discard', action: 'discard', reason: '上游确认计费异常', actor: 'admin-1' });
   assert.strictEqual(r.ok, true);
   assert.strictEqual(r.action, 'discard');
   assert.deepStrictEqual(releases, [{ userId: 'u1', amount: 5, ref: 'ik-1' }]);
-  const upd = lastStatusUpdate(pool, 'failed');
-  assert.ok(upd, '应写 failed 终态（updateTaskStatus 参数化）');
-  const parsed = JSON.parse(upd.params[2]);
+  const upd = lastMatch(pool, /UPDATE generation_tasks[\s\S]*status='failed'/);
+  assert.ok(upd, '应 CAS 写 failed 终态');
+  assert.strictEqual(upd.params[0], 'rv-discard');
+  const parsed = JSON.parse(upd.params[1]);
   assert.strictEqual(parsed.discarded, true);
   assert.strictEqual(parsed.action, 'discard');
-  assert.ok(/人工处置 discard/.test(upd.params[3]));
+  assert.ok(/人工处置 discard/.test(upd.params[2]));
   assert.ok(emits.some((e) => e.status === 'failed'));
   // 幂等护栏：非 review_required 的任务再次处置 → 409，绝不二次释放
   status = 'failed';
@@ -309,6 +311,20 @@ test('resolveReviewTask discard: 释放 held 一次 + failed 终态（result 含
   assert.strictEqual(again.ok, false);
   assert.strictEqual(again.code, 409);
   assert.strictEqual(releases.length, 1, '不得二次释放 held');
+});
+
+test('resolveReviewTask discard: CAS 0 行（已被并发 retry_new 移出 review_required）→ 409 且绝不退款', async () => {
+  const releases = [];
+  stubAll({ releaseCredits: async (pg, userId, amount, ref) => releases.push({ userId, amount, ref }) });
+  // SELECT 仍读到 review_required，但抢占 UPDATE 返回 0 行 = 并发 retry_new 已抢先转 running 重排队
+  const pool = makePool([
+    { match: TASK_SELECT, rows: [reviewRow({ status: 'review_required' })] },
+    { match: /UPDATE generation_tasks[\s\S]*status='failed'/, rows: [], rowCount: 0 },
+  ]);
+  const r = await dispatcher.resolveReviewTask(pool, { taskId: 'rv-discard', action: 'discard', reason: 'x', actor: 'admin-2' });
+  assert.strictEqual(r.ok, false);
+  assert.strictEqual(r.code, 409);
+  assert.strictEqual(releases.length, 0, 'CAS 0 行 = 已被并发处置移出，绝不退款（防 retry_new 重排队后又被退款）');
 });
 
 // ─── 9) resolveReviewTask retry_new（waiting 源：清键后重入等待区）───
@@ -325,8 +341,8 @@ test('resolveReviewTask retry_new: 清 provider_task_id/client_request_id → �
   assert.strictEqual(r.ok, true);
   assert.strictEqual(r.requeued, true);
   const reset = lastMatch(pool, /provider_task_id=NULL/);
-  assert.ok(reset, '应清提交标记（provider_task_id=NULL, client_request_id=NULL）');
-  assert.ok(/client_request_id=NULL/.test(reset.sql));
+  assert.ok(reset, '应清真提交标记（provider_task_id=NULL）');
+  assert.ok(!/client_request_id=NULL/.test(reset.sql), 'client_request_id 保留（稳定幂等痕迹，不清不换）');
   assert.ok(/status='running'/.test(reset.sql));
   assert.strictEqual(releases.length, 0, 'retry_new 不释放积分');
   assert.ok(dispatcher.getWaitingAreaStatus().waitingAreaSize >= 1, '任务应重入等待区');

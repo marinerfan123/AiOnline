@@ -175,13 +175,23 @@ function createStudioRunEngine(deps) {
       });
       if (!r || r.ok !== true) {
         const code = r && r.error && r.error.code;
-        log('run.node.spend_not_recorded', { runNodeId, projectId, code });
-        await relaySpendWarning(runId, runNodeId, 'studio.run_node.spend_rejected', { projectId, code });
+        // SPEND_NO_BUDGET = NO project_budgets row at all: the node already ran
+        // and was billed with zero budget governance in place — a config
+        // invariant violation, strictly louder than a normal over-remaining
+        // reject. Emit a DISTINCT alert event type (ops can page on it) and
+        // carry the attempted amount so the leak is quantifiable in both the
+        // structured log and the durable run_events (SSE) trail.
+        const noBudget = code === 'SPEND_NO_BUDGET';
+        log(noBudget ? 'run.node.spend_no_budget' : 'run.node.spend_not_recorded',
+          { runNodeId, projectId, code, amount });
+        await relaySpendWarning(runId, runNodeId,
+          noBudget ? 'studio.run_node.spend_no_budget' : 'studio.run_node.spend_rejected',
+          { projectId, code, amount });
       }
     } catch (e) {
       const msg = e && e.message ? e.message : String(e);
-      log('run.node.spend_failed', { runNodeId, projectId, error: msg });
-      await relaySpendWarning(runId, runNodeId, 'studio.run_node.spend_failed', { projectId, error: msg });
+      log('run.node.spend_failed', { runNodeId, projectId, amount, error: msg });
+      await relaySpendWarning(runId, runNodeId, 'studio.run_node.spend_failed', { projectId, amount, error: msg });
     }
   }
 
@@ -838,7 +848,12 @@ function createStudioRunEngine(deps) {
       // connection (pg.connect), so holding ours — even idle — could deadlock a
       // maxed-out pool. The spend is best-effort and runs after the run is
       // durably committed; it can never throw or roll back the run.
-      releaseOnce();
+      // Guard the release: a release() failure is pathological but must never
+      // skip the best-effort spend record nor lose the (already-committed)
+      // completion result — both sit downstream of a durable COMMIT.
+      try { releaseOnce(); } catch (e) {
+        log('run.node.client_release_failed', { runNodeId, error: e && e.message ? e.message : String(e) });
+      }
       await recordNodeSpend(runNodeId, node.run_id, node.run_project_id, result);
       log('run.node.succeeded', { runId: node.run_id, studioNodeId: node.studio_node_id, attempt: node.attempt, unlocked: unlockedRows.map((r) => r.studio_node_id), workerId: owner });
       return { ok: true, runId: node.run_id, unlocked: unlockedRows.map((r) => r.studio_node_id) };

@@ -79,7 +79,7 @@ function makeMockPg(opts = {}) {
       }
       throw new Error('mock pg: unhandled SQL: ' + s);
     },
-    release() {},
+    release() { if (opts.releaseThrows) throw new Error('release failed'); },
   };
   return {
     pg: { connect: async () => client, query: async () => { throw new Error('mock pg: no pool-level query expected'); } },
@@ -221,7 +221,7 @@ test('recordSpend rejected (over remaining) + relay → durable spend_rejected e
   assert.deepEqual(warns[0], {
     runId: 'run-1',
     type: 'studio.run_node.spend_rejected',
-    payload: { run_node_id: 'srn-1', projectId: 'proj-1', code: 'SPEND_OVER_REMAINING' },
+    payload: { run_node_id: 'srn-1', projectId: 'proj-1', code: 'SPEND_OVER_REMAINING', amount: 7 },
   });
 });
 
@@ -239,6 +239,7 @@ test('recordSpend throws + relay → durable spend_failed event, run unaffected'
   assert.equal(warns[0].runId, 'run-1');
   assert.equal(warns[0].payload.run_node_id, 'srn-1');
   assert.equal(warns[0].payload.projectId, 'proj-1');
+  assert.equal(warns[0].payload.amount, 4);
   assert.equal(warns[0].payload.error, 'store down');
 });
 
@@ -253,4 +254,36 @@ test('recordSpend succeeded + relay → no spend warning event (only failure/rej
   assert.equal(r.ok, true);
   const warns = relay.events.filter((e) => typeof e.type === 'string' && e.type.startsWith('studio.run_node.spend_'));
   assert.equal(warns.length, 0, 'successful spend emits no warning event');
+});
+
+test('recordSpend SPEND_NO_BUDGET → DISTINCT alert event type (not silent warn), payload carries code + amount', async () => {
+  const m = makeMockPg();
+  const store = makeFakeStore({ result: { ok: false, error: { code: 'SPEND_NO_BUDGET' } } });
+  const relay = makeFakeRelay();
+  const { engine, logs } = makeEngine(m.pg, { budgetSpentStore: store, relay });
+
+  const r = await engine.completeRunNode('srn-1', { owner: 'w-A', token: 'tok', result: { text: 'hi', cost: 11 } });
+
+  assert.equal(r.ok, true);
+  const noBudget = relay.events.filter((e) => e.type === 'studio.run_node.spend_no_budget');
+  assert.equal(noBudget.length, 1, 'SPEND_NO_BUDGET relays a DISTINCT spend_no_budget alert, not the generic spend_rejected warn');
+  assert.deepEqual(noBudget[0], {
+    runId: 'run-1',
+    type: 'studio.run_node.spend_no_budget',
+    payload: { run_node_id: 'srn-1', projectId: 'proj-1', code: 'SPEND_NO_BUDGET', amount: 11 },
+  });
+  assert.ok(logs.some((l) => l.tag === 'run.node.spend_no_budget' && l.payload.code === 'SPEND_NO_BUDGET' && l.payload.amount === 11),
+    'SPEND_NO_BUDGET logs under the distinct alert tag run.node.spend_no_budget with the attempted amount');
+});
+
+test('client.release throws after COMMIT → spend still recorded, run still succeeds', async () => {
+  const m = makeMockPg({ releaseThrows: true });
+  const store = makeFakeStore();
+  const { engine } = makeEngine(m.pg, { budgetSpentStore: store });
+
+  const r = await engine.completeRunNode('srn-1', { owner: 'w-A', token: 'tok', result: { text: 'hi', cost: 6 } });
+
+  assert.equal(r.ok, true, 'a release() failure must not lose the already-committed completion');
+  assert.equal(r.runId, 'run-1');
+  assert.equal(store.calls.length, 1, 'best-effort spend must still be recorded when client.release throws');
 });

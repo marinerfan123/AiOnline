@@ -1870,12 +1870,22 @@ async function resolveReviewTask(pgPool, body) {
   try { dequeueWaiting(taskId); } catch (_) { /* 不在等待区则忽略 */ }
   if (action === 'discard') {
     const msg = `人工处置 discard${actor ? `（${actor}）` : ''}${reason ? `：${reason}` : ''}`;
+    const result = { status: 'failed', discarded: true, action: 'discard', reason: reason || null };
     try {
-      // 释放 held 积分（按池回退，幂等：credit_transactions ON CONFLICT 防双退）；failed 置 completed_at（updateTaskStatus CASE）
+      // CAS 抢占终态：仅当任务仍为 review_required 才原子转 failed（0 行 = 已被并发 retry_new/其它处置移出）。
+      // 先抢占再退款：杜绝「retry_new 已把任务转 running 重排队（将再次上游提交+commit）而 discard 又退款」的
+      // 双重计费面（用户白拿结果 + 上游二次计费）。先 SELECT 后写是 TOCTOU，必须用 WHERE status='review_required' 原子化。
+      const claim = await pgPool.query(
+        `UPDATE generation_tasks
+           SET status='failed', result=$2, error=$3, completed_at=NOW(), updated_at=NOW(), user_id=$4
+         WHERE task_id=$1 AND status='review_required'`,
+        [taskId, JSON.stringify(result), msg, row.user_id],
+      );
+      if (claim && typeof claim.rowCount === 'number' && claim.rowCount === 0) {
+        return { ok: false, code: 409, error: '任务状态已变化（非 review_required），discard 未执行，请刷新后重试' };
+      }
+      // 抢占成功才释放 held 积分（按池回退，幂等：credit_transactions ON CONFLICT (ref, kind) 防双退）
       await billing.releaseCredits(pgPool, row.user_id, row.cost || 0, row.idempotency_key, row.cost_pool || 'recharge');
-      await updateTaskStatus(pgPool, taskId, 'failed',
-        { status: 'failed', discarded: true, action: 'discard', reason: reason || null },
-        msg, row.user_id);
       realtime.emitTaskUpdate(row.user_id, { taskId, status: 'failed', error: msg });
       console.log(`[review] 任务 ${taskId} 已 discard（释放 held 积分 → failed 终态）userId=${row.user_id || ''} actor=${actor || 'admin'}`);
       return { ok: true, action: 'discard' };
@@ -1887,9 +1897,11 @@ async function resolveReviewTask(pgPool, body) {
   const msg = `人工处置 retry_new${actor ? `（${actor}）` : ''}${reason ? `：${reason}` : ''}，已清提交标记重新排队/重驱（运营确认上游未实际计费）`;
   let resetRes;
   try {
+    // 只清「真提交」标记 provider_task_id（+ 随提交写入的 provider_key）；client_request_id 保留（不清不换）——
+    // 它是任务稳定幂等痕迹（statusById 对账入参、未来幂等上游以同 cr 关联防重计费），清掉会永久丢失该兜底。
     resetRes = await pgPool.query(
       `UPDATE generation_tasks
-         SET provider_task_id=NULL, client_request_id=NULL, provider_key=NULL,
+         SET provider_task_id=NULL, provider_key=NULL,
              status='running',
              error=$2, updated_at=NOW()
        WHERE task_id=$1 AND status='review_required'`,
@@ -1906,7 +1918,7 @@ async function resolveReviewTask(pgPool, body) {
   const waitOpts = (row.resume_meta && row.resume_meta.waitingOpts) || null;
   if (waitOpts && waitOpts.model) {
     try {
-      const runOpts = { ...waitOpts, taskId, onSubmitted: (info) => persistProviderTaskId(pgPool, taskId, info) };
+      const runOpts = { ...waitOpts, taskId, clientRequestId: row.client_request_id || undefined, onSubmitted: (info) => persistProviderTaskId(pgPool, taskId, info) };
       enqueueWaiting(taskId, runOpts, (row.resume_meta && row.resume_meta.waitingState) || null);
       persistWaitingOpts(pgPool, taskId, waitOpts, (row.resume_meta && row.resume_meta.waitingState) || null).catch(() => {});
       realtime.emitTaskUpdate(row.user_id, { taskId, status: 'running', error: msg });

@@ -82,9 +82,13 @@ async function loadDispatchPairs(pgPool, modelIds, contentType) {
   );
   // key = model_id|provider_id → 行（同组合多行取首个，保持确定性）
   const modelRowByCombo = new Map();
+  // key = model_id → 行（canonical 兜底：binding 可指向非模型主 provider，
+  // 此时组合键命中不到模型行，须按 model_id 回退到该模型的 canonical 行，否则多 provider 线路被静默丢弃）
+  const modelRowByModelId = new Map();
   for (const mr of mRes.rows || []) {
     const key = `${mr.model_id}|${mr.provider_id}`;
     if (!modelRowByCombo.has(key)) modelRowByCombo.set(key, mr);
+    if (!modelRowByModelId.has(mr.model_id)) modelRowByModelId.set(mr.model_id, mr);
   }
 
   // 4) 加载涉及的服务商行
@@ -112,7 +116,7 @@ async function loadDispatchPairs(pgPool, modelIds, contentType) {
   //    可用 key = 老列 providers.api_key（legacy fallback） OR 池中至少一把 active 且长度≥6 的 key
   const pairs = [];
   for (const t of targets) {
-    const mr = modelRowByCombo.get(`${t.model_id}|${t.provider_id}`);
+    const mr = modelRowByCombo.get(`${t.model_id}|${t.provider_id}`) || modelRowByModelId.get(t.model_id);
     const pr = providerById.get(t.provider_id);
     if (!mr || !pr) continue;                       // 模型行或服务商缺失 → 跳过
     if (!pr.enabled) continue;                      // 服务商未启用
