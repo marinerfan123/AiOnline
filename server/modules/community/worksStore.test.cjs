@@ -467,6 +467,137 @@ test('incrementView: DRAFT/TAKEDOWN do not count (NOT_PUBLISHED), missing -> WOR
 });
 
 // ------------------------------------------------------------ 全链路
+// ------------------------------------------------------------ cover / resolveMedia（叶②浏览丰富）
+function makeResolver(map, { failIds = new Set() } = {}) {
+  const calls = [];
+  return {
+    calls,
+    resolve: async (id) => {
+      calls.push(id);
+      if (failIds.has(id)) throw new Error(`resolve ${id} boom`);
+      return Object.prototype.hasOwnProperty.call(map, id) ? map[id] : null;
+    },
+  };
+}
+
+test('cover: resolveMedia 注入时 listPublic/getPublic 附 cover（thumbnail=解析对象）；无 asset 行 cover:null', async () => {
+  const { m, store } = makeStore();
+  const r1 = await store.create({ creatorUserId: 'u1', title: 'A', mediaAssetId: 'media-1' });
+  const r2 = await store.create({ creatorUserId: 'u1', title: 'B', tags: ['x'] }); // 无 media
+  const r3 = await store.create({ creatorUserId: 'u1', title: 'C', mediaAssetId: 'media-ghost' }); // 解析不到
+  await store.publish(r1.work.id, 'u1');
+  await store.publish(r2.work.id, 'u1');
+  await store.publish(r3.work.id, 'u1');
+
+  const res = makeResolver({
+    'media-1': { thumbnailKey: 'th/k1.jpg', width: 1280, height: 720, kind: 'video' },
+  });
+  const store2 = createWorksStore({ pg: m.pg, resolveMedia: res.resolve });
+
+  const list = await store2.listPublic({});
+  assert.equal(list.ok, true);
+  const a = list.works.find((w) => w.id === r1.work.id);
+  assert.deepEqual(a.cover, {
+    mediaAssetId: 'media-1',
+    thumbnail: { thumbnailKey: 'th/k1.jpg', width: 1280, height: 720, kind: 'video' },
+  });
+  const b = list.works.find((w) => w.id === r2.work.id);
+  assert.equal(b.cover, null, '无 mediaAssetId 的行 cover 为 null');
+  const c = list.works.find((w) => w.id === r3.work.id);
+  assert.deepEqual(c.cover, { mediaAssetId: 'media-ghost', thumbnail: null }, '解析不到 → thumbnail null');
+
+  const g = await store2.getPublic(r1.work.id);
+  assert.deepEqual(g.work.cover, a.cover, 'getPublic 与 listPublic 同款 cover');
+  // 列表页内按行序解析（created_at DESC：C 在前、A 在后；B 无 asset 跳过）；getPublic 是新一次独立解析。
+  assert.deepEqual(res.calls, ['media-ghost', 'media-1', 'media-1'], '每页/每详情按不同 asset 去重解析一次');
+});
+
+test('cover: 同页多个行共享同一 asset 只调一次 resolve（去重，避免 N+1）', async () => {
+  const { m } = makeStore();
+  const store = createWorksStore({
+    pg: m.pg,
+    resolveMedia: async () => ({ thumbnailKey: 'th/same.jpg', width: 640, height: 360, kind: 'image' }),
+  });
+  const w1 = await store.create({ creatorUserId: 'u1', title: 'A', mediaAssetId: 'media-shared' });
+  const w2 = await store.create({ creatorUserId: 'u1', title: 'B', mediaAssetId: 'media-shared' });
+  const w3 = await store.create({ creatorUserId: 'u1', title: 'C' });
+  for (const w of [w1, w2, w3]) await store.publish(w.work.id, 'u1');
+
+  const calls = [];
+  const store2 = createWorksStore({
+    pg: m.pg,
+    resolveMedia: async (id) => { calls.push(id); return { thumbnailKey: 'th/same.jpg' }; },
+  });
+  const list = await store2.listPublic({});
+  assert.equal(list.works.length, 3);
+  assert.equal(calls.length, 1, '同一 asset 两行只解析一次');
+  assert.deepEqual(calls, ['media-shared']);
+  const covers = list.works.filter((w) => w.cover !== null).map((w) => w.cover.thumbnail.thumbnailKey);
+  assert.deepEqual(covers, ['th/same.jpg', 'th/same.jpg']);
+});
+
+test('cover: resolveMedia 缺省 → cover 结构稳定（thumbnail:null）且零额外 DB 调用（不触库）', async () => {
+  const { m, store } = makeStore();
+  const w = await store.create({ creatorUserId: 'u1', title: 'A', mediaAssetId: 'media-1' });
+  await store.publish(w.work.id, 'u1');
+
+  const before = m.calls.length;
+  const list = await store.listPublic({});
+  const after = m.calls.length;
+  const item = list.works.find((x) => x.id === w.work.id);
+  assert.deepEqual(item.cover, { mediaAssetId: 'media-1', thumbnail: null });
+
+  const before2 = m.calls.length;
+  const g = await store.getPublic(w.work.id);
+  const after2 = m.calls.length;
+  assert.deepEqual(g.work.cover, { mediaAssetId: 'media-1', thumbnail: null });
+  // 缺省 resolver 时 cover 富化绝不能引入任何 SQL（仅原有 SELECT 各一次）。
+  assert.equal(after - before, 1, 'listPublic 只发原有 1 条 SELECT');
+  assert.equal(after2 - before2, 1, 'getPublic 只发原有 1 条 SELECT');
+});
+
+test('cover: resolver 抛错 → thumbnail:null 降级，列表/详情不失败', async () => {
+  const { m } = makeStore();
+  const res = makeResolver({}, { failIds: new Set(['media-boom']) });
+  const store2 = createWorksStore({ pg: m.pg, resolveMedia: res.resolve });
+  const w = await store2.create({ creatorUserId: 'u1', title: 'A', mediaAssetId: 'media-boom' });
+  await store2.publish(w.work.id, 'u1');
+
+  const list = await store2.listPublic({});
+  assert.equal(list.ok, true);
+  assert.deepEqual(list.works[0].cover, { mediaAssetId: 'media-boom', thumbnail: null });
+  const g = await store2.getPublic(w.work.id);
+  assert.equal(g.ok, true);
+  assert.deepEqual(g.work.cover, { mediaAssetId: 'media-boom', thumbnail: null });
+  // 列表与详情各独立解析一次（均抛错 → 降级 null，不中断调用）。
+  assert.deepEqual(res.calls, ['media-boom', 'media-boom']);
+});
+
+test('cover: create/publish/listByCreator 输出不带 cover（富化仅限公开读面）', async () => {
+  const { m } = makeStore();
+  const store = createWorksStore({
+    pg: m.pg,
+    resolveMedia: async () => ({ thumbnailKey: 'k' }),
+  });
+  const w = await store.create({ creatorUserId: 'u1', title: 'A', mediaAssetId: 'media-1' });
+  assert.equal('cover' in w.work, false, 'create 输出不带 cover');
+  const p = await store.publish(w.work.id, 'u1');
+  assert.equal('cover' in p.work, false, 'publish 输出不带 cover');
+  const mine = await store.listByCreator('u1');
+  assert.ok(mine.works.every((x) => !('cover' in x)), 'listByCreator 输出不带 cover');
+  const g = await store.getPublic(w.work.id);
+  assert.equal('cover' in g.work, true, 'getPublic 才带 cover');
+});
+
+test('createWorksStore: resolveMedia 非函数时构造抛 TypeError', () => {
+  const { pg } = createMockPg();
+  assert.throws(() => createWorksStore({ pg, resolveMedia: 'nope' }), /resolveMedia/);
+  assert.throws(() => createWorksStore({ pg, resolveMedia: 42 }), /resolveMedia/);
+  // 缺省 / 函数 均合法
+  assert.doesNotThrow(() => createWorksStore({ pg }));
+  assert.doesNotThrow(() => createWorksStore({ pg, resolveMedia: async () => null }));
+});
+
 test('end-to-end: create -> publish -> public list/get -> views accumulate; drafts stay private', async () => {
   const { m, store } = makeStore();
   const a = await store.create({ creatorUserId: 'u1', title: 'A', tags: ['tv'] });

@@ -1,6 +1,6 @@
 'use strict';
 /**
- * 24-community-wave-phases.md Phase-0 叶① — community_works store（社区作品地基）。
+ * 24-community-wave-phases.md Phase-0 叶①/② — community_works store（社区作品地基）。
  *
  * 覆盖 C001（TV Show 浏览最小）所需的最小行语义：
  *   create      —— 落 DRAFT 行；id = rid('cw') = `cw-<uuid>`（与 0051 batch 同款前缀约定）。
@@ -11,6 +11,23 @@
  *   listByCreator —— 某作者全部状态（含 DRAFT/TAKEDOWN），同序分页。
  *   getPublic   —— 仅 PUBLISHED 可见；DRAFT/TAKEDOWN/不存在一律 work:null（不泄露存在性）。
  *   incrementView —— PUBLISHED 行 view_count + 1（BIGINT）；非 PUBLISHED 不计数（NOT_PUBLISHED）。
+ *
+ * 浏览丰富（叶②新增，可选注入）：
+ *   createWorksStore({ pg, resolveMedia? }) —— resolveMedia(mediaAssetId) 由宿主注入
+ *   （规划文档 24 复用清单：media 行 / probe 产物可作封面）。签名：
+ *       resolveMedia(mediaAssetId: string) -> Promise<{thumbnailKey?, width?, height?,
+ *       kind?}|null>（同步返回值亦可）—— 可解析时返回媒体元信息对象，否则 null。
+ *   listPublic / getPublic 输出行附 cover：
+ *       work.mediaAssetId == null            -> cover: null
+ *       work.mediaAssetId 有值               -> cover: { mediaAssetId, thumbnail }
+ *         其中 thumbnail = 该 asset 的 resolveMedia 结果对象（原样透传）或 null。
+ *   规则：
+ *       - resolveMedia 未注入（缺省）→ thumbnail 一律 null；本层绝不自行查询媒体表
+ *         （“不触库”）；cover 结构仍稳定输出，便于客户端统一渲染。
+ *       - resolveMedia 注入时逐页对“去重后的不同 mediaAssetId”仅调用一次（避免 N+1）。
+ *       - 解析失败（resolver throw / 返回 falsy）→ thumbnail:null —— cover 是增强字段，
+ *         解析故障绝不拖垮列表/详情（吞错降级，记录于注释）。
+ *   listByCreator / create / publish 的输出不带 cover（作者工作台自取原行即可）。
  *
  * 约定（与 batchTaskStore / mediaDerivedStore / runEventStore 同款）：
  *   - Factory-injected pg ({ query })；结果形状统一 { ok: true, ... } | { ok: false, error }。
@@ -155,16 +172,55 @@ function checkLimit(limit) {
   return { ok: true, value: v };
 }
 
-function createWorksStore({ pg }) {
+function createWorksStore({ pg, resolveMedia }) {
   if (!pg || typeof pg.query !== 'function') {
     throw new TypeError('createWorksStore requires { pg } with .query()');
   }
+  if (resolveMedia !== undefined && typeof resolveMedia !== 'function') {
+    throw new TypeError('createWorksStore: resolveMedia (when provided) must be a function');
+  }
+  const resolve = typeof resolveMedia === 'function' ? resolveMedia : null;
 
   // Memoized once per store instance so concurrent first writes share one CREATE.
   let schemaReady = null;
   function ensureSchema() {
     if (!schemaReady) schemaReady = pg.query(DDL).then(() => true);
     return schemaReady;
+  }
+
+  /**
+   * 给公开读输出行附加 cover（浏览丰富，叶②）。
+   * 行内 mediaAssetId 为空 -> cover:null；有值 -> cover:{ mediaAssetId, thumbnail }。
+   * thumbnail 语义：resolve 注入则取 resolve(mediaAssetId) 结果（可解析=原样透传对象，
+   * 解析失败/无结果 = null）；resolve 缺省 = null（本层绝不自行查媒体表，即“不触库”）。
+   * 同一次调用内对不同 mediaAssetId 去重调用 resolver（避免逐行 N+1）。
+   */
+  async function withCovers(rows) {
+    const out = [];
+    const cache = new Map(); // mediaAssetId -> thumbnail (null 也缓存，去重解析)
+    for (const w of rows) {
+      if (w.mediaAssetId === undefined || w.mediaAssetId === null
+        || (typeof w.mediaAssetId === 'string' && w.mediaAssetId.trim() === '')) {
+        out.push({ ...w, cover: null });
+        continue;
+      }
+      let thumbnail = null;
+      if (resolve) {
+        if (cache.has(w.mediaAssetId)) {
+          thumbnail = cache.get(w.mediaAssetId);
+        } else {
+          let meta = null;
+          try {
+            const m = await resolve(w.mediaAssetId);
+            if (m && typeof m === 'object') meta = m;
+          } catch (_) { meta = null; } // cover 是增强字段：解析故障降级 null，绝不拖垮列表/详情
+          thumbnail = meta;
+          cache.set(w.mediaAssetId, thumbnail);
+        }
+      }
+      out.push({ ...w, cover: { mediaAssetId: w.mediaAssetId, thumbnail } });
+    }
+    return out;
   }
 
   /**
@@ -220,6 +276,7 @@ function createWorksStore({ pg }) {
    * listPublic({ tags?, cursor?, limit? }) -> { ok:true, works, nextCursor }
    * 仅 PUBLISHED；tags 为 AND 语义（每个给定 tag 均须命中）；空数组/缺省 = 不过滤。
    * 排序 (created_at DESC, id DESC)；nextCursor 供翻页（不足一页时为 null）。
+   * 输出行带 cover（叶②浏览丰富）：resolveMedia 注入则逐 asset 解析一次；缺省 thumbnail null。
    */
   async function listPublic({ tags, cursor, limit } = {}) {
     const vt = normalizeTags(tags);
@@ -230,7 +287,9 @@ function createWorksStore({ pg }) {
     }
     const vl = checkLimit(limit);
     if (!vl.ok) return vl.error;
-    return queryWorks({ publicOnly: true, tagsArr: vt.value, cursor, limit: vl.value });
+    const r = await queryWorks({ publicOnly: true, tagsArr: vt.value, cursor, limit: vl.value });
+    if (!r.ok) return r;
+    return { ok: true, works: await withCovers(r.works), nextCursor: r.nextCursor };
   }
 
   /**
@@ -284,13 +343,16 @@ function createWorksStore({ pg }) {
   /**
    * getPublic(id) -> { ok:true, work } | { ok:true, work:null }
    * 仅 PUBLISHED 可见；DRAFT/TAKEDOWN/不存在一律 null（公开侧不泄露存在性）。
+   * 可见时输出行带 cover（叶②浏览丰富；语义同 listPublic）。
    */
   async function getPublic(id) {
     if (!isNonEmptyString(id)) return err('INVALID_ID', 'id (non-empty string) required');
     await ensureSchema();
     const r = await pg.query(GET_PUBLIC_SQL, [id]);
     const row = r && r.rows && r.rows[0];
-    return { ok: true, work: row ? normalizeRow(row) : null };
+    if (!row) return { ok: true, work: null };
+    const enriched = await withCovers([normalizeRow(row)]);
+    return { ok: true, work: enriched[0] };
   }
 
   /**
