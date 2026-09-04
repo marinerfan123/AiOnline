@@ -12,6 +12,15 @@
 
 const crypto = require('crypto');
 const { createOssLogger } = require('./oss-logger.cjs');
+// local-disk provider（真链无云凭据落库后端）：统一适配层把 put/url 操作映射到本模块。
+// 模块内容见 localMediaStore.cjs 头部注释；createLocalMediaStore 只做磁盘 IO、零外部依赖。
+const {
+  createLocalMediaStore,
+  MEDIA_NOT_FOUND,
+  isMediaNotFound,
+  decodeUrlKey,
+  encodeUrlKey,
+} = require('./modules/media/localMediaStore.cjs');
 
 // ─── 阿里云 OSS helpers ──────────────────────────────
 function aliyunHost(cfg) {
@@ -187,7 +196,14 @@ function tencentCosPutSignUrl(cfg, objectKey, contentType) {
 
 // 按 provider 重签 GET（下载）预签名 URL —— 供服务端最终化场景使用，
 // 杜绝信任客户端传来的 oss_url（避免前端篡改或伪造 URL）
+// local-disk：无签名概念；返回自托管 URL（store.urlFor），getUrl 可直接入库/下发。
+//   '/local-media/<enc key>' 由 server.js 挂载的本地读取路由服务（父线挂载；
+//   解码侧现成工具：ossMod.decodeUrlKey / ossMod.localMediaStore.decodeUrlKey）。
 function buildOssGetUrl(cfg, objectKey) {
+  if (isLocalDiskProvider(cfg)) {
+    const store = localStoreFor(cfg);
+    return { getUrl: store.urlFor(objectKey), expires: 0, local: true };
+  }
   if (cfg.providerType === 'tencent-cos') {
     const { signedUrl, expires } = tencentCosSignUrl(cfg, objectKey);
     return { getUrl: signedUrl, expires };
@@ -200,6 +216,82 @@ function buildOssGetUrl(cfg, objectKey) {
 function userOssNamespace(cfg, userId) {
   const prefix = (cfg?.pathPrefix || 'images/').replace(/^\/+|\/+$/g, '');
   return `${prefix}/${userId}/`;
+}
+
+// ─── local-disk provider（统一适配层）──────────────────────────────
+// cfg 约定（父线 getActiveStorageConfig / DB oss_configs 行均可产出）：
+//   { providerType: 'local-disk', localDir?: '/data/media' }  // localDir 可省略
+// rootDir 解析顺序：cfg.localDir ?? cfg.rootDir ?? '/app/data/media'（模块缺省）。
+function isLocalDiskProvider(cfg) {
+  return !!(cfg && String(cfg.providerType || cfg.provider || cfg.type || '') === 'local-disk');
+}
+// 每次返回全新 store 实例（无状态、仅盘 IO），rootDir 以 cfg 或缺省为准。
+function localStoreFor(cfg) {
+  const rootDir = (cfg && (cfg.localDir || cfg.rootDir)) || undefined;
+  return createLocalMediaStore(rootDir ? { rootDir } : {});
+}
+
+// 用户命名空间下的 objectKey：与云分支共用 userOssNamespace 语义
+//   local-disk 不校验云凭据，但 key 同样锁在 pathPrefix/userId 下，跨用户隔离不变。
+
+// ─── 统一预签名 PUT（signedPut 适配）────────────────────────────
+// 返回契约与 aliyunPutSignUrl/tencentCosPutSignUrl 一致：{ rawUrl, putUrl, getUrl,
+// expires, putExpires } —— 云分支逐字段透传原函数返回值，绝不自造签名。
+// local-disk：无预签名概念（浏览器 PUT 到磁盘没有意义），返回固定契约
+//   { providerType:'local-disk', local:true, putUrl:null, getUrl:'/local-media/<enc>',
+//     putExpires:0, expires:0 }；
+// 调用方见到 local:true 应改走服务端 uploadObject()（store.put），putUrl:null 即该信号。
+function buildOssSignPutUrl(cfg, objectKey, contentType) {
+  if (isLocalDiskProvider(cfg)) {
+    const store = localStoreFor(cfg);
+    return {
+      providerType: 'local-disk', local: true, objectKey,
+      rawUrl: null, putUrl: null, getUrl: store.urlFor(objectKey),
+      putExpires: 0, expires: 0,
+    };
+  }
+  const kind = String((cfg && (cfg.providerType || cfg.provider || cfg.type)) || '');
+  // 与 server.js 历史选择一致：tencent/cos → COS，其余（含缺省）→ aliyun
+  if (kind.includes('tencent') || kind.includes('cos')) {
+    return tencentCosPutSignUrl(cfg, objectKey, contentType || 'application/octet-stream');
+  }
+  return aliyunPutSignUrl(cfg, objectKey, contentType || 'application/octet-stream');
+}
+
+// ─── 统一服务端上传（upload/putObject 适配）──────────────────────
+// 新增统一函数，供「真链」/挂载代码对任意 providerType 走同一入口：
+//   aliyun/tencent：沿用既有 PutHeaders(+Stream) 签名 + HTTP PUT（与 assetFinalize.putObject
+//     同款实现，body 收 Buffer/Uint8Array/string；超大流式上传仍建议直接用 stream 头版本）
+//   local-disk：store.put（原子写），不碰网络
+// 返回：{ ok, key, url, providerType }；失败抛 Error（消息经 diagnoseOssError 包装）。
+// 注：云分支为纯网络路径，测试栈无云凭据 → 只做代码路径/契约单测，未做云端实测（如实声明）。
+async function uploadObject(cfg, objectKey, body, opts = {}) {
+  if (isLocalDiskProvider(cfg)) {
+    const store = localStoreFor(cfg);
+    const r = await store.put({ objectKey, body });
+    return { ok: true, key: r.key, url: store.urlFor(r.key), providerType: 'local-disk' };
+  }
+  const contentType = opts.contentType || 'application/octet-stream';
+  let buf = body;
+  if (typeof buf === 'string') buf = Buffer.from(buf, 'utf8');
+  else if (!Buffer.isBuffer(buf)) buf = Buffer.from(buf);
+  const kind = String((cfg && (cfg.providerType || cfg.provider || cfg.type)) || '');
+  let putUrl;
+  let headers;
+  if (kind.includes('tencent') || kind.includes('cos')) {
+    if (!cfg._hostName) cfg._hostName = `${cfg.bucket}${cfg.appId ? '-' + cfg.appId : ''}.cos.${cfg.region || 'ap-shanghai'}.myqcloud.com`;
+    putUrl = `https://${cfg._hostName}/${objectKey}`;
+    headers = tencentCosPutHeaders(cfg, objectKey, buf, contentType).headers;
+  } else {
+    const host = aliyunHost(cfg);
+    putUrl = `https://${host}/${objectKey}`;
+    headers = aliyunPutHeaders(cfg, objectKey, buf, contentType).headers;
+  }
+  const r = await fetch(putUrl, { method: 'PUT', headers, body: buf });
+  if (!r.ok) {
+    throw new Error(diagnoseOssError(cfg.providerType, r.status, await r.text().catch(() => '')));
+  }
+  return { ok: true, key: objectKey, url: putUrl, providerType: kind.includes('tencent') ? 'tencent-cos' : 'aliyun-oss' };
 }
 
 // ─── oss_config / oss_configs 行 snake→camel ──────────────────────────
@@ -216,6 +308,8 @@ const OSS_ROW_SNAKE_MAP = {
   provider_type: 'providerType',
   display_name: 'displayName',
   app_id: 'appId',
+  local_dir: 'localDir',
+  root_dir: 'rootDir',
   created_at: 'createdAt',
 };
 function fromSnake(row) {
@@ -244,6 +338,10 @@ async function loadOssConfigs(pgPool) {
 // ─── 错误诊断 ──────────────────────────
 function diagnoseOssError(providerType, status, body) {
   const text = String(body || '').slice(0, 200);
+  if (providerType === 'local-disk') {
+    if (status === 500 || status === 0) return `本地磁盘存储写入失败: ${text}`;
+    return `本地磁盘存储错误 HTTP ${status}: ${text}`;
+  }
   if (providerType === 'aliyun-oss') {
     if (text.includes('NoSuchBucket')) return 'Bucket 不存在，请检查 Bucket 名称';
     if (text.includes('SignatureDoesNotMatch')) return '签名错误，请检查 AccessKey 或 Bucket';
@@ -275,6 +373,18 @@ function log(level, action, message, details) {
 // 探测：服务端在「最终化 provider 资源到 OSS」之前要确保可写、可拉
 async function probeConnectivity(cfg, buffer = Buffer.alloc(1), contentType = 'application/octet-stream') {
   const t0 = Date.now();
+  // local-disk：目录可写性探测（mkdir -p + W_OK 检查），不留探测文件
+  if (isLocalDiskProvider(cfg)) {
+    try {
+      const store = localStoreFor(cfg);
+      const fsp = require('fs').promises;
+      await fsp.mkdir(store.rootDir, { recursive: true });
+      await fsp.access(store.rootDir, require('fs').constants.W_OK);
+      return { ok: true, status: 200, durMs: Date.now() - t0, local: true };
+    } catch (e) {
+      return { ok: false, status: 500, durMs: Date.now() - t0, local: true, error: e && e.message };
+    }
+  }
   let url2put, headers;
   if (cfg.providerType === 'tencent-cos') {
     cfg._hostName = `${cfg.bucket}${cfg.appId ? '-' + cfg.appId : ''}.cos.${cfg.region || 'ap-shanghai'}.myqcloud.com`;
@@ -312,6 +422,18 @@ module.exports = {
   userOssNamespace,
   loadOssConfigs,
   diagnoseOssError,
+  // local-disk provider（统一适配 + store 桥）
+  isLocalDiskProvider,
+  localStoreFor,
+  buildOssSignPutUrl,
+  uploadObject,
+  localMediaStore: { createLocalMediaStore, MEDIA_NOT_FOUND, isMediaNotFound, decodeUrlKey, encodeUrlKey },
+  // 便捷：直接 re-export store 工具，父线挂载 /local-media 路由时可单 require oss.cjs
+  createLocalMediaStore,
+  MEDIA_NOT_FOUND,
+  isMediaNotFound,
+  decodeUrlKey,
+  encodeUrlKey,
   // 日志
   getLogger,
   setLogger,

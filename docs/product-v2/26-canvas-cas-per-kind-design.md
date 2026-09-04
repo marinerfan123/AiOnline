@@ -180,17 +180,30 @@
 ## 5. 拆叶清单（8 叶，文件归属 + 回滚路径）
 
 > 依赖顺序：叶 1→叶 3→叶 4 是主链（叶 2 可与叶 1 并行）；叶 5/7 可并行于主链；叶 6/8 收尾。每叶独立可回滚。
+>
+> **状态图例（2026-09-04 修订）**：✅已合 / ⚠️部分（核心已合，剩余缺口见 §5.1，其中「挂载」类属 Phase-4）/ ⬜未合。依据 = git 近波（16e55fe..HEAD 60b18cd）提交摘要 + HEAD 源码读取，**非运行时实测**。
 
 | 叶 | 内容 | 文件归属 | 回滚路径 | 依赖 |
 |---|---|---|---|---|
-| **叶 1** | 命令日志转权威：`recordCanvasPatch` 从 warn-only 升为准入前必须 + payload 从「ops 计数」升级为「完整 kind 分解 ops」（或每 kind 子命令各 append 一行，`type`=具体 kind） | `server/modules/project-foundation/studioCanvasPersistence.cjs`（L160-171、L237）；`server/modules/collaboration/commandLogStore.cjs`（批量 append） | 还原 L160-171/L237 为 warn-only（payload 兼容，不删表） | 无 |
-| **叶 2** | kind 拆解器（纯函数）：把 legacy PATCH `{upsertNodes, deleteNodeIds, upsertEdges, deleteEdgeIds, viewport}` → 子命令列表（`node.create/delete/move/resize/update`、`edge.create/delete`、`canvas.viewport.update`），复用 `CONFLICT_POLICY_BY_KIND` | 新 `server/modules/collaboration/canvasCommandDecomposer.cjs`（或 studio-contracts 内）；单测 `canvasCommandDecomposer.test.cjs` | 删文件，无接线 | 无（可并行叶 1） |
-| **叶 3** | dual-mode 开关 + 按 kind 分派：handlePatch 按 `STUDIO_CANVAS_KIND_SCOPED` 分流——reject-409 走现有整画布 CAS（L201-232 保留），LWW/merge/append 走命令日志投影路径；混合 kind 同事务分组执行 | `server/modules/project-foundation/studioCanvasPersistence.cjs`（handlePatch L188-240 重构） | 开关清空即回 Phase 1 全量 CAS（分支保留，不删） | 叶 2 |
-| **叶 4** | 投影 apply 执行器：per-entity LWW（按 seq 窗口）+ merge 并集（边/列表元素独立主键）+ append 纯追加；供叶 3 调用 | 新 `server/modules/collaboration/canvasProjection.cjs`（或扩展 commandLogStore）；单测 | 删文件，叶 3 回退全量 CAS | 叶 3 |
-| **叶 5** | conflict 响应形状扩展：409 body 增 `{kindPolicy, commandSeq}`（§4）；同步三处契约 | `studioCanvasPersistence.cjs`（L202/L245）；`src/shared/api/contract/schemas.ts`（L289-293 `CanvasConflictResponseSchema`）；`src/shared/api/contract/studio-canvas-client.ts`（L15-28 `StudioCanvasApiError`） | 还原 schema（additive passthrough，旧字段不变；回滚=去掉两新字段） | 无 |
-| **叶 6** | append/presence 接入：presence 心跳 + comment/annotation 走 append 策略（无 CAS）；presence 用现有 `presencePgStore.cjs`，append 前缀走 `isAppendKind` | `server/modules/collaboration/presencePgStore.cjs`（已存在）；`collabContract.cjs`（`APPEND_KIND_PREFIXES` L183 已就绪，补路由） | n/a（当前无生产路由，纯新增） | 叶 4 |
-| **叶 7** | 客户端 rebase 升级：reject-409 保留 conflict-panel + 整图 reload（现状）；LWW/merge 用成功响应的新 `revision/seq` 增量 rebase 保留本地 buffer，不做整图替换 | `src/features/studio-v2/useStudioCanvasPersistence.ts`（L59-126 `attempt/doFlush/flush`、L179-193 `retry`）；`src/features/studio-v2/persistence.ts`（`DirtyOperationBuffer` 增量 commit） | 还原现有 F1/F2 rebase（revision 单值路径） | 叶 5 |
-| **叶 8** | 投影重建 + 集成测试：快照 + `listAfter` 回放重建投影；按 kind 四策略各一集成测试（reject-409 并发 409 / LWW 并发不冲突 / merge 并集 / append 幂等） | 新测试 `server/tests/integration/studio-canvas-kind-cas.test.cjs`；扩展 `commandLogStore.test.cjs`、`studioCanvasPersistence.test.cjs` | n/a（测试，删即回滚） | 叶 4、叶 5 |
+| **叶 1** ⚠️部分 | 命令日志转权威：`recordCanvasPatch` 从 warn-only 升为准入前必须 + payload 从「ops 计数」升级为「完整 kind 分解 ops」（或每 kind 子命令各 append 一行，`type`=具体 kind） | `server/modules/project-foundation/studioCanvasPersistence.cjs`（L160-171、L237）；`server/modules/collaboration/commandLogStore.cjs`（批量 append） | 还原 L160-171/L237 为 warn-only（payload 兼容，不删表） | 无 |
+| **叶 2** ✅已合 | kind 拆解器（纯函数）：把 legacy PATCH `{upsertNodes, deleteNodeIds, upsertEdges, deleteEdgeIds, viewport}` → 子命令列表（`node.create/delete/move/resize/update`、`edge.create/delete`、`canvas.viewport.update`），复用 `CONFLICT_POLICY_BY_KIND` | 新 `server/modules/collaboration/canvasCommandDecomposer.cjs`（或 studio-contracts 内）；单测 `canvasCommandDecomposer.test.cjs` | 删文件，无接线 | 无（可并行叶 1） |
+| **叶 3** ⚠️部分 | dual-mode 开关 + 按 kind 分派：handlePatch 按 `STUDIO_CANVAS_KIND_SCOPED` 分流——reject-409 走现有整画布 CAS（L201-232 保留），LWW/merge/append 走命令日志投影路径；混合 kind 同事务分组执行 | `server/modules/project-foundation/studioCanvasPersistence.cjs`（handlePatch L188-240 重构） | 开关清空即回 Phase 1 全量 CAS（分支保留，不删） | 叶 2 |
+| **叶 4** ⚠️部分 | 投影 apply 执行器：per-entity LWW（按 seq 窗口）+ merge 并集（边/列表元素独立主键）+ append 纯追加；供叶 3 调用 | 新 `server/modules/collaboration/canvasProjection.cjs`（或扩展 commandLogStore）；单测 | 删文件，叶 3 回退全量 CAS | 叶 3 |
+| **叶 5** ⚠️部分 | conflict 响应形状扩展：409 body 增 `{kindPolicy, commandSeq}`（§4）；同步三处契约 | `studioCanvasPersistence.cjs`（L202/L245）；`src/shared/api/contract/schemas.ts`（L289-293 `CanvasConflictResponseSchema`）；`src/shared/api/contract/studio-canvas-client.ts`（L15-28 `StudioCanvasApiError`） | 还原 schema（additive passthrough，旧字段不变；回滚=去掉两新字段） | 无 |
+| **叶 6** ⬜未合 | append/presence 接入：presence 心跳 + comment/annotation 走 append 策略（无 CAS）；presence 用现有 `presencePgStore.cjs`，append 前缀走 `isAppendKind` | `server/modules/collaboration/presencePgStore.cjs`（已存在）；`collabContract.cjs`（`APPEND_KIND_PREFIXES` L183 已就绪，补路由） | n/a（当前无生产路由，纯新增） | 叶 4 |
+| **叶 7** ⚠️部分 | 客户端 rebase 升级：reject-409 保留 conflict-panel + 整图 reload（现状）；LWW/merge 用成功响应的新 `revision/seq` 增量 rebase 保留本地 buffer，不做整图替换 | `src/features/studio-v2/useStudioCanvasPersistence.ts`（L59-126 `attempt/doFlush/flush`、L179-193 `retry`）；`src/features/studio-v2/persistence.ts`（`DirtyOperationBuffer` 增量 commit） | 还原现有 F1/F2 rebase（revision 单值路径） | 叶 5 |
+| **叶 8** ⚠️部分 | 投影重建 + 集成测试：快照 + `listAfter` 回放重建投影；按 kind 四策略各一集成测试（reject-409 并发 409 / LWW 并发不冲突 / merge 并集 / append 幂等） | 新测试 `server/tests/integration/studio-canvas-kind-cas.test.cjs`；扩展 `commandLogStore.test.cjs`、`studioCanvasPersistence.test.cjs` | n/a（测试，删即回滚） | 叶 4、叶 5 |
+
+### 5.1 状态回填（2026-09-04，截至 HEAD 60b18cd；纯文档，非实测）
+
+- **叶 1 ⚠️部分**：kind 直写路径已录**完整 kind 分解 ops + mode**（lww L257、merge L298 的 `recordCanvasPatch` 载荷），但整画布 CAS 路径 payload 仍是 ops 计数（L381）；`recordCanvasPatch` 全程仍 warn-only（L209-224 注释「命令日志任何失败绝不让主链破」）——「准入前必须 + 全量 ops」未达成。
+- **叶 2 ✅已合**：`canvasCommandDecomposer.cjs` 落地（eff0f83，24/24），落点 `server/modules/project-foundation/`（文档预估 collaboration/ 有出入）；被 studioCanvasPersistence 与 canvasProjection 同源引用（bucket/kind 漂移即崩守卫，canvasProjection.cjs L89-128）。
+- **叶 3 ⚠️部分**：`STUDIO_CANVAS_KIND_SCOPED` 分流已接——data-only node.update → kind-scoped LWW 直写（9fb7e85 Phase-2）、纯边 create/delete → kind-scoped merge 直写（a5e7770 Phase-3）、reject-409 / 混合 kind / 非 data-only 回落整画布 CAS（handlePatch L335-356）；env-on real-PG 集成 18/18（6cf5d7a）。append 类未接线。
+- **叶 4 ⚠️部分**：直写执行器 `applyKindScopedLww/Merge` 已合（handlePatch 接线）；纯重放 `canvasProjection.applyLogToProjection`（cec8a3e wave G，33/33）与 `studioCanvasPersistence.rebuildProjection`（a5e7770，导出 L469）已导出 + 单测，但**无任何生产挂载点** → 挂载前置条件缺口见 §7-c（Phase-4 挂载剩余）。
+- **叶 5 ⚠️部分**：FE 契约层已合——`schemas.ts` conflict extras + hook passthrough（cec8a3e）、CanvasConflictBanner（b0d81c8）；**服务端 409 body 未扩展**（仍 `{serverRevision, canvasId}`）→ 见 §7-e。
+- **叶 6 ⬜未合**：presence 已 PG 化（8f161f4，0047 store + async bus adapter），但 canvas append 路由未接、实时通道约束未变（§6 结论成立）。
+- **叶 7 ⚠️部分**：Banner 替换 monolithic conflict-panel（b0d81c8）+ reload 失败保留 buffer/成功才 clear（60b18cd，dirty-loss HIGH 修复）已合；kindPolicy 增量 rebase 分支为**前向脚手架**——服务端不发 kindPolicy，真实 409 恒 legacy undefined → 整图 reload（§7-e）。
+- **叶 8 ⚠️部分**：纯重放单测（canvasProjection 33/33；persistence rebuildProjection 用例）+ env-on real-PG 集成组（6cf5d7a，18/18）+ 命令日志游标读 API（47675df，23/23；`GET /api/v2/projects/:id/studio/canvas/commands?afterSeq=` 已挂载 server.js）已合；「快照 + listAfter → 投影落库」的**重建链未挂载** → 见 §7-c（Phase-4 挂载剩余）。
 
 ---
 
@@ -201,3 +214,51 @@
 - `recordCanvasPatch` 当前 warn-only 的判定基于源码阅读（L160-171、L237 注释），非运行时日志实测；Phase 1 起日志是否已实际积累数据未验证。
 - 「命令日志作为真源 + 投影」是**设计主张**，非现状描述；现状命令日志是「旁路地基、未挂载为权威」（0046 注释「地基, 未挂载」、18 审计「命令总线零」）。
 - 叶 6（presence/append 路由）依赖 G22 命令总线/传输层（SSE/WS），当前仓库**零实时通道**（18 审计 §3），故叶 6 是「预留契约接入」，非可立即落地的执行端点。
+
+---
+
+## 7. 审计收编（2026-09-04）
+
+> 本节为 pro-audit 对 §1-5 设计「已实现 vs 仍缺口」的收编，纯文档：结论全部来自 git 近波提交（16e55fe..HEAD **60b18cd**）摘要与 HEAD 源码读取，**未运行 DB/API/测试，不作任何「已实测」声称**。本节 L 行号均指 HEAD(60b18cd) 对应文件行号（与 §1 引用 0014/0046 的行号体系不同，已就地标注文件名）。a/b 为 60b18cd 新修；c/d/e 未修。
+
+### 7.1 a) assertBindingsValid：LWW 直写与整画布 CAS 同源（HIGH，**已修** @60b18cd）
+
+- **问题**：权威绑定守卫（W2-06：`data.shotId`/`data.structureNodeId` 必须指向项目域执行 shot / 结构节点）修复前仅内联在整画布 CAS 路径。`STUDIO_CANVAS_KIND_SCOPED=1` 时 data-only node.update 走 kind-scoped LWW 直写（不改 revision、无 CAS 门）→ **env 开即绕过绑定守卫**，可把节点绑定串改写为项目外非权威 id。
+- **修复**：守卫抽为模块级 `assertBindingsValid(client, projectId, canvasId, nodes)`（studioCanvasPersistence.cjs L131-147），CAS 路径（L369）与 LWW 直写路径（applyKindScopedLww L241）**共用同一校验**；非法抛 `BINDING_INVALID`（带 bindingErrors/canvasId）→ handlePatch catch 统一 409（L383）。merge 路径（纯边 upsert/delete）不携绑定串，无需该校验。60b18cd 增补测试（studioCanvasPersistence.test.cjs +127 行）。
+
+### 7.2 b) insertMutation：ON CONFLICT 幂等，防同 clientMutationId 并发 23505（HIGH，**已修** @60b18cd）
+
+- **问题**：kind-scoped LWW/merge 直写无整画布 CAS 门，同 `clientMutationId` 并发双请求在「prior SELECT 空（L331）→ 各自写入」TOCTOU 窗内撞 `UNIQUE(canvas_id, client_mutation_id)`（0014 L88）→ 23505 → 500。
+- **修复**：三处裸 INSERT 统一改走模块级 `insertMutation`（L154-168）：`INSERT … ON CONFLICT (canvas_id, client_mutation_id) DO NOTHING RETURNING client_mutation_id`；冲突（0 行）→ 回读已提交 `response_json` → 调用方 ROLLBACK 后 200 `{...raced, idempotent: true}`。接线点：L254-255（lww）、L295-296（merge）、L375-376（CAS）。
+
+### 7.3 c) rebuildProjection / applyLogToProjection：挂载前置条件（MEDIUM，**未修**）
+
+- **现状**：两支纯重放函数均已导出并通过单测，但**无任何生产挂载点**（grep 全仓：仅自身模块与测试引用）：
+  - `canvasProjection.applyLogToProjection`（canvasProjection.cjs L385-398；cec8a3e wave G，33/33）——严格重放：Phase-1/2 历史行（payload.ops 为计数对象/无行值）**不可重放**，喂入即 `ERR_INVALID_LOG`（L366-367 明示「rebuild cursor must start after Phase-3 snapshot」；模块头 L65-67 同嘱）。reject 桶内容入日志 → `ERR_REJECT_BUCKET_IN_LOG`（拒绝而非错图）。
+  - `studioCanvasPersistence.rebuildProjection`（L432-467，导出 L469；a5e7770）——宽容重放（畸形 entry/op 静默跳过），只消费 kind 分解 ops（lww data-only / merge edge 载荷），注释自述「调用方须 seq 升序」。
+- **挂载前置条件三缺**（= 叶 4/叶 8 剩余工作，Phase-4 挂载）：
+  1. **seq 游标起点**：重放只能从「快照点之后的 seq」开始——早于快照的行已体现在 current，且 Phase-1/2 计数载荷行不可重放；当前无每画布持久化的「最后可重放 seq / 快照 seq」游标标记；
+  2. **current 快照取点**：重建基线 `{nodes, edges}` 在何处、何时取，如何与游标读取构成一致点（并发写入窗内「快照与游标错位」会漏行/重放/双写）；
+  3. **基线断言**：快照 ↔ 游标起点对应性无断言/漂移检测；两函数皆纯（零 I/O），快照必须由调用方自供并自证对应。
+- **已就绪的半程**：命令日志游标读 API 已挂载——`GET /api/v2/projects/:id/studio/canvas/commands?afterSeq=…`（canvasCommandLogApi.cjs：READ_SQL `WHERE canvas_id=$1 AND seq > $2 ORDER BY seq ASC` L93-96；server.js L62 引入 / L1538 装配 / L2689 挂载；47675df wave I，23/23）——「按 seq 游标拉增量」读侧已有；缺的是把纯重放挂上「快照 + listAfter → 投影落库」的重建链（无重建端点/无启动时自愈路径）。
+
+### 7.4 d) CAS 成功响应 mode 落位不一致：顶层 vs extra 袋（LOW，**未修**）
+
+- kind-scoped lww/merge 成功响应：`mode`/`revision`/`ok` **显式平铺在 body 顶层**——L253 `{...response(...), ok: true, mode: 'kind-scoped-lww', revision: fresh.revision}`；L294 同构 `'kind-scoped-merge'`。
+- 整画布 CAS 成功响应：`mode: 'canvas-cas'` 塞进局部 **extra 袋**（L374 `const extra = {applied:true, clientMutationId:cmid}; if (kindScopedEnabled()) extra.mode='canvas-cas'`），经 `response()` 的 `...extra.extra`（L94）通道平铺带出；env 关（legacy）时 CAS 成功响应**无 mode 字段**（lww/merge 的 mode 则无条件存在）。
+- 不一致点：构造/通道两套（顶层显式 vs extra 袋）、值词表两套（`kind-scoped-lww/merge` vs `canvas-cas`）、legacy 缺失；FE 侧**零 mode 消费点**（src/ 无 'kind-scoped'/'canvas-cas' 引用）→ 纯服务端形状问题，无现网行为差。LOW，未修。
+
+### 7.5 e) 服务端 409 仍只回 {serverRevision, canvasId}；kindPolicy client 分支为前向脚手架（FE 审计结论）
+
+- **服务端**：所有 409 仍只回 `{serverRevision, canvasId}`——handlePatch CAS CONFLICT（L357）、版本 restore CAS（L389）；`BINDING_INVALID` 409 亦仅 `{errors, canvasId}`（L383）。§4/叶 5 设计的 `kindPolicy/commandSeq` 字段**服务端侧未实现**。
+- **FE 已先行建模（零行为变化）**：
+  - `src/features/studio-v2/schemas.ts` L13-70：`StudioConflictKindPolicySchema`（reject409/lww/merge/append）+ `ConflictInfoSchema`（kindPolicy/commandSeq 均 optional）+ `parseConflictInfo`（absent→undefined）+ `conflictClientMode`（lww|merge→'rebase'、reject409|undefined→'reload'、append→'none'）。
+  - `useStudioCanvasPersistence.ts` L65-69：parseConflict 仅要求 409 + serverRevision + canvasId（与扩展前同门槛），kindPolicy/commandSeq 附加剥离；L105 F1 按 `serverRevision` 重试一次。
+  - `CanvasConflictBanner.tsx` L41-56：lww/merge→amber「已按最新内容自动合并」、append→neutral；L58-73：reject409 **与 legacy undefined**→danger 整图 reload CTA。
+- **FE 审计结论**：因服务端从不发 kindPolicy，真实 409 恒为 legacy undefined → `conflictClientMode` 恒 'reload'（整图 reload 语义，与扩展前完全一致）；banner 的 lww/merge/append 分支、hook 的 rebase 语义均为**前向脚手架**（测试明示：schemas.test.ts L12-18 legacy body→新字段 undefined、CanvasConflictBanner.test.tsx L33 legacy undefined→reject409 类）。kindPolicy 驱动的增量 rebase 须等服务端 409 扩展（叶 5 服务端侧）落地方可触达。
+
+### 7.6 与 §5 拆叶清单的对应
+
+- a/b = 叶 3/叶 4 已合实现之上的加固修复（60b18cd），不新增叶。
+- c = 叶 4 + 叶 8 的剩余「Phase-4 挂载」缺口；e = 叶 5 的服务端侧缺口（FE 侧已合）；d = 已合路径间的成功响应形状欠统一（并入叶 5 同域观察）。
+- 各叶合并状态与依据见 §5.1。
