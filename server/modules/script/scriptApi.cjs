@@ -37,7 +37,16 @@
  *          recomputed server-side (rows → buildStoryboardPlan → beats →
  *          storyboardBatchPlan) and every shot lacking a produced image is
  *          enqueued via batchTaskStore.createBatch. rows 空 / 计划空 → 400.
- *          Success 200 { ok:true, batchId, enqueued, total }.
+ *          Batch 一致性收口: ① 前置 dirty 门 —— 该 script 最新代持久化计划
+ *          dirty=true（rows 写 markDirty 或 存储指纹 ≠ 现算指纹）→ 409
+ *          { ok:false, error:'PLAN_DIRTY', message:'先 apply 再批量生成' }，
+ *          不建批（与 GET plan 视图同口径 readPlanStaleness）; ② locked shot
+ *          （0052）钉在旧代、apply 也跳过 —— 批量同样不为 locked shot 建任务
+ *          （建批前查 (project,script) 锁定集合并排除）; ③ 全锁 → 空批 200
+ *          { ok:true, batchId:null, enqueued:0, total, skippedLocked:全部,
+ *          dirty:false }（选 200 非 409：请求合法只是无可生成内容；空批无任务
+ *          行、不 mint 批次）。Success 200 { ok:true, batchId, enqueued, total,
+ *          skippedLocked:[被锁排除的 shotId], dirty:false }。
  *   GET    /api/v2/script/storyboard/batches/:batchId   batch view (tasks +
  *          progress). Read follows GET /rows (viewer may read).
  *   POST   /api/v2/script/storyboard/batches/:batchId/retry-failed   batch-wide
@@ -74,6 +83,7 @@ const {
   markDirty,
   lockShots,
   computePlanFingerprint,
+  SQL: { LOCKED_SHOT_IDS_SQL },
 } = require('./storyboardShots.cjs');
 const { storyboardBatchPlan } = require('./storyboardBatchPlan.cjs');
 const { createBatchTaskStore } = require('./batchTaskStore.cjs');
@@ -264,6 +274,25 @@ function createScriptApi({ pg, sessionUser, sendJSON, parseBody }) {
     }
   }
 
+  // 0054 共用读取：某 (project, script) 最新代持久化计划的陈旧度。dirty = 最新代
+  // 存在 markDirty 脏行（rows 写后置位、apply 落新行即清），或存储指纹 ≠
+  // freshFingerprint（现算——rows 结构被绕过 API 直改的兜底）；从未 apply（无
+  // 计划行）→ { dirty:false, storedFingerprint:null }。GET plan 视图与 POST batch
+  // 前置 dirty 门共用同一计算（同一 PERSISTED_PLAN_SUMMARY_SQL），口径恒一致。
+  async function readPlanStaleness(projectId, scriptId, freshFingerprint) {
+    const sum = await pg.query(PERSISTED_PLAN_SUMMARY_SQL, [projectId, scriptId]);
+    const persistedRow = sum && sum.rows && sum.rows[0] ? sum.rows[0] : null;
+    const storedFingerprint = persistedRow && persistedRow.fingerprint != null
+      ? String(persistedRow.fingerprint)
+      : null;
+    const persistedDirty = persistedRow ? !!persistedRow.dirty : false;
+    return {
+      dirty: persistedDirty
+        || (storedFingerprint !== null && storedFingerprint !== freshFingerprint),
+      storedFingerprint,
+    };
+  }
+
   // POST …/batches/:batchId/tasks/:taskId/retry — single-task partial retry.
   // Only a FAILED row with attempt < max_attempts may be reset to QUEUED
   // (attempt+1, result_ref/error cleared). Rejected otherwise: 404 when the
@@ -435,6 +464,21 @@ function createScriptApi({ pg, sessionUser, sendJSON, parseBody }) {
         });
       }
       if (storyboard.kind === 'createBatch') {
+        // ── 前置 dirty 门（batch 一致性收口 ①）── 批量生成只对准「已 apply 且
+        // 最新」的计划：最新代 dirty=true（rows 写 markDirty 置位，或存储指纹 ≠
+        // 本次现算指纹）⇒ 持久化计划已落后于 script_rows，此刻批量生成会按过期
+        // 结构产图 → 409 PLAN_DIRTY 且不建批；先 apply 落新行（dirty 复位 false）
+        // 再批量生成。与 GET plan 视图共用 readPlanStaleness —— 报 STALE 与拒批
+        // 恒同口径。从未 apply（无计划行 → dirty false）不拦：批量以服务端现算
+        // 计划为准（既有语义）。
+        const stale = await readPlanStaleness(projectId, scriptId, computePlanFingerprint(plan));
+        if (stale.dirty) {
+          return sendJSON(res, 409, {
+            ok: false,
+            error: 'PLAN_DIRTY',
+            message: '先 apply 再批量生成',
+          });
+        }
         // shotImagesByShotId: 当前没有"已产出图"注册表（迁移 0001–0052 无
         // shot→produced-image 表）——传空查找即每个计划 shot 都入队；执行引擎
         // 经 result_ref 记录产出后，后续叶子可接入真实查找让已产出 shot 跳过。
@@ -449,7 +493,32 @@ function createScriptApi({ pg, sessionUser, sendJSON, parseBody }) {
         if (bp.tasks.length === 0) {
           return sendJSON(res, 400, { ok: false, error: '计划为空：无待生成的镜头任务（空计划）' });
         }
-        const created = await batchStore.createBatch({ scriptId, tasks: bp.tasks });
+        // ── locked shot 排除（batch 一致性收口 ②，0052）── locked shot 钉在
+        // 旧代（apply 亦跳过覆写/删除），批量生成同样不得为其建任务：建批前查
+        // (project, script) 锁定 shot 集合并排除。skippedLocked = 锁定 ∩ 本计划
+        // shot（按计划序，只回报本次真正被拦下的）；total 恒为计划 shot 数。
+        const lockRes = await pg.query(LOCKED_SHOT_IDS_SQL, [scriptId, projectId]);
+        const lockedIds = new Set((lockRes.rows || []).map((r) => String(r.shot_id)));
+        const total = bp.counts && Number.isInteger(bp.counts.total) ? bp.counts.total : bp.tasks.length;
+        const skippedLocked = lockedIds.size === 0
+          ? []
+          : bp.tasks.filter((t) => lockedIds.has(t.shotId)).map((t) => t.shotId);
+        const tasks = lockedIds.size === 0 ? bp.tasks : bp.tasks.filter((t) => !lockedIds.has(t.shotId));
+        // ── 全锁 → 空批（batch 一致性收口 ③，决策：200 而非 409）── 请求合法
+        // 只是无可生成内容，不 mint 批次（空批次无任务行、GET 视图无法列出）→
+        // 200 { ok:true, batchId:null, enqueued:0, total, skippedLocked:全部,
+        // dirty:false }，batchId null 即「空批、无落库任务」的注明。
+        if (tasks.length === 0) {
+          return sendJSON(res, 200, {
+            ok: true,
+            batchId: null,
+            enqueued: 0,
+            total,
+            skippedLocked,
+            dirty: false,
+          });
+        }
+        const created = await batchStore.createBatch({ scriptId, tasks });
         if (!created || created.ok !== true) {
           const e = created && created.error;
           const reason = e && typeof e.message === 'string'
@@ -457,12 +526,13 @@ function createScriptApi({ pg, sessionUser, sendJSON, parseBody }) {
             : (e && typeof e.code === 'string' ? e.code : '批次创建失败');
           return sendJSON(res, 500, { ok: false, error: reason });
         }
-        const total = bp.counts && Number.isInteger(bp.counts.total) ? bp.counts.total : bp.tasks.length;
         return sendJSON(res, 200, {
           ok: true,
           batchId: created.batchId,
           enqueued: created.enqueued,
           total,
+          skippedLocked,
+          dirty: false,
         });
       }
       if (storyboard.kind === 'apply') {
@@ -488,21 +558,14 @@ function createScriptApi({ pg, sessionUser, sendJSON, parseBody }) {
       // dirty = 持久化计划落后于 script_rows —— 该 script 最新代存在 markDirty
       // 脏行（rows 写后置位，apply 落新行即清），或存储指纹 ≠ 本次现算指纹
       // （rows 结构变化而未被 flag 覆盖的兜底）；planFingerprint = 存储的
-      // 最新代计划指纹（客户端可自行与现算比较），从未 apply → null。
-      const freshFingerprint = computePlanFingerprint(plan);
-      const sum = await pg.query(PERSISTED_PLAN_SUMMARY_SQL, [projectId, scriptId]);
-      const persistedRow = sum && sum.rows && sum.rows[0] ? sum.rows[0] : null;
-      const storedFingerprint = persistedRow && persistedRow.fingerprint != null
-        ? String(persistedRow.fingerprint)
-        : null;
-      const persistedDirty = persistedRow ? !!persistedRow.dirty : false;
-      const dirty = persistedDirty
-        || (storedFingerprint !== null && storedFingerprint !== freshFingerprint);
+      // 最新代计划指纹（客户端可自行与现算比较），从未 apply → null。与 batch
+      // 前置门共用 readPlanStaleness（见文件头 0054 接线说明）。
+      const stale = await readPlanStaleness(projectId, scriptId, computePlanFingerprint(plan));
       return sendJSON(res, 200, {
         ok: true,
         plan: { beats: plan.beats, totalShots: plan.totalShots },
-        dirty,
-        planFingerprint: storedFingerprint,
+        dirty: stale.dirty,
+        planFingerprint: stale.storedFingerprint,
       });
     }
 

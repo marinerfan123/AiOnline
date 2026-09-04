@@ -164,6 +164,14 @@ function makeHarness({ memberFor = ['p-1'], role = 'editor', characters = [], lo
           .sort((a, b) => (a.task_id < b.task_id ? -1 : a.task_id > b.task_id ? 1 : 0));
         return { rows };
       }
+      if (/SELECT shot_id FROM project_shots_rows/.test(sql)) {
+        // LOCKED_SHOT_IDS_SQL: script_id=$1, project_id=$2, locked=true
+        // (batch 建批前置排除 locked shot；apply 内部同款查询也走这里)
+        const lockedRows = state.shots
+          .filter((s) => s.script_id === params[0] && s.project_id === params[1] && s.locked === true)
+          .map((s) => ({ shot_id: s.shot_id }));
+        return { rows: lockedRows };
+      }
       return { rows: [] };
     },
   };
@@ -1087,4 +1095,130 @@ test('0054: GET storyboard 未登录 → 401 且不触达 dirty/fp（沿用既�
   const res = {};
   await anon.handle({ params: { projectId: 'p-1' } }, res, '/api/v2/script/s-1/storyboard', 'GET');
   assert.equal(res.status, 401);
+});
+
+// ══ batch 一致性收口 — dirty 前置门(409 PLAN_DIRTY) + locked shot 排除 + 全锁空批 ══
+// 批次创建前置语义（与 GET plan 视图同口径）：
+//   ① 最新代持久化计划 dirty=true（rows 写 markDirty，或 存储指纹 ≠ 现算指纹）
+//      → 409 { ok:false, error:'PLAN_DIRTY', message:'先 apply 再批量生成' }，不建批；
+//   ② locked shot（0052）不为它建任务 → 200 { enqueued, total,
+//      skippedLocked:[被锁排除的 shotId], dirty:false }；
+//   ③ 全锁且无任务 → 200 空批（选 200 非 409：请求合法只是无可生成内容；
+//      空批无任务行、不 mint 批次 → batchId:null 注明），而非 409。
+const BATCH_PATH = '/api/v2/script/s-1/storyboard/batch';
+
+test('batch 一致性: dirty=true（rows 写后）→ POST batch 409 PLAN_DIRTY 不建批；apply 复位后放行', async () => {
+  const { api, state } = makeHarness();
+  state.rows.push(...batchRows2()); // 1 beat → k0/k1
+  // 从未 apply（无计划行 → dirty=false）：批量允许（批量以服务端现算计划为准）。
+  const neverApplied = await callParams(api, 'POST', BATCH_PATH, { projectId: 'p-1' });
+  assert.equal(neverApplied.status, 200);
+  assert.equal(neverApplied.body.enqueued, 2);
+  assert.equal(neverApplied.body.dirty, false);
+  assert.deepEqual(neverApplied.body.skippedLocked, []);
+  assert.ok(neverApplied.body.batchId.startsWith('bt-'));
+  // apply 落最新代（clean）→ 仍放行（apply 后过）。
+  const applied = await callParams(api, 'POST', '/api/v2/script/s-1/storyboard/apply', { projectId: 'p-1' });
+  assert.equal(applied.status, 200);
+  const ok = await callParams(api, 'POST', BATCH_PATH, { projectId: 'p-1' });
+  assert.equal(ok.status, 200);
+  assert.equal(ok.body.ok, true);
+  assert.equal(ok.body.dirty, false);
+  const batchesBefore = state.batches.length;
+  // rows 写（PATCH）→ 0054 markDirty 置位该 script 全部计划行 → 最新代 dirty=true。
+  const patch = await call(api, 'PATCH', { text: 'A hesitates.' }, '/api/v2/script/rows/sb-a', 'p-1');
+  assert.equal(patch.status, 200);
+  const view = await callParams(api, 'GET', '/api/v2/script/s-1/storyboard', { projectId: 'p-1' });
+  assert.equal(view.body.dirty, true, '前置：rows 写后计划视图应报 STALE');
+  // dirty → 409 PLAN_DIRTY（精确 body），且不建批。
+  const blocked = await callParams(api, 'POST', BATCH_PATH, { projectId: 'p-1' });
+  assert.equal(blocked.status, 409);
+  assert.deepEqual(blocked.body, {
+    ok: false,
+    error: 'PLAN_DIRTY',
+    message: '先 apply 再批量生成',
+  });
+  assert.equal(state.batches.length, batchesBefore, '409 不得建批');
+  // apply 落新行 → dirty 复位 false → 批量放行（apply 后过）。
+  const reapply = await callParams(api, 'POST', '/api/v2/script/s-1/storyboard/apply', { projectId: 'p-1' });
+  assert.equal(reapply.status, 200);
+  const ok2 = await callParams(api, 'POST', BATCH_PATH, { projectId: 'p-1' });
+  assert.equal(ok2.status, 200);
+  assert.equal(ok2.body.ok, true);
+  assert.equal(ok2.body.enqueued, 2);
+  assert.equal(ok2.body.total, 2);
+  assert.equal(ok2.body.dirty, false);
+  assert.deepEqual(ok2.body.skippedLocked, []);
+});
+
+test('batch 一致性: 无脏行但存储指纹 ≠ 现算（直改 rows）同样 409 —— 与 GET 兜底同口径', async () => {
+  const { api, state } = makeHarness();
+  state.rows.push(seedRow('sb-a', { scene_index: 0, row_index: 0, kind: 'action', text: 'A enters.' }));
+  const applied = await callParams(api, 'POST', '/api/v2/script/s-1/storyboard/apply', { projectId: 'p-1' });
+  assert.equal(applied.status, 200);
+  // 绕过 API 直改 rows（无 markDirty），但结构变化（scriptRowIds 增加）→ 指纹变。
+  state.rows.push(seedRow('sb-b', { scene_index: 0, row_index: 1, kind: 'action', text: 'B follows.' }));
+  const view = await callParams(api, 'GET', '/api/v2/script/s-1/storyboard', { projectId: 'p-1' });
+  assert.equal(view.body.dirty, true, '指纹比较兜底应报 STALE');
+  assert.ok(state.shots.every((s) => s.dirty === false), '无 dirty 行：纯指纹失配');
+  const res = await callParams(api, 'POST', BATCH_PATH, { projectId: 'p-1' });
+  assert.equal(res.status, 409);
+  assert.equal(res.body.error, 'PLAN_DIRTY');
+  assert.equal(res.body.message, '先 apply 再批量生成');
+  assert.equal(state.batches.length, 0, '409 不得建批');
+});
+
+test('batch 一致性: locked shot 不建任务 → 200 {enqueued, total, skippedLocked:[锁定], dirty:false}', async () => {
+  const { api, state } = makeHarness();
+  state.rows.push(...batchRows2()); // 1 beat → k0/k1
+  await callParams(api, 'POST', '/api/v2/script/s-1/storyboard/apply', { projectId: 'p-1' });
+  assert.equal(state.shots.length, 2);
+  // 锁 k0（0052 路由）；锁定非 rows 写 → 不改 dirty。
+  const lock = await callBody(api, 'POST', { shotIds: ['s0:b0:k0'], locked: true },
+    '/api/v2/script/s-1/storyboard/shots/lock', { projectId: 'p-1' });
+  assert.equal(lock.status, 200);
+  const res = await callParams(api, 'POST', BATCH_PATH, { projectId: 'p-1' });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.ok, true);
+  assert.equal(res.body.enqueued, 1, '只入队未锁定 shot');
+  assert.equal(res.body.total, 2, 'total = 计划 shot 数（含被锁排除者）');
+  assert.deepEqual(res.body.skippedLocked, ['s0:b0:k0']);
+  assert.equal(res.body.dirty, false);
+  assert.ok(res.body.batchId.startsWith('bt-'));
+  // 任务行里没有 k0：批内仅 k1。
+  const taskRows = state.batches.filter((r) => r.script_id === 's-1');
+  assert.deepEqual(taskRows.map((r) => r.shot_id), ['s0:b0:k1']);
+  assert.ok(taskRows.every((r) => r.status === 'QUEUED' && r.kind === 'image_gen'));
+  const view = await callParams(api, 'GET', `/api/v2/script/storyboard/batches/${res.body.batchId}`, { projectId: 'p-1' });
+  assert.equal(view.status, 200);
+  assert.deepEqual(view.body.tasks.map((t) => t.shotId), ['s0:b0:k1']);
+});
+
+test('batch 一致性: 全锁且无任务 → 200 空批 {enqueued:0, skippedLocked:全部}（选 200 非 409，batchId:null 注明）', async () => {
+  const { api, state } = makeHarness();
+  state.rows.push(...batchRows2());
+  await callParams(api, 'POST', '/api/v2/script/s-1/storyboard/apply', { projectId: 'p-1' });
+  const ids = ['s0:b0:k0', 's0:b0:k1'];
+  const lock = await callBody(api, 'POST', { shotIds: ids, locked: true },
+    '/api/v2/script/s-1/storyboard/shots/lock', { projectId: 'p-1' });
+  assert.equal(lock.status, 200);
+  const res = await callParams(api, 'POST', BATCH_PATH, { projectId: 'p-1' });
+  assert.equal(res.status, 200, '全锁 → 200 空批（决策：非 409）');
+  assert.equal(res.body.ok, true);
+  assert.equal(res.body.batchId, null, '空批无任务落库、不 mint 批次 → batchId null 注明');
+  assert.equal(res.body.enqueued, 0);
+  assert.equal(res.body.total, 2);
+  assert.deepEqual(res.body.skippedLocked, ids);
+  assert.equal(res.body.dirty, false);
+  assert.equal(state.batches.length, 0, '空批不产生任何任务行');
+  // 解锁其一后重试 → 该 shot 正常入队（空批语义不污染后续批次）。
+  const unlock = await callBody(api, 'POST', { shotIds: ['s0:b0:k0'], locked: false },
+    '/api/v2/script/s-1/storyboard/shots/lock', { projectId: 'p-1' });
+  assert.equal(unlock.status, 200);
+  const retry = await callParams(api, 'POST', BATCH_PATH, { projectId: 'p-1' });
+  assert.equal(retry.status, 200);
+  assert.equal(retry.body.enqueued, 1);
+  assert.equal(retry.body.total, 2);
+  assert.deepEqual(retry.body.skippedLocked, ['s0:b0:k1']);
+  assert.equal(retry.body.dirty, false);
 });
