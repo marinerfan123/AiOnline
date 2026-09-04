@@ -107,6 +107,7 @@ import referenceStylesMod from './reference-styles.cjs'; // 参考样式库：�
 import referenceStyleAudit from './reference-style-audit.cjs'; // 参考样式 AI 预审
 import agentResolver from './agent-model-resolver.cjs';         // 智能体文本模型统一解析（全局兜底模型）
 import seedDefaultsMod from './seed-defaults.cjs'; // 首次部署兜底种子（占位服务商 + 常用模型）
+import flags from './modules/modelhub/flags.cjs'; // L7 视频轨灰度旗标（FF_VIDEO_* 默认 off，resolveFlag/isFlagEnabled）
 
 // 初始化向导限流（同一进程内 ≤20 次/10min；真正防护靠"建好即锁定"）
 const setupAttempts = new Map();
@@ -5135,6 +5136,17 @@ if (pgPool && IS_LEADER) {
   dispatcher.startUploadQueue(pgPool)
     .then(() => console.log('[startup] 上传队列 worker 已启动'))
     .catch((e) => console.warn('[startup] 上传队列启动失败（不影响启动）:', e.message));
+
+  // L11 生产挂载（§138 渐进上线，默认 OFF）：generation_outbox_v2 relay 消费面。
+  // 仅当 FF_VIDEO_DURABLE_EVENTS=1（L7 视频轨旗标）时启动，定时消费 outbox 事件续投 legacy 分发
+  // （runGenerationRelayTick → dispatchFromOutbox → driveGenerateTask）。默认 off 不改变现行为。
+  // 裁决：relay 复用视频轨旗标 VIDEO_DURABLE_EVENTS gate（非独立 GENERATION_OUTBOX_RELAY_ENABLED）。
+  if (typeof dispatcher.runGenerationRelayTick === 'function' && flags.isFlagEnabled('VIDEO_DURABLE_EVENTS')) {
+    setInterval(() => {
+      dispatcher.runGenerationRelayTick(pgPool, { workerId: `legacy-relay-${process.pid}` }).catch(() => {});
+    }, 5000);
+    console.log('[startup] generation outbox relay 已启动（FF_VIDEO_DURABLE_EVENTS=1，每 5s 一个 tick）');
+  }
 }
 
 // ─── 核心错误持久化 + 进程级异常兜底（#449/#450）───

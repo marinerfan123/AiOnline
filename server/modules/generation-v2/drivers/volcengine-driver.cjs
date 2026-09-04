@@ -22,7 +22,7 @@
  */
 
 const {
-  normalizeStatus, normalizeError, normalizeResult, DRIVER_ERROR,
+  normalizeStatus, normalizeError, normalizeResult, DRIVER_ERROR, registerDriverFactory,
 } = require('../provider-adapter.cjs');
 
 const DEFAULT_BASE_URL = 'https://ark.cn-beijing.volces.com/api/v3';
@@ -194,5 +194,9 @@ function createVolcengineDriver({ http, credentials, baseUrl } = {}) {
 
   return { submit, poll, fetch, cancel, compile };
 }
+
+// 静态工厂注册（§138 无副作用）：模块加载即登记工厂引用，不实例化、不 I/O。
+// fromContract(..., { instantiate }) 在 DI 层提供 http/credentials 后延迟实例化。
+registerDriverFactory('volcengine', createVolcengineDriver);
 
 module.exports = { createVolcengineDriver, DEFAULT_BASE_URL };

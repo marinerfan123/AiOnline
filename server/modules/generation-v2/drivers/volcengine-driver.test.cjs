@@ -224,3 +224,14 @@ test('compile: 仅透传 provider 层可表达参数（不掺 quota/billing/rout
   });
   assert.ok(!('userId' in out) && !('quotaScope' in out) && !('maxCostAuthorized' in out) && !('routingPolicy' in out));
 });
+
+// ── 静态工厂注册（§138 无副作用）──
+test('静态注册: 模块加载即登记 volcengine 工厂（无副作用），fromContract 经 instantiate 解析', () => {
+  const { registeredDriverFactories, fromContract } = require('../provider-adapter.cjs');
+  assert.ok(registeredDriverFactories().includes('volcengine'));
+  const adapter = fromContract('p-volc', { driver_kind: 'volcengine' }, {
+    instantiate: (f) => f({ http: { request: async () => ({ status: 200, body: {} }) }, credentials: { apiKey: 'k' } }),
+  });
+  assert.equal(adapter.driverKind, 'volcengine');
+  assert.equal(typeof adapter.submit, 'function');
+});

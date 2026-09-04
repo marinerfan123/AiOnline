@@ -244,3 +244,14 @@ test('cancel: 无公开取消端点 → UNSUPPORTED（禁 return null）', async
   assert.equal(r.errorCode, 'UNSUPPORTED');
   assert.ok(r.status !== null && r.status !== undefined);
 });
+
+// ── 静态工厂注册（§138 无副作用）──
+test('静态注册: 模块加载即登记 vidu 工厂（无副作用），fromContract 经 instantiate 解析', () => {
+  const { registeredDriverFactories, fromContract } = require('../provider-adapter.cjs');
+  assert.ok(registeredDriverFactories().includes('vidu'));
+  const adapter = fromContract('p-vidu', { driver_kind: 'vidu' }, {
+    instantiate: (f) => f({ http: { request: async () => ({ status: 200, body: { task_id: 't' } }) }, credentials: { token: 'tok' } }),
+  });
+  assert.equal(adapter.driverKind, 'vidu');
+  assert.equal(typeof adapter.submit, 'function');
+});

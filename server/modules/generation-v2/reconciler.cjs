@@ -191,6 +191,21 @@ async function resolveReconcilingItem(pg, item, injected = {}) {
     });
     return { status: 'rejected_terminal_regression' };
   }
+  // poll 同汇（L19 接线，§138 默认 OFF）：flag on 时 poll 结果经 applyProviderEvent 唯一入口归口；
+  // 由 production（entry.cjs reconcileDeps）在 FF_VIDEO_DURABLE_EVENTS=1 时注入
+  // { applyProviderEvent, eventStore }（eventStore 用 createEventReducerStore(pg) 构建）。
+  // 未注入（默认）→ 走下方旧路径，行为不变。
+  if (typeof deps.applyProviderEvent === 'function' && deps.eventStore) {
+    const outcome = await deps.applyProviderEvent({
+      store: deps.eventStore,
+      inbox: null,      // poll 路径无 webhook inbox 行
+      event: null,
+      normalizedStatus: providerResult,
+      providerRequestId: item.provider_request_id,
+    });
+    if (outcome.outcome === 'reduced') return { status: outcome.to || 'reconcile_wait' };
+    return { status: outcome.outcome };
+  }
   if (providerResult.status === 'success' && providerResult.providerUrl) {
     const row = await deps.transitionItem(pg, {
       ...base, from: 'reconciling', to: 'generated',
@@ -226,6 +241,29 @@ async function resolveReconcilingItem(pg, item, injected = {}) {
     patch: { last_error_code: 'RECONCILE_UNKNOWN', last_error: providerResult.error || 'provider status unknown', lease_expires_at: null },
   });
   return row ? { status: 'review_required' } : { status: 'stale_lease' };
+}
+
+// ─── poll 同汇 store 适配（L19 接线，§138 默认 OFF）───
+// 把 applyProviderEvent 需要的 store 契约（transitionItem + findItemByProviderRequestId）
+// 绑定到本模块的 lease.transitionItem 与 generation_items_v2 查询。production（entry.cjs）
+// 在 FF_VIDEO_DURABLE_EVENTS=1 时用它构建 eventStore，再注入 resolveReconcilingItem，
+// 使 poll 结果经 applyProviderEvent 唯一入口归口；未接线则旧路径不变。
+function createEventReducerStore(pg) {
+  if (!pg || typeof pg.query !== 'function') throw new TypeError('pg.query is required');
+  return {
+    transitionItem: (args) => lease.transitionItem(pg, { ...args, workerId: args.workerId || null }),
+    findItemByProviderRequestId: async (providerId, providerRequestId) => {
+      if (!providerRequestId) return null;
+      const r = await pg.query(
+        `SELECT * FROM generation_items_v2
+          WHERE provider_request_id = $1
+            AND ($2::text IS NULL OR provider_id = $2)
+          ORDER BY created_at ASC LIMIT 1`,
+        [String(providerRequestId), providerId || null],
+      );
+      return (r.rows && r.rows[0]) || null;
+    },
+  };
 }
 
 async function publishOutbox(pg, { limit = 100, workerId = `outbox-${process.pid}`, leaseSeconds = 60 } = {}, injected = {}) {
@@ -275,4 +313,5 @@ async function markOutboxDelivered(pg, ids) {
 module.exports = {
   claimReconciling, resolveReconcilingItem, publishOutbox, markOutboxDelivered,
   recoverSubmitUnknown, recordProviderEventAnomaly, isTerminalRegression, PROVIDER_STATUS_RANK,
+  createEventReducerStore,
 };

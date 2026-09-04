@@ -28,6 +28,7 @@ const {
   normalizeStatus: baseNormalizeStatus,
   normalizeError: baseNormalizeError,
   normalizeResult: baseNormalizeResult,
+  registerDriverFactory,
 } = require('../provider-adapter.cjs');
 
 const DEFAULT_BASE_URL = 'https://api.vidu.cn';
@@ -257,6 +258,10 @@ function createViduDriver({ http, credentials, baseUrl, operations } = {}) {
 
   return { submit, poll, fetch, cancel, compile, normalizeStatus, normalizeError, normalizeResult };
 }
+
+// 静态工厂注册（§138 无副作用）：模块加载即登记工厂引用，不实例化、不 I/O。
+// fromContract(..., { instantiate }) 在 DI 层提供 http/credentials 后延迟实例化。
+registerDriverFactory('vidu', createViduDriver);
 
 module.exports = {
   createViduDriver,

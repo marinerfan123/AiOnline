@@ -49,6 +49,7 @@ test('adapter调用注入dispatchSingle且永远count=1', async () => {
 const {
   normalizeStatus, normalizeError, normalizeResult,
   fromContract, registerDriver, registeredDriverKinds,
+  registerDriverFactory, registeredDriverFactories,
   assertDriverShape, DRIVER_METHODS, DRIVER_KINDS, DRIVER_ERROR, DriverContractError,
 } = require('./provider-adapter.cjs');
 
@@ -164,6 +165,33 @@ test('fromContract: registerDriver 注册后可经默认注册表实例化', () 
   const adapter = fromContract('p2', { driver_kind: DRIVER_KINDS.IMAGE_SYNC });
   assert.equal(adapter.driverKind, 'image-sync');
   assert.equal(typeof adapter.submit, 'function');
+});
+
+// ─── 静态工厂注册（§138 无副作用）：volcengine/fal/vidu kind 词表 + 延迟实例化 ───
+test('DRIVER_KINDS: volcengine/fal/vidu 词表已登记（L22-25 直连 driver）', () => {
+  assert.equal(DRIVER_KINDS.VOLCENGINE, 'volcengine');
+  assert.equal(DRIVER_KINDS.FAL, 'fal');
+  assert.equal(DRIVER_KINDS.VIDU, 'vidu');
+});
+
+test('registerDriverFactory: 无副作用登记工厂引用（不实例化、不校验形状），fromContract 经 instantiate 解析', () => {
+  let instantiated = 0;
+  const factory = () => { instantiated++; return makeFakeDriver(); };
+  registerDriverFactory(DRIVER_KINDS.VIDU, factory);
+  assert.equal(instantiated, 0, '登记期不得实例化（无副作用）');
+  assert.ok(registeredDriverFactories().includes('vidu'));
+
+  // 未注入 instantiate → 明确 DRIVER_NOT_INSTANTIATED（非 UNKNOWN_DRIVER_KIND：kind 已知）
+  assert.throws(
+    () => fromContract('p-vidu', { driver_kind: 'vidu' }),
+    (e) => e instanceof DriverContractError && e.code === DRIVER_ERROR.DRIVER_NOT_INSTANTIATED,
+  );
+
+  // 注入 instantiate → 工厂延迟实例化并解析 adapter
+  const adapter = fromContract('p-vidu', { driver_kind: 'vidu' }, { instantiate: (f, kind) => { assert.equal(kind, 'vidu'); return f(); } });
+  assert.equal(adapter.driverKind, 'vidu');
+  assert.equal(typeof adapter.submit, 'function');
+  assert.equal(instantiated, 1);
 });
 
 // ─── 4) 未知 driver_kind / 契约缺失 → 错误码（绝不 return null）───

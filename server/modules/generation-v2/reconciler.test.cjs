@@ -1,6 +1,6 @@
 'use strict';
 const test=require('node:test');const assert=require('node:assert/strict');
-const {claimReconciling,resolveReconcilingItem,publishOutbox,markOutboxDelivered,recordProviderEventAnomaly,isTerminalRegression}=require('./reconciler.cjs');
+const {claimReconciling,resolveReconcilingItem,publishOutbox,markOutboxDelivered,recordProviderEventAnomaly,isTerminalRegression,createEventReducerStore}=require('./reconciler.cjs');
 
 function fakePg(rows=[]){const calls=[];return{calls,async query(sql,params=[]){calls.push({sql,params});return{rows,rowCount:rows.length}}}}
 
@@ -77,4 +77,44 @@ test('resolveReconcilingItem not_found 明确转 review_required, 不盲目重�
   assert.equal(r.status,'review_required');
   assert.equal(transitions[0].to,'review_required');
   assert.equal(transitions[0].patch.last_error_code,'PROVIDER_TASK_NOT_FOUND');
+});
+
+// ─── poll 同汇（L19 接线, §138 默认 OFF）: 注入 applyProviderEvent+eventStore 经唯一入口归口 ───
+test('resolveReconcilingItem poll 同汇: 注入 applyProviderEvent+eventStore 时经唯一入口归口; 未注入走旧路径',async()=>{
+  const seen=[];
+  const pg=fakePg();
+  const store=createEventReducerStore(pg);
+  // flag on（注入 applyProviderEvent + eventStore）→ 经 applyProviderEvent 归口
+  const r=await resolveReconcilingItem(pg,{item_id:'i1',lease_version:1,provider_request_id:'r1'},{
+    queryProviderStatus:async()=>({status:'success',providerUrl:'u'}),
+    applyProviderEvent:async(opts)=>{seen.push(opts);return{outcome:'reduced',to:'generated'}},
+    eventStore:store,
+  });
+  assert.equal(r.status,'generated');
+  assert.equal(seen.length,1);
+  assert.equal(seen[0].inbox,null,'poll 路径无 inbox 行');
+  assert.equal(seen[0].event,null);
+  assert.equal(seen[0].normalizedStatus.status,'success');
+  assert.equal(seen[0].store,store,'eventStore 直传 applyProviderEvent');
+
+  // flag off（未注入）→ 旧路径（transitionItem 直写）
+  const transitions=[];
+  const r2=await resolveReconcilingItem(pg,{item_id:'i2',lease_version:1,provider_request_id:'r2'},{
+    queryProviderStatus:async()=>({status:'success',providerUrl:'u2'}),
+    transitionItem:async(_pg,a)=>{transitions.push(a);return{status:a.to}},
+  });
+  assert.equal(r2.status,'generated');
+  assert.equal(transitions.at(-1).to,'generated');
+});
+
+test('createEventReducerStore: transitionItem 绑定 lease CAS; findItemByProviderRequestId 按 provider_request_id 查询',async()=>{
+  const pg=fakePg([{item_id:'i-x',status:'reconciling',lease_version:3,provider_request_id:'pr-x'}]);
+  const store=createEventReducerStore(pg);
+  // findItemByProviderRequestId 命中
+  const item=await store.findItemByProviderRequestId(null,'pr-x');
+  assert.equal(item.item_id,'i-x');
+  assert.match(pg.calls.at(-1).sql,/provider_request_id/);
+  // transitionItem 委托 lease.transitionItem（CAS UPDATE）
+  await store.transitionItem({itemId:'i-x',leaseVersion:3,from:'reconciling',to:'generated',patch:{provider_url:'u'}});
+  assert.match(pg.calls.at(-1).sql,/UPDATE generation_items_v2/);
 });

@@ -35,6 +35,7 @@ const {
   normalizeError,
   normalizeResult,
   DriverContractError,
+  registerDriverFactory,
 } = require('../provider-adapter.cjs');
 
 const DEFAULT_BASE_URL = 'https://queue.fal.run';
@@ -341,6 +342,10 @@ function registerFalDriver(driver, kind = 'fal') {
   const { registerDriver } = require('../provider-adapter.cjs');
   return registerDriver(kind, driver);
 }
+
+// 静态工厂注册（§138 无副作用）：模块加载即登记工厂引用，不实例化、不 I/O。
+// fromContract(..., { instantiate }) 在 DI 层提供 http/credentials 后延迟实例化。
+registerDriverFactory('fal', createFalDriver);
 
 module.exports = {
   createFalDriver,

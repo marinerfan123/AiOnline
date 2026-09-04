@@ -262,3 +262,14 @@ test('normalizeArtifacts: 纯函数暴露(直测 files 归一)', () => {
   assert.deepEqual(arts, [{ url: 'u.mp4', role: 'video', content_type: 'video/mp4' }]);
   assert.equal(DEFAULT_BASE_URL, 'https://queue.fal.run');
 });
+
+// ── 静态工厂注册（§138 无副作用）──
+test('静态注册: 模块加载即登记 fal 工厂（无副作用），fromContract 经 instantiate 解析', () => {
+  const { registeredDriverFactories, fromContract } = require('../provider-adapter.cjs');
+  assert.ok(registeredDriverFactories().includes('fal'));
+  const adapter = fromContract('p-fal-static', { driver_kind: 'fal' }, {
+    instantiate: (f) => f({ http: async () => ({ status: 200, body: {} }), credentials: 'k' }),
+  });
+  assert.equal(adapter.driverKind, 'fal');
+  assert.equal(typeof adapter.submit, 'function');
+});

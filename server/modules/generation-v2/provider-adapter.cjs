@@ -80,11 +80,16 @@ const DRIVER_KINDS = Object.freeze({
   VOLCANO: 'volcano',
   GENERIC_VIDEO: 'generic-video',
   IMAGE_SYNC: 'image-sync',
+  // L22-25 直连 driver（volcengine/fal/vidu）——静态工厂注册（§138 无副作用）后 fromContract 可解析。
+  VOLCENGINE: 'volcengine',
+  FAL: 'fal',
+  VIDU: 'vidu',
 });
 
 // 错误码（§70 Error Taxonomy 子集 + 契约层专用码）。三归一与工厂只产出这些码。
 const DRIVER_ERROR = Object.freeze({
   UNKNOWN_DRIVER_KIND: 'UNKNOWN_DRIVER_KIND',
+  DRIVER_NOT_INSTANTIATED: 'DRIVER_NOT_INSTANTIATED',
   CONTRACT_MISSING: 'CONTRACT_MISSING',
   DRIVER_INTERFACE_INCOMPLETE: 'DRIVER_INTERFACE_INCOMPLETE',
   UNSUPPORTED: 'UNSUPPORTED',
@@ -210,6 +215,11 @@ function compile(driver, businessInput) {
 // 注册表用 Object.create(null) 防 prototype 链键穿透（与 providers/video/index.cjs hasAdapter 同款）。
 const _registry = Object.create(null);
 
+// 静态工厂注册表（§138 无副作用）：driver 模块加载时登记 factory 函数引用，
+// 不实例化、不 I/O。fromContract 经注入 instantiate（DI 层提供 http/credentials）延迟实例化。
+// 与 _registry（完整实例）分离，避免工厂误当作实例被 assertDriverShape 校验。
+const _factoryRegistry = Object.create(null);
+
 function registerDriver(driverKind, impl) {
   if (!driverKind || typeof driverKind !== 'string') {
     throw new DriverContractError(DRIVER_ERROR.CONTRACT_MISSING, 'registerDriver: driverKind required');
@@ -219,11 +229,28 @@ function registerDriver(driverKind, impl) {
   return impl;
 }
 
+// 静态工厂注册：仅登记工厂引用（无副作用，不校验形状、不实例化）。
+// driverKind 必须是 string，factory 必须是 function。返回 factory。
+function registerDriverFactory(driverKind, factory) {
+  if (!driverKind || typeof driverKind !== 'string') {
+    throw new DriverContractError(DRIVER_ERROR.CONTRACT_MISSING, 'registerDriverFactory: driverKind required');
+  }
+  if (typeof factory !== 'function') {
+    throw new DriverContractError(DRIVER_ERROR.CONTRACT_MISSING, 'registerDriverFactory: factory must be a function');
+  }
+  _factoryRegistry[driverKind] = factory;
+  return factory;
+}
+
 function registeredDriverKinds() {
   return Object.keys(_registry);
 }
 
-function fromContract(providerId, contractRow, { drivers } = {}) {
+function registeredDriverFactories() {
+  return Object.keys(_factoryRegistry);
+}
+
+function fromContract(providerId, contractRow, { drivers, instantiate } = {}) {
   if (!providerId || typeof providerId !== 'string') {
     throw new DriverContractError(DRIVER_ERROR.CONTRACT_MISSING, 'fromContract: providerId required');
   }
@@ -232,8 +259,24 @@ function fromContract(providerId, contractRow, { drivers } = {}) {
   if (!driverKind || typeof driverKind !== 'string') {
     throw new DriverContractError(DRIVER_ERROR.CONTRACT_MISSING, 'fromContract: contractRow.driver_kind required');
   }
-  const registry = drivers || _registry;
-  const impl = registry[driverKind];
+  // 解析优先级：显式 drivers 注入 > 静态实例注册表 > 静态工厂注册表（需 instantiate 延迟实例化）。
+  let impl;
+  if (drivers) {
+    impl = drivers[driverKind];
+  } else {
+    impl = _registry[driverKind];
+    if (!impl && _factoryRegistry[driverKind]) {
+      // 静态工厂注册（§138 无副作用）：经注入 instantiate 延迟实例化。
+      // 未注入 instantiate → 明确报 DRIVER_NOT_INSTANTIATED（非 UNKNOWN_DRIVER_KIND，kind 是已知的）。
+      if (typeof instantiate !== 'function') {
+        throw new DriverContractError(
+          DRIVER_ERROR.DRIVER_NOT_INSTANTIATED,
+          `driver_kind "${driverKind}" is registered as a factory; provide fromContract(..., { instantiate }) to resolve`,
+        );
+      }
+      impl = instantiate(_factoryRegistry[driverKind], driverKind);
+    }
+  }
   if (!impl) {
     throw new DriverContractError(DRIVER_ERROR.UNKNOWN_DRIVER_KIND, `unknown driver_kind: ${driverKind}`);
   }
@@ -267,4 +310,5 @@ module.exports = {
   DriverContractError,
   normalizeStatus, normalizeError, normalizeResult,
   assertDriverShape, compile, fromContract, registerDriver, registeredDriverKinds,
+  registerDriverFactory, registeredDriverFactories,
 };
