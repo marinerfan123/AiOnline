@@ -59,6 +59,8 @@ import mediaWorkerMod from './modules/media/mediaWorker.cjs';
 import mediaExecMod from './modules/media/executors.cjs';
 import bibleApiMod from './modules/project-foundation/bibleApi.cjs';
 import scriptApiMod from './modules/script/scriptApi.cjs';
+import communityWorksApiMod from './modules/community/communityWorksApi.cjs';
+import communityWorksStoreMod from './modules/community/worksStore.cjs';
 import continuityApiMod from './modules/project-foundation/continuityApi.cjs';
 import studioCanvasPersistenceMod from './modules/project-foundation/studioCanvasPersistence.cjs';
 import studioEpisodeApiMod from './modules/project-foundation/studioEpisodeApi.cjs';
@@ -1553,6 +1555,19 @@ const continuityApi = continuityApiMod.createContinuityApi({
 // (createPresenceBus defaults to its memory store) with periodic TTL sweep.
 // Production swaps a PG/Redis store via the same seam.
 const presenceBus = presenceBusMod.createPresenceBus({});
+
+// V3.1 Community Phase-0 — /api/v2/community/works.
+const communityWorksStore = communityWorksStoreMod.createWorksStore({
+  pg: {
+    query: (sql, params) => pgPool ? pgPool.query(sql, params) : Promise.reject(Object.assign(new Error('数据库未就绪'), { status: 503 })),
+  },
+});
+const communityWorksApi = communityWorksApiMod.createWorksApi({
+  store: communityWorksStore,
+  sessionUser: (req) => session.getUserFromCookie(req),
+  sendJSON,
+  parseBody,
+});
 const presenceApi = presenceApiMod.createPresenceApi({
   bus: presenceBus,
   sessionUser: (req) => session.getUserFromCookie(req),
@@ -2675,6 +2690,11 @@ async function handleAPI(req, res) {
   // ── G22 Presence（/api/v2/presence/heartbeat|peers/:canvasId）──
   if (url.startsWith('/api/v2/presence')) {
     if (await presenceApi.handle(req, res, url.split('?')[0], method)) return;
+  }
+
+  // ── V3.1 Community Phase-0（/api/v2/community/works）──
+  if (url.startsWith('/api/v2/community')) {
+    if (await communityWorksApi.handle(req, res, url.split('?')[0], method)) return;
   }
 
   // ── M01-S Project / Workspace Foundation（/api/v2/workspaces, /api/v2/projects）──
