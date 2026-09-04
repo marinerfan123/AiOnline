@@ -4,6 +4,7 @@ const crypto = require('crypto');
 const billing = require('./billing.cjs'); // Phase A 计费（reserve/commit/release）
 const accounting = require('./accounting.cjs'); // 全局双边账务：generate 真实消耗走账
 const videoRouter = require('./providers/video/index.cjs'); // 视频 provider 适配层（agnes/minimax/volcano/generic 路由）
+const imageIndex = require('./providers/image/index.cjs'); // 图像 provider 适配层（gpt-image/agnes/openai-compat 路由）——G10 波收口 imageGenerate 委托此层
 const { pollLoop } = require('./providers/video/shared.cjs'); // 共享自适应轮询循环（供 generic 续轮询与崩溃恢复复用）
 const realtime = require('./realtime.cjs'); // 生成任务实时通道（SSE）：终态切换时通知前端，替代前端固定轮询
 // ModelHub V3 Phase 1 — 唯一模型身份 resolver（收敛 display_name / model_id 归一逻辑，dispatcher 内不再散落处理 display_name）
@@ -218,116 +219,65 @@ function resolveEndpoint(provider, model, kind) {
 }
 
 // ─── 图片生成 ──────────────────────────────────────
-const RATIO_TO_SIZE = { '16:9': '1792x1024', '4:3': '1024x768', '1:1': '1024x1024', '3:4': '768x1024', '9:16': '1024x1792' };
-// OpenAI GPT Image 系列（gpt-image-1 / gpt-image-2 / gpt-image-1.5）支持的 size 枚举与 DALL-E 3 不同。
-// 官方有效值：auto / 1024x1024 / 1536x1024（横向 16:9） / 1024x1536（纵向 9:16）。
-// 其余比例回退到 auto，由模型按提示词自动决定画幅。
-const GPT_IMAGE_RATIO_TO_SIZE = { '1:1': '1024x1024', '16:9': '1536x1024', '9:16': '1024x1536', 'auto': 'auto' };
-const RES_MULTIPLIER = { '1k': 1, '2k': 2, '4k': 4, '8k': 8 };
-
-function bumpSize(size, res) {
-  const mul = RES_MULTIPLIER[res] || 1;
-  if (mul === 1) return size;
-  const [w, h] = size.split('x').map(Number);
-  return `${w * mul}x${h * mul}`;
-}
-
+// G10 波收口：imageGenerate 已切到 server/providers/image 适配层（index 路由 gpt-image/agnes/openai-compat）。
+// dispatcher 保留：key 解析（override ≥6 优先 → provider.api_key，缺 key 早退不发请求）、规范 payload 组装、
+// 结果归一为历史失败语义（{ status, error, images, videoUrl, rateLimited, retryAfterMs }）。
+// 线格式构造（ratio/resolution/negative 字段规则、尺寸枚举、custom 端点传输、图片提取）已全部下沉至各 image adapter；
+// 此处仅做「opts → 规范 ImageTask」薄适配 + 「{ok,result}|{ok:false,code,retryable} → dispatcher 失败语义」映射。
+// isGptImageModel 仍保留在 dispatcher：generate() 的 nCapable 计费安全闸依赖（见下方 generate）。
 function isGptImageModel(model) {
   if (!model) return false;
   const name = (model.upstreamModelName || model.model_id || model.model || '').toLowerCase();
   return /gpt-image/i.test(name);
 }
 
+// 适配层统一错误码 → dispatcher 历史失败语义（与 makeError 的 rateLimited/retryAfterMs 语义对齐）。
+//   TIMEOUT/NETWORK → 瞬时错误文案（isTransient 命中，外层有界重试吸收）；NO_API_KEY/EMPTY_RESPONSE 无业务前缀；
+//   其余（UNAUTHORIZED/BAD_REQUEST/RATE_LIMITED/UPSTREAM/UNKNOWN_PROVIDER/HTTP_*）→ '图片生成失败：' 前缀（makeError 同款）。
+function adaptImageOutcome(outcome) {
+  if (outcome && outcome.ok === true) {
+    const images = (outcome.result && outcome.result.images) || [];
+    return { images, status: 'success' };
+  }
+  const code = (outcome && outcome.code) || 'NETWORK';
+  const message = (outcome && outcome.message) || '';
+  let error;
+  if (code === 'TIMEOUT') error = message || '图片生成超时(60s)';
+  else if (code === 'NETWORK') error = `网络错误：${message}`.slice(0, 120);
+  else if (code === 'NO_API_KEY') error = message || '服务商未配置 API Key';
+  else if (code === 'EMPTY_RESPONSE') error = message; // '响应中未找到图片字段' | '响应中无图片数据'（无前缀，与旧内联一致）
+  else error = `图片生成失败：${message}`;
+  return {
+    images: [],
+    status: 'error',
+    error: String(error).slice(0, 200),
+    videoUrl: '',
+    rateLimited: code === 'RATE_LIMITED',
+    retryAfterMs: (outcome && outcome.retryAfterMs) || undefined,
+  };
+}
+
 async function imageGenerate(provider, model, opts, apiKeyOverride) {
-  const { prompt, ratio, resolution, count, referenceImages, negative } = opts;
-  const baseUrl = provider.base_url;
+  // key 解析保持 dispatcher 原语义不动（override ≥6 优先 → provider.api_key；缺 key 直接归一错误、不发请求）
   const apiKey = (apiKeyOverride && apiKeyOverride.length >= 6) ? apiKeyOverride : provider.api_key;
   if (!apiKey) return { images: [], status: 'error', error: '服务商未配置 API Key' };
-
-  const isAgnes = /agnes-ai\.cn/i.test(baseUrl || '');
-  const isGptImage = isGptImageModel(model);
-  const de = provider.default_endpoint || {};
-  const me = (model && model.endpoint) || {};
-  const sizeFormat = me.sizeFormat || de.sizeFormat || (isAgnes ? 'agnes' : 'openai');
-  const img2imgInExtraBody = (me.img2imgInExtraBody != null ? me.img2imgInExtraBody
-    : (de.img2imgInExtraBody != null ? de.img2imgInExtraBody : isAgnes));
-
-  const hasImages = Array.isArray(referenceImages) && referenceImages.length > 0;
-  let size;
-  if (isGptImage) {
-    size = GPT_IMAGE_RATIO_TO_SIZE[ratio] || GPT_IMAGE_RATIO_TO_SIZE.auto;
-  } else if (sizeFormat === 'agnes') {
-    size = String(resolution || '1k').toUpperCase();
-  } else {
-    size = bumpSize(RATIO_TO_SIZE[ratio] || '1024x1024', resolution);
-  }
-
-  const vars = {
-    model: model.upstreamModelName || model.model_id, // Phase 2：上游 wire name 取自 binding（兜底 model_id）
-    prompt,
-    n: Math.max(1, Math.min(4, count || 1)),
-    size,
+  // 规范 ImageTask（与 adapter 头契约一致）：{ prompt, ratio, resolution, count, referenceImages[], negative }
+  const payload = {
+    prompt: opts.prompt,
+    ratio: opts.ratio,
+    resolution: opts.resolution,
+    count: opts.count,
+    referenceImages: opts.referenceImages,
+    negative: opts.negative,
   };
-  // OpenAI GPT Image 官方端点不识别 ratio / resolution / negative_prompt；
-  // 传这些字段会被官方忽略，但严格的中转站可能报错。DALL-E 3 / SD / 自定义端点才需要它们。
-  if (!isGptImage) {
-    vars.ratio = ratio;
-    if (sizeFormat !== 'agnes') {
-      vars.resolution = resolution;
-    }
-    // 反向提示词（正负向搭配刚需）：SD/自定义端点支持 negative_prompt 字段；
-    // agnes 图像端点规范不含此字段，跳过以免其严格校验报错（negative 仍存库，UI 完整展示）。
-    if (sizeFormat !== 'agnes' && negative) {
-      vars.negative_prompt = negative;
-    }
-  }
-  // 图生图/多图合成：Agnes 等要求把参考图放到 extra_body.image；
-  // 同时保留顶层 images 兼容 relay / 自定义端点。
-  if (hasImages) {
-    vars.images = referenceImages;
-    if (img2imgInExtraBody) {
-      vars.extra_body = { image: referenceImages, response_format: 'url' };
-    }
-  }
-
-  const { protocol, endpoint } = resolveEndpoint(provider, model, 'generate');
+  let outcome;
   try {
-    if (protocol === 'custom' && endpoint) {
-      const { status, body } = await callEndpoint(baseUrl, endpoint, apiKey, vars);
-      if (status >= 400) return makeError(body, status, '图片生成失败');
-      const imgs = extractImages(body, endpoint);
-      return imgs.length
-        ? { images: imgs, status: 'success' }
-        : { images: [], status: 'error', error: '响应中未找到图片字段' };
-    }
-    const apiUrl = `${baseUrl.replace(/\/$/, '')}/images/generations`;
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 60000);
-    let response;
-    try {
-      response = await fetch(apiUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
-        body: JSON.stringify(vars),
-        signal: ctrl.signal,
-      });
-    } catch (fe) {
-      clearTimeout(timer);
-      const aborted = fe && (fe.name === 'AbortError' || /abort/i.test(fe.message || ''));
-      return { images: [], status: 'error', error: (aborted ? '图片生成超时(60s)' : `网络错误：${(fe && fe.message) || String(fe)}`).slice(0, 120) };
-    } finally {
-      clearTimeout(timer);
-    }
-    const text = await response.text();
-    const data = text ? JSON.parse(text) : null;
-    if (!response.ok) return makeError(data, response.status, '图片生成失败', response.headers);
-    const imgs = extractImages(data, undefined);
-    return imgs.length
-      ? { images: imgs, status: 'success' }
-      : { images: [], status: 'error', error: '响应中无图片数据' };
+    outcome = await imageIndex.generate({ apiKey, payload, provider, model });
   } catch (e) {
-    return { images: [], status: 'error', error: `网络错误：${(e && e.message) || String(e)}`.slice(0, 120) };
+    // 适配层任何意外异常不阻断主链路（旧内联最外层 catch 同语义）→ 归一为瞬时网络错误
+    outcome = { ok: false, code: 'NETWORK', retryable: true, message: (e && e.message) || String(e) };
   }
+  return adaptImageOutcome(outcome);
 }
 
 // ─── 视频生成（异步 submit + poll 模式）───
@@ -1709,6 +1659,9 @@ async function listActiveTasks(pgPool, userId) {
 // 导出内部调度函数（供测试 / 调试断言 RPM 门控与均匀分配用）
 module.exports = {
   generate, generateAsync, getTaskStatus, listActiveTasks, callEndpoint, getByPath, getArrayByPath,
+  // ── 执行面单测接缝（server/tests/unit/dispatcher-image-video.test.cjs）──
+  // 仅导出既有函数供注入 fake 上游的单元测试直测，不改任何运行时行为。
+  dispatchOne, attemptOnAccount, imageGenerate, videoGenerate, completeViaQueue,
   setLogSink, logError,
   resumeRunningTasks, resumeWaitingArea, resumeRunningImageTasks, persistProviderTaskId, finalizeResumedTask, genericVideoPoll,
   startStuckTaskWatchdog,
