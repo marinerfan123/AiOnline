@@ -160,7 +160,10 @@
 | 分镜 rows 面板 | 已实现未接线 | `StoryboardRowsPanel.tsx` L1-25 已实现；StudioPage L69 未传 `scriptId` → 恒空态。接线点：StudioPage 传 scriptId（W6②） |
 
 ## E) 实施进度（2026-09-05 更新）
-- 已合入：M1 viewport(54824d2)/W1 run-client+Runs+节点缩略图+scriptId(96a9b26)/W1② Run+runState(54a63b8)/W2 NodePreviewModal 预览下载重跑(54a63b8)/W3 资产拖拽成节点+上传待接(a485fd7)/W4 canvasCommandLogClient+syncFromCommandLog 游标+History(a485fd7)/W5 presence client(7d97a26)+在场条+节点锁(2d3add6)/W6① canvasId 上提(7d65cba)/M2 快捷键真因修复(5aae41b: 原 7 失败=NodePreviewModal 常挂+query-client 边界吞 CanvasCore)
-- 测试: studio-v2 200/200; 全量 vitest 531/531; tsc 0
-- 剩余可选: W3 上传口(需 G06 端点面)/服务端多画布 REST(list/副画布/切换)/自动布局(M2 doc33)/34 波次标记复核
+- 已合入：M1 viewport(54824d2)/W1 run-client+Runs+节点缩略图+scriptId(96a9b26)/W1② Run+runState(54a63b8)/W2 NodePreviewModal 预览下载重跑(54a63b8)/W3 资产拖拽成节点(a485fd7)+G06 上传口(f6a27b9)/W4 canvasCommandLogClient+syncFromCommandLog 游标+History(a485fd7)/W5 presence client(7d97a26)+在场条+节点锁(2d3add6)/W6① canvasId 上提(7d65cba)/W6③ Inspector 陈旧文案已同步("会话态刷新丢失"→现 L144"自动保存约900ms不丢")/M2 快捷键真因修复(5aae41b)
+- 测试(截至 f6a27b9): 全量套件前轮记录 531 绿; studio-v2+v2 子集 55 files/427 passed; tsc 0
+- 剩余(未合入, 记录不臆造):
+  - W6④ 自动布局(DAG 分层, M2 doc33) —— 核心 store.ts + Inspector/StudioCanvas 工具栏耦合(位置/undo 快照/锁语义同 alignSelection)。按用户并行纪律核心/耦合=父线 v4-pro 串行, flash cron 不写核心 store → 待父线/委托, 本轮不派。不派。
+  - 服务端多画布 REST(list/副画布/切换) —— server+DB 级(客户端 W6① 已注 primary-only, 多画布留 DB-level)。本地无真 PG 无法取证(node --test 集成 fail-closed 属预期), 待容器/父线。不派。
+- 本轮判定: 空闲无未合入叶(src/ 净, live/ 无 running); 仅剩两叶均属核心/服务端耦合, flash cron 依纪律不强行推进(不臆造 PASS), 故 round 无可见新画布能力合入, 只做 34 波次复核(本 E 更新) + LEDGER 记录。
 - 测试环境 UI 刷新(13001 呈现): 待审批放行(大机预构建 dist + fast 镜像)
