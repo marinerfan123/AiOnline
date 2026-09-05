@@ -9,7 +9,8 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm install --no-audit --no-fund
 COPY . .
-RUN npm run build
+# 容器内 client 构建在 896M 小机易 OOM；预构建 dist/build2 存在时跳过（大机产物）
+RUN if [ ! -d dist/build2 ] || [ -z "$(ls -A dist/build2 2>/dev/null)" ]; then npm run build; fi
 
 # ── 运行阶段 ──
 FROM node:22-alpine AS runtime
