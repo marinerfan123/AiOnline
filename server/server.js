@@ -4303,6 +4303,31 @@ async function handleAPI(req, res) {
         const arr = Array.isArray(data && data.data) ? data.data : [];
         models = arr.map((m) => ({ id: String(m.id || ''), name: String(m.id || '') })).filter((m) => m.id);
       }
+      // 持久化：把服务商拉到的模型写库（幂等 upsert），否则刷新后内存态丢失 → "添加服务商后刷新就没了"。
+      // 模型行确定性 id，杜绝重复同步产生僵尸行；provider_id 外键挂在该服务商下，刷新后仍能显示。
+      try {
+        const slug = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9._-]+/g, '-').slice(0, 60) || 'm';
+        const typeOf = (mid) => (/video/i.test(mid) ? 'video' : /image|img|t2i|sdxl/i.test(mid) ? 'image' : /llm|chat|text|gpt|qwen|deepseek|glm|gemini|claude/i.test(mid) ? 'text' : 'other');
+        const rows = models.map((m) => ({
+          id: `m-${slug(id)}-${slug(m.id)}`,
+          model_id: m.id,
+          display_name: m.name || m.id,
+          type: typeOf(m.id),
+          provider_id: slug(id),
+          enabled: true,
+        }));
+        for (const r of rows) {
+          await pgPool.query(
+            `INSERT INTO models (id, model_id, display_name, type, provider_id, enabled)
+             VALUES ($1,$2,$3,$4,$5,TRUE)
+             ON CONFLICT (id) DO UPDATE SET model_id=EXCLUDED.model_id, display_name=EXCLUDED.display_name, type=EXCLUDED.type, provider_id=EXCLUDED.provider_id, enabled=TRUE`,
+            [r.id, r.model_id, r.display_name, r.type, r.provider_id],
+          );
+        }
+      } catch (persistErr) {
+        // 落库失败不阻断：仍把列表返回给调用方，但标注以便排障
+        return sendJSON(res, 200, { success: true, models, _persistError: (persistErr && persistErr.message) || String(persistErr) });
+      }
       return sendJSON(res, 200, { success: true, models });
     } catch (e) {
       return sendJSON(res, 200, { success: false, message: `同步异常：${(e && e.message) || String(e)}` });

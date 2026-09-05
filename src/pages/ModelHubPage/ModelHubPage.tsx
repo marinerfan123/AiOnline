@@ -45,7 +45,7 @@ import {
   defaultCommercialUse,
 } from '@/data/models';
 import { ModelParamTemplateEditor } from '@/components/ModelParamTemplateEditor';
-import { useModelHub } from '@/hooks/useModelHub';
+import { useModelHub, reloadModelHubAfterAuth } from '@/hooks/useModelHub';
 import { groupModelsByModelId } from '@/utils/groupModels';
 import { useOssConfig, dataUrlToFile } from '@/hooks/useOssConfig';
 import { MOCK_MEDIA_LIST } from '@/data/media';
@@ -167,6 +167,10 @@ export default function ModelHubPage() {
   // 新用户注册赠送（后台可视化设置）
   const [signupBonus, setSignupBonus] = useState(50);
   const [signupRechargeBonus, setSignupRechargeBonus] = useState(0);
+  useEffect(() => {
+    // 挂载后强制重载一次真实模型/服务商快照：防「匿名首屏 401 → 登录后空快照」
+    reloadModelHubAfterAuth().catch(() => {});
+  }, []);
   useEffect(() => {
     apiGetSettings().then((s) => {
       if (s && s.maxThreads) setMaxThreads(Number(s.maxThreads) || 10);

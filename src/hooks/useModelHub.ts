@@ -63,8 +63,10 @@ export async function reloadModelHubAfterAuth(): Promise<void> {
   const generation = ++loadGeneration;
   const [apiP, apiM] = await Promise.all([apiGetProviders(), apiGetModels()]);
   if (generation !== loadGeneration) return;
-  providersState = apiP;
-  modelsState = apiM;
+  // 防御：登录瞬时的空响应可能是鉴权竞态（401 被吞成 []），
+  // 绝不允许用空数组覆盖已存在的非空快照 —— 这正是"添加服务商后刷新就没了"的根因之一。
+  if (apiP.length > 0) providersState = apiP;
+  if (apiM.length > 0) modelsState = apiM;
   initialized = true;
   notify();
 }
