@@ -189,6 +189,11 @@ export function useStudioCanvasPersistence(projectId: string, enabled = true) {
       setConflict(null);
       suppressRef.current = true;
       useStudioStore.getState().loadGraph(nodes, edges, data.viewport ?? { x: 0, y: 0, zoom: 1 });
+      // W6① canvasId 上提：成功 loadGraph 后把解析到的主画布 id 写入 store，供
+      // presence（及后续多画布叶）共用 —— 消除 W5a 在 useCanvasPresence 里每轮
+      // 多一次的 getCanvas。data.canvas 在无主画布 fallback（createCanvas）后仍
+      // 非空，故此处 canvasId 恒有值（除非 get/create 双失败已在上方 catch 拦截）。
+      useStudioStore.getState().setCurrentCanvasId(data.canvas?.id ?? null);
       suppressRef.current = false;
       const rev = data.canvas?.revision ?? 1;
       revisionRef.current = rev;

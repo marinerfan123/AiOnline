@@ -113,6 +113,13 @@ interface StudioState {
   projectId: string | null;
   canvasRevision: number | null;
 
+  // ── W6① canvas identity (lifted from persistence — single primary canvas) ──
+  // Resolved primary canvas id (`canvas-<uuid>`, ≠ projectId). Server keys presence,
+  // persistence writes and every canvas read/write on it. Written by
+  // useStudioCanvasPersistence.reloadFromServer right after loadGraph succeeds;
+  // read by useCanvasPresence (removing W5a's per-mount getCanvas round-trip).
+  currentCanvasId: string | null;
+
   // ── W4a command-log read cursor (server seq alignment; read-only) ──
   /** highest canvas_command_log seq consumed from the server (0 = not synced). */
   commandLogCursor: number;
@@ -160,6 +167,8 @@ interface StudioState {
   resetProjectState: () => void;
   /** W1② run context: Inspector syncs projectId + canvas revision before running. */
   setRunContext: (projectId: string | null, canvasRevision: number | null) => void;
+  /** W6① canvas identity: persistence writes the resolved primary canvas id after loadGraph. */
+  setCurrentCanvasId: (canvasId: string | null) => void;
   /** W1② trigger a FROM_NODE run for one node (fire-and-forget; no polling). */
   runNode: (nodeId: string) => Promise<void>;
   /**
@@ -281,6 +290,7 @@ export const useStudioStore = create<StudioState>((set, get) => ({
 
   projectId: null,
   canvasRevision: null,
+  currentCanvasId: null,
   commandLogCursor: 0,
   runningNodeId: null,
   lastRun: null,
@@ -668,6 +678,8 @@ export const useStudioStore = create<StudioState>((set, get) => ({
   // ── W1② run trigger (fire-and-forget; terminal state is the Runs tab's job) ──
   setRunContext: (projectId, canvasRevision) => set({ projectId, canvasRevision }),
 
+  setCurrentCanvasId: (canvasId) => set({ currentCanvasId: canvasId }),
+
   runNode: async (nodeId) => {
     const s = get();
     // busy gate: one run in flight at a time — no re-entrant trigger
@@ -733,6 +745,7 @@ export const useStudioStore = create<StudioState>((set, get) => ({
       invalidConnection: null,
       projectId: null,
       canvasRevision: null,
+      currentCanvasId: null,
       commandLogCursor: 0,
       lockedNodeIds: new Set<string>(),
       runningNodeId: null,
