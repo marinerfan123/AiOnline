@@ -86,13 +86,10 @@ async function webStreamToBuffer(webStream) {
 async function fetchBytes(url) {
   let parsed;
   try { parsed = new URL(String(url)); } catch { throw new Error('非法 URL'); }
-  // SSRF protection: only allow http/https to public IPs
-  const { asyncCheckUrl } = require('./ssrf.cjs');
-  const ssrf = await asyncCheckUrl(String(url));
-  if (!ssrf.ok) throw new Error(`SSRF blocked: ${ssrf.reason}`);
 
   // 支持 data: URI（dispatcher 把 provider 返回的 b64_json 包装成 data:image/...;base64,...）
   // 不经过 HTTP fetch，直接解码 base64 为 Buffer，供后续 OSS PUT 使用。
+  // 必须放在 SSRF 校验之前：data: 无 host，asyncCheckUrl 会误判为非法/内网导致误杀。
   if (parsed.protocol === 'data:') {
     const raw = String(url);
     const comma = raw.indexOf(',');
@@ -107,6 +104,11 @@ async function fetchBytes(url) {
     if (buffer.length > MAX_BYTES) throw new Error('超过 50MB 上限');
     return { buffer, contentType: normalizeContentType(url, ct), byteLength: buffer.length, isStream: false };
   }
+
+  // SSRF protection: only allow http/https to public IPs
+  const { asyncCheckUrl } = require('./ssrf.cjs');
+  const ssrf = await asyncCheckUrl(String(url));
+  if (!ssrf.ok) throw new Error(`SSRF blocked: ${ssrf.reason}`);
 
   if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') throw new Error('URL 协议不支持');
   if (isBlockedHost(parsed.hostname)) throw new Error('URL 指向内网，已拒绝（SSRF 防护）');
