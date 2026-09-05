@@ -3,6 +3,8 @@ import { Routes, Route, useNavigate } from 'react-router-dom';
 import { Layout } from '@/components/Layout';
 import { ErrorBoundary } from '@/components/ErrorBoundary';
 import { isFeatureEnabled, FF } from '@/shared/config/featureFlags';
+import { QueryClientProvider } from '@tanstack/react-query';
+import { queryClient } from '@/shared/state/queryClient';
 
 // V2 (M00 platform foundation) — lazy-loaded preview shell. Additive only:
 // lives behind /__v2/* and the V2_APP_SHELL flag (default OFF in prod), so the
@@ -177,7 +179,7 @@ export default function App() {
         <Route path="/monitoring/:tab" element={<RequireAdmin><MonitoringStandalonePage /></RequireAdmin>} />
 
         {/* 创作工作室壳（需登录） */}
-        <Route path="/studio" element={<RequireAuth><StudioLayout /></RequireAuth>}>
+        <Route path="/studio" element={<RequireAuth><QueryClientProvider client={queryClient}><StudioLayout /></QueryClientProvider></RequireAuth>}>
           <Route index element={<StudioListPage />} />
           <Route path=":projectId" element={<StudioCanvasPage />} />
         </Route>
