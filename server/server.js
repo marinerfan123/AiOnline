@@ -4306,17 +4306,22 @@ async function handleAPI(req, res) {
       }
       // 持久化：把服务商拉到的模型写库（幂等 upsert），否则刷新后内存态丢失 → "添加服务商后刷新就没了"。
       // 模型行确定性 id，杜绝重复同步产生僵尸行；provider_id 外键挂在该服务商下，刷新后仍能显示。
+      // 只落服务商 supported_types 内的类型：本产品是图像/视频短剧管线，agnes 这类聚合商
+      // /models 会吐出数百文本 LLM，全落库会把模型台/价格页灌爆（此前涨到 320 行）。
       try {
         const slug = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9._-]+/g, '-').slice(0, 60) || 'm';
         const typeOf = (mid) => (/video/i.test(mid) ? 'video' : /image|img|t2i|sdxl/i.test(mid) ? 'image' : 'text');
-        const rows = models.map((m) => ({
-          id: `m-${slug(id)}-${slug(m.id)}`,
-          model_id: m.id,
-          display_name: m.name || m.id,
-          type: typeOf(m.id),
-          provider_id: slug(id),
-          enabled: true,
-        }));
+        const allowed = new Set((Array.isArray(p.supported_types) ? p.supported_types : []).map((s) => String(s).toLowerCase()));
+        const rows = models
+          .filter((m) => allowed.size === 0 || allowed.has(typeOf(m.id)))
+          .map((m) => ({
+            id: `m-${slug(id)}-${slug(m.id)}`,
+            model_id: m.id,
+            display_name: m.name || m.id,
+            type: typeOf(m.id),
+            provider_id: slug(id),
+            enabled: true,
+          }));
         for (const r of rows) {
           await pgPool.query(
             `INSERT INTO models (id, model_id, display_name, type, provider_id, enabled)
