@@ -10,9 +10,9 @@
 // "Ready to run" / "Invalid configuration" / "Stale" result placeholders
 // (never fake media).
 
-import { useMemo } from 'react';
+import { useEffect, useMemo } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { Trash2, Copy, Group, AlignStartVertical, AlignCenterVertical, AlignEndVertical } from 'lucide-react';
+import { Trash2, Copy, Group, AlignStartVertical, AlignCenterVertical, AlignEndVertical, Play } from 'lucide-react';
 import { useStudioStore } from './store';
 import { getNodeDef } from './registry';
 import { NodeIcon } from './NodeIcon';
@@ -40,12 +40,15 @@ export function Inspector({
   projectId,
   episodeId,
   selectedShotId,
+  canvasRevision,
 }: {
   projectId: string;
   /** When provided with `selectedShotId`, the rail shows the Shot Inspector (W1-11). */
   episodeId?: string;
   /** The currently selected shot id to inspect. */
   selectedShotId?: string;
+  /** W1②: current canvas revision (from autosave) for the FROM_NODE run closure. */
+  canvasRevision?: number;
 }) {
   const showingShot = Boolean(episodeId && selectedShotId);
   const nodes = useStudioStore((s) => s.nodes);
@@ -58,10 +61,28 @@ export function Inspector({
   const copySelection = useStudioStore((s) => s.copySelection);
   const alignSelection = useStudioStore((s) => s.alignSelection);
   const groupSelection = useStudioStore((s) => s.groupSelection);
+  const setRunContext = useStudioStore((s) => s.setRunContext);
+  const runNode = useStudioStore((s) => s.runNode);
+  const runningNodeId = useStudioStore((s) => s.runningNodeId);
+  const lastRun = useStudioStore((s) => s.lastRun);
+  const runError = useStudioStore((s) => s.runError);
+
+  // W1② run context: sync projectId + canvas revision into the store so
+  // runNode() can build the FROM_NODE closure without extra props.
+  useEffect(() => {
+    setRunContext(projectId, canvasRevision ?? null);
+  }, [projectId, canvasRevision, setRunContext]);
 
   const selected = useMemo(() => nodes.filter((n) => n.selected), [nodes]);
   const single = selected.length === 1 ? selected[0] : null;
   const def = single ? getNodeDef(single.data.nodeKind) : null;
+
+  // W1② run button state: only GENERATION nodes are runnable (media producers);
+  // busy gate mirrors the store's single-flight runNode. Read surface for
+  // terminal status/artifacts stays the Runs tab — the button only triggers.
+  const isRunnable = Boolean(def && def.executionKind === 'GENERATION');
+  const runBusy = runningNodeId != null;
+  const thisNodeRunning = Boolean(single && runningNodeId === single.id);
 
   // M02 logical model catalog (cached; generation nodes only)
   const modelField = def?.modelField ? def.parameterSchema.find((f) => f.key === def.modelField) : undefined;
@@ -119,11 +140,14 @@ export function Inspector({
                 </div>
               </Section>
               <Section title="Persistence">
-                <p className="text-[11px] leading-relaxed text-ml2-text-3">
-                  当前为 M05-A/M05-B 会话态 Canvas（内存，可 undo/redo）。
-                  正式保存与版本将在 M05-C 接入 shared PostgreSQL。
-                  刷新页面将丢失未保存的画布内容。
+                <p data-test="inspector-persistence-note" className="text-[11px] leading-relaxed text-ml2-text-3">
+                  自动保存已开启：编辑后约 900ms 自动保存，刷新页面不丢失。
+                  多人同时编辑冲突时，画布顶部会弹出冲突提示横幅，可按策略重试或重载。
                 </p>
+              </Section>
+              <Section title="Run">
+                <Button data-test="inspector-run-button" size="sm" variant="primary" disabled><Play className="size-3" />运行</Button>
+                <p className="mt-1.5 text-[10px] text-ml2-text-3">选择节点后可运行。</p>
               </Section>
             </>
           )}
@@ -228,6 +252,32 @@ export function Inspector({
                   </p>
                   <p className="text-[10px] text-ml2-text-3">Result contract: durable assetId only（provider 临时 URL 不作为最终 authority）</p>
                 </div>
+              </Section>
+
+              <Section title="Run">
+                <Button
+                  data-test="inspector-run-button"
+                  size="sm"
+                  variant="primary"
+                  disabled={!isRunnable || runBusy}
+                  loading={thisNodeRunning}
+                  onClick={() => { void runNode(single.id); }}
+                >
+                  {thisNodeRunning ? '运行中…' : lastRun ? '重跑' : '运行'}
+                </Button>
+                {!isRunnable && (
+                  <p data-test="inspector-run-disabled-note" className="mt-1.5 text-[10px] text-ml2-text-3">
+                    仅生成（媒体）节点可运行；此节点为 {def.executionKind} 类型。
+                  </p>
+                )}
+                {runError && (
+                  <p data-test="inspector-run-error" className="mt-1.5 text-[11px] text-red-400">{runError}</p>
+                )}
+                {lastRun && !thisNodeRunning && !runError && (
+                  <p data-test="inspector-run-last" className="mt-1.5 text-[10px] text-ml2-text-3">
+                    已触发 Run {lastRun.runId} · {lastRun.status}
+                  </p>
+                )}
               </Section>
 
               <Section title="Actions">

@@ -41,6 +41,7 @@ import {
   type StudioNodeKind,
   type PortSpec,
 } from './types';
+import { studioRunClient, type StudioRunStatus } from './run/studioRunClient';
 
 export type StudioNode = Node<StudioNodeData>;
 export type StudioEdge = Edge<StudioEdgeData>;
@@ -71,6 +72,18 @@ interface StudioState {
   dragSnapshot: Snapshot | null;
   /** inspector transaction: pre-edit snapshot committed on blur/apply */
   editSnapshot: Snapshot | null;
+
+  // ── run context (session; populated by Inspector via setRunContext) ──
+  projectId: string | null;
+  canvasRevision: number | null;
+
+  // ── W1② run trigger state (fire-and-forget; read surface is the Runs tab) ──
+  /** node currently being run (non-null = one run in flight; busy gate) */
+  runningNodeId: string | null;
+  /** last triggered run (initial server response; NOT polled to terminal) */
+  lastRun: { runId: string; status: StudioRunStatus } | null;
+  /** inline failure copy for the last run trigger */
+  runError: string | null;
 
   // ── react-flow wiring ──
   onNodesChange: (changes: NodeChange<StudioNode>[]) => void;
@@ -103,6 +116,10 @@ interface StudioState {
   loadGraph: (nodes: StudioNode[], edges: StudioEdge[], viewport?: Viewport) => void;
   /** P0: project-switch isolation — fully reset ephemeral session state (no cross-project leak). */
   resetProjectState: () => void;
+  /** W1② run context: Inspector syncs projectId + canvas revision before running. */
+  setRunContext: (projectId: string | null, canvasRevision: number | null) => void;
+  /** W1② trigger a FROM_NODE run for one node (fire-and-forget; no polling). */
+  runNode: (nodeId: string) => Promise<void>;
 }
 
 /**
@@ -198,6 +215,12 @@ export const useStudioStore = create<StudioState>((set, get) => ({
   invalidConnection: null,
   dragSnapshot: null,
   editSnapshot: null,
+
+  projectId: null,
+  canvasRevision: null,
+  runningNodeId: null,
+  lastRun: null,
+  runError: null,
 
   onNodesChange: (changes) =>
     set((s) => {
@@ -544,6 +567,36 @@ export const useStudioStore = create<StudioState>((set, get) => ({
 
   clearInvalidConnection: () => set({ invalidConnection: null }),
 
+  // ── W1② run trigger (fire-and-forget; terminal state is the Runs tab's job) ──
+  setRunContext: (projectId, canvasRevision) => set({ projectId, canvasRevision }),
+
+  runNode: async (nodeId) => {
+    const s = get();
+    // busy gate: one run in flight at a time — no re-entrant trigger
+    if (s.runningNodeId != null) return;
+    if (!s.projectId) {
+      set({ runError: '未绑定项目，无法运行（缺少 projectId）' });
+      return;
+    }
+    if (s.canvasRevision == null) {
+      set({ runError: '画布尚未保存，无法运行（缺少 canvas revision）' });
+      return;
+    }
+    // initial trigger state: clear previous result/error, mark the node busy
+    set({ runningNodeId: nodeId, lastRun: null, runError: null });
+    try {
+      const res = await studioRunClient.runNode({
+        projectId: s.projectId,
+        nodeId,
+        canvasRevision: s.canvasRevision,
+      });
+      set({ runningNodeId: null, lastRun: { runId: res.runId, status: res.status } });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      set({ runningNodeId: null, runError: msg ? `运行失败：${msg}` : '运行失败，请稍后重试' });
+    }
+  },
+
   loadGraph: (nodes, edges, viewport) => set({ nodes, edges, ...(viewport ? { viewport } : {}), undoStack: [], redoStack: [], clipboard: null, dragSnapshot: null, editSnapshot: null, invalidConnection: null }),
 
   resetProjectState: () =>
@@ -557,6 +610,11 @@ export const useStudioStore = create<StudioState>((set, get) => ({
       dragSnapshot: null,
       editSnapshot: null,
       invalidConnection: null,
+      projectId: null,
+      canvasRevision: null,
+      runningNodeId: null,
+      lastRun: null,
+      runError: null,
     }),
 }));
 

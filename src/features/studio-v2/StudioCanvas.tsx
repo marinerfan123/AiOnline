@@ -19,8 +19,10 @@ import {
   selectCanUndo,
   selectCanRedo,
   studioCanvasActions,
+  type StudioNode,
 } from './store';
 import { StudioNodeComponent } from './StudioNode';
+import { NodePreviewModal } from './NodePreviewModal';
 import { NODE_DEFS_LIST, canConnectToPort, getNodeDef } from './registry';
 import type { StudioNodeKind } from './types';
 import type { PortType } from './types';
@@ -124,7 +126,7 @@ function EmptyState({ onAdd }: { onAdd: (k: StudioNodeKind) => void }) {
   );
 }
 
-function CanvasCore() {
+function CanvasCore({ projectId, canvasRevision }: { projectId?: string; canvasRevision?: number | null }) {
   const nodes = useStudioStore((s) => s.nodes);
   const edges = useStudioStore((s) => s.edges);
   const onNodesChange = useStudioStore((s) => s.onNodesChange);
@@ -147,6 +149,8 @@ function CanvasCore() {
     x: number; y: number; fx: number; fy: number;
     edgeFrom?: { nodeId: string; handleId: string; portType: PortType };
   } | null>(null);
+  // W2: double-clicked node → NodePreviewModal (output preview / download / re-run).
+  const [previewNode, setPreviewNode] = useState<StudioNode | null>(null);
   const { screenToFlowPosition, fitView } = useReactFlow();
   const canvasRef = useRef<HTMLDivElement>(null);
 
@@ -315,6 +319,8 @@ function CanvasCore() {
         onNodeDoubleClick={(_e, node) => {
           // M1 ②: double-click a node centres it in the viewport (节点双击定位居中).
           fitView({ nodes: [{ id: node.id }], duration: 200, padding: 0.35, maxZoom: 1.5 });
+          // W2: same double-click also opens the output preview modal.
+          setPreviewNode(node);
         }}
         onDoubleClick={(e) => {
           const target = e.target as HTMLElement;
@@ -341,6 +347,13 @@ function CanvasCore() {
 
       <InvalidConnectionToast />
       {nodes.length === 0 && <EmptyState onAdd={addAtCenter} />}
+      <NodePreviewModal
+        open={previewNode !== null}
+        node={previewNode}
+        projectId={projectId}
+        canvasRevision={canvasRevision}
+        onClose={() => setPreviewNode(null)}
+      />
       {menu && (
         <ContextMenu
           at={{ x: menu.x, y: menu.y }}
@@ -367,11 +380,11 @@ function CanvasCore() {
   );
 }
 
-export function StudioCanvas() {
+export function StudioCanvas({ projectId, canvasRevision }: { projectId?: string; canvasRevision?: number | null }) {
   return (
     <ReactFlowProvider>
       <StudioErrorBoundary>
-        <CanvasCore />
+        <CanvasCore projectId={projectId} canvasRevision={canvasRevision} />
       </StudioErrorBoundary>
     </ReactFlowProvider>
   );

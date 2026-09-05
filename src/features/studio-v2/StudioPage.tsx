@@ -64,7 +64,7 @@ function StudioLayout() {
       <div className="flex min-h-0 flex-1">
         <NodeLibrary onAdd={addFromLibrary} />
         <div className="relative min-w-0 flex-1">
-          <StudioCanvas />
+          <StudioCanvas projectId={projectId} canvasRevision={persistence.revision} />
           <StudioComposer projectId={projectId} />
           {assetLibraryOpen && projectId ? (
             <AssetLibraryDrawer projectId={projectId} onClose={() => setAssetLibraryOpen(false)} />
