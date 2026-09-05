@@ -1098,7 +1098,15 @@ async function generateAsync(pgPool, opts) {
   }
   // dual-write 过渡：事务提交后仍进程内 fire-and-forget 直驱（保持单进程部署即时出图）；
   // generation_outbox_v2 行是崩溃恢复权威记录，由 runGenerationRelayTick（生产另叶挂载）消费续投。
-  driveGenerateTask(pgPool, runOpts).catch((e) => console.warn('[dispatcher] outbox 内联分发异常:', e.message));
+  // L53 翻转（测试环境 2026-09-05 实证后）：FF_VIDEO_DURABLE_EVENTS=1（on）时 inline 直驱关闭，
+  // relay 成唯一提交路径（权威 outbox）；shadow/off 保持 dual-write。生产默认 off 未翻转。
+  const { classifyDurableEventsMode } = require('./modules/generation-v2/shadowCompare.cjs');
+  const mode = classifyDurableEventsMode(process.env);
+  if (mode !== 'on') {
+    driveGenerateTask(pgPool, runOpts).catch((e) => console.warn('[dispatcher] outbox 内联分发异常:', e.message));
+  } else {
+    console.log(`[dispatcher] durable-events=on：inline 直驱关闭，任务 ${taskId} 交 relay 权威提交`);
+  }
   return { taskId };
 }
 
