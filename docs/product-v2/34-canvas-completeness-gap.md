@@ -158,3 +158,9 @@
 | 画布投影 + shot lineage | 已备未消费 | `canvasProjection.cjs`(405L)+`shotLineage.cjs`(220L) 挂载 L2742。接线点：版本/血缘视图（未来） |
 | react-flow 内建 pan/zoom/minimap/controls | **已接线** | `StudioCanvas.tsx` L261-324；doc 33 M1「无 pan/zoom」论断需更正，M1 应聚焦「无边网格 + 世界坐标 + 双击定位」 |
 | 分镜 rows 面板 | 已实现未接线 | `StoryboardRowsPanel.tsx` L1-25 已实现；StudioPage L69 未传 `scriptId` → 恒空态。接线点：StudioPage 传 scriptId（W6②） |
+
+## E) 实施进度（2026-09-05 更新）
+- 已合入：M1 viewport(54824d2)/W1 run-client+Runs+节点缩略图+scriptId(96a9b26)/W1② Run+runState(54a63b8)/W2 NodePreviewModal 预览下载重跑(54a63b8)/W3 资产拖拽成节点+上传待接(a485fd7)/W4 canvasCommandLogClient+syncFromCommandLog 游标+History(a485fd7)/W5 presence client(7d97a26)+在场条+节点锁(2d3add6)/W6① canvasId 上提(7d65cba)/M2 快捷键真因修复(5aae41b: 原 7 失败=NodePreviewModal 常挂+query-client 边界吞 CanvasCore)
+- 测试: studio-v2 200/200; 全量 vitest 531/531; tsc 0
+- 剩余可选: W3 上传口(需 G06 端点面)/服务端多画布 REST(list/副画布/切换)/自动布局(M2 doc33)/34 波次标记复核
+- 测试环境 UI 刷新(13001 呈现): 待审批放行(大机预构建 dist + fast 镜像)
