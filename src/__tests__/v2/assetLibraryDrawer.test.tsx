@@ -266,9 +266,12 @@ describe('AssetLibraryDrawer — drag-to-canvas + upload gate (G06)', () => {
     );
   });
 
-  it('upload button is disabled with a 待接 note (G06 direct-upload endpoint pending)', async () => {
+  // W3 (2026-09-05): upload is now wired to the G06 3-step flow — the button is
+  // enabled and the obsolete '待接' placeholder note is gone (see the dedicated
+  // assetLibraryUpload.test.tsx for the upload-state coverage).
+  it('upload button is enabled (G06 upload wired, no 待接 placeholder)', async () => {
     await renderDrawer([asset('m-1', '首图')]);
-    expect((screen.getByTestId('asset-library-upload') as HTMLButtonElement).disabled).toBe(true);
-    expect(screen.getByTestId('asset-library-upload-note').textContent).toContain('待接');
+    expect((screen.getByTestId('asset-library-upload') as HTMLButtonElement).disabled).toBe(false);
+    expect(screen.queryByTestId('asset-library-upload-note')).toBeNull();
   });
 });

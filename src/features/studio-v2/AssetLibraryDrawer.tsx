@@ -1,12 +1,13 @@
 // G06 — Asset Library drawer (Blueprint 02 §20 subset).
 //
-// Read-only window into the project asset library (M04-S). This surface NEVER
-// mutates the library: the upload button is disabled pending the G06 upload
-// endpoint (which requires a 3-step OSS direct-upload flow — POST /api/v2
-// /uploads → signed PUT → finalize — not a single multipart POST). Dragging an
-// asset item onto the canvas IS supported: items are draggable and carry a
-// serialized { assetId, assetType, url, thumbnail } payload that StudioCanvas
-// turns into an ASSET node (never a generation node).
+// Read window into the project asset library (M04-S). Wired upload (2026-09-05):
+// the upload button drives the G06 3-step OSS direct-upload flow
+// (POST /api/v2/uploads → signed PUT → finalize) via upload-client.ts; a
+// 503 UPLOAD_STORAGE_UNCONFIGURED (test env) surfaces as an honest inline
+// error, never a fake success. Dragging an asset item onto the canvas IS
+// supported: items are draggable and carry a serialized
+// { assetId, assetType, url, thumbnail } payload that StudioCanvas turns
+// into an ASSET node (never a generation node).
 //
 // Honest contract notes (verified against the real client, 2026-09-03):
 //   * v2asset.listProjectAssets(projectId, query) → AssetListResponse where
@@ -29,11 +30,13 @@
 //   * Both methods throw AssetApiError on HTTP errors; this surface maps that
 //     to a compact retry-able error state.
 
-import { useEffect, useMemo, useState } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
+  AlertTriangle,
   AudioLines,
   Box,
+  CheckCircle2,
   ChevronDown,
   Film,
   History,
@@ -41,6 +44,7 @@ import {
   Images,
   Inbox,
   LibraryBig,
+  Loader2,
   RefreshCw,
   Search,
   Star,
@@ -48,6 +52,7 @@ import {
   X,
 } from 'lucide-react';
 import { v2asset } from '@/shared/api/contract/asset-client';
+import { uploadFile, UploadApiError } from '@/shared/api/contract/upload-client';
 import type { AssetSummary, AssetType } from '@/shared/api/contract/schemas';
 import { api } from '@/shared/api/client';
 import { Input } from '@/shared/ui/v2';
@@ -434,6 +439,48 @@ export function AssetLibraryDrawer({ projectId, onClose }: { projectId: string; 
   const [versionDetails, setVersionDetails] = useState<Record<string, AssetVersionSummary>>({});
   const [detailsLoaded, setDetailsLoaded] = useState<Set<string>>(new Set());
 
+  // ── W3 — upload (3-step OSS direct upload via G06 endpoint) ────────────────
+  const [uploadState, setUploadState] = useState<'idle' | 'uploading' | 'success' | 'error'>('idle');
+  const [uploadError, setUploadError] = useState('');
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const queryClient = useQueryClient();
+
+  const handleUploadClick = useCallback(() => {
+    setUploadError('');
+    fileInputRef.current?.click();
+  }, []);
+
+  const handleFileSelected = useCallback(
+    async (file: File) => {
+      setUploadState('uploading');
+      setUploadError('');
+      try {
+        await uploadFile(projectId, file);
+        setUploadState('success');
+        // Refresh the read-only list so the freshly-uploaded asset appears.
+        await queryClient.invalidateQueries({ queryKey: ['v2', 'assetLibrary', projectId] });
+      } catch (e) {
+        setUploadState('error');
+        if (e instanceof UploadApiError && e.isStorageUnconfigured) {
+          setUploadError('对象存储未配置，本次测试环境仅开放只读素材库');
+        } else {
+          setUploadError(e instanceof Error ? e.message : '上传失败');
+        }
+      }
+    },
+    [projectId, queryClient],
+  );
+
+  const onFileInputChange = useCallback(
+    (e: React.ChangeEvent<HTMLInputElement>) => {
+      const file = e.target.files?.[0];
+      if (file) void handleFileSelected(file);
+      // Reset so selecting the same file again re-triggers.
+      e.target.value = '';
+    },
+    [handleFileSelected],
+  );
+
   // Close on Escape while open (drawer has no focus trap in this window).
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -643,19 +690,47 @@ export function AssetLibraryDrawer({ projectId, onClose }: { projectId: string; 
         <button
           type="button"
           data-test="asset-library-upload"
-          disabled
-          aria-disabled="true"
-          title="上传待接 — G06 端点需 OSS 直传三步流（POST /api/v2/uploads → 签名 PUT → finalize），尚未接入"
-          className="flex items-center gap-1 rounded-md border border-ml2-border bg-ml2-surface-2 px-1.5 py-0.5 text-[10px] text-ml2-text-3 opacity-60"
+          onClick={handleUploadClick}
+          disabled={uploadState === 'uploading'}
+          title={
+            uploadState === 'uploading'
+              ? '上传中…'
+              : '上传素材（G06 OSS 直传三步流：创上传 → 签名 PUT → finalize）'
+          }
+          className="flex items-center gap-1 rounded-md border border-ml2-border bg-ml2-surface-2 px-1.5 py-0.5 text-[10px] text-ml2-text hover:bg-ml2-surface-3"
         >
-          <Upload className="size-3" />
+          {uploadState === 'uploading' ? (
+            <Loader2 className="size-3 animate-spin" />
+          ) : uploadState === 'success' ? (
+            <CheckCircle2 className="size-3 text-emerald-500" />
+          ) : uploadState === 'error' ? (
+            <AlertTriangle className="size-3 text-amber-500" />
+          ) : (
+            <Upload className="size-3" />
+          )}
           <span>上传</span>
-          <span data-test="asset-library-upload-note" className="text-ml2-text-3/80">
-            待接
-          </span>
         </button>
+        <input
+          ref={fileInputRef}
+          type="file"
+          className="hidden"
+          data-test="asset-library-upload-input"
+          onChange={onFileInputChange}
+        />
+        {/* ── compact upload status line (rendered only when active) ── */}
+        {(uploadState === 'uploading' || uploadState === 'error') && (
+          <div
+            data-test="asset-library-upload-status"
+            className={
+              'ml-auto max-w-[9rem] truncate text-[9px] ' +
+              (uploadState === 'error' ? 'text-amber-500' : 'text-ml2-text-3')
+            }
+          >
+            {uploadState === 'uploading' ? '上传中…' : uploadError}
+          </div>
+        )}
         <span className="ml-auto rounded border border-ml2-border bg-ml2-surface-2 px-1.5 py-0.5 text-[9px] uppercase tracking-wide text-ml2-text-3">
-          read-only
+          {uploadState === 'success' ? 'uploaded' : 'library'}
         </span>
         <button
           type="button"
