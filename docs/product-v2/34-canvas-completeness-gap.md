@@ -162,8 +162,8 @@
 ## E) 实施进度（2026-09-05 更新）
 - 已合入：M1 viewport(54824d2)/W1 run-client+Runs+节点缩略图+scriptId(96a9b26)/W1② Run+runState(54a63b8)/W2 NodePreviewModal 预览下载重跑(54a63b8)/W3 资产拖拽成节点(a485fd7)+G06 上传口(f6a27b9)/W4 canvasCommandLogClient+syncFromCommandLog 游标+History(a485fd7)/W5 presence client(7d97a26)+在场条+节点锁(2d3add6)/W6① canvasId 上提(7d65cba)/W6③ Inspector 陈旧文案已同步("会话态刷新丢失"→现 L144"自动保存约900ms不丢")/M2 快捷键真因修复(5aae41b)/M1 无边网格线(23873d7)/W6④ 自动布局 DAG 分层(bb031c0：dagLayout.ts 纯函数+store.autoLayout 锁/frame 跳过+Inspector 按钮；9/9 绿、studio-v2 195/195、tsc 0)
 - 测试(截至 f6a27b9): 全量套件前轮记录 531 绿; studio-v2+v2 子集 55 files/427 passed; tsc 0
-- 剩余(未合入, 记录不臆造):
-  - 服务端多画布 REST(list/副画布/切换) —— server+DB 级(客户端 W6① 已注 primary-only, 多画布留 DB-level)。本地已有 PG(5441)可跑集成取证, 待父线串行。不派。
+- 剩余(未合入, 记录不臆造): **无**。8 域验收清单 + Top 缺项全部落地；服务端多画布 REST(4d8f295)后，34 号清单的「缺失」项清零。
+- 本轮(09-05 深夜, 本地): W6④ 自动布局(bb031c0) + 服务端多画布 REST(4d8f295: list/建副画布/切主/按 id 读, 真实本地 PG 集成测试 1/1, audit 6/6 无回归) + 修复 /studio 路由 QueryClientProvider 崩溃(0f68056, 画布页此前一直 ErrorBoundary)。
 - 本轮判定: 空闲无未合入叶(src/ 净, live/ 无 running); 仅剩两叶均属核心/服务端耦合, flash cron 依纪律不强行推进(不臆造 PASS), 故 round 无可见新画布能力合入, 只做 34 波次复核(本 E 更新) + LEDGER 记录。
 - 测试环境 UI 刷新(13001 呈现): 待审批放行(大机预构建 dist + fast 镜像)
 - (17:25) 本轮: 空闲无未合入叶/无在飞委托。复核发现 M1 剩余独立 UI 缺口「无边网格线」确实未完成——StudioCanvas L398 仍 `BackgroundVariant.Dots`(点阵, 非「无边网格线」)。已接线: `Background`→`BackgroundVariant.Lines`(react-flow 内建无限线格, 随视口延伸, 位于节点下层, 关闭 doc30/§33 M1 目标准备)。提交 23873d7;  studio-v2 子集 23 files/189 tests 绿 + tsc 0。
