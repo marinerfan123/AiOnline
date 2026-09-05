@@ -15,10 +15,12 @@ export function initApi(baseUrl: string, token: string) {
 }
 
 function headers(): Record<string, string> {
-  return {
-    'Content-Type': 'application/json',
-    Authorization: `Bearer ${API_TOKEN}`,
-  };
+  const h: Record<string, string> = { 'Content-Type': 'application/json' };
+  // 仅在有 token 时附加 Bearer：若 token 探测失败(/api/token 被护住→403)却强带空 Bearer，
+  // 后端会视作一次鉴权尝试而 401（即使有效 session cookie 在）→ 前台列表全空。
+  // 无 token 时完全依赖 credentials:'include' 的会话 cookie 鉴权。
+  if (API_TOKEN) h.Authorization = `Bearer ${API_TOKEN}`;
+  return h;
 }
 
 async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
@@ -53,9 +55,13 @@ export function ensureApi(): Promise<boolean> {
         if (res.ok) {
           const { token } = await res.json();
           initApi(apiBase, token);
-          console.log(`[API] 已连接 ${apiBase}`);
-          return true;
+        } else {
+          // token 探测不可用（例如 /api/token 被安全护住返回 403）：同域仍视为已连接，
+          // 靠 credentials:'include' 的会话 cookie 鉴权，绝不因此把列表加载跳过/置空。
+          initApi(apiBase, '');
         }
+        console.log(`[API] 已连接 ${apiBase}`);
+        return true;
       } catch {
         console.log('[API] 后端未启动，使用内置默认数据（不持久化）');
       }
