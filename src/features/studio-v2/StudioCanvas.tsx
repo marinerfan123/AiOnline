@@ -312,6 +312,10 @@ function CanvasCore() {
           const f = screenToFlowPosition({ x, y });
           setMenu({ x: x - 40, y: y - 10, fx: f.x, fy: f.y, edgeFrom: { nodeId: from.id, handleId, portType: outPort.type } });
         }}
+        onNodeDoubleClick={(_e, node) => {
+          // M1 ②: double-click a node centres it in the viewport (节点双击定位居中).
+          fitView({ nodes: [{ id: node.id }], duration: 200, padding: 0.35, maxZoom: 1.5 });
+        }}
         onDoubleClick={(e) => {
           const target = e.target as HTMLElement;
           if (!target.classList.contains('react-flow__pane')) return;
