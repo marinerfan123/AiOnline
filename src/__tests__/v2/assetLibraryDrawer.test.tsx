@@ -246,3 +246,29 @@ describe('AssetLibraryDrawer — version browsing', () => {
     expect(detail.textContent).not.toContain('storageKey');
   });
 });
+
+describe('AssetLibraryDrawer — drag-to-canvas + upload gate (G06)', () => {
+  it('asset items are draggable (HTML5 drag-to-canvas)', async () => {
+    await renderDrawer([asset('m-1', '首图')]);
+    const item = screen.getByTestId('asset-library-item-m-1') as HTMLButtonElement;
+    expect(item.draggable).toBe(true);
+  });
+
+  it('dragstart serializes { assetId, assetType, url, thumbnail } into the drag payload', async () => {
+    await renderDrawer([
+      { ...asset('m-9', '片头'), assetType: 'VIDEO', url: 'https://cdn/v.mp4', thumbnailUrl: 'https://cdn/v.jpg' },
+    ]);
+    const dt = { setData: vi.fn(), effectAllowed: '' } as unknown as DataTransfer;
+    fireEvent.dragStart(screen.getByTestId('asset-library-item-m-9'), { dataTransfer: dt });
+    expect(dt.setData).toHaveBeenCalledWith(
+      'application/x-studio-asset',
+      JSON.stringify({ assetId: 'm-9', assetType: 'VIDEO', url: 'https://cdn/v.mp4', thumbnail: 'https://cdn/v.jpg' }),
+    );
+  });
+
+  it('upload button is disabled with a 待接 note (G06 direct-upload endpoint pending)', async () => {
+    await renderDrawer([asset('m-1', '首图')]);
+    expect((screen.getByTestId('asset-library-upload') as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByTestId('asset-library-upload-note').textContent).toContain('待接');
+  });
+});

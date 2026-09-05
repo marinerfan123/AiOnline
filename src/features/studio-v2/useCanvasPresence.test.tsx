@@ -1,17 +1,16 @@
 // @vitest-environment jsdom
 // W5a — useCanvasPresence 接线：enter→online 心跳、unmount→leave、visibilitychange
-// hidden→offline/visible→online、peers 轮询。presenceClient / v2studio 全部 mock，
-// 隔离到 hook 的生命周期接线（状态机/节流已由 canvasPresenceState.test 单测）。
+// hidden→offline/visible→online、peers 轮询。presenceClient mock；canvasId 来源
+// (W6① 上提后) 由 store.currentCanvasId 提供 —— 本 hook 不再自行 getCanvas。
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { renderHook, act, cleanup } from '@testing-library/react';
 import { useCanvasPresence } from './useCanvasPresence';
+import { useStudioStore } from './store';
 
 const mocks = vi.hoisted(() => ({
   heartbeat: vi.fn(),
   leave: vi.fn(),
   getPresence: vi.fn(),
-  getCanvas: vi.fn(),
-  createCanvas: vi.fn(),
 }));
 
 vi.mock('./collab/presenceClient', () => ({
@@ -23,35 +22,13 @@ vi.mock('./collab/presenceClient', () => ({
   HEARTBEAT_INTERVAL_MS: 15_000,
 }));
 
-vi.mock('@/shared/api/contract/studio-canvas-client', () => ({
-  v2studio: {
-    getCanvas: mocks.getCanvas,
-    createCanvas: mocks.createCanvas,
-  },
-}));
-
-const canvasMeta = (id: string) => ({
-  id,
-  projectId: 'p1',
-  workspaceId: 'w1',
-  name: 'Primary Canvas',
-  revision: 1,
-  schemaVersion: 1,
-  archivedAt: null,
-  createdAt: null,
-  updatedAt: null,
-  restoredFromVersionId: null,
-});
-const canvasResponse = (id: string) => ({ canvas: canvasMeta(id), nodes: [], edges: [], viewport: null });
-
 async function drain() {
   for (let i = 0; i < 8; i++) await act(async () => { await Promise.resolve(); });
 }
 
 beforeEach(() => {
   vi.resetAllMocks();
-  mocks.getCanvas.mockResolvedValue(canvasResponse('canvas-uuid-1'));
-  mocks.createCanvas.mockResolvedValue(canvasResponse('canvas-uuid-2'));
+  useStudioStore.getState().setCurrentCanvasId('canvas-uuid-1');
   mocks.heartbeat.mockResolvedValue({ userId: 'me', state: 'online', lastSeenMs: 1 });
   mocks.leave.mockResolvedValue(undefined);
   mocks.getPresence.mockResolvedValue([
@@ -60,29 +37,30 @@ beforeEach(() => {
   ]);
 });
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  useStudioStore.getState().setCurrentCanvasId(null);
+});
 
-describe('useCanvasPresence — canvasId 来源（单主画布/项目）', () => {
-  it('解析 canvas.id（非 projectId）：getCanvas 后 presence 以 canvas.id 键', async () => {
+describe('useCanvasPresence — canvasId 来源（W6① 上提：读 store）', () => {
+  it('canvasId 取自 store.currentCanvasId（非 projectId），presence 以其键', async () => {
     const { result } = renderHook(() => useCanvasPresence('p1'));
     await drain();
 
-    expect(mocks.getCanvas).toHaveBeenCalledWith('p1');
+    // 寻址键 = canvasId（canvas-uuid-1），绝非 projectId（p1）。
     expect(result.current.canvasId).toBe('canvas-uuid-1');
-    // presence 寻址键 = canvasId（canvas-uuid-1），绝非 projectId。
     expect(mocks.heartbeat).toHaveBeenCalledWith({ canvasId: 'canvas-uuid-1', state: 'online' });
   });
 
-  it('无主画布时 createCanvas 取回 id（幂等 fallback）', async () => {
-    mocks.getCanvas.mockResolvedValue({ canvas: null, nodes: [], edges: [], viewport: null });
+  it('store 无 canvasId（尚未解析/失败）→ presence 停用，不 heartbeat', async () => {
+    useStudioStore.getState().setCurrentCanvasId(null);
     const { result } = renderHook(() => useCanvasPresence('p1'));
     await drain();
-
-    expect(mocks.createCanvas).toHaveBeenCalledWith('p1', { name: 'Primary Canvas' });
-    expect(result.current.canvasId).toBe('canvas-uuid-2');
+    expect(result.current.canvasId).toBeNull();
+    expect(mocks.heartbeat).not.toHaveBeenCalled();
   });
 
-  it('projectId 为空 → presence 停用（canvasId null，不 heartbeat）', async () => {
+  it('projectId 为空 → presence 停用（即便 store 有 canvasId，也不 heartbeat）', async () => {
     const { result } = renderHook(() => useCanvasPresence(undefined));
     await drain();
     expect(result.current.canvasId).toBeNull();
