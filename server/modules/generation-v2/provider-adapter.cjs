@@ -259,23 +259,24 @@ function fromContract(providerId, contractRow, { drivers, instantiate } = {}) {
   if (!driverKind || typeof driverKind !== 'string') {
     throw new DriverContractError(DRIVER_ERROR.CONTRACT_MISSING, 'fromContract: contractRow.driver_kind required');
   }
-  // 解析优先级：显式 drivers 注入 > 静态实例注册表 > 静态工厂注册表（需 instantiate 延迟实例化）。
+  // 解析优先级（回退链，非排他）：显式 drivers 注入 > 静态实例注册表 > 静态工厂注册表。
+  // 任一源命中即止；未命中继续向下回退，直到三源全部落空才判 UNKNOWN_DRIVER_KIND。
+  // （此前 `if (drivers) {…} else {…}` 把显式注入做成排他分支：一旦传入 drivers 映射，
+  //  工厂注册表(volcengine/fal/vidu)被整体跳过 —— 部分映射/驱动模块未加载时误判 UNKNOWN_DRIVER_KIND，
+  //  掩盖了「kind 已知但需 instantiate」这一真实原因，调用方会误吞为配置错。）
   let impl;
-  if (drivers) {
-    impl = drivers[driverKind];
-  } else {
-    impl = _registry[driverKind];
-    if (!impl && _factoryRegistry[driverKind]) {
-      // 静态工厂注册（§138 无副作用）：经注入 instantiate 延迟实例化。
-      // 未注入 instantiate → 明确报 DRIVER_NOT_INSTANTIATED（非 UNKNOWN_DRIVER_KIND，kind 是已知的）。
-      if (typeof instantiate !== 'function') {
-        throw new DriverContractError(
-          DRIVER_ERROR.DRIVER_NOT_INSTANTIATED,
-          `driver_kind "${driverKind}" is registered as a factory; provide fromContract(..., { instantiate }) to resolve`,
-        );
-      }
-      impl = instantiate(_factoryRegistry[driverKind], driverKind);
+  if (drivers) impl = drivers[driverKind];
+  if (!impl) impl = _registry[driverKind];
+  if (!impl && _factoryRegistry[driverKind]) {
+    // 静态工厂注册（§138 无副作用）：经注入 instantiate 延迟实例化。
+    // 未注入 instantiate → 明确报 DRIVER_NOT_INSTANTIATED（非 UNKNOWN_DRIVER_KIND，kind 是已知的）。
+    if (typeof instantiate !== 'function') {
+      throw new DriverContractError(
+        DRIVER_ERROR.DRIVER_NOT_INSTANTIATED,
+        `driver_kind "${driverKind}" is registered as a factory; provide fromContract(..., { instantiate }) to resolve`,
+      );
     }
+    impl = instantiate(_factoryRegistry[driverKind], driverKind);
   }
   if (!impl) {
     throw new DriverContractError(DRIVER_ERROR.UNKNOWN_DRIVER_KIND, `unknown driver_kind: ${driverKind}`);

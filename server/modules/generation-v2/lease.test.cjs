@@ -165,7 +165,7 @@ test('completeActivity/failActivity fencing：UPDATE WHERE id AND lease_owner=$m
   assert.equal(await completeActivity(pg, { id: 'a1', workerId: 'old' }), null);
   const c0 = pg.calls[0];
   assert.match(c0.sql, /WHERE id=\$1 AND lease_owner=\$2/);
-  assert.match(c0.sql, /SET status='done'/);
+  assert.match(c0.sql, /SET status='succeeded'/);
   assert.match(c0.sql, /lease_owner=NULL, lease_expires_at=NULL/);
   assert.match(c0.sql, /status IN \('pending','waiting_retry','running'\)/);
   assert.deepEqual(c0.params, ['a1', 'old']);

@@ -215,7 +215,14 @@ function createFalDriver({ http, credentials, baseUrl } = {}) {
     else if (status === 429) code = 'RATE_LIMIT';
     else if (status >= 500) code = 'NETWORK_ERROR';
     else code = 'UNKNOWN';
-    return normalizeError({ code, message: String(detail).slice(0, 200), httpStatus: status });
+    // 抽取 Retry-After（body 或响应头），交给上层 decideRetry 尊重（与 vidu/volcengine 一致）。
+    const ra = (body && typeof body === 'object' && (body.retry_after ?? body.retryAfter))
+      ?? (res && (res.retryAfter
+        || (res.headers && (res.headers['retry-after'] || res.headers['Retry-After']))))
+      ?? null;
+    const err = { code, message: String(detail).slice(0, 200), httpStatus: status };
+    if (ra != null) err.retryAfter = ra;
+    return normalizeError(err);
   }
 
   return {

@@ -66,7 +66,11 @@ function durableNodeData(raw) {
     status: String(d.status || 'IDLE'),
     parameters: safeJson(d.parameters, {}),
   };
-  if (typeof d.assetId === 'string' || d.assetId === null) out.assetId = d.assetId;
+  // v4-pro 审计叶E: assetId 与 §119 jobId 双写对齐——snake_case `asset_id` 与 camelCase
+  // `assetId` 均认(遗漏任一处→下游 safeNodeInput 读 data.assetId 断链)。优先级与 §119
+  // 词表循环一致(snake 优先), 仅 string/null 落列(保持既有 assetId 语义)。
+  const assetId = d.asset_id !== undefined ? d.asset_id : d.assetId;
+  if (typeof assetId === 'string' || assetId === null) out.assetId = assetId;
   if (typeof d.prompt === 'string') out.prompt = d.prompt;
   if (d.validation && typeof d.validation === 'object') out.validation = d.validation;
   if (typeof d.frameLabel === 'string') out.frameLabel = d.frameLabel;
@@ -591,7 +595,15 @@ function createStudioCanvasPersistence(deps) {
         // 否则: reject409 / 混合 kind / 非 data-only → 回落整画布 CAS。
       }
       const cas = await client.query('UPDATE studio_canvases SET revision=revision+1, viewport_json=COALESCE($3, viewport_json), updated_by=$4, updated_at=NOW() WHERE id=$1 AND revision=$2 RETURNING *', [canvas.id, base, body.viewport === undefined ? null : JSON.stringify(safeJson(body.viewport, {})), user.id]);
-      if (!cas.rows.length) { const cur = await client.query('SELECT revision FROM studio_canvases WHERE id=$1', [canvas.id]); await client.query('ROLLBACK'); return sendErr(sendJSON, res, 409, 'CONFLICT', { serverRevision: cur.rows[0]?.revision || canvas.revision, canvasId: canvas.id }); }
+      if (!cas.rows.length) {
+        // v4-pro 审计叶E: 并发同 clientMutationId 双请求——CAS 被对方推进后, 本请求是重放
+        // 而非真冲突。整画布 CAS 路径与 kind-scoped 路径的 insertMutation ON CONFLICT 幂等对齐:
+        // 先回读同 cmid 已提交 mutation, 命中则幂等 200(非 409), 并 ROLLBACK 丢弃本事务
+        // 任何部分写入(含 LWW 回落前的 parked/UPDATE)。未命中才是真 stale → 409。
+        const idem = await client.query('SELECT response_json FROM studio_canvas_mutations WHERE canvas_id=$1 AND client_mutation_id=$2', [canvas.id, cmid]);
+        if (idem.rows.length) { await client.query('ROLLBACK'); return sendJSON(res, 200, { ...idem.rows[0].response_json, idempotent: true }); }
+        const cur = await client.query('SELECT revision FROM studio_canvases WHERE id=$1', [canvas.id]); await client.query('ROLLBACK'); return sendErr(sendJSON, res, 409, 'CONFLICT', { serverRevision: cur.rows[0]?.revision || canvas.revision, canvasId: canvas.id });
+      }
       // W2-06 — 权威绑定校验接线(三视图叶2)。CAS 通过后、任何写入(delete/upsert)之前,
       // 对本次 upsertNodes 全部先归一化再校验 —— 绑定只可能随节点 data_json.shotId /
       // data_json.structureNodeId 进入, 故边 upsert / 节点删除路径不携带绑定串, 由同一

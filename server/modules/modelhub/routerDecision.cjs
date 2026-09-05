@@ -13,6 +13,13 @@
  * no reservation, no admission slot acquire (§37 无提交权威).
  */
 const { resolveRoute: coreResolveRoute } = require('./router.cjs');
+const { toSemanticsObject, parseSemanticMap } = require('./semanticMap.cjs');
+
+// 候选描述符的保留结构键：metadata 自由 JSONB 不得覆盖这些字段（字段名契约防漂移）。
+const RESERVED_MODEL_KEYS = new Set([
+  'logicalModelCode', 'mediaType', 'status', 'operations', 'schema', 'semantics',
+  'capabilityDescriptor', 'code', 'media_type', 'id',
+]);
 
 /** Compute a provider score + pick the best provider. Deterministic (ties broken by id). */
 function routeDecision({ task, providers = [], continuity = {}, duration, resolution, plan, requiredCapabilities = [] } = {}) {
@@ -102,10 +109,10 @@ function emptyEnvelope(code, reasons) {
  *  - model_operation_revisions × model_operations（supported operations + input_schema + semantics）
  * 表缺失/查询失败 → 优雅降级返回 []（候选空 → NO_ROUTABLE_MODEL），不向上抛异常。
  * @param {{query:Function}} pg
- * @param {{mediaType:string, logicalModelCode?:string}} q
+ * @param {{mediaType:string, logicalModelCode?:string, operationCode?:string}} q
  * @returns {Promise<Array<object>>} model 描述符（normalizeModel 兼容形状）
  */
-async function fetchModels(pg, { mediaType, logicalModelCode } = {}) {
+async function fetchModels(pg, { mediaType, logicalModelCode, operationCode } = {}) {
   try {
     const params = [mediaType];
     let sql = "SELECT * FROM logical_models WHERE media_type = $1 AND status = 'ACTIVE'";
@@ -155,13 +162,29 @@ async function fetchModels(pg, { mediaType, logicalModelCode } = {}) {
       const ops = opsByLm.get(lm.id) || [];
       const revs = revsByLm.get(lm.id) || [];
       const opCodes = [...new Set(ops.map((o) => o.operation_code).filter(Boolean))];
-      const first = ops[0] || {};
-      // metadata：首个 ACTIVE revision 的富字段（宽容合并，缺失字段由 score 默认值兜底）
+      // 选定「当前请求 operation」的修订：多 operation model 时 schema/semantics 必须匹配请求 op，
+      // 而非 code 序首个（否则 schemaCompat/requiredSemantic 两道会误读其它 op 的 schema）。
+      const scopeOps = operationCode != null && String(operationCode) !== ''
+        ? ops.filter((o) => o.operation_code === String(operationCode))
+        : ops;
+      const effOps = scopeOps.length ? scopeOps : ops;
+      const first = effOps[0] || {};
+      // semantics：从 semantic_map 归一出语义键集（{bySurface, bySemantic}），供 router
+      //   _supportedSemantics 消费（§21 capability_descriptor 是 operations+limits，不含语义键，
+      //   若塞入 semantics 则 requiredSemantic 门恒误拒 —— 契约漂移，此处显式拆开）。
+      const mergedSem = {};
+      for (const o of effOps) {
+        const sm = parseSemanticMap(o.semantic_map);
+        for (const [k, v] of Object.entries(sm)) mergedSem[k] = v;
+      }
+      const semantics = toSemanticsObject(mergedSem);
+      // metadata：首个 ACTIVE revision 的富字段（宽容合并，缺失字段由 score 默认值兜底）。
+      // 防漂移：保留键（结构字段）不随 metadata 覆盖，避免自由 JSONB 污染候选描述符契约。
       const meta = {};
       for (const rv of revs) {
         if (rv.metadata && typeof rv.metadata === 'object') {
           for (const [k, v] of Object.entries(rv.metadata)) {
-            if (meta[k] === undefined) meta[k] = v;
+            if (meta[k] === undefined && !RESERVED_MODEL_KEYS.has(k)) meta[k] = v;
           }
         }
       }
@@ -171,7 +194,8 @@ async function fetchModels(pg, { mediaType, logicalModelCode } = {}) {
         status: lm.status,
         operations: opCodes,
         schema: first.input_schema !== undefined ? first.input_schema : undefined,
-        semantics: first.capability_descriptor || first.semantic_map || undefined,
+        semantics,
+        capabilityDescriptor: first.capability_descriptor !== undefined ? first.capability_descriptor : undefined,
       }, meta);
     });
   } catch (e) {
@@ -194,7 +218,7 @@ async function fetchBindings(pg, modelCodes = []) {
   try {
     const bRes = await pg.query(
       `SELECT pmb.id AS binding_id, pmb.model_id, pmb.provider_id,
-              pmb.upstream_model_name, pmb.priority, pmb.weight
+              pmb.upstream_model_name, pmb.priority, pmb.weight, pmb.cert_id
          FROM provider_model_bindings pmb
          JOIN providers p ON p.id = pmb.provider_id
         WHERE pmb.enabled = true AND p.enabled = true AND pmb.model_id = ANY($1)
@@ -202,6 +226,20 @@ async function fetchBindings(pg, modelCodes = []) {
       [modelCodes],
     );
     const rows = bRes.rows || [];
+
+    // cert 联读（0067 cert_id → provider_certifications）：下层 routeBinding cert 门
+    // （minFidelity）消费 binding.cert；缺失 → null，dry-run 放行。表缺失非阻断。
+    const certByBinding = new Map();
+    try {
+      const certIds = [...new Set(rows.map((r) => r.cert_id).filter(Boolean))];
+      if (certIds.length) {
+        const cRes = await pg.query(
+          `SELECT cert_id, cert_status, fidelity_class FROM provider_certifications WHERE cert_id = ANY($1)`,
+          [certIds],
+        );
+        for (const r of cRes.rows || []) certByBinding.set(r.cert_id, r);
+      }
+    } catch (_) { /* cert 缺失非阻断 */ }
 
     let costByModel = new Map();
     try {
@@ -213,15 +251,21 @@ async function fetchBindings(pg, modelCodes = []) {
       for (const r of cRes.rows || []) costByModel.set(r.model_id, r.cost);
     } catch (_) { /* cost 缺失非阻断 */ }
 
-    return rows.map((b) => ({
-      bindingId: b.binding_id,
-      logicalModelCode: b.model_id, // 顶层逻辑码：routeBinding 层隔离用（_bindingModelCode 优先取此键）
-      model: { logicalModelCode: b.model_id, model_id: b.model_id },
-      provider: { id: b.provider_id },
-      cost: costByModel.has(b.model_id) ? Number(costByModel.get(b.model_id)) : null,
-      bindingWeight: Number(b.weight || 0),
-      upstreamModelName: b.upstream_model_name || '',
-    }));
+    return rows.map((b) => {
+      const certRow = b.cert_id ? (certByBinding.get(b.cert_id) || null) : null;
+      return {
+        bindingId: b.binding_id,
+        logicalModelCode: b.model_id, // 顶层逻辑码：routeBinding 层隔离用（_bindingModelCode 优先取此键）
+        model: { logicalModelCode: b.model_id, model_id: b.model_id },
+        provider: { id: b.provider_id },
+        cost: costByModel.has(b.model_id) ? Number(costByModel.get(b.model_id)) : null,
+        bindingWeight: Number(b.weight || 0),
+        upstreamModelName: b.upstream_model_name || '',
+        cert: certRow
+          ? { certStatus: certRow.cert_status, fidelityClass: certRow.fidelity_class }
+          : null,
+      };
+    });
   } catch (e) {
     console.warn('[routerDecision] fetchBindings 失败(降级为空候选):', e && e.message);
     return [];
@@ -297,7 +341,7 @@ async function resolveRoute({ pg, mediaType, operationCode, logicalModelCode, re
   }
   if (usage !== undefined) effReq.usage = usage;
 
-  const models = await fetchModels(pg, { mediaType, logicalModelCode });
+  const models = await fetchModels(pg, { mediaType, logicalModelCode, operationCode });
   const modelCodes = models.map((m) => m.logicalModelCode).filter(Boolean);
   const bindings = await fetchBindings(pg, modelCodes);
 

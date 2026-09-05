@@ -33,9 +33,13 @@ async function recordProviderEventAnomaly(pg, anomaly) {
     fromStatus = null, toStatus = null, reason = null, detail = null,
   } = anomaly || {};
   if (!itemId) throw new TypeError('anomaly.itemId required');
+  // published_at 入队即 NOW()：anomaly 是内部审计事件，消费端 publishOutbox 按 event_type
+  // 显式跳过、永不发布/重试；若不标记 published，会永久计入 observability 的
+  // `outbox_pending`（published_at IS NULL）并随审计事件无限膨胀。标记为已发布后既不阻塞、
+  // 也不污染 pending 计数，且 payload 全量保留（append-only 审计语义不变）。
   const r = await pg.query(
-    `INSERT INTO generation_outbox_v2 (aggregate_type, aggregate_id, event_type, payload)
-     VALUES ($1, $2, 'provider_event_anomaly', $3::jsonb)
+    `INSERT INTO generation_outbox_v2 (aggregate_type, aggregate_id, event_type, payload, published_at)
+     VALUES ($1, $2, 'provider_event_anomaly', $3::jsonb, NOW())
      RETURNING event_id`,
     ['generation_item', itemId, JSON.stringify({
       item_id: itemId, job_id: jobId, attempt_id: attemptId,
@@ -173,7 +177,17 @@ async function claimReconciling(pg, { workerId, limit = 10, leaseSeconds = 300 }
 async function resolveReconcilingItem(pg, item, injected = {}) {
   const deps = { transitionItem: lease.transitionItem, queryProviderStatus: null, recordAnomaly: recordProviderEventAnomaly, ...injected };
   if (typeof deps.queryProviderStatus !== 'function') throw new TypeError('queryProviderStatus required');
-  const base = { itemId: item.item_id, leaseVersion: Number(item.lease_version) };
+  let base = { itemId: item.item_id, leaseVersion: Number(item.lease_version) };
+  // claimReconciling 也会领取 reconcile_wait 项（next_attempt_at 到期后）。状态机仅允许
+  // reconcile_wait>reconciling 再推进；若直接以 from='reconciling' 处理 reconcile_wait 项，
+  // 下方所有 CAS（WHERE status=$3）必失败 → 返回 stale_lease → item 永卡 reconcile_wait，
+  // provider 永不再被对账（CRITICAL：pending / SUBMIT_UNKNOWN 等待窗口到期后无法恢复）。
+  // 故先归一 hop：reconcile_wait → reconciling，并推进 lease_version。
+  if (item.status === 'reconcile_wait') {
+    const hopped = await deps.transitionItem(pg, { ...base, from: 'reconcile_wait', to: 'reconciling', patch: {} });
+    if (!hopped) return { status: 'stale_lease' };
+    base = { itemId: item.item_id, leaseVersion: Number(hopped.lease_version) };
+  }
   let providerResult;
   try {
     providerResult = await deps.queryProviderStatus(item.provider_request_id, item);

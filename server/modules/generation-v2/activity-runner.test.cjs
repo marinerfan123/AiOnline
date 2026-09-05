@@ -93,7 +93,7 @@ function makeMemoryStore() {
     if (!a) return null;
     if (a.lease_owner !== workerId) return null;
     if (!['pending', 'waiting_retry', 'running'].includes(a.status)) return null;
-    a.status = 'done';
+    a.status = 'succeeded';
     a.completed_at = now();
     a.lease_owner = null;
     a.lease_expires_at = null;
@@ -130,7 +130,7 @@ test.beforeEach(() => { ({ store, clock } = makeMemoryStore()); });
 
 test('失败只重试该 activity，不重跑已完成步骤（§43）', async () => {
   store.seed({ id: 'submit', activity_type: 'SUBMIT_PROVIDER', status: 'pending' });
-  store.seed({ id: 'prepare', activity_type: 'PREPARE_ASSETS', status: 'done' });
+  store.seed({ id: 'prepare', activity_type: 'PREPARE_ASSETS', status: 'succeeded' });
   const ran = [];
   const worker = async (a) => {
     ran.push(a.id);
@@ -140,10 +140,10 @@ test('失败只重试该 activity，不重跑已完成步骤（§43）', async (
   const r = await runner.runOnce();
   assert.equal(r.waiting_retry, 1);
   assert.equal(r.done, 0);
-  assert.deepEqual(ran, ['submit'], '只执行失败的 submit，done 的 prepare 不重跑');
+  assert.deepEqual(ran, ['submit'], '只执行失败的 submit，succeeded 的 prepare 不重跑');
   assert.equal(store.get('submit').status, 'waiting_retry');
   assert.equal(store.get('submit').error_code, 'RATE_LIMIT');
-  assert.equal(store.get('prepare').status, 'done');
+  assert.equal(store.get('prepare').status, 'succeeded');
   assert.equal(store.get('prepare').attempt_count, 0, '已完成步骤 attempt_count 不变');
 });
 
@@ -162,7 +162,7 @@ test('重试计数递增：失败→waiting_retry→重领→attempt_count 递�
   const r2 = await runner.runOnce();
   assert.equal(r2.done, 1);
   assert.equal(store.get('a1').attempt_count, 2, '重试后 attempt_count 递增');
-  assert.equal(store.get('a1').status, 'done');
+  assert.equal(store.get('a1').status, 'succeeded');
   assert.equal(calls, 2);
 });
 
@@ -196,7 +196,7 @@ test('timeout 独立：慢 activity 超时不影响其它 activity 完成', asyn
   const r = await runner.runOnce();
   assert.equal(r.done, 1);
   assert.equal(r.waiting_retry, 1);
-  assert.equal(store.get('fast').status, 'done', 'fast 独立完成');
+  assert.equal(store.get('fast').status, 'succeeded', 'fast 独立完成');
   assert.equal(store.get('slow').status, 'waiting_retry');
   assert.equal(store.get('slow').error_code, 'TIMEOUT', 'timeout 只归因于该 activity');
 });
@@ -216,7 +216,7 @@ test('幂等重入拒：并发 runOnce 同 activity 只跑一次', async () => {
   const r1 = await p1;
   assert.equal(r1.done, 1);
   assert.equal(calls, 1, 'worker 只执行一次');
-  assert.equal(store.get('a1').status, 'done');
+  assert.equal(store.get('a1').status, 'succeeded');
 });
 
 test('done 的 activity 不会被再次 claim（顺序重入不双跑）', async () => {
@@ -244,7 +244,7 @@ test('lease 到期 → 他 worker 接管，旧 owner 的 complete/fail 被 fenci
   assert.equal(await store.complete({ id: 'a1', workerId: 'A' }), null, '旧 owner complete 被拒');
   assert.equal(await store.fail({ id: 'a1', workerId: 'A', status: 'waiting_retry' }), null, '旧 owner fail 被拒');
   const done = await store.complete({ id: 'a1', workerId: 'B' });
-  assert.equal(done.status, 'done', '新 owner 正常完成');
+  assert.equal(done.status, 'succeeded', '新 owner 正常完成');
 });
 
 test('runner：执行中 lease 被接管 → complete 被 fencing 拒（fenced）', async () => {
@@ -271,7 +271,7 @@ test('runner：长任务期间心跳续租', async () => {
   const runner = createActivityRunner({ store, worker, workerId: 'w', heartbeatMs: 100, timeoutMs: 1000 });
   await runner.runOnce();
   assert.ok(renews >= 2, `心跳续租 ${renews} 次`);
-  assert.equal(store.get('a1').status, 'done');
+  assert.equal(store.get('a1').status, 'succeeded');
 });
 
 test('未知 activity_type 直接 failed，不进入 retry', async () => {

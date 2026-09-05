@@ -225,3 +225,50 @@ test('T5: concurrent settleByAttempt (same attempt_id) writes exactly one commit
     await dropTestDb(dbName);
   }
 }, { timeout: 60000 });
+
+// ─── T6: 并发 reserveCreditsV2（同 ref）只扣一次（幂等声明先占唯一键）───
+test('T6: concurrent reserveCreditsV2 (same ref) deducts exactly once', async () => {
+  const dbName = await createTestDb(randomSuffix());
+  const pg = createPool(dbName);
+  try {
+    await setupBillingDb(pg);
+    const ref = 't6-job';
+    const results = await Promise.all(Array.from({ length: 8 }, () =>
+      billing.reserveCreditsV2(pg, { userId: 'u-bill3', estimated: 100, ref, pool: 'recharge' })));
+    const nonIdem = results.filter(r => !r.idempotent).length;
+    assert.equal(nonIdem, 1, 'exactly one reserve takes effect (idempotent claim first)');
+
+    const bal = await pg.query('SELECT recharge_credits FROM users WHERE id=$1', ['u-bill3']);
+    assert.equal(Number(bal.rows[0].recharge_credits), 900, 'balance deducted exactly once (1000-100)');
+
+    const rows = await pg.query(`SELECT COUNT(*) AS c FROM credit_transactions WHERE ref=$1 AND kind='reserve'`, [ref]);
+    assert.equal(Number(rows.rows[0].c), 1, 'exactly one reserve row');
+  } finally {
+    await pg.end();
+    await dropTestDb(dbName);
+  }
+}, { timeout: 60000 });
+
+// ─── T7: 并发 commitCreditsV2（同 ref，delta>0）补扣差额只应用一次 ───
+test('T7: concurrent commitCreditsV2 (same ref, delta>0) applies delta exactly once', async () => {
+  const dbName = await createTestDb(randomSuffix());
+  const pg = createPool(dbName);
+  try {
+    await setupBillingDb(pg);
+    const ref = 't7-job';
+    await billing.reserveCreditsV2(pg, { userId: 'u-bill3', estimated: 100, ref, pool: 'recharge' }); // 1000 -> 900
+    const results = await Promise.all(Array.from({ length: 8 }, () =>
+      billing.commitCreditsV2(pg, { userId: 'u-bill3', actual: 130, userCharge: 130, estimated: 100, ref, pool: 'recharge' })));
+    const nonIdem = results.filter(r => !r.idempotent).length;
+    assert.equal(nonIdem, 1, 'exactly one commit applies the delta');
+
+    const bal = await pg.query('SELECT recharge_credits FROM users WHERE id=$1', ['u-bill3']);
+    assert.equal(Number(bal.rows[0].recharge_credits), 870, 'delta applied exactly once (100 reserve + 30 extra)');
+
+    const rows = await pg.query(`SELECT COUNT(*) AS c FROM credit_transactions WHERE ref=$1 AND kind='commit'`, [ref]);
+    assert.equal(Number(rows.rows[0].c), 1, 'exactly one commit row');
+  } finally {
+    await pg.end();
+    await dropTestDb(dbName);
+  }
+}, { timeout: 60000 });

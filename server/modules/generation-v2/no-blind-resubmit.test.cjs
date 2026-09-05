@@ -151,3 +151,45 @@ test('SUBMIT_UNKNOWN: 窗口已过但 provider 不支持 token → 转人工复�
   assert.equal(deps.calls.resubmit, 0, 'no token support → never blind resubmit (§52-53)');
   assert.equal(deps.calls.transition[0].to, 'review_required');
 });
+
+// ─── CRITICAL: reconcile_wait 项被 claimReconciling 领取后必须先 hop 回 reconciling ───
+// 修复前 resolveReconcilingItem 对 reconcile_wait 项硬编码 from='reconciling'，CAS 必失败
+// → stale_lease → item 永卡 reconcile_wait（pending/SUBMIT_UNKNOWN 等待窗口到期后无法恢复）。
+test('reconcile_wait 项先 hop 回 reconciling 再推进（不因 from 硬编码卡死）', async () => {
+  let currentStatus = 'reconcile_wait';
+  let leaseVersion = 5;
+  const transitions = [];
+  const result = await resolveReconcilingItem({}, {
+    item_id: 'i-rw-hop', lease_version: leaseVersion, provider_request_id: 'pr-rw', status: currentStatus,
+  }, {
+    queryProviderStatus: async () => ({ status: 'success', providerUrl: 'https://cdn/x.png' }),
+    // 模拟真实 CAS：from 必须等于当前 status，否则返回 null（stale_lease）
+    transitionItem: async (_pg, action) => {
+      transitions.push(action);
+      if (action.from !== currentStatus) return null;
+      currentStatus = action.to;
+      leaseVersion += 1;
+      return { item_id: action.itemId, status: action.to, lease_version: leaseVersion };
+    },
+  });
+
+  assert.equal(result.status, 'generated');
+  assert.equal(transitions.length, 2);
+  assert.equal(transitions[0].from, 'reconcile_wait', '先归一 hop');
+  assert.equal(transitions[0].to, 'reconciling');
+  assert.equal(transitions[1].from, 'reconciling', 'hop 后再按 reconciling 推进');
+  assert.equal(transitions[1].to, 'generated');
+});
+
+test('reconcile_wait 项 hop 失败（lease 被并发抢走）→ stale_lease，不误推进', async () => {
+  const transitions = [];
+  const result = await resolveReconcilingItem({}, {
+    item_id: 'i-rw-race', lease_version: 2, provider_request_id: 'pr-race', status: 'reconcile_wait',
+  }, {
+    queryProviderStatus: async () => ({ status: 'success', providerUrl: 'https://cdn/y.png' }),
+    transitionItem: async (_pg, action) => { transitions.push(action); return null; },
+  });
+  assert.equal(result.status, 'stale_lease');
+  assert.equal(transitions.length, 1);
+  assert.equal(transitions[0].from, 'reconcile_wait');
+});

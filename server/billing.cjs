@@ -204,20 +204,25 @@ const billing = {
     if (!Number.isFinite(est) || est <= 0) return { idempotent: false, reserved: 0 };
     const col = pool === 'reward' ? 'reward_credits' : 'recharge_credits';
     return tx(pg, async (txClient) => {
-      const existing = await txClient.query(
-        `SELECT id FROM credit_transactions WHERE ref = $1 AND kind = 'reserve'`, [ref],
+      // 幂等声明先行：先占 (ref,'reserve') 唯一键（INSERT ... ON CONFLICT DO NOTHING RETURNING）。
+      // 并发同 ref 的 reserve 在此阻塞，冲突时 no-op → 杜绝「余额重复扣但仅落一行」的双扣竞态。
+      const inserted = await txClient.query(
+        `INSERT INTO credit_transactions (user_id, kind, amount, ref, pool, balance_after, estimated_amount, user_charge_amount)
+         VALUES ($1, 'reserve', $2, $3, $4, (SELECT credits FROM users WHERE id = $1), $2, $2)
+         ON CONFLICT (ref, kind) DO NOTHING
+         RETURNING id`,
+        [userId, est, ref, pool],
       );
-      if (existing.rowCount) return { idempotent: true, reserved: 0 };
+      if (inserted.rowCount === 0) return { idempotent: true, reserved: 0 };
       const r = await txClient.query(
         `UPDATE users SET ${col} = ${col} - $1 WHERE id = $2 AND ${col} >= $1`,
         [est, userId],
       );
       if (r.rowCount === 0) { const e = new Error('Balance insufficient'); e.code = 'INSUFFICIENT'; throw e; }
+      // balance_after 补为扣减后快照（reconcile 不采信 reserve 的 balance_after，仅账本/审计展示用）
       await txClient.query(
-        `INSERT INTO credit_transactions (user_id, kind, amount, ref, pool, balance_after, estimated_amount, user_charge_amount)
-         VALUES ($1, 'reserve', $2, $3, $4, (SELECT credits FROM users WHERE id = $1), $2, $2)
-         ON CONFLICT (ref, kind) DO NOTHING`,
-        [userId, est, ref, pool],
+        `UPDATE credit_transactions SET balance_after = (SELECT credits FROM users WHERE id = $1) WHERE id = $2`,
+        [userId, inserted.rows[0].id],
       );
       return { idempotent: false, reserved: est };
     });
@@ -249,10 +254,16 @@ const billing = {
     const est = estimated == null ? charge : Number(estimated);
     const col = pool === 'reward' ? 'reward_credits' : 'recharge_credits';
     return tx(pg, async (txClient) => {
-      const existing = await txClient.query(
-        `SELECT id FROM credit_transactions WHERE ref = $1 AND kind = 'commit'`, [ref],
+      // 幂等声明先行：先占 (ref,'commit') 唯一键，再补扣/退回差额。
+      // 并发同 ref 的 commit 在此阻塞，冲突时 no-op → 杜绝「差额被重复应用」的双算竞态。
+      const inserted = await txClient.query(
+        `INSERT INTO credit_transactions (user_id, kind, amount, ref, pool, balance_after, estimated_amount, actual_amount, user_charge_amount)
+         VALUES ($1, 'commit', $2, $3, $4, (SELECT credits FROM users WHERE id = $1), $5, $6, $2)
+         ON CONFLICT (ref, kind) DO NOTHING
+         RETURNING id`,
+        [userId, charge, ref, pool, est, actualAmt],
       );
-      if (existing.rowCount) return { idempotent: true };
+      if (inserted.rowCount === 0) return { idempotent: true };
       const delta = charge - est;
       if (delta < 0) {
         await txClient.query(`UPDATE users SET ${col} = ${col} + $1 WHERE id = $2`, [Math.abs(delta), userId]);
@@ -262,11 +273,10 @@ const billing = {
         );
         if (r.rowCount === 0) { const e = new Error('Balance insufficient for actual calibration'); e.code = 'INSUFFICIENT'; throw e; }
       }
+      // balance_after 补为差额调整后的权威快照（reconcile 以 commit balance_after 校准 sim）
       await txClient.query(
-        `INSERT INTO credit_transactions (user_id, kind, amount, ref, pool, balance_after, estimated_amount, actual_amount, user_charge_amount)
-         VALUES ($1, 'commit', $2, $3, $4, (SELECT credits FROM users WHERE id = $1), $5, $6, $2)
-         ON CONFLICT (ref, kind) DO NOTHING`,
-        [userId, charge, ref, pool, est, actualAmt],
+        `UPDATE credit_transactions SET balance_after = (SELECT credits FROM users WHERE id = $1) WHERE id = $2`,
+        [userId, inserted.rows[0].id],
       );
       // §88 cap_adjust：差额（actual - authorized）单独记账，不动余额；幂等 ON CONFLICT。
       if (overage > 0) {

@@ -100,7 +100,7 @@ async function reapExpiredLeases(pg, { limit = 100 } = {}) {
 // ---- Activity lease (L10: EXTEND lease mechanism to generation_activity_runs / 0060) ----
 // 8 activity types (§42). Activity-level lifecycle is separate from
 // generation_items_v2.status:
-//   pending -> running -> done
+//   pending -> running -> succeeded
 //                    \-> waiting_retry -> (re-claimed) running
 //                    \-> failed (terminal once attempt_count >= maxAttempts)
 // lease_owner / lease_expires_at / heartbeat_at fence every write (§51):
@@ -200,9 +200,11 @@ async function renewActivityLease(pg, { id, workerId, leaseSeconds = 120 } = {})
 // the row has been adopted by someone else (no double-run, no double-settle).
 async function completeActivity(pg, { id, workerId } = {}) {
   if (!id || !workerId) throw new TypeError('id and workerId are required');
+  // 0060 CHECK 词表的终态成功是 'succeeded'（非 'done'）；写 'done' 会撞
+  // generation_activity_runs_status_check 约束（23514），activity 永远无法完成。
   const result = await pg.query(
     `UPDATE generation_activity_runs
-        SET status='done', completed_at=NOW(), lease_owner=NULL, lease_expires_at=NULL
+        SET status='succeeded', completed_at=NOW(), lease_owner=NULL, lease_expires_at=NULL
       WHERE id=$1 AND lease_owner=$2
         AND status IN ('pending','waiting_retry','running')
       RETURNING id, status, attempt_count`,

@@ -13,7 +13,7 @@ const { resolveRoute, buildAlternatives } = require('./routerDecision.cjs');
 const R = require('./router.cjs');
 
 /** 构造 mock pg：按 SQL 关键字分派到对应结果集。 */
-function makePg({ models = [], revisions = [], opRevs = [], bindings = [], costs = {} } = {}) {
+function makePg({ models = [], revisions = [], opRevs = [], bindings = [], costs = {}, certs = [] } = {}) {
   const rowsOf = (table, params, filterFn) => {
     const all = table;
     const filtered = filterFn ? all.filter((r) => filterFn(r, params)) : all;
@@ -35,6 +35,9 @@ function makePg({ models = [], revisions = [], opRevs = [], bindings = [], costs
       }
       if (s.includes('FROM model_operation_revisions')) {
         return rowsOf(opRevs, params, (r) => flat.includes(r.logical_model_id));
+      }
+      if (s.includes('FROM provider_certifications')) {
+        return rowsOf(certs, params, (r) => flat.includes(r.cert_id));
       }
       if (s.includes('FROM provider_model_bindings')) {
         return rowsOf(bindings, params, (r) => flat.includes(r.model_id));
@@ -249,4 +252,84 @@ test('buildAlternatives：runner-up 不足时补 rejected 淘汰原因', () => {
   assert.deepStrictEqual(alts.map((a) => a.logicalModelCode), ['x', 'y']);
   assert.match(alts[0].reason, /quota/);
   assert.match(alts[1].reason, /costCeiling/);
+});
+
+// ─── 5) 契约漂移修复（F 叶审计）：semantics 语义键 / schema 请求 op 定位 / binding cert ──
+test('契约修复：requiredSemantics 门经 resolve 路径按 semantic_map 语义键放行', async () => {
+  const pg = makePg({
+    models: [lm('lm-veo', 'video.veo-3.1', 'video')],
+    revisions: [rev('mr-veo', 'lm-veo', { quality: 0.9 })],
+    opRevs: [opRev('lm-veo', 'video.text_to_video', {
+      semantic_map: { duration: 'video.duration', resolution: 'video.resolution' },
+      capability_descriptor: { operations: ['video.text_to_video'], limits: { ratio: [] } },
+    })],
+    bindings: [binding('pmb-veo-1', 'video.veo-3.1', 'prov-1')],
+    costs: {},
+  });
+  const res = await resolveRoute({
+    pg, mediaType: 'video', operationCode: 'video.text_to_video',
+    requirements: { requiredSemantics: ['video.duration'], params: { prompt: 'hi' } },
+  });
+  assert.equal(res.ok, true, 'semantic_map 声明的 video.duration 应满足 requiredSemantics');
+  assert.equal(res.decision.model.logicalModelCode, 'video.veo-3.1');
+});
+
+test('契约修复：semantic_map 缺语义 → requiredSemantic 门剔除', async () => {
+  const pg = makePg({
+    models: [lm('lm-veo', 'video.veo-3.1', 'video')],
+    revisions: [rev('mr-veo', 'lm-veo', { quality: 0.9 })],
+    opRevs: [opRev('lm-veo', 'video.text_to_video', { semantic_map: {}, capability_descriptor: {} })],
+    bindings: [binding('pmb-veo-1', 'video.veo-3.1', 'prov-1')],
+    costs: {},
+  });
+  const res = await resolveRoute({
+    pg, mediaType: 'video', operationCode: 'video.text_to_video',
+    requirements: { requiredSemantics: ['video.duration'] },
+  });
+  assert.equal(res.ok, false);
+  assert.equal(res.code, R.NO_ROUTABLE_MODEL);
+  assert.ok(
+    (res.modelTrace && res.modelTrace.rejected || []).some((r) => r.rejectedAt === 'requiredSemantic'),
+    '应以 requiredSemantic 门剔除（而非误放行）',
+  );
+});
+
+test('契约修复：多 operation model 的 schema 定位到请求 operation', async () => {
+  const pg = makePg({
+    models: [lm('lm-multi', 'video.multi', 'video')],
+    revisions: [rev('mr-multi', 'lm-multi', { quality: 0.9 })],
+    opRevs: [
+      opRev('lm-multi', 'video.a_op', { input_schema: { type: 'object', properties: { a: { type: 'string' } }, required: ['a'] } }),
+      opRev('lm-multi', 'video.b_op', { input_schema: { type: 'object', properties: { b: { type: 'string' } }, required: ['b'] } }),
+    ],
+    bindings: [binding('pmb-multi-1', 'video.multi', 'prov-1')],
+    costs: {},
+  });
+  // 请求 video.b_op 且 params 提供 b：若 schema 误用 code 序首个 a_op（required a）→ schemaCompat 拒
+  const res = await resolveRoute({
+    pg, mediaType: 'video', operationCode: 'video.b_op',
+    requirements: { params: { b: 'x' } },
+  });
+  assert.equal(res.ok, true, 'schema 应匹配请求的 video.b_op（required b），而非 code 序首个 a_op');
+  assert.equal(res.decision.model.logicalModelCode, 'video.multi');
+});
+
+test('契约修复：binding cert 联读 → minFidelity 下层 cert 门放行/拒绝', async () => {
+  const pg = makePg({
+    models: [lm('lm-veo', 'video.veo-3.1', 'video')],
+    revisions: [rev('mr-veo', 'lm-veo', { quality: 0.9, certification: { certStatus: 'certified', fidelityClass: 'EXACT' } })],
+    opRevs: [opRev('lm-veo', 'video.text_to_video')],
+    bindings: [
+      { ...binding('pmb-veo-1', 'video.veo-3.1', 'prov-1'), cert_id: 'cert-1' },
+      { ...binding('pmb-veo-2', 'video.veo-3.1', 'prov-2'), cert_id: null },
+    ],
+    certs: [{ cert_id: 'cert-1', cert_status: 'certified', fidelity_class: 'EXACT' }],
+    costs: {},
+  });
+  const res = await resolveRoute({
+    pg, mediaType: 'video', operationCode: 'video.text_to_video',
+    requirements: { minFidelity: 'EXACT' },
+  });
+  assert.equal(res.ok, true, 'certified binding 应满足 EXACT');
+  assert.equal(res.decision.binding.bindingId, 'pmb-veo-1', '无 cert 的 pmb-veo-2 应被 cert 门剔除');
 });

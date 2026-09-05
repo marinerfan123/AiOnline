@@ -122,3 +122,76 @@ test('fake-provider: dispatchSingle 四种契约态 outcome 与 golden expected 
     assert.equal(n.status, state, `outcome ${outcome} → ${n.status}`);
   }
 });
+
+// ─── 4) 审计回归（L22-25 接线 + 429/5xx 一致性）───
+const {
+  fromContract, registerDriver, registerDriverFactory,
+  DRIVER_ERROR, DriverContractError,
+} = require('./provider-adapter.cjs');
+const { createViduDriver } = require('./drivers/vidu-driver.cjs');
+const { createFalDriver, mapFalStatus } = require('./drivers/fal-driver.cjs');
+const { createVolcengineDriver } = require('./drivers/volcengine-driver.cjs');
+
+function _auditFakeDriver() {
+  return { submit: async () => ({}), poll: async () => ({}), fetch: async () => ({}), cancel: async () => ({}), compile: () => ({}) };
+}
+
+test('fromContract: 显式 drivers 部分映射 → 回退静态工厂注册表（非排他），未注入 instantiate → DRIVER_NOT_INSTANTIATED', () => {
+  const kind = 'audit-fallback-factory';
+  registerDriverFactory(kind, () => _auditFakeDriver());
+  // 传入 drivers 映射但不含该 kind：此前排他分支直接判 UNKNOWN_DRIVER_KIND（掩盖真实原因，被调用方误吞为配置错）；
+  // 修复后回退到工厂注册表，因未注入 instantiate → 明确 DRIVER_NOT_INSTANTIATED（kind 已知）。
+  assert.throws(
+    () => fromContract('p', { driver_kind: kind }, { drivers: { agnes: _auditFakeDriver() } }),
+    (e) => e instanceof DriverContractError && e.code === DRIVER_ERROR.DRIVER_NOT_INSTANTIATED,
+  );
+});
+
+test('fromContract: 显式 drivers 未命中 → 回退静态实例注册表', () => {
+  const kind = 'audit-fallback-instance';
+  registerDriver(kind, _auditFakeDriver());
+  const adapter = fromContract('p', { driver_kind: kind }, { drivers: { other: _auditFakeDriver() } });
+  assert.equal(adapter.driverKind, kind);
+});
+
+test('driver 一致性: vidu 5xx → unknown/NETWORK_ERROR（绝不判 failed），保留 retryAfter', async () => {
+  const d = createViduDriver({
+    http: { request: async () => ({ status: 503, body: { error: { message: 'overloaded' }, retry_after: 7 } }) },
+    credentials: { token: 't' },
+  });
+  const r = await d.submit({ operationCode: 'video.text_to_video', prompt: 'x' });
+  assert.equal(r.status, 'unknown');
+  assert.equal(r.errorCode, 'NETWORK_ERROR');
+  assert.equal(r.retryAfter, 7);
+});
+
+test('driver 一致性: volcengine 429 → RATE_LIMIT + retryAfter（非 body.error.code 直通）', async () => {
+  const d = createVolcengineDriver({
+    http: { request: async () => ({ status: 429, body: { error: { code: 'RateLimitExceeded', message: 'slow down' }, retry_after: 12 } }) },
+    credentials: { apiKey: 'k' },
+  });
+  const r = await d.submit({ model: 'm', prompt: 'p' });
+  assert.equal(r.status, 'unknown');
+  assert.equal(r.errorCode, 'RATE_LIMIT');
+  assert.equal(r.retryAfter, 12);
+});
+
+test('driver 一致性: fal 429 → RATE_LIMIT + 抽取 retryAfter（body retry_after）', async () => {
+  const d = createFalDriver({
+    http: async () => ({ status: 429, body: { detail: 'busy', retry_after: 20 } }),
+    credentials: 'k',
+  });
+  const r = await d.poll({ statusUrl: 'https://queue.fal.run/m/r/status' });
+  assert.equal(r.status, 'unknown');
+  assert.equal(r.errorCode, 'RATE_LIMIT');
+  assert.equal(r.retryAfter, 20);
+});
+
+test('覆盖缺口: golden 只锁 base 三归一，未覆盖 driver 的 mapFalStatus / 嵌套 normalizeResult 分支', () => {
+  // fixture fal-status-004 锁 base normalizeStatus('IN_QUEUE')='unknown'；但 fal driver 先 mapFalStatus→'queued' 再归一 → 'pending'。
+  // 黄金样本未覆盖 fal 词表映射与 vidu 嵌套抽平，属 §127 覆盖缺口（非实现漂移）。
+  assert.equal(mapFalStatus('IN_QUEUE'), 'queued');
+  assert.equal(normalizeStatus(mapFalStatus('IN_QUEUE')), 'pending');
+  const vd = createViduDriver({ http: { request: async () => ({ status: 200, body: {} }) }, credentials: { token: 't' } });
+  assert.equal(vd.normalizeResult({ status: 'success', data: { url: 'https://cdn/v.mp4' } }).providerUrl, 'https://cdn/v.mp4');
+});

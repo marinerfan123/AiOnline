@@ -56,6 +56,28 @@ function buildContent(businessInput) {
   return content;
 }
 
+// 非2xx → 归一错误（与 fal/vidu 一致：429→RATE_LIMIT、5xx→NETWORK_ERROR 可重试，绝不判 failed）。
+// 此前 volcengine 无 status 映射：submit/poll/fetch 把 429/5xx 落到 body.error.code 直通或 normalizeStatus(undefined)，
+// 丢失 RATE_LIMIT 码 + Retry-After，破坏与 L21 poll policy(decideRetry) 的交互（429 无法识别 → 走固定退避而非 Retry-After）。
+function httpError(res) {
+  const body = (res && res.body) || {};
+  const b = body && typeof body === 'object' ? body : {};
+  const rawMessage = (b.error && (b.error.message || b.error.msg)) || b.message
+    || (typeof body === 'string' ? body : '') || `HTTP ${res.status}`;
+  let code;
+  if (res.status === 429) code = 'RATE_LIMIT';
+  else if (res.status === 401 || res.status === 403) code = 'AUTH_ERROR';
+  else if (res.status === 404) code = 'NOT_FOUND';
+  else if (res.status === 400 || res.status === 422) code = 'INVALID_INPUT';
+  else if (res.status >= 500) code = 'NETWORK_ERROR';
+  else code = 'UNKNOWN';
+  const out = { code, httpStatus: res.status, message: String(rawMessage).slice(0, 200) };
+  const ra = b.retry_after ?? b.retryAfter ?? res.retryAfter
+    ?? (res.headers && (res.headers['retry-after'] || res.headers['Retry-After']));
+  if (ra != null) out.retryAfter = ra;
+  return out;
+}
+
 function createVolcengineDriver({ http, credentials, baseUrl } = {}) {
   if (!http || typeof http.request !== 'function') {
     throw new TypeError('createVolcengineDriver: http.request is required');
@@ -112,6 +134,7 @@ function createVolcengineDriver({ http, credentials, baseUrl } = {}) {
     const request = compile(businessInput);
     const res = await call('POST', '/contents/generations/tasks', { body: request });
     if (res && res._normalizedError) return res._normalizedError;
+    if (res && res.status >= 400) return normalizeError(httpError(res));
     const body = res && res.body ? res.body : {};
     const taskId = String(body.id || (body.data && body.data.id) || body.task_id || '').trim();
     if (taskId) {
@@ -130,9 +153,7 @@ function createVolcengineDriver({ http, credentials, baseUrl } = {}) {
     const got = await getTask(taskId);
     if (got.error) return got.error;
     const { res, obj } = got;
-    if (res && res.status === 404) {
-      return normalizeError({ code: 'NOT_FOUND', message: 'volcengine task not found' });
-    }
+    if (res && res.status >= 400) return normalizeError(httpError(res));
     const status = normalizeStatus(obj.status);
     if (status === 'success') {
       return normalizeResult({
@@ -162,7 +183,8 @@ function createVolcengineDriver({ http, credentials, baseUrl } = {}) {
   async function fetch(taskId) {
     const got = await getTask(taskId);
     if (got.error) return got.error;
-    const { obj } = got;
+    const { res, obj } = got;
+    if (res && res.status >= 400) return normalizeError(httpError(res));
     // video_url / videoUrl / url / images[0] 经 normalizeResult 收敛为 providerUrl。
     return normalizeResult({
       status: normalizeStatus(obj.status),

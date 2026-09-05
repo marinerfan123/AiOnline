@@ -31,6 +31,7 @@ const UNORDERED_SET_FIELDS = new Set([
   'supported',  // semantics.supported  —— 支持语义集合
   'resolution', // limits.resolution    —— 允许分辨率集合
   'ratio',      // limits.ratio         —— 允许宽高比集合
+  'assetRefs',  // limits.assetRefs     —— 参考资产集合（§21 asset limits；readCapDescriptor 归一为字符串数组）
 ]);
 
 /**

@@ -99,6 +99,24 @@ test('裁决：白名单无序集合（required/supported/resolution/ratio）顺
   assert.strictEqual(a, b);
 });
 
+test('裁决：limits.assetRefs（§21 asset limits）为无序集合 → 顺序无关同签', () => {
+  const a = buildCapabilitySignature({
+    operationCode: 'image_to_video',
+    semantics: { required: ['reference.image'] },
+    limits: { assetRefs: ['img-a', 'img-b', 'img-c'] },
+    apiVersion: 'v1',
+    compilerRevision: 'r1',
+  });
+  const b = buildCapabilitySignature({
+    operationCode: 'image_to_video',
+    semantics: { required: ['reference.image'] },
+    limits: { assetRefs: ['img-c', 'img-a', 'img-b'] },
+    apiVersion: 'v1',
+    compilerRevision: 'r1',
+  });
+  assert.strictEqual(a, b, 'assetRefs 顺序重排不应改变签名');
+});
+
 test('裁决：白名单外有序数组保留顺序 → 顺序不同签变', () => {
   const a = buildCapabilitySignature({
     operationCode: 'compose',

@@ -126,6 +126,31 @@ test('reduceDecision: failed + retry_after_cap_ms 封顶重试退避', () => {
   assert.ok(uncapDelta >= 30000 && uncapDelta < 31000, `默认应 ≈30000ms（got ${uncapDelta}ms）`);
 });
 
+// ── from 一致性（修复前 failed/pending/unknown 硬编码 from='reconciling'，对 generating 项 CAS 必失败）──
+test('reduceDecision: generating 项 failed/unknown 用实际 from（不硬编码 reconciling）', () => {
+  const item = { status: 'generating', provider_request_id: 'r-gen' };
+  const failed = reduceDecision(item, { status: 'failed' });
+  assert.equal(failed.from, 'generating');
+  assert.equal(failed.to, 'retry_wait'); // generating>retry_wait 是合法边
+
+  const unknown = reduceDecision(item, { status: 'unknown' });
+  assert.equal(unknown.from, 'generating');
+  assert.equal(unknown.to, 'review_required'); // generating>review_required 是合法边
+});
+
+test('reduceDecision: generating 项 pending 收敛 generating>reconciling（非 reconcile_wait）', () => {
+  const item = { status: 'generating', provider_request_id: 'r-gen' };
+  const d = reduceDecision(item, { status: 'pending' });
+  assert.equal(d.from, 'generating');
+  assert.equal(d.to, 'reconciling', 'generating>reconcile_wait 非法，收敛到 reconciling 交 poll 对账');
+  assert.equal(d.patch.last_error_code, 'PROVIDER_PENDING');
+
+  // reconciling 项 pending 仍走 reconcile_wait（旧行为不变）
+  const rw = reduceDecision({ status: 'reconciling', provider_request_id: 'r1' }, { status: 'pending' });
+  assert.equal(rw.from, 'reconciling');
+  assert.equal(rw.to, 'reconcile_wait');
+});
+
 // ── 纯函数：applyProviderEvent 等待≠取消（fake store）──────────────────
 function fakeStore(item, { transitionResult } = {}) {
   const calls = { transition: 0, find: 0, lastTransition: null };

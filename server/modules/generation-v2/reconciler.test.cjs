@@ -33,6 +33,7 @@ test('recordProviderEventAnomaly 写入 append-only 异常行',async()=>{
   const call=pg.calls[0];
   assert.match(call.sql,/INSERT INTO generation_outbox_v2/);
   assert.match(call.sql,/provider_event_anomaly/);
+  assert.match(call.sql,/published_at/, 'anomaly 行入队即标记 published_at（不污染 pending 计数/不阻塞）');
   assert.equal(call.params[1],'i-anom','aggregate_id = itemId');
   const payload=JSON.parse(call.params[2]);
   assert.equal(payload.reason,'TERMINAL_REGRESSION');

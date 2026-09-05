@@ -124,7 +124,11 @@ function httpError(res) {
   else if (res.status === 401 || res.status === 403) code = 'AUTH_ERROR';
   else if (res.status === 404) code = 'NOT_FOUND';
   else if (res.status === 400 || res.status === 422) code = 'INVALID_INPUT';
-  else code = 'PROVIDER_FAILED';
+  // 5xx 瞬时（过载/网关错）→ NETWORK_ERROR（可重试 unknown，绝不判 failed）。
+  // 此前 5xx 落 `else → PROVIDER_FAILED`（FAILED_CODES 内 → status:'failed'），把瞬时故障判成终态失败，
+  // 与 fal/volcengine 及契约头注「429/5xx/网络→unknown 绝不判 provider failed」冲突。
+  else if (res.status >= 500) code = 'NETWORK_ERROR';
+  else code = 'UNKNOWN';
   const out = { code, httpStatus: res.status, message: String(rawMessage).slice(0, 200) };
   const ra = b.retry_after ?? b.retryAfter ?? res.retryAfter;
   if (ra != null) out.retryAfter = ra;

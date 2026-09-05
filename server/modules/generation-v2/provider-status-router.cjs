@@ -458,7 +458,7 @@ function reduceDecision(item, normalizedStatus, pollPolicy, pollTiming) {
     const cap = policy.retry_after_cap_ms;
     const waitMs = (cap != null && cap >= 0) ? Math.min(backoffMs, cap) : backoffMs;
     return {
-      from: 'reconciling', to: 'retry_wait',
+      from, to: 'retry_wait',
       patch: {
         last_error_code: 'PROVIDER_FAILED',
         last_error: normalizedStatus.errorMessage || 'provider reported failure',
@@ -469,12 +469,17 @@ function reduceDecision(item, normalizedStatus, pollPolicy, pollTiming) {
   }
   if (st === 'pending') {
     const poll = evaluatePollDeadline(policy, pollTiming);
+    // 早期 webhook 落在 generating：状态机无 generating>reconcile_wait 边，收敛到
+    // generating>reconciling 交 poll 权威对账（下一 reconcile tick 再据 pending 判
+    // reconcile_wait / 终态）。from 取实际源状态，否则下方 CAS（WHERE status=$3）
+    // 对 generating 项必失败 → 事件被静默吞掉（concurrent_noop）→ item 卡 generating。
+    const to = from === 'generating' ? 'reconciling' : 'reconcile_wait';
     if (!poll.continue) {
       // 等待≠取消（§65）：deadline / max_polls 到期 → 只停 poll，绝不 cancel
       // provider task；转 reconcile_wait 待 watchdog 后台对账到真实终态。
       // next_attempt_at 推到远端（POLL_STOPPED_DEFER_MS）使 poll 谓词不再命中。
       return {
-        from: 'reconciling', to: 'reconcile_wait',
+        from, to,
         patch: {
           last_error_code: 'POLL_STOPPED',
           last_error: `poll stopped (${poll.reason}); provider task NOT cancelled — awaiting watchdog reconcile`,
@@ -484,7 +489,7 @@ function reduceDecision(item, normalizedStatus, pollPolicy, pollTiming) {
       };
     }
     return {
-      from: 'reconciling', to: 'reconcile_wait',
+      from, to,
       patch: {
         last_error_code: 'PROVIDER_PENDING',
         last_error: 'still processing; reconciliation only',
@@ -494,7 +499,7 @@ function reduceDecision(item, normalizedStatus, pollPolicy, pollTiming) {
     };
   }
   return {
-    from: 'reconciling', to: 'review_required',
+    from, to: 'review_required',
     patch: {
       last_error_code: 'RECONCILE_UNKNOWN',
       last_error: normalizedStatus.errorMessage || 'provider status unknown',
