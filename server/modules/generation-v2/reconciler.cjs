@@ -280,10 +280,18 @@ function createEventReducerStore(pg) {
   };
 }
 
-async function publishOutbox(pg, { limit = 100, workerId = `outbox-${process.pid}`, leaseSeconds = 60 } = {}, injected = {}) {
+async function publishOutbox(pg, { limit = 100, workerId = `outbox-${process.pid}`, leaseSeconds = 60, eventTypes = null, eventTypeMode = 'include' } = {}, injected = {}) {
   const deps = { publish: null, ...injected };
   if (typeof deps.publish !== 'function') throw new TypeError('publish function required');
   const n = Math.max(1, Math.min(500, Number(limit) || 100));
+  // 消费端分域（2026-09-05 真链发现）：legacy relay 只取 'generate.requested'；
+  // worker V2 outboxTick 传 eventTypes:['generate.requested'], eventTypeMode:'exclude' 防误领 legacy 行。
+  const scope = Array.isArray(eventTypes) && eventTypes.length
+    ? (eventTypeMode === 'exclude'
+      ? 'AND (event_type <> ALL($4::text[]))'
+      : 'AND (event_type = ANY($4::text[]))')
+    : '';
+  const scopeParams = Array.isArray(eventTypes) && eventTypes.length ? [eventTypes] : [];
   const r = await pg.query(
     `WITH picked AS (
        SELECT event_id FROM generation_outbox_v2
@@ -291,13 +299,14 @@ async function publishOutbox(pg, { limit = 100, workerId = `outbox-${process.pid
           AND (lease_expires_at IS NULL OR lease_expires_at<NOW())
           -- anomaly 审计事件永不对外发布/重试(§62 内部事件; 消费端过滤职责分离)
           AND (event_type IS DISTINCT FROM 'provider_event_anomaly')
+          ${scope}
         ORDER BY created_at ASC FOR UPDATE SKIP LOCKED LIMIT $1
      )
      UPDATE generation_outbox_v2 o
         SET lease_owner=$2,lease_expires_at=NOW()+($3*INTERVAL '1 second')
        FROM picked WHERE o.event_id=picked.event_id
      RETURNING o.event_id,o.aggregate_id,o.aggregate_type,o.event_type,o.payload,o.created_at`,
-    [n,workerId,Math.max(10,Math.min(600,Number(leaseSeconds)||60))]);
+    scopeParams.length ? [n, workerId, Math.max(10, Math.min(600, Number(leaseSeconds) || 60)), ...scopeParams] : [n, workerId, Math.max(10, Math.min(600, Number(leaseSeconds) || 60))]);
   const events = r.rows || [];
   if (!events.length) return { published: 0 };
   let published = 0;

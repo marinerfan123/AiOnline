@@ -1350,6 +1350,7 @@ async function runGenerationRelayTick(pgPool, { workerId, limit = 20, leaseSecon
     workerId: workerId || `legacy-relay-${process.pid}`,
     limit,
     leaseSeconds,
+    eventTypes: ['generate.requested'], // 分域：只消费 legacy 分发行，不碰 V2 item 事件
   }, { publish });
 }
 
