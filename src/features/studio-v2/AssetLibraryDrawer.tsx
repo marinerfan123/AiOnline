@@ -1,8 +1,12 @@
 // G06 — Asset Library drawer (Blueprint 02 §20 subset).
 //
-// Read-only window into the project asset library (M04-S). Upload / write /
-// drag-to-canvas ship with the G06 upload endpoint and later gates — this
-// surface NEVER mutates anything and says so in its empty state.
+// Read-only window into the project asset library (M04-S). This surface NEVER
+// mutates the library: the upload button is disabled pending the G06 upload
+// endpoint (which requires a 3-step OSS direct-upload flow — POST /api/v2
+// /uploads → signed PUT → finalize — not a single multipart POST). Dragging an
+// asset item onto the canvas IS supported: items are draggable and carry a
+// serialized { assetId, assetType, url, thumbnail } payload that StudioCanvas
+// turns into an ASSET node (never a generation node).
 //
 // Honest contract notes (verified against the real client, 2026-09-03):
 //   * v2asset.listProjectAssets(projectId, query) → AssetListResponse where
@@ -40,6 +44,7 @@ import {
   RefreshCw,
   Search,
   Star,
+  Upload,
   X,
 } from 'lucide-react';
 import { v2asset } from '@/shared/api/contract/asset-client';
@@ -52,6 +57,14 @@ import { cn } from '@/lib/utils';
 const DETAIL_FETCH_CAP = 60;
 /** Server-side page size requested for the read-only list. */
 const LIST_LIMIT = 200;
+
+/**
+ * Drag MIME type carrying a serialized asset payload (assetId + assetType +
+ * url + thumbnail) from this drawer to StudioCanvas. Mirrors the NodeLibrary
+ * `application/x-studio-node-kind` drag contract; the canvas parses it and
+ * creates an ASSET node (not a generation node).
+ */
+const ASSET_DRAG_MIME = 'application/x-studio-asset';
 
 const TYPE_ICON: Record<AssetType, React.ElementType> = {
   IMAGE: ImageIcon,
@@ -627,6 +640,20 @@ export function AssetLibraryDrawer({ projectId, onClose }: { projectId: string; 
       <header className="flex h-10 shrink-0 items-center gap-2 border-b border-ml2-border px-3">
         <LibraryBig className="size-4 text-ml2-accent" />
         <h2 className="text-xs font-semibold text-ml2-text">素材库</h2>
+        <button
+          type="button"
+          data-test="asset-library-upload"
+          disabled
+          aria-disabled="true"
+          title="上传待接 — G06 端点需 OSS 直传三步流（POST /api/v2/uploads → 签名 PUT → finalize），尚未接入"
+          className="flex items-center gap-1 rounded-md border border-ml2-border bg-ml2-surface-2 px-1.5 py-0.5 text-[10px] text-ml2-text-3 opacity-60"
+        >
+          <Upload className="size-3" />
+          <span>上传</span>
+          <span data-test="asset-library-upload-note" className="text-ml2-text-3/80">
+            待接
+          </span>
+        </button>
         <span className="ml-auto rounded border border-ml2-border bg-ml2-surface-2 px-1.5 py-0.5 text-[9px] uppercase tracking-wide text-ml2-text-3">
           read-only
         </span>
@@ -705,6 +732,17 @@ export function AssetLibraryDrawer({ projectId, onClose }: { projectId: string; 
                     <button
                       type="button"
                       data-test={`asset-library-item-${a.assetId}`}
+                      draggable
+                      onDragStart={(e) => {
+                        const payload = {
+                          assetId: a.assetId,
+                          assetType: a.assetType,
+                          url: a.url || '',
+                          thumbnail: a.thumbnailUrl || '',
+                        };
+                        e.dataTransfer.setData(ASSET_DRAG_MIME, JSON.stringify(payload));
+                        e.dataTransfer.effectAllowed = 'copy';
+                      }}
                       onClick={() => handleAssetClick(a.assetId)}
                       aria-pressed={isSelected}
                       aria-expanded={isSelected ? versionsOpen : undefined}

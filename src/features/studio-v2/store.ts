@@ -42,6 +42,7 @@ import {
   type PortSpec,
 } from './types';
 import { studioRunClient, type StudioRunStatus } from './run/studioRunClient';
+import { canvasCommandLogClient, type CanvasCommand } from '@/shared/api/contract/canvasCommandLogClient';
 
 export type StudioNode = Node<StudioNodeData>;
 export type StudioEdge = Edge<StudioEdgeData>;
@@ -52,6 +53,22 @@ export const PASTE_OFFSET = 32;
 interface Snapshot {
   nodes: StudioNode[];
   edges: StudioEdge[];
+}
+
+/**
+ * W4a — result of a command-log read-only alignment pass. `cursor` is the
+ * highest server seq now consumed (monotonic); `commands` is the delta for
+ * callers (History panel / remote-activity indicator). This does NOT mutate
+ * nodes/edges — the read API is summary-only (no op payloads), so remote
+ * graph reconciliation stays on the persistence/projection main chain.
+ */
+export interface SyncFromCommandLogResult {
+  commands: CanvasCommand[];
+  hasMore: boolean;
+  /** highest server seq consumed after this pass (monotonic, ≥ afterSeq). */
+  cursor: number;
+  /** number of commands newly returned in this pass. */
+  remoteCount: number;
 }
 
 export interface InvalidConnectionInfo {
@@ -76,6 +93,10 @@ interface StudioState {
   // ── run context (session; populated by Inspector via setRunContext) ──
   projectId: string | null;
   canvasRevision: number | null;
+
+  // ── W4a command-log read cursor (server seq alignment; read-only) ──
+  /** highest canvas_command_log seq consumed from the server (0 = not synced). */
+  commandLogCursor: number;
 
   // ── W1② run trigger state (fire-and-forget; read surface is the Runs tab) ──
   /** node currently being run (non-null = one run in flight; busy gate) */
@@ -120,6 +141,15 @@ interface StudioState {
   setRunContext: (projectId: string | null, canvasRevision: number | null) => void;
   /** W1② trigger a FROM_NODE run for one node (fire-and-forget; no polling). */
   runNode: (nodeId: string) => Promise<void>;
+  /**
+   * W4a read-only alignment: pull commands after `afterSeq` (default = current
+   * cursor) from the server command log and advance `commandLogCursor`. Never
+   * mutates nodes/edges and never touches the undo/redo stacks — local undo/redo
+   * stays instant + snapshot-based; the persistence write chain (CAS revision +
+   * 409 banner) is untouched. Rejects with the client error on network/HTTP
+   * failure (caller decides how to surface).
+   */
+  syncFromCommandLog: (afterSeq?: number) => Promise<SyncFromCommandLogResult>;
 }
 
 /**
@@ -218,6 +248,7 @@ export const useStudioStore = create<StudioState>((set, get) => ({
 
   projectId: null,
   canvasRevision: null,
+  commandLogCursor: 0,
   runningNodeId: null,
   lastRun: null,
   runError: null,
@@ -535,6 +566,9 @@ export const useStudioStore = create<StudioState>((set, get) => ({
       return { nodes: recomputeStatus(staleNodes, [id, ...downstream], s.edges) };
     }),
 
+  // W4a 裁决: undo/redo 保持本地快照式（每操作一条目、即时、有界 UNDO_LIMIT），
+  // 不改为命令日志消费；远端他人命令通过 syncFromCommandLog 只读对齐（读游标），
+  // 图形和解走既有 persistence/CAS + 409 banner。此处逻辑不重写。
   undo: () =>
     set((s) => {
       const prev = s.undoStack[s.undoStack.length - 1];
@@ -597,7 +631,30 @@ export const useStudioStore = create<StudioState>((set, get) => ({
     }
   },
 
-  loadGraph: (nodes, edges, viewport) => set({ nodes, edges, ...(viewport ? { viewport } : {}), undoStack: [], redoStack: [], clipboard: null, dragSnapshot: null, editSnapshot: null, invalidConnection: null }),
+  // ── W4a command-log read-only alignment ────────────────────────────────
+  // 裁决 (verdict): local undo/redo stays snapshot-per-operation + instant;
+  // it is NOT rewired to command-log consumption. This method is the second
+  // track — advance a server-seq read cursor and hand the summary delta to
+  // callers. It is READ-ONLY: no node/edge mutation, no undo/redo push, no
+  // write to the persistence main chain (CAS revision + 409 banner untouched).
+  syncFromCommandLog: async (afterSeq) => {
+    const s = get();
+    const projectId = s.projectId;
+    // No bound project → cannot align against a server log; report empty delta.
+    if (!projectId) {
+      return { commands: [], hasMore: false, cursor: s.commandLogCursor, remoteCount: 0 };
+    }
+    const from = afterSeq ?? s.commandLogCursor;
+    const res = await canvasCommandLogClient.listCommands({ projectId, afterSeq: from });
+    const commands = res.commands;
+    const lastSeq = commands.length > 0 ? commands[commands.length - 1].seq : from;
+    // Monotonic: never regress the cursor (a caller could pass an older afterSeq).
+    const cursor = Math.max(s.commandLogCursor, lastSeq);
+    if (cursor !== s.commandLogCursor) set({ commandLogCursor: cursor });
+    return { commands, hasMore: res.hasMore, cursor, remoteCount: commands.length };
+  },
+
+  loadGraph: (nodes, edges, viewport) => set({ nodes, edges, ...(viewport ? { viewport } : {}), undoStack: [], redoStack: [], clipboard: null, dragSnapshot: null, editSnapshot: null, invalidConnection: null, commandLogCursor: 0 }),
 
   resetProjectState: () =>
     set({
@@ -612,6 +669,7 @@ export const useStudioStore = create<StudioState>((set, get) => ({
       invalidConnection: null,
       projectId: null,
       canvasRevision: null,
+      commandLogCursor: 0,
       runningNodeId: null,
       lastRun: null,
       runError: null,

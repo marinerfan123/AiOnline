@@ -1,15 +1,17 @@
 import { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { Clapperboard, ListVideo, PlaySquare, History } from 'lucide-react';
+import { Clapperboard, ListVideo, PlaySquare, History, ScrollText } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { v2studio } from '@/shared/api/contract/studio-canvas-client';
 import { StoryboardRowsPanel } from './StoryboardRowsPanel';
 import { RunsPanel } from './run/RunsPanel';
+import { HistoryPanel } from './history/HistoryPanel';
 
 const TABS = [
   { id: 'shots', label: 'Shots', icon: Clapperboard, phase: 'M05-D 镜头工作流' },
   { id: 'timeline', label: 'Timeline', icon: ListVideo, phase: 'M05-D 时间线' },
   { id: 'runs', label: 'Runs', icon: PlaySquare, phase: 'M05-D Studio Run Engine' },
+  { id: 'history', label: 'History', icon: ScrollText, phase: 'M05-D 协作历史' },
   { id: 'versions', label: 'Versions', icon: History, phase: 'M05-C Canvas 版本' },
 ] as const;
 
@@ -49,6 +51,10 @@ export function BottomDock({ projectId, scriptId, revision, onRestored }: { proj
           /* W1A — Runs 只读消费面：状态/时间/产物 id 列表 + 自动刷新。
              Run 触发按钮归 Inspector（W1B），本 tab 仅展示。 */
           <RunsPanel projectId={projectId} />
+        ) : active === 'history' ? (
+          /* W4b — History 只读消费面：命令日志（协作历史）。进 tab 拉取 + 手动
+             刷新按钮（不自动轮询，避免与 CAS 写链竞争）。 */
+          <HistoryPanel projectId={projectId} />
         ) : <div className="grid h-full place-items-center"><p className="text-[11px] text-ml2-text-3"><span className="font-medium text-ml2-text-2">{tab.label}</span> — {tab.phase} 提供。</p></div>}
       </div>}
     </div>

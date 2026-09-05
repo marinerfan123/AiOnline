@@ -32,6 +32,53 @@ import { Undo2, Redo2, Maximize2, Scan, X, Copy, Trash2 } from "lucide-react";
 
 const nodeTypes: NodeTypes = { studio: StudioNodeComponent };
 
+// ── G06 asset drag contract ────────────────────────────────────────────────
+// The Asset Library drawer serializes an asset summary into a custom drag MIME
+// type; the canvas parses it on drop and creates a Blueprint ASSET node whose
+// data.assetId references the asset. Asset nodes are NOT generation nodes —
+// executionKind 'ASSET' never enters the DAG execution path; generation nodes
+// are added by the user from the Node Library.
+export const ASSET_DRAG_MIME = 'application/x-studio-asset';
+
+export interface AssetDragPayload {
+  assetId: string;
+  assetType: 'IMAGE' | 'VIDEO' | 'AUDIO' | 'OTHER';
+  url: string;
+  thumbnail: string;
+}
+
+/** Map an M04-S assetType to a Blueprint ASSET node kind (never GENERATION). */
+export function assetTypeToNodeKind(assetType: AssetDragPayload['assetType']): StudioNodeKind {
+  switch (assetType) {
+    case 'IMAGE':
+      return 'image';
+    case 'VIDEO':
+      return 'video';
+    case 'AUDIO':
+      return 'audio';
+    default:
+      return 'reference'; // OTHER / unknown → generic asset reference node
+  }
+}
+
+/** Best-effort parse of the asset drag payload; malformed data → null. */
+export function parseAssetDragPayload(raw: string): AssetDragPayload | null {
+  if (!raw) return null;
+  try {
+    const p = JSON.parse(raw) as Partial<AssetDragPayload>;
+    if (!p || typeof p.assetId !== 'string' || !p.assetId) return null;
+    return {
+      assetId: p.assetId,
+      assetType:
+        p.assetType === 'IMAGE' || p.assetType === 'VIDEO' || p.assetType === 'AUDIO' ? p.assetType : 'OTHER',
+      url: typeof p.url === 'string' ? p.url : '',
+      thumbnail: typeof p.thumbnail === 'string' ? p.thumbnail : '',
+    };
+  } catch {
+    return null;
+  }
+}
+
 // ── Error boundary: one broken node renderer must not white-screen Studio ──
 class StudioErrorBoundary extends Component<{ children: ReactNode }, { hasError: boolean }> {
   state = { hasError: false };
@@ -133,6 +180,7 @@ function CanvasCore({ projectId, canvasRevision }: { projectId?: string; canvasR
   const onEdgesChange = useStudioStore((s) => s.onEdgesChange);
   const onConnect = useStudioStore((s) => s.onConnect);
   const addNode = useStudioStore((s) => s.addNode);
+  const updateNodeParameter = useStudioStore((s) => s.updateNodeParameter);
   const undo = useStudioStore((s) => s.undo);
   const redo = useStudioStore((s) => s.redo);
   const canUndo = useStudioStore(selectCanUndo);
@@ -285,6 +333,19 @@ function CanvasCore({ projectId, canvasRevision }: { projectId?: string; canvasR
         }}
         onDrop={(e) => {
           e.preventDefault();
+          // G06 asset-library drag → ASSET node (assetId reference; never a
+          // generation node). Parsed first so an asset drop never falls through
+          // to the file-drop reference path below.
+          const assetPayload = parseAssetDragPayload(e.dataTransfer.getData(ASSET_DRAG_MIME));
+          if (assetPayload) {
+            const kind = assetTypeToNodeKind(assetPayload.assetType);
+            const f = screenToFlowPosition({ x: e.clientX, y: e.clientY });
+            const id = addNode(kind, { x: f.x - 120, y: f.y - 60 });
+            // Land the durable M04-S assetId on the node (both data.assetId and
+            // parameters.assetId — same path the Inspector's asset field uses).
+            if (id) updateNodeParameter(id, 'assetId', assetPayload.assetId);
+            return;
+          }
           const kind = e.dataTransfer.getData('application/x-studio-node-kind') as StudioNodeKind;
           if (kind && getNodeDef(kind)) {
             const f = screenToFlowPosition({ x: e.clientX, y: e.clientY });
