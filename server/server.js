@@ -5,6 +5,7 @@ import http from 'http';
 import express from 'express'; // 框架化：HTTP 服务 + 中间件 + 路由由 Express 承载
 import fs from 'fs';
 import crypto from 'crypto';
+import { asyncCheckUrl } from './ssrf.cjs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import cluster from 'node:cluster';
@@ -3498,7 +3499,7 @@ async function handleAPI(req, res) {
     const body = await parseBody(req);
     if (!body?.imageUrl) return sendJSON(res, 400, { success: false, message: '缺少 imageUrl' });
     // SSRF check
-    const { asyncCheckUrl } = require('./ssrf.cjs');
+    // asyncCheckUrl 已在文件顶部 import（ESM 下不宜再用 require）
     const ssrf = await asyncCheckUrl(body.imageUrl);
     if (!ssrf.ok) return sendJSON(res, 400, { success: false, message: `URL 不安全：${ssrf.reason}` });
     try {
@@ -3686,7 +3687,7 @@ async function handleAPI(req, res) {
     if (lines.length === 0) return sendJSON(res, 400, { error: '没有有效的 key（至少6位）' });
     let added = 0;
     for (const key of lines) {
-      const keyId = require('crypto').randomUUID();
+      const keyId = crypto.randomUUID();
       try {
         await pgPool.query(`INSERT INTO api_keys (id, provider_id, api_key, label, status, weight, created_at) VALUES ($1, $2, $3, $4, 'active', 100, NOW()) ON CONFLICT (provider_id, api_key) DO NOTHING`, [keyId, id, key, 'user-key']);
         added++;
@@ -5340,7 +5341,7 @@ server.listen(PORT, '0.0.0.0', async () => {
         const cfg = await activeOssConfig();
         const fpath = String(file || '');
         const abs = fpath.startsWith('/') ? fpath : `${process.cwd()}/${fpath}`;
-        const buf = await require('node:fs').promises.readFile(abs).catch(() => null);
+        const buf = await fs.promises.readFile(abs).catch(() => null);
         if (!cfg || !buf) return { ok: false, reason: cfg ? 'file-unreadable' : 'no-storage' };
         const objectKey = deriveKey(assetId, kind, abs.split('/').pop());
         const contentType = kind === 'thumbnail' ? 'image/jpeg' : kind === 'proxy' ? 'video/mp4' : 'application/octet-stream';
