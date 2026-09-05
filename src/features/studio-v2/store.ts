@@ -43,6 +43,7 @@ import {
 } from './types';
 import { studioRunClient, type StudioRunStatus } from './run/studioRunClient';
 import { canvasCommandLogClient, type CanvasCommand } from '@/shared/api/contract/canvasCommandLogClient';
+import { computeAutoLayout } from './dagLayout';
 
 export type StudioNode = Node<StudioNodeData>;
 export type StudioEdge = Edge<StudioEdgeData>;
@@ -149,6 +150,8 @@ interface StudioState {
   paste: () => void;
   alignSelection: (kind: 'left' | 'middle' | 'right') => void;
   groupSelection: () => string | null;
+  /** W6④ — layered DAG auto-layout of all non-frame, non-locked nodes (undoable). */
+  autoLayout: () => void;
   beginEdit: () => void;
   endEdit: () => void;
   updateNodeData: (id: string, patch: Partial<StudioNodeData>) => NodeEditResult;
@@ -547,6 +550,25 @@ export const useStudioStore = create<StudioState>((set, get) => ({
       ],
     }));
     return id;
+  },
+
+  autoLayout: () => {
+    const s = get();
+    // layoutable = non-frame, non-locked nodes (locked nodes stay put — the
+    // store-action guard keeps a locked node's position stable under auto-layout).
+    const layoutable = s.nodes.filter((n) => n.data.nodeKind !== 'frame' && !isNodeLocked(s, n.id));
+    if (layoutable.length === 0) return;
+    const positions = computeAutoLayout(
+      layoutable.map((n) => ({ id: n.id, kind: n.data.nodeKind, width: (n as { width?: number }).width, height: (n as { height?: number }).height })),
+      s.edges.map((e) => ({ source: e.source, target: e.target })),
+    );
+    if (positions.size === 0) return;
+    const { undoStack, redoStack } = pushUndo(s, snapshot(s));
+    set({
+      undoStack,
+      redoStack,
+      nodes: s.nodes.map((n) => (positions.has(n.id) ? { ...n, position: positions.get(n.id)! } : n)),
+    });
   },
 
   beginEdit: () => set((s) => (s.editSnapshot ? s : { editSnapshot: snapshot(s) })),

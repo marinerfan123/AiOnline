@@ -12,7 +12,7 @@
 
 import { useEffect, useMemo } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { Trash2, Copy, Group, AlignStartVertical, AlignCenterVertical, AlignEndVertical, Play } from 'lucide-react';
+import { Trash2, Copy, Group, AlignStartVertical, AlignCenterVertical, AlignEndVertical, Play, Network } from 'lucide-react';
 import { useStudioStore } from './store';
 import { getNodeDef } from './registry';
 import { NodeIcon } from './NodeIcon';
@@ -61,6 +61,7 @@ export function Inspector({
   const copySelection = useStudioStore((s) => s.copySelection);
   const alignSelection = useStudioStore((s) => s.alignSelection);
   const groupSelection = useStudioStore((s) => s.groupSelection);
+  const autoLayout = useStudioStore((s) => s.autoLayout);
   const setRunContext = useStudioStore((s) => s.setRunContext);
   const runNode = useStudioStore((s) => s.runNode);
   const runningNodeId = useStudioStore((s) => s.runningNodeId);
@@ -138,6 +139,9 @@ export function Inspector({
                   <p>连接：{edges.length}</p>
                   <p>Project：{projectId || '—'}</p>
                 </div>
+                <Button data-test="inspector-auto-layout" size="sm" variant="ghost" className="mt-2 w-full justify-start" onClick={autoLayout}>
+                  <Network className="size-3" />自动布局（DAG 分层）
+                </Button>
               </Section>
               <Section title="Persistence">
                 <p data-test="inspector-persistence-note" className="text-[11px] leading-relaxed text-ml2-text-3">
