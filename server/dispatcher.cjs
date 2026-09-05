@@ -1163,9 +1163,10 @@ async function enqueueGenerationOutbox(pgPool, enq) {
     [taskId, displayModel, canonicalModelId, prompt || '', count || 1, contentType || 'image', pendingIds, clientMeta, user_id || null, idempotencyKey || null, cost || 0, costPool || 'recharge', clientRequestId],
   );
   const insertOutbox = (q) => q(
-    `INSERT INTO generation_outbox_v2 (aggregate_type, aggregate_id, event_type, payload)
-     VALUES ('generation_task', $1, 'generate.requested', $2::jsonb)`,
-    [taskId, JSON.stringify(payload)],
+    // 0002 形状列 item_id/batch_id/user_id 均 NOT NULL —— 补中性值（item/batch 锚定 taskId）
+    `INSERT INTO generation_outbox_v2 (item_id, batch_id, user_id, aggregate_type, aggregate_id, event_type, payload)
+     VALUES ($1, $1, $2, 'generation_task', $1, 'generate.requested', $3::jsonb)`,
+    [taskId, (enq && enq.user_id) || 'system', JSON.stringify(payload)],
   );
   if (typeof pgPool.connect === 'function') {
     const client = await pgPool.connect();

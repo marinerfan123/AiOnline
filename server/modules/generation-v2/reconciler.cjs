@@ -38,10 +38,10 @@ async function recordProviderEventAnomaly(pg, anomaly) {
   // `outbox_pending`（published_at IS NULL）并随审计事件无限膨胀。标记为已发布后既不阻塞、
   // 也不污染 pending 计数，且 payload 全量保留（append-only 审计语义不变）。
   const r = await pg.query(
-    `INSERT INTO generation_outbox_v2 (aggregate_type, aggregate_id, event_type, payload, published_at)
-     VALUES ($1, $2, 'provider_event_anomaly', $3::jsonb, NOW())
+    `INSERT INTO generation_outbox_v2 (item_id, batch_id, user_id, aggregate_type, aggregate_id, event_type, payload, published_at)
+     VALUES ($1, $2, $3, 'generation_item', $1, 'provider_event_anomaly', $4::jsonb, NOW())
      RETURNING event_id`,
-    ['generation_item', itemId, JSON.stringify({
+    [String(itemId), String(jobId || 'n/a'), 'system', JSON.stringify({
       item_id: itemId, job_id: jobId, attempt_id: attemptId,
       provider_id: providerId, provider_request_id: providerRequestId,
       from_status: fromStatus, to_status: toStatus, reason, detail,

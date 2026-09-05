@@ -34,8 +34,9 @@ test('recordProviderEventAnomaly 写入 append-only 异常行',async()=>{
   assert.match(call.sql,/INSERT INTO generation_outbox_v2/);
   assert.match(call.sql,/provider_event_anomaly/);
   assert.match(call.sql,/published_at/, 'anomaly 行入队即标记 published_at（不污染 pending 计数/不阻塞）');
-  assert.equal(call.params[1],'i-anom','aggregate_id = itemId');
-  const payload=JSON.parse(call.params[2]);
+  assert.equal(call.params[0],'i-anom','item_id = itemId');
+  assert.equal(call.params[1],'j1','batch_id = jobId');
+  const payload=JSON.parse(call.params[3]);
   assert.equal(payload.reason,'TERMINAL_REGRESSION');
   assert.equal(payload.from_status,'success');
   assert.equal(payload.to_status,'running');

@@ -103,7 +103,8 @@ test('enqueueGenerationOutbox：有 connect → BEGIN/INSERT task/INSERT outbox/
   // outbox payload
   const ob = pool.calls.find((c) => /INSERT INTO generation_outbox_v2/.test(c.sql));
   assert.strictEqual(ob.params[0], 't1');
-  const payload = JSON.parse(ob.params[1]);
+  assert.strictEqual(ob.params[1], 'u1');
+  const payload = JSON.parse(ob.params[2]);
   assert.strictEqual(payload.client_request_id, 'cr-1');
   assert.strictEqual(payload.provider_task_id, null, 'provider_task_id 入队为 null（回填字段）');
   assert.strictEqual(payload.task_id, 't1');
@@ -145,7 +146,7 @@ test('generateAsync 默认路径：写 generation_tasks（含 client_request_id�
   assert.ok(crId && crId.startsWith(`cr-${taskId}`), 'task INSERT 应内联 client_request_id（事务内原子写入）');
   const ob = lastMatch(pool, /INSERT INTO generation_outbox_v2/);
   assert.ok(ob, '默认路径应写 generation_outbox_v2');
-  const payload = JSON.parse(ob.params[1]);
+  const payload = JSON.parse(ob.params[2]);
   assert.strictEqual(payload.client_request_id, crId);
   assert.strictEqual(payload.task_id, taskId);
   assert.strictEqual(payload.provider_task_id, null);
