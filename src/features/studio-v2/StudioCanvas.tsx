@@ -414,13 +414,15 @@ function CanvasCore({ projectId, canvasRevision }: { projectId?: string; canvasR
       <InvalidConnectionToast />
       <PresenceBar peers={presence.peers} />
       {nodes.length === 0 && <EmptyState onAdd={addAtCenter} />}
-      <NodePreviewModal
-        open={previewNode !== null}
-        node={previewNode}
-        projectId={projectId}
-        canvasRevision={canvasRevision}
-        onClose={() => setPreviewNode(null)}
-      />
+      {previewNode !== null && (
+        <NodePreviewModal
+          open
+          node={previewNode}
+          projectId={projectId}
+          canvasRevision={canvasRevision}
+          onClose={() => setPreviewNode(null)}
+        />
+      )}
       {menu && (
         <ContextMenu
           at={{ x: menu.x, y: menu.y }}

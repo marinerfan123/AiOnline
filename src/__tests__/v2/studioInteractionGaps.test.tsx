@@ -19,6 +19,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render, screen, fireEvent, cleanup, act, configure } from '@testing-library/react';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { StudioCanvas } from '@/features/studio-v2/StudioCanvas';
 import { useStudioStore, selectCanUndo, type StudioNode } from '@/features/studio-v2/store';
 import { getNodeDef } from '@/features/studio-v2/registry';
@@ -100,7 +101,16 @@ function rfProps(): Record<string, unknown> {
 
 beforeEach(() => {
   reset();
-  render(<StudioCanvas />);
+  // W2: NodePreviewModal (always mounted inside CanvasCore) calls useQueryClient
+  // unconditionally, so CanvasCore needs react-query context or it throws and the
+  // StudioErrorBoundary swallows the whole canvas (silencing every keyboard
+  // handler). Same provider wiring as the sibling v2 canvas test files.
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  render(
+    <QueryClientProvider client={qc}>
+      <StudioCanvas />
+    </QueryClientProvider>,
+  );
 });
 afterEach(() => { cleanup(); });
 
