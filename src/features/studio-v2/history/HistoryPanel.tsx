@@ -2,7 +2,7 @@
 //
 // Read-only consumer of the canvas command log (协作历史), wired into
 // BottomDock's History tab. Pure list (HistoryList) + fetching wrapper
-// (HistoryPanel) + a local minimal fetch client.
+// (HistoryPanel), reading via the shared canvasCommandLogClient.
 //
 // SERVER CONTRACT (server/modules/project-foundation/canvasCommandLogApi.cjs):
 //   GET /api/v2/projects/:projectId/studio/canvas/commands?afterSeq=&limit=&bucket=
@@ -33,72 +33,24 @@
 // 进 tab 拉取（react-query enabled 由 BottomDock 的 active==='history' 门控）
 // + 手动刷新按钮。不设 refetchInterval —— 避免自动轮询与 CAS 写链竞争。
 //
-// ── W4a 合并对齐 ───────────────────────────────────────────────────────────
-// canvasCommandLogClient 由并行 W4a 叶新建。本叶未见到该文件，故在下方用本地
-// 最小 fetch 契约（api.get + zod 边界解析）。合并时：删除本文件内的
-// `canvasCommandLogClient` 导出 + 其 zod schema，改为
-// `import { canvasCommandLogClient } from '<W4a 的路径>'`，其余不变。
+// ── W4a 合并 ───────────────────────────────────────────────────────────────
+// 读取统一走共享 client（src/shared/api/contract/canvasCommandLogClient），
+// zod 边界 + 契约对齐 canvasCommandLogApi（23/23）。本文件仅保留展示逻辑、
+// 倒排与手动刷新；内联 schema / fetch client 已删除。
 
 import { useQuery } from '@tanstack/react-query';
 import { ScrollText } from 'lucide-react';
-import { z } from 'zod';
-import { api } from '@/shared/api/client';
+import { canvasCommandLogClient, type CanvasCommand } from '@/shared/api/contract/canvasCommandLogClient';
 import { EmptyState, LoadingState, ErrorState } from '@/shared/ui/v2/states';
 
-// ── wire schemas (boundary parse; lenient → tolerant of null/extra fields) ──
+export type { CanvasCommand };
 
-export const CanvasCommandSummarySchema = z
-  .object({
-    ops: z.number(),
-    counts: z.record(z.string(), z.number()),
-    nodeIds: z.array(z.string()),
-    edgeIds: z.array(z.string()),
-    idsTruncated: z.boolean().optional(),
-  })
-  .catchall(z.unknown());
-
-export const CanvasCommandSchema = z
-  .object({
-    seq: z.number(),
-    commandId: z.string(),
-    commandType: z.string(),
-    createdAtMs: z.number().nullable().optional(),
-    bucket: z.string().optional(),
-    summary: CanvasCommandSummarySchema,
-  })
-  .catchall(z.unknown());
-
-export const CanvasCommandLogResponseSchema = z
-  .object({
-    commands: z.array(CanvasCommandSchema),
-    hasMore: z.boolean(),
-  })
-  .catchall(z.unknown());
-
-export type CanvasCommandSummary = z.infer<typeof CanvasCommandSummarySchema>;
-export type CanvasCommand = z.infer<typeof CanvasCommandSchema>;
-export type CanvasCommandLogResponse = z.infer<typeof CanvasCommandLogResponseSchema>;
-
-// ── minimal fetch client (local; W4a merge swap point — see header) ─────────
+// ── shared contract client (W4a) ────────────────────────────────────────────
+// 读取走 src/shared/api/contract/canvasCommandLogClient（zod 边界，契约对齐
+// server canvasCommandLogApi 23/23）。本文件不再内联 schema / fetch client。
 
 /** server 端 LIMITS.maxLimit = 200；「最近窗口」用上限拉取后客户端倒排。 */
 export const HISTORY_LIMIT = 200;
-
-function commandLogPath(projectId: string, query: { afterSeq?: number; limit?: number; bucket?: string } = {}): string {
-  const qs = new URLSearchParams();
-  if (query.afterSeq != null) qs.set('afterSeq', String(query.afterSeq));
-  if (query.limit != null) qs.set('limit', String(query.limit));
-  if (query.bucket) qs.set('bucket', query.bucket);
-  return `/api/v2/projects/${encodeURIComponent(projectId)}/studio/canvas/commands${qs.toString() ? `?${qs}` : ''}`;
-}
-
-export const canvasCommandLogClient = {
-  /** 升序读命令日志（server 契约顺序）。倒排展示由消费方负责。 */
-  async listCommands(projectId: string, query: { afterSeq?: number; limit?: number } = {}): Promise<CanvasCommandLogResponse> {
-    const raw = await api.get<unknown>(commandLogPath(projectId, query));
-    return CanvasCommandLogResponseSchema.parse(raw);
-  },
-};
 
 // ── display helpers ─────────────────────────────────────────────────────────
 
@@ -251,7 +203,7 @@ function HistoryPanelBound({ projectId }: { projectId: string }) {
   // 进 tab 拉取；无 refetchInterval —— 手动刷新按钮驱动（避免自动轮询与 CAS 冲突）。
   const listQuery = useQuery({
     queryKey: ['v2', 'studio', projectId, 'commands'],
-    queryFn: () => canvasCommandLogClient.listCommands(projectId, { limit: HISTORY_LIMIT }),
+    queryFn: () => canvasCommandLogClient.listCommands({ projectId, limit: HISTORY_LIMIT }),
     retry: 1,
   });
 

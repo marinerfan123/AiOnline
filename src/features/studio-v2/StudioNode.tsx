@@ -15,7 +15,7 @@ import { Loader2, AlertCircle, User } from 'lucide-react';
 import { getNodeDef } from './registry';
 import { NodeIcon } from './NodeIcon';
 import { v2asset } from '@/shared/api/contract/asset-client';
-import type { StudioNode, StudioEdge } from './store';
+import { useStudioStore, type StudioNode, type StudioEdge } from './store';
 import { cn } from '@/lib/utils';
 
 const STATUS_META: Record<string, { label: string; className: string }> = {
@@ -147,7 +147,11 @@ function GenerationPlaceholder({ status }: { status: string }) {
 }
 
 function StudioNodeInner({ id, data, selected, width }: NodeProps<StudioNode>) {
-  void id;
+  const lockNode = useStudioStore((s) => s.lockNode);
+  // W5b — locked nodes are non-draggable (react-flow node.draggable=false,
+  // set by the store's lockNode) and non-editable (rejected at the store
+  // action layer). This flag is the reactive render mirror.
+  const locked = data.locked === true;
   const def = getNodeDef(data.nodeKind);
   if (!def) {
     // Unknown node kind — isolated error card, never crash the whole canvas.
@@ -177,7 +181,7 @@ function StudioNodeInner({ id, data, selected, width }: NodeProps<StudioNode>) {
       )}
       style={isFrame ? undefined : { width: width ?? def.width }}
     >
-      {!isFrame && <NodeResizer isVisible={selected} minWidth={240} minHeight={90} />}
+      {!isFrame && <NodeResizer isVisible={selected && !locked} minWidth={240} minHeight={90} />}
       <div className="flex items-center gap-1.5 border-b border-ml2-border bg-ml2-surface-2 px-2 py-1.5">
         <NodeIcon name={def.icon} className="size-3.5 shrink-0 text-ml2-text-2" />
         <span className="truncate text-[11px] font-medium text-ml2-text">{data.title}</span>
@@ -185,6 +189,25 @@ function StudioNodeInner({ id, data, selected, width }: NodeProps<StudioNode>) {
           {status.label}
         </span>
       </div>
+
+      {locked && (
+        // W5b — unlock entry (徽标点击, chosen over a selected-state button):
+        // the corner 🔒 badge is itself the toggle back to unlocked. The badge
+        // stops propagation so the click never drags/selects the node.
+        <button
+          type="button"
+          data-test="node-lock-badge"
+          aria-label="解锁节点"
+          title="已锁定 — 点击解锁"
+          onClick={(e) => {
+            e.stopPropagation();
+            lockNode(id, false);
+          }}
+          className="absolute left-1 top-1 z-20 grid size-5 place-items-center rounded border border-ml2-border bg-ml2-surface-2 text-[10px] leading-none shadow-sm hover:bg-ml2-surface-3"
+        >
+          🔒
+        </button>
+      )}
 
       <div className="p-1.5">
         {def.id === 'prompt' && <TextPreview text={text} hint="在右侧 Inspector 编辑提示词" />}

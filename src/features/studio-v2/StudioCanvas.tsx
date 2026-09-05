@@ -23,6 +23,8 @@ import {
 } from './store';
 import { StudioNodeComponent } from './StudioNode';
 import { NodePreviewModal } from './NodePreviewModal';
+import { PresenceBar } from './PresenceBar';
+import { useCanvasPresence } from './useCanvasPresence';
 import { NODE_DEFS_LIST, canConnectToPort, getNodeDef } from './registry';
 import type { StudioNodeKind } from './types';
 import type { PortType } from './types';
@@ -201,6 +203,9 @@ function CanvasCore({ projectId, canvasRevision }: { projectId?: string; canvasR
   const [previewNode, setPreviewNode] = useState<StudioNode | null>(null);
   const { screenToFlowPosition, fitView } = useReactFlow();
   const canvasRef = useRef<HTMLDivElement>(null);
+
+  // W5a — 协作在场：进画布即在线 + 15s 节流续活 + 15s peers 轮询（右上角在场条）。
+  const presence = useCanvasPresence(projectId);
 
   // G05 edge-to-empty: node kinds whose input accepts the dragged output type.
   const compatibleTargetKinds = useCallback((portType: PortType): StudioNodeKind[] => {
@@ -407,6 +412,7 @@ function CanvasCore({ projectId, canvasRevision }: { projectId?: string; canvasR
       </div>
 
       <InvalidConnectionToast />
+      <PresenceBar peers={presence.peers} />
       {nodes.length === 0 && <EmptyState onAdd={addAtCenter} />}
       <NodePreviewModal
         open={previewNode !== null}

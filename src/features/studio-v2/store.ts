@@ -77,6 +77,16 @@ export interface InvalidConnectionInfo {
   code?: string;
 }
 
+/**
+ * W5b — result of a node-data edit attempt. `NODE_LOCKED` means the target
+ * node is locked at the store-action layer (UX guard; server CAS remains the
+ * concurrency authority — this does NOT replace it).
+ */
+export interface NodeEditResult {
+  ok: boolean;
+  code?: 'NODE_LOCKED';
+}
+
 interface StudioState {
   nodes: StudioNode[];
   edges: StudioEdge[];
@@ -89,6 +99,15 @@ interface StudioState {
   dragSnapshot: Snapshot | null;
   /** inspector transaction: pre-edit snapshot committed on blur/apply */
   editSnapshot: Snapshot | null;
+
+  /**
+   * W5b — local/session node lock registry (UX layer). NOT durable (the
+   * persistence whitelist strips `locked`, so toggles never reach the server)
+   * and NOT the concurrency authority (server CAS is). `data.locked` on each
+   * node is the reactive mirror the card UI reads; this Set is the fast O(1)
+   * authoritative gate used by the store-action rejection.
+   */
+  lockedNodeIds: Set<string>;
 
   // ── run context (session; populated by Inspector via setRunContext) ──
   projectId: string | null;
@@ -125,10 +144,12 @@ interface StudioState {
   groupSelection: () => string | null;
   beginEdit: () => void;
   endEdit: () => void;
-  updateNodeData: (id: string, patch: Partial<StudioNodeData>) => void;
-  updateNodeParameter: (id: string, key: string, value: unknown) => void;
+  updateNodeData: (id: string, patch: Partial<StudioNodeData>) => NodeEditResult;
+  updateNodeParameter: (id: string, key: string, value: unknown) => NodeEditResult;
   /** M05-B2 model switch: replace the whole parameter set in ONE set() (deterministic normalization). */
-  replaceNodeParameters: (id: string, parameters: StudioNodeData['parameters'], changedKeys: string[]) => void;
+  replaceNodeParameters: (id: string, parameters: StudioNodeData['parameters'], changedKeys: string[]) => NodeEditResult;
+  /** W5b — lock/unlock a node (session-level UX lock; draggable=false while locked). */
+  lockNode: (nodeId: string, locked: boolean) => void;
   undo: () => void;
   redo: () => void;
   setViewport: (v: Viewport) => void;
@@ -173,6 +194,17 @@ function pushUndo(s: { undoStack: Snapshot[]; redoStack: Snapshot[] }, snap: Sna
   const undoStack = [...s.undoStack, snap];
   if (undoStack.length > UNDO_LIMIT) undoStack.shift(); // bounded
   return { undoStack, redoStack: [] as Snapshot[] }; // new op clears redo
+}
+
+/**
+ * W5b — 防呆双保险 (belt-and-suspenders): a node counts as locked when EITHER
+ * the authoritative `lockedNodeIds` registry OR the denormalized `data.locked`
+ * mirror says so. The store-action rejection stays correct even if the two
+ * sources ever drift.
+ */
+function isNodeLocked(s: StudioState, nodeId: string): boolean {
+  if (s.lockedNodeIds.has(nodeId)) return true;
+  return s.nodes.some((n) => n.id === nodeId && n.data.locked === true);
 }
 
 /** push a typed edge with portType carried in edge data. */
@@ -245,6 +277,7 @@ export const useStudioStore = create<StudioState>((set, get) => ({
   invalidConnection: null,
   dragSnapshot: null,
   editSnapshot: null,
+  lockedNodeIds: new Set<string>(),
 
   projectId: null,
   canvasRevision: null,
@@ -369,6 +402,7 @@ export const useStudioStore = create<StudioState>((set, get) => ({
       ...pushUndo(st, snapshot(st)),
       nodes: st.nodes.filter((n) => !remove(n.id)),
       edges: st.edges.filter((e) => !selectedEdges.has(e.id) && !remove(e.source) && !remove(e.target)),
+      lockedNodeIds: new Set([...st.lockedNodeIds].filter((id) => !remove(id))),
     }));
   },
 
@@ -385,7 +419,8 @@ export const useStudioStore = create<StudioState>((set, get) => ({
         id: nid,
         position: { x: n.position.x + PASTE_OFFSET, y: n.position.y + PASTE_OFFSET },
         selected: true,
-        data: { ...n.data },
+        draggable: true,
+        data: { ...n.data, locked: false },
       };
     });
     const cloneEdges: StudioEdge[] = s.edges
@@ -431,7 +466,8 @@ export const useStudioStore = create<StudioState>((set, get) => ({
         id: nid,
         position: { x: n.position.x + PASTE_OFFSET, y: n.position.y + PASTE_OFFSET },
         selected: true,
-        data: { ...n.data },
+        draggable: true,
+        data: { ...n.data, locked: false },
       };
     });
     const cloneEdges: StudioEdge[] = s.clipboard.edges
@@ -512,12 +548,16 @@ export const useStudioStore = create<StudioState>((set, get) => ({
       return changed ? { ...pushUndo(s, s.editSnapshot), editSnapshot: null } : { editSnapshot: null };
     }),
 
-  updateNodeData: (id, patch) =>
+  updateNodeData: (id, patch) => {
+    if (isNodeLocked(get(), id)) return { ok: false, code: 'NODE_LOCKED' };
     set((s) => ({
       nodes: s.nodes.map((n) => (n.id === id ? { ...n, data: { ...n.data, ...patch } } : n)),
-    })),
+    }));
+    return { ok: true };
+  },
 
-  updateNodeParameter: (id, key, value) =>
+  updateNodeParameter: (id, key, value) => {
+    if (isNodeLocked(get(), id)) return { ok: false, code: 'NODE_LOCKED' };
     set((s) => {
       const nodes = s.nodes.map((n) => {
         if (n.id !== id) return n;
@@ -541,9 +581,12 @@ export const useStudioStore = create<StudioState>((set, get) => ({
           )
         : nodes;
       return { nodes: recomputeStatus(staleNodes, [id, ...downstream], s.edges) };
-    }),
+    });
+    return { ok: true };
+  },
 
-  replaceNodeParameters: (id, parameters, changedKeys) =>
+  replaceNodeParameters: (id, parameters, changedKeys) => {
+    if (isNodeLocked(get(), id)) return { ok: false, code: 'NODE_LOCKED' };
     set((s) => {
       const nodes = s.nodes.map((n) => {
         if (n.id !== id) return n;
@@ -564,6 +607,27 @@ export const useStudioStore = create<StudioState>((set, get) => ({
           )
         : nodes;
       return { nodes: recomputeStatus(staleNodes, [id, ...downstream], s.edges) };
+    });
+    return { ok: true };
+  },
+
+  // W5b — session-level node lock (UX layer, NOT server CAS). Toggles the
+  // authoritative `lockedNodeIds` registry and mirrors onto `data.locked`
+  // (reactive card badge) + react-flow `draggable` (node-level drag gate).
+  // Intentionally NOT undoable (a UX toggle, not a graph edit) and NOT
+  // persisted (see lockedNodeIds doc above).
+  lockNode: (nodeId, locked) =>
+    set((s) => {
+      if (!s.nodes.some((n) => n.id === nodeId)) return s;
+      const lockedNodeIds = new Set(s.lockedNodeIds);
+      if (locked) lockedNodeIds.add(nodeId);
+      else lockedNodeIds.delete(nodeId);
+      return {
+        lockedNodeIds,
+        nodes: s.nodes.map((n) =>
+          n.id === nodeId ? { ...n, draggable: !locked, data: { ...n.data, locked } } : n,
+        ),
+      };
     }),
 
   // W4a 裁决: undo/redo 保持本地快照式（每操作一条目、即时、有界 UNDO_LIMIT），
@@ -654,7 +718,7 @@ export const useStudioStore = create<StudioState>((set, get) => ({
     return { commands, hasMore: res.hasMore, cursor, remoteCount: commands.length };
   },
 
-  loadGraph: (nodes, edges, viewport) => set({ nodes, edges, ...(viewport ? { viewport } : {}), undoStack: [], redoStack: [], clipboard: null, dragSnapshot: null, editSnapshot: null, invalidConnection: null, commandLogCursor: 0 }),
+  loadGraph: (nodes, edges, viewport) => set({ nodes, edges, ...(viewport ? { viewport } : {}), undoStack: [], redoStack: [], clipboard: null, dragSnapshot: null, editSnapshot: null, invalidConnection: null, commandLogCursor: 0, lockedNodeIds: new Set(nodes.filter((n) => n.data.locked === true).map((n) => n.id)) }),
 
   resetProjectState: () =>
     set({
@@ -670,6 +734,7 @@ export const useStudioStore = create<StudioState>((set, get) => ({
       projectId: null,
       canvasRevision: null,
       commandLogCursor: 0,
+      lockedNodeIds: new Set<string>(),
       runningNodeId: null,
       lastRun: null,
       runError: null,
