@@ -108,6 +108,7 @@ import referenceStyleAudit from './reference-style-audit.cjs'; // 参考样式 A
 import agentResolver from './agent-model-resolver.cjs';         // 智能体文本模型统一解析（全局兜底模型）
 import seedDefaultsMod from './seed-defaults.cjs'; // 首次部署兜底种子（占位服务商 + 常用模型）
 import flags from './modules/modelhub/flags.cjs'; // L7 视频轨灰度旗标（FF_VIDEO_* 默认 off，resolveFlag/isFlagEnabled）
+import shadowCompare from './modules/generation-v2/shadowCompare.cjs'; // L53 流量切换 shadow 对照（classifyDurableEventsMode/compareOutcome/writeShadowCompare/recordRelayOutcome）
 
 // 初始化向导限流（同一进程内 ≤20 次/10min；真正防护靠"建好即锁定"）
 const setupAttempts = new Map();
@@ -5141,11 +5142,34 @@ if (pgPool && IS_LEADER) {
   // 仅当 FF_VIDEO_DURABLE_EVENTS=1（L7 视频轨旗标）时启动，定时消费 outbox 事件续投 legacy 分发
   // （runGenerationRelayTick → dispatchFromOutbox → driveGenerateTask）。默认 off 不改变现行为。
   // 裁决：relay 复用视频轨旗标 VIDEO_DURABLE_EVENTS gate（非独立 GENERATION_OUTBOX_RELAY_ENABLED）。
-  if (typeof dispatcher.runGenerationRelayTick === 'function' && flags.isFlagEnabled('VIDEO_DURABLE_EVENTS')) {
+  //
+  // L53 流量切换 shadow 模式（PREP，零行为变更）：FF_VIDEO_DURABLE_EVENTS=shadow（或 =2）时
+  // 同样启动 relay（双路都跑：现 legacy inline 直驱 + outbox relay 续投），并在 relay 消费面
+  // 包一层 recordRelayOutcome 写 shadow_compare 对照行取证（outbox 结果 vs legacy 结果终态一致性），
+  // 供父线证据充分后翻转。翻转 = 移除 inline fire-and-forget、relay 成权威提交，本批不做。
+  const durableEventsMode = shadowCompare.classifyDurableEventsMode(process.env);
+  const relayEnabled = flags.isFlagEnabled('VIDEO_DURABLE_EVENTS') || durableEventsMode === 'shadow';
+  if (typeof dispatcher.runGenerationRelayTick === 'function' && relayEnabled) {
+    // shadow 模式：包装 publish 捕获 relay 每事件真实 dispatch 决策 → 落 shadow_compare 对照行。
+    // injected.publish 是 runGenerationRelayTick 的单测接缝；复用它在生产零改 dispatcher 地挂钩，
+    // dispatch 行为与默认 dispatchFromOutbox 完全一致（不做行为切换）。对照写失败仅告警，绝不阻断 relay。
+    const relayPublish = durableEventsMode === 'shadow'
+      ? async (ev) => {
+          const r = await dispatcher.dispatchFromOutbox(pgPool, ev);
+          shadowCompare.recordRelayOutcome(pgPool, ev, r)
+            .then((out) => { if (!out.ok) console.warn('[shadow-compare] 对照行落库失败:', out.error); })
+            .catch((e) => console.warn('[shadow-compare] 对照行异常:', e.message));
+          return r;
+        }
+      : undefined;
     setInterval(() => {
-      dispatcher.runGenerationRelayTick(pgPool, { workerId: `legacy-relay-${process.pid}` }).catch(() => {});
+      dispatcher.runGenerationRelayTick(
+        pgPool,
+        { workerId: `legacy-relay-${process.pid}` },
+        relayPublish ? { publish: relayPublish } : undefined,
+      ).catch(() => {});
     }, 5000);
-    console.log('[startup] generation outbox relay 已启动（FF_VIDEO_DURABLE_EVENTS=1，每 5s 一个 tick）');
+    console.log(`[startup] generation outbox relay 已启动（FF_VIDEO_DURABLE_EVENTS=${durableEventsMode === 'shadow' ? 'shadow' : '1'}，每 5s 一个 tick${durableEventsMode === 'shadow' ? ' + shadow_compare 对照取证' : ''}）`);
   }
 }
 
