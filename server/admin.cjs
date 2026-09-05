@@ -76,7 +76,8 @@ function createAdmin(ctx) {
       if (!cur.rows.length) throw new Error('用户不存在');
       if (Number(cur.rows[0][col]) + amt < 0) throw new Error('扣减后余额不能为负');
     }
-    const ref = `admin:${actorId}:${note || ''}`;
+    // ref 必须每笔唯一：UNIQUE(ref, kind) 约束下，固定 admin:<actor>:<note> 会因备注空而重复冲突。
+    const ref = `admin:${actorId}:${note || ''}:${Date.now()}`;
     return tx(pg(), async (client) => {
       const u = await client.query(
         `UPDATE users SET ${col} = ${col} + $1, updated_at=NOW() WHERE id=$2 RETURNING credits`,
