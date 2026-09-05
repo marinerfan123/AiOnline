@@ -7,9 +7,9 @@
 //   4. ledger       单用户账本（期初→流水→期末 + 每笔 balance_after）
 //   5. topup-packages 充值套餐 CRUD（后台可配置，替换前端硬编码预设）
 // 依赖（由 server.js 注入）：getPg / session / sendJSON / fromSnake / parseBody
-// 设计依据：credit_transactions.kind ∈ {reserve,commit,release,grant,adjust}
+// 设计依据：credit_transactions.kind ∈ {reserve,commit,release,grant,adjust,refund}
 //   - billing W1C 起，reserve / release / commit / grant / adjust 全部写 balance_after（余额快照）
-//   - 但 reserve / release 的 balance_after 仅作审计/账本参考，对账引擎不采信（见 reconcile）
+//   - 但 reserve / release / refund 的 balance_after 仅作审计/账本参考，对账引擎不采信（见 reconcile）
 //   - commit / grant / adjust 的 balance_after 为权威快照，对账引擎据此校准
 //   对账引擎混合重建（快照校准 + 金额逐笔加减），对任何漏记/重复记账都能暴露漂移。
 
@@ -306,11 +306,18 @@ function createFinance(ctx) {
   // 规则：逐笔推进 sim ——
   //   reserve: 实际扣余额（sim -= amount）
   //   release: 实际补余额（sim += amount）
+  //   refund : 实际补余额（sim += amount）——同 release 按 amount 加回，不读 balance_after
   //   commit / grant / adjust: 用 balance_after 校准 sim（权威快照）
   // 注意（billing W1C）：reserve / release / commit / grant / adjust 现都写 balance_after，
   //   但 reserve / release 仍按 amount 加减、不读其 balance_after——因为 commit/grant/adjust
   //   的 balance_after 快照已包含此前 reserve/release 的影响，若 reserve/release 也改用
   //   balance_after 校准会与快照叠加导致双算；金额加减保持与快照语义一致。
+  //   refund 同理：billing.refundUserCharge 写 balance_after 时取的是 INSERT 前的余额快照
+  //   （balance_after 落在 +charge UPDATE 之前），退款后快照不对称、非权威，故对账按 amount
+  //   加回而非读 balance_after 校准。
+  // 防双算：逐行扫描（同 kind+ref 只出现一行）——(ref, kind) 唯一约束
+  //   uq_credit_transactions_ref_kind（0004）在 billing 侧已保证幂等，重复写入被 ON CONFLICT
+  //   DO NOTHING 吞掉、不会落第二行，故 reconcile 无需额外去重，逐行口径即不重复计。
   // 最终 sim 必须 == users.credits，否则账实不符 / 漏记 / 重复记账。
   async function reconcile() {
     const p = pg();
@@ -326,7 +333,7 @@ function createFinance(ctx) {
         const amt = Number(t.amount);
         const ba = t.balance_after != null ? Number(t.balance_after) : null;
         if (t.kind === 'reserve') { if (sim !== null) sim -= amt; }
-        else if (t.kind === 'release') { if (sim !== null) sim += amt; }
+        else if (t.kind === 'release' || t.kind === 'refund') { if (sim !== null) sim += amt; }
         else if (t.kind === 'commit' || t.kind === 'grant' || t.kind === 'adjust') { if (ba !== null) sim = ba; }
       }
       const real = Number(u.credits);
