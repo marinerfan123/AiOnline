@@ -417,6 +417,24 @@ function createStudioCanvasPersistence(deps) {
     return r.rows[0];
   }
   async function ensureCanvas(client, project, user) { return await getCanvas(client, project.id) || await createCanvasTx(client, project, user, 'Primary Canvas'); }
+
+  // ── W6 多画布（服务端 REST）：list / 副画布创建 / 切主画布 / 按 id 读 ──
+  async function getCanvasById(client, projectId, canvasId) { const r = await client.query('SELECT * FROM studio_canvases WHERE project_id=$1 AND id=$2 AND archived_at IS NULL LIMIT 1', [projectId, canvasId]); return r.rows[0] || null; }
+  async function listCanvases(client, projectId) { const r = await client.query('SELECT id,name,is_primary,revision,schema_version,created_by,updated_by,created_at,updated_at FROM studio_canvases WHERE project_id=$1 AND archived_at IS NULL ORDER BY is_primary DESC, created_at ASC', [projectId]); return r.rows; }
+  async function createSecondaryCanvasTx(client, project, user, name) {
+    const id = `canvas-${crypto.randomUUID()}`;
+    const r = await client.query(`INSERT INTO studio_canvases (id,project_id,workspace_id,name,revision,schema_version,is_primary,created_by,updated_by,created_at,updated_at)
+      VALUES ($1,$2,$3,$4,1,$5,FALSE,$6,$6,NOW(),NOW()) RETURNING *`, [id, project.id, project.workspace_id, cleanText(name, LIMITS.maxNameLength) || 'Canvas', CANVAS_SCHEMA_VERSION, user.id]);
+    return r.rows[0];
+  }
+  async function setPrimaryCanvasTx(client, project, user, canvasId) {
+    const target = await client.query('SELECT id FROM studio_canvases WHERE project_id=$1 AND id=$2 AND archived_at IS NULL', [project.id, canvasId]);
+    if (!target.rows.length) return null;
+    // 部分唯一索引 uq_studio_canvases_primary_project 只约束主画布：先清旧主，再立新主（同一事务）。
+    await client.query('UPDATE studio_canvases SET is_primary=FALSE, updated_at=NOW(), updated_by=$2 WHERE project_id=$1 AND is_primary=TRUE AND archived_at IS NULL', [project.id, user.id]);
+    const r = await client.query('UPDATE studio_canvases SET is_primary=TRUE, updated_at=NOW(), updated_by=$2 WHERE id=$1 RETURNING *', [canvasId, user.id]);
+    return r.rows[0];
+  }
   async function emit(eventType, payload) { if (!logEvent) return; try { await logEvent(pg, { aggregate: 'studio_canvas', eventType, payload }); } catch (_) {} }
 
   // G22 — canvas.patch 命令日志。优先用合成根注入的 commandLogStore(需含幂等 appendCommand);
@@ -547,6 +565,36 @@ function createStudioCanvasPersistence(deps) {
       return sendJSON(res, canvas.created_by === user.id ? 201 : 200, response(canvas, graph, canvas.viewport_json, { permissions: access.permissions }));
     } catch (e) { try { await client.query('ROLLBACK'); } catch (_) {} if (e.message === 'INVALID_NODE') return sendErr(sendJSON, res, 400, 'INVALID_NODE'); throw e; } finally { client.release(); }
   }
+  async function handleListCanvases(req, res, user, projectId) {
+    const access = await requireProject(pg, res, user, projectId); if (!access) return;
+    const rows = await listCanvases(pg, projectId);
+    return sendJSON(res, 200, { canvases: rows.map((c) => ({ id: c.id, name: c.name, isPrimary: c.is_primary, revision: c.revision, schemaVersion: c.schema_version, createdAt: toIso(c.created_at), updatedAt: toIso(c.updated_at) })) });
+  }
+  async function handleCreateSecondary(req, res, user, projectId) {
+    const body = (await parseBody(req)) || {}; const client = await pg.connect();
+    try { await client.query('BEGIN'); const access = await requireProject(client, res, user, projectId); if (!access) { await client.query('ROLLBACK'); return; } if (!access.permissions.canUpdate) { await client.query('ROLLBACK'); return sendErr(sendJSON, res, 403, '无权编辑该项目'); }
+      const canvas = await createSecondaryCanvasTx(client, access.project, user, body.name); const graph = await loadGraph(client, canvas.id); await client.query('COMMIT');
+      await emit('canvas.created', { canvas_id: canvas.id, project_id: projectId, workspace_id: canvas.workspace_id, revision: canvas.revision, actor_id: user.id, timestamp: new Date().toISOString() });
+      return sendJSON(res, 201, response(canvas, graph, canvas.viewport_json, { permissions: access.permissions }));
+    } catch (e) { try { await client.query('ROLLBACK'); } catch (_) {} throw e; } finally { client.release(); }
+  }
+  async function handleSetPrimary(req, res, user, projectId, canvasId) {
+    const client = await pg.connect();
+    try { await client.query('BEGIN'); const access = await requireProject(client, res, user, projectId); if (!access) { await client.query('ROLLBACK'); return; } if (!access.permissions.canUpdate) { await client.query('ROLLBACK'); return sendErr(sendJSON, res, 403, '无权编辑该项目'); }
+      const canvas = await setPrimaryCanvasTx(client, access.project, user, canvasId); await client.query('COMMIT');
+      if (!canvas) return sendErr(sendJSON, res, 404, '画布不存在');
+      await emit('canvas.primary_set', { canvas_id: canvasId, project_id: projectId, actor_id: user.id, timestamp: new Date().toISOString() });
+      return sendJSON(res, 200, { ok: true, canvas: formatCanvas(canvas) });
+    } catch (e) { try { await client.query('ROLLBACK'); } catch (_) {} throw e; } finally { client.release(); }
+  }
+  async function handleGetById(req, res, user, projectId, canvasId) {
+    const access = await requireProject(pg, res, user, projectId); if (!access) return;
+    const canvas = await getCanvasById(pg, projectId, canvasId);
+    if (!canvas) return sendJSON(res, 404, { ok: false, error: '画布不存在' });
+    const graph = await loadGraph(pg, canvas.id);
+    await restoreParkedIntoGraph(pg, canvas.id, graph);
+    return sendJSON(res, 200, response(canvas, graph, canvas.viewport_json, { permissions: access.permissions }));
+  }
   async function handlePatch(req, res, user, projectId) {
     const body = (await parseBody(req)) || {}; const cmid = String(body.clientMutationId || '').trim(); const base = Number(body.baseRevision);
     if (!cmid || !Number.isInteger(base)) return sendErr(sendJSON, res, 400, 'INVALID_PATCH');
@@ -643,19 +691,26 @@ function createStudioCanvasPersistence(deps) {
 
   async function handle(req, res, urlPath, method) {
     const restore = urlPath.match(/^\/api\/v2\/projects\/([^/]+)\/studio\/canvas\/versions\/([^/]+)\/restore$/);
+    // W6 多画布：/canvases 复数面（列表/建副画布）与 /canvases/:id/set-primary 先于单数 PREFIX_RE 判定。
+    const canvasesList = urlPath.match(/^\/api\/v2\/projects\/([^/]+)\/studio\/canvases$/);
+    const setPrimary = urlPath.match(/^\/api\/v2\/projects\/([^/]+)\/studio\/canvases\/([^/]+)\/set-primary$/);
     const m = urlPath.match(PREFIX_RE);
-    if (!m && !restore) return false;
+    if (!m && !restore && !canvasesList && !setPrimary) return false;
     if (method === 'OPTIONS') { sendJSON(res, 204, {}); return true; }
     const user = requireUser(req, res); if (!user) return true;
-    const projectId = decodeURIComponent((restore ? restore[1] : m[1]));
+    const projectId = decodeURIComponent((restore ? restore[1] : canvasesList ? canvasesList[1] : setPrimary ? setPrimary[1] : m[1]));
     const seg1 = m && m[2]; const seg2 = m && m[3];
     try {
       if (restore && method === 'POST') return await handleRestore(req,res,user,projectId,decodeURIComponent(restore[2])), true;
+      if (canvasesList && method === 'GET') return await handleListCanvases(req,res,user,projectId), true;
+      if (canvasesList && method === 'POST') return await handleCreateSecondary(req,res,user,projectId), true;
+      if (setPrimary && method === 'POST') return await handleSetPrimary(req,res,user,projectId,decodeURIComponent(setPrimary[2])), true;
       if (!seg1 && method === 'GET') return await handleGet(req,res,user,projectId), true;
       if (!seg1 && method === 'POST') return await handleCreate(req,res,user,projectId), true;
       if (!seg1 && method === 'PATCH') return await handlePatch(req,res,user,projectId), true;
       if (seg1 === 'versions' && !seg2 && method === 'GET') return await handleVersionList(req,res,user,projectId), true;
       if (seg1 === 'versions' && !seg2 && method === 'POST') return await handleVersionCreate(req,res,user,projectId), true;
+      if (seg1 && !seg2 && method === 'GET') return await handleGetById(req,res,user,projectId,decodeURIComponent(seg1)), true;
       return sendJSON(res, 404, { ok:false, error:'Not Found' }), true;
     } catch (e) { console.error('[studio-canvas] route error:', e && e.stack); return sendJSON(res, 500, { ok:false, error:'服务内部错误' }), true; }
   }
