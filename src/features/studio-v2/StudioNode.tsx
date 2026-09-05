@@ -80,6 +80,56 @@ function AssetPlaceholder({ label, hint }: { label: string; hint: string }) {
   );
 }
 
+/**
+ * W1B — durable output asset ids from node data.
+ * §119 dual-write: `output_asset_ids` (snake) is canonical in data_json, but
+ * both camelCase (`outputAssetIds`) and snake_case round-trip through the
+ * persistence whitelist (studioCanvasPersistence.cjs VIDEO_NODE_FIELD_ALIASES).
+ * A single `media_id`/`mediaId` is also accepted as the first-output fallback.
+ */
+function outputAssetIdsOf(data: StudioNode['data']): string[] {
+  const d = data as Record<string, unknown>;
+  const arr = (v: unknown): string[] =>
+    Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string' && x.length > 0) : [];
+  const camel = arr(d.outputAssetIds);
+  if (camel.length) return camel;
+  const snake = arr(d.output_asset_ids);
+  if (snake.length) return snake;
+  const single = d.media_id ?? d.mediaId;
+  return typeof single === 'string' && single.length > 0 ? [single] : [];
+}
+
+/**
+ * W1B — durable output thumbnail badge (bottom-left corner of the node card).
+ * Reads the FIRST output asset id through the M04-S asset read endpoint
+ * (v2asset.getAsset → GET /api/v2/assets/:assetId; the shared api client
+ * already sends credentials:'include' for the httpOnly session cookie). The
+ * endpoint resolves media.thumbnail (thumb) with media.full_url (full)
+ * fallback — media has no `poster` column, so video thumbnails are stills
+ * served from `thumbnail` and an <img> is correct for both image and video.
+ *
+ * Non-blocking by construction: no ids → no badge; a pending/unresolved URL
+ * → no badge (honest empty state), never a fake asset.
+ */
+function OutputThumbBadge({ assetId }: { assetId: string }) {
+  const q = useQuery({
+    queryKey: ['v2', 'asset', assetId],
+    queryFn: () => v2asset.getAsset(assetId),
+    retry: 0,
+    staleTime: 60_000,
+  });
+  const url = q.data?.asset?.thumbnailUrl || q.data?.asset?.url || '';
+  if (!url) return null;
+  return (
+    <span
+      data-test="output-thumb-badge"
+      className="pointer-events-none absolute bottom-1 left-1 z-10 h-9 w-9 shrink-0 overflow-hidden rounded border border-ml2-border bg-ml2-surface-2 shadow"
+    >
+      <img src={url} alt="" loading="lazy" className="h-full w-full object-cover" />
+    </span>
+  );
+}
+
 function GenerationPlaceholder({ status }: { status: string }) {
   const label =
     status === 'STALE' || status === 'stale'
@@ -112,13 +162,15 @@ function StudioNodeInner({ id, data, selected, width }: NodeProps<StudioNode>) {
   const isFrame = def.executionKind === 'STRUCTURAL';
   const params = (data.parameters ?? {}) as Record<string, unknown>;
   const text = (params.prompt ?? params.scriptText ?? params.name ?? params.description ?? params.content ?? data.prompt) as string | undefined;
+  // W1B: durable output thumbnail — first output assetId (§119 outputAssetIds).
+  const outputAssetId = outputAssetIdsOf(data)[0];
 
   return (
     <div
       data-test="studio-node-card"
       data-node-kind={def.id}
       className={cn(
-        'flex flex-col overflow-hidden rounded-lg border bg-ml2-surface-1 shadow-md transition-shadow',
+        'relative flex flex-col overflow-hidden rounded-lg border bg-ml2-surface-1 shadow-md transition-shadow',
         selected ? 'border-ml2-accent ring-2 ring-ml2-accent/40 shadow-lg' : 'border-ml2-border hover:border-ml2-border-strong',
         data.status === 'disabled' && 'opacity-60',
         isFrame && 'w-full',
@@ -206,6 +258,8 @@ function StudioNodeInner({ id, data, selected, width }: NodeProps<StudioNode>) {
           </div>
         )}
       </div>
+
+      {outputAssetId ? <OutputThumbBadge assetId={outputAssetId} /> : null}
 
       {def.inputPorts.map((p, i) => (
         <Handle

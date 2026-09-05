@@ -4,6 +4,7 @@ import { Clapperboard, ListVideo, PlaySquare, History } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { v2studio } from '@/shared/api/contract/studio-canvas-client';
 import { StoryboardRowsPanel } from './StoryboardRowsPanel';
+import { RunsPanel } from './run/RunsPanel';
 
 const TABS = [
   { id: 'shots', label: 'Shots', icon: Clapperboard, phase: 'M05-D 镜头工作流' },
@@ -31,7 +32,7 @@ export function BottomDock({ projectId, scriptId, revision, onRestored }: { proj
             <t.icon className="size-3.5" />{t.label}
           </button>
         ))}
-        {closed ? <span className="ml-auto text-[10px] text-ml2-text-3">Versions enabled · Timeline/Runs reserved</span> : <button data-test="dock-close" onClick={() => setActive(null)} aria-label="收起 Dock" className="ml-auto rounded p-1 text-ml2-text-3 hover:bg-ml2-surface-3 hover:text-ml2-text"><span className="block text-sm leading-none">×</span></button>}
+        {closed ? <span className="ml-auto text-[10px] text-ml2-text-3">Versions/Runs enabled · Timeline reserved</span> : <button data-test="dock-close" onClick={() => setActive(null)} aria-label="收起 Dock" className="ml-auto rounded p-1 text-ml2-text-3 hover:bg-ml2-surface-3 hover:text-ml2-text"><span className="block text-sm leading-none">×</span></button>}
       </div>
       {!closed && <div className="min-h-0 flex-1 px-3 py-2">
         {active === 'versions' ? (
@@ -44,6 +45,10 @@ export function BottomDock({ projectId, scriptId, revision, onRestored }: { proj
              plan 投影（GET /api/v2/script/:scriptId/storyboard）。画布接入前无
              scriptId → 面板显示未绑定说明空态；剧本工作区接入后传 scriptId 即亮。 */
           <StoryboardRowsPanel projectId={projectId} scriptId={scriptId} />
+        ) : active === 'runs' ? (
+          /* W1A — Runs 只读消费面：状态/时间/产物 id 列表 + 自动刷新。
+             Run 触发按钮归 Inspector（W1B），本 tab 仅展示。 */
+          <RunsPanel projectId={projectId} />
         ) : <div className="grid h-full place-items-center"><p className="text-[11px] text-ml2-text-3"><span className="font-medium text-ml2-text-2">{tab.label}</span> — {tab.phase} 提供。</p></div>}
       </div>}
     </div>

@@ -25,6 +25,18 @@ import './studio.css';
 
 function StudioLayout() {
   const { projectId } = useProjectContext();
+  // G13/W6② — 分镜接线：scriptId 来源（实查结论）。
+  // 当前 schema（迁移 0001–0054）无独立 scripts 表、projects 表无 script_id 列、
+  // scriptApi 无脚本列表/创建端点 —— scriptId 是 project_shots_rows 上的一个无 FK
+  // 命名空间键，plan view（GET /api/v2/script/:scriptId/storyboard）实为 project 级
+  // 投影（服务端按 script_rows WHERE project_id=$1 读取，scriptId 不参与行过滤，仅
+  // 非空校验 + 作用于持久化计划的 dirty/指纹/lock 作用域）。且
+  // project_shots_rows 的 UNIQUE(script_id, shot_id) 是全局约束（shotId = s{scene}:
+  // b{beat}:k{shot} 为项目内局部值），跨项目复用同一 scriptId 会撞唯一键 —— 故
+  // scriptId 必须按项目确定性派生。当前「单脚本/项目」模型下取 scriptId = projectId
+  // （apply/batch/lock 未来叶用同一稳定值即保证 dirty/lock 口径一致）。
+  // 缺省处理：projectId 为空时传 undefined → StoryboardRowsPanel 显示「未绑定」空态。
+  const scriptId = projectId || undefined;
   const persistence = useStudioCanvasPersistence(projectId, Boolean(projectId));
   // G06 Asset Library drawer open state (toggle lives in the TopToolbar).
   const [assetLibraryOpen, setAssetLibraryOpen] = useState(false);
@@ -66,7 +78,7 @@ function StudioLayout() {
         </div>
         <Inspector projectId={projectId} />
       </div>
-      <BottomDock projectId={projectId} revision={persistence.revision} onRestored={persistence.reloadFromServer} />
+      <BottomDock projectId={projectId} scriptId={scriptId} revision={persistence.revision} onRestored={persistence.reloadFromServer} />
     </div>
   );
 }
