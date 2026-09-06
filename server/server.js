@@ -5058,8 +5058,11 @@ app.use((req, res, next) => {
 // API token（网关探针）—— 审计 2026-09-04：公开泄露即 system 提权面；仅当 GATEWAY_TOKEN 匹配 x-gateway-token 才回。
 app.get('/api/token', (req, res) => {
   const gw = process.env.GATEWAY_TOKEN;
-  if (!gw || req.headers['x-gateway-token'] !== gw) return sendJSON(res, 403, { error: 'Forbidden' });
-  return sendJSON(res, 200, { token: API_TOKEN });
+  // 仅网关（带 x-gateway-token）能拿到真实 API_TOKEN —— 防泄露守卫（原 CRITICAL 修复）。
+  if (gw && req.headers['x-gateway-token'] === gw) return sendJSON(res, 200, { token: API_TOKEN });
+  // 浏览器前端探测：返回 200 空 token（不泄露 API_TOKEN），前端已改用会话 cookie 鉴权，
+  // 避免之前 403 在前端控制台刷 "Failed to load resource: 403 Forbidden" 噪音。
+  return sendJSON(res, 200, { token: '' });
 });
 
 // API 路由 → handleAPI（含流量采样）
