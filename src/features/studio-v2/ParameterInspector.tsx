@@ -60,7 +60,7 @@ function ModelField({ field, value, onChange }: { field: ParameterField; value: 
   const models = useMemo(() => (q.data ?? []).filter((m) => modelMatches(m, field.capability ?? '')), [q.data, field.capability]);
   const current = q.data ? q.data.find((m) => m.model_id === String(value)) ?? null : null;
 
-  if (q.isPending) return <p data-test={`param-${field.key}-loading`} className="text-[11px] text-ml2-text-3">加载 Logical Models…</p>;
+  if (q.isPending) return <p data-test={`param-${field.key}-loading`} className="text-[11px] text-ml2-text-3">加载逻辑模型…</p>;
   if (q.isError) {
     return (
       <div className="rounded border border-red-500/30 bg-red-500/5 p-2">
@@ -72,7 +72,7 @@ function ModelField({ field, value, onChange }: { field: ParameterField; value: 
   if (models.length === 0) {
     return (
       <div data-test={`param-${field.key}-empty`} className="rounded border border-amber-500/30 bg-amber-500/5 p-2">
-        <p className="text-[11px] text-amber-400">No compatible model configured</p>
+        <p className="text-[11px] text-amber-400">未配置兼容模型</p>
         <p className="mt-0.5 text-[10px] leading-snug text-ml2-text-3">
           请管理员在 AI Control 中配置具备该 capability 的 Logical Model（不会显示任何 key / provider 凭证）。
         </p>
@@ -94,13 +94,13 @@ function ModelField({ field, value, onChange }: { field: ParameterField; value: 
         aria-invalid={validateParameterValue(field, value).errors.length > 0 || unknownSelected || undefined}
         className="h-8 w-full rounded-md bg-ml2-surface-3 px-2 text-xs text-ml2-text outline-none focus:ring-1 focus:ring-ml2-accent"
       >
-        <option value="">选择 Logical Model…</option>
+        <option value="">选择逻辑模型…</option>
         {models.map((m) => <option key={m.model_id} value={m.model_id}>{m.display_name || m.model_id}</option>)}
-        {unknownSelected && <option value={String(value)} disabled>Selected model is unavailable</option>}
+        {unknownSelected && <option value={String(value)} disabled>所选模型不可用</option>}
       </select>
       {unknownSelected && (
         <p data-test={`param-${field.key}-unavailable`} className="text-[10px] text-red-400">
-          Selected model is unavailable — 请重新选择。
+          所选模型不可用 — 请重新选择。
         </p>
       )}
     </div>
@@ -238,14 +238,14 @@ export function ParameterInspector({ node, def, projectId }: { node: StudioNode;
       {advanced.length > 0 && (
         <div className="border-t border-ml2-border pt-2">
           <button type="button" data-test="inspector-advanced-toggle" onClick={() => setAdvancedOpen((v) => !v)} className="mb-2 flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wide text-ml2-text-3 hover:text-ml2-text-2">
-            {advancedOpen ? <ChevronDown className="size-3" /> : <ChevronRight className="size-3" />} Advanced
+            {advancedOpen ? <ChevronDown className="size-3" /> : <ChevronRight className="size-3" />} 高级
           </button>
           {advancedOpen && <div className="space-y-2">{advanced.map((f) => <ParameterRow key={f.key} field={f} node={node} projectId={projectId} />)}</div>}
         </div>
       )}
       {def.isGeneration && (
         <p data-test="cost-contract" className="text-[10px] leading-snug text-ml2-text-3">
-          Cost estimate unavailable until Run Engine (M05-D+). 本阶段不计算真实 credit / 不调用计费。
+          成本估算需待 Run Engine（M05-D+）。本阶段不计算真实 credit / 不调用计费。
         </p>
       )}
     </div>

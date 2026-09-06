@@ -226,7 +226,7 @@ function HistoryPanelBound({ projectId }: { projectId: string }) {
   return (
     <div data-test="studio-history-panel" className="flex h-full min-h-0 flex-col gap-1.5">
       <div className="flex items-center gap-2">
-        <span className="font-medium text-ml2-text">History</span>
+        <span className="font-medium text-ml2-text">历史</span>
         <span className="text-ml2-text-3">{newestFirst.length} 条</span>
         <button
           data-test="history-refresh"

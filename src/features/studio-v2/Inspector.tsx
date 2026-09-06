@@ -133,7 +133,7 @@ export function Inspector({
         <>
           {selected.length === 0 && (
             <>
-              <Section title="Canvas">
+              <Section title="画布">
                 <div className="space-y-1 text-[11px] text-ml2-text-2">
                   <p>节点：{nodes.length}</p>
                   <p>连接：{edges.length}</p>
@@ -143,13 +143,13 @@ export function Inspector({
                   <Network className="size-3" />自动布局（DAG 分层）
                 </Button>
               </Section>
-              <Section title="Persistence">
+              <Section title="持久化">
                 <p data-test="inspector-persistence-note" className="text-[11px] leading-relaxed text-ml2-text-3">
                   自动保存已开启：编辑后约 900ms 自动保存，刷新页面不丢失。
                   多人同时编辑冲突时，画布顶部会弹出冲突提示横幅，可按策略重试或重载。
                 </p>
               </Section>
-              <Section title="Run">
+              <Section title="运行">
                 <Button data-test="inspector-run-button" size="sm" variant="primary" disabled><Play className="size-3" />运行</Button>
                 <p className="mt-1.5 text-[10px] text-ml2-text-3">选择节点后可运行。</p>
               </Section>
@@ -171,7 +171,7 @@ export function Inspector({
 
           {single && def && (
             <>
-              <Section title="Node identity">
+              <Section title="节点标识">
                 <div className="flex items-center gap-2">
                   <span className="grid size-7 place-items-center rounded bg-ml2-surface-3">
                     <NodeIcon name={def.icon} className="size-4 text-ml2-accent" />
@@ -193,32 +193,32 @@ export function Inspector({
               </Section>
 
               {def.isGeneration && (
-                <Section title="Status">
+                <Section title="状态">
                   <div data-test="inspector-status" className="space-y-1 text-[11px]">
                     {single.data.status === 'STALE' ? (
-                      <p className="text-amber-400">Stale — upstream changed (upstream 变更后待重跑)</p>
+                      <p className="text-amber-400">已过期 — 上游已变更（upstream 变更后待重跑）</p>
                     ) : validation && !validation.valid ? (
-                      <p className="text-red-400">Invalid configuration（配置无效）</p>
+                      <p className="text-red-400">配置无效</p>
                     ) : readiness ? (
-                      <p className={cn('text-emerald-400')}>Ready to run（就绪 · 本阶段不执行）</p>
+                      <p className={cn('text-emerald-400')}>可运行（就绪 · 本阶段不执行）</p>
                     ) : (
-                      <p className="text-ml2-text-3">Loading…</p>
+                      <p className="text-ml2-text-3">加载中…</p>
                     )}
                     <p className="text-[10px] text-ml2-text-3">M05-B2：纯配置图，不触发真实生成。</p>
                   </div>
                 </Section>
               )}
 
-              <Section title="Validation">
+              <Section title="校验">
                 <div data-test="inspector-validation" className="space-y-1 text-[11px]">
-                  {validation?.valid ? <p className="text-emerald-400">valid</p> : <p className="text-red-400">invalid</p>}
+                  {validation?.valid ? <p className="text-emerald-400">有效</p> : <p className="text-red-400">无效</p>}
                   {validation?.errors.map((e) => <p key={`${e.code}-${e.field ?? e.port}`} className="text-red-400">{e.message}</p>)}
                   {validation?.warnings.map((e) => <p key={`${e.code}-${e.field ?? e.port}`} className="text-amber-400">{e.message}</p>)}
                 </div>
               </Section>
 
               {def.inputPorts.length > 0 && (
-                <Section title="Required Inputs">
+                <Section title="必需输入">
                   <div data-test="inspector-ports" className="space-y-1 text-[11px]">
                     {inputSummary.map(({ port, connected }) => (
                       <div key={port.id} className="flex items-center justify-between gap-2">
@@ -237,7 +237,7 @@ export function Inspector({
                               : 'bg-ml2-surface-3 text-ml2-text-3',
                           )}
                         >
-                          {port.required ? (connected ? 'CONNECTED' : 'MISSING') : connected ? 'CONNECTED' : 'OPTIONAL'}
+                          {port.required ? (connected ? '已连接' : '缺失') : connected ? '已连接' : '可选'}
                         </span>
                       </div>
                     ))}
@@ -245,20 +245,20 @@ export function Inspector({
                 </Section>
               )}
 
-              <Section title="Parameters">
+              <Section title="参数">
                 <ParameterInspector node={single} def={def} projectId={projectId} />
               </Section>
 
-              <Section title="Outputs">
+              <Section title="输出">
                 <div className="space-y-1 text-[11px] text-ml2-text-2">
                   <p data-test="inspector-output-type">
-                    Output: {def.outputPorts.length ? def.outputPorts.map((p) => `${p.label}:${p.type}`).join(' · ') : 'none'}
+                    输出：{def.outputPorts.length ? def.outputPorts.map((p) => `${p.label}:${p.type}`).join(' · ') : '无'}
                   </p>
-                  <p className="text-[10px] text-ml2-text-3">Result contract: durable assetId only（provider 临时 URL 不作为最终 authority）</p>
+                  <p className="text-[10px] text-ml2-text-3">结果契约：仅持久化 assetId（provider 临时 URL 不作为最终权威）</p>
                 </div>
               </Section>
 
-              <Section title="Run">
+              <Section title="运行">
                 <Button
                   data-test="inspector-run-button"
                   size="sm"
@@ -284,7 +284,7 @@ export function Inspector({
                 )}
               </Section>
 
-              <Section title="Actions">
+              <Section title="操作">
                 <div className="grid grid-cols-2 gap-1.5">
                   <Button size="sm" variant="secondary" onClick={() => { copySelection(); }}><Copy className="size-3" />复制</Button>
                   <Button size="sm" variant="destructive" onClick={removeSelection}><Trash2 className="size-3" />删除</Button>
@@ -295,14 +295,14 @@ export function Inspector({
 
           {single && !def && (
             <>
-              <Section title="Unknown Node">
+              <Section title="未知节点">
                 <div data-test="unknown-node-inspector" className="space-y-1 text-[11px] text-ml2-text-2">
-                  <p>node type: {String(single.data.nodeKind)}</p>
-                  <p>schema version: {String(single.data.schemaVersion ?? 'unknown')}</p>
-                  <p className="text-amber-400">unsupported · execution disabled</p>
+                  <p>节点类型：{String(single.data.nodeKind)}</p>
+                  <p>schema 版本：{String(single.data.schemaVersion ?? '未知')}</p>
+                  <p className="text-amber-400">不支持 · 已禁用执行</p>
                 </div>
               </Section>
-              <Section title="Actions">
+              <Section title="操作">
                 <Button size="sm" variant="destructive" onClick={removeSelection}><Trash2 className="size-3" />删除</Button>
               </Section>
             </>

@@ -165,9 +165,9 @@ function EmptyState({ onAdd }: { onAdd: (k: StudioNodeKind) => void }) {
         <h2 className="text-sm font-semibold text-ml2-text">开始搭建你的 Creative Flow</h2>
         <p className="mt-1 text-[11px] text-ml2-text-3">从 Prompt 出发，连接参考素材与媒体节点（会话态，M05-C 接入正式保存）。</p>
         <div className="mt-4 grid grid-cols-3 gap-1.5">
-          <Button size="sm" variant="primary" data-test="empty-add-prompt" onClick={() => onAdd('prompt')}>Start with Prompt</Button>
-          <Button size="sm" variant="secondary" data-test="empty-add-reference" onClick={() => onAdd('reference')}>Add Reference</Button>
-          <Button size="sm" variant="secondary" data-test="empty-add-image" onClick={() => onAdd('image-generation')}>Add Image Generation</Button>
+          <Button size="sm" variant="primary" data-test="empty-add-prompt" onClick={() => onAdd('prompt')}>从提示词开始</Button>
+          <Button size="sm" variant="secondary" data-test="empty-add-reference" onClick={() => onAdd('reference')}>添加参考</Button>
+          <Button size="sm" variant="secondary" data-test="empty-add-image" onClick={() => onAdd('image-generation')}>添加图像生成</Button>
         </div>
         <p className="mt-3 text-[10px] text-ml2-text-3">或在左侧 Node Library 拖拽 · 或双击画布空白处快速添加</p>
       </div>

@@ -147,7 +147,7 @@ export function ShotInspector({ projectId, episodeId, shotId }: ShotInspectorPro
   if (shotsQuery.isLoading) {
     return (
       <div data-test="shot-inspector">
-        <Section title="Shot Inspector">
+        <Section title="镜头检视器">
           <LoadingState label="加载镜头…" />
         </Section>
       </div>
@@ -157,7 +157,7 @@ export function ShotInspector({ projectId, episodeId, shotId }: ShotInspectorPro
   if (shotsQuery.isError) {
     return (
       <div data-test="shot-inspector">
-        <Section title="Shot Inspector">
+        <Section title="镜头检视器">
           <ErrorState
             title="无法加载镜头"
             description={(shotsQuery.error as Error).message}
@@ -171,7 +171,7 @@ export function ShotInspector({ projectId, episodeId, shotId }: ShotInspectorPro
   if (!shot) {
     return (
       <div data-test="shot-inspector">
-        <Section title="Shot Inspector">
+        <Section title="镜头检视器">
           <EmptyState title="镜头不存在" description="请先在 Shots 时间线中选择一个镜头。" />
         </Section>
       </div>
@@ -183,7 +183,7 @@ export function ShotInspector({ projectId, episodeId, shotId }: ShotInspectorPro
 
   return (
     <div data-test="shot-inspector" className="space-y-0">
-      <Section title="Shot Inspector">
+      <Section title="镜头检视器">
         <div className="flex items-center gap-2">
           <span className="grid size-7 place-items-center rounded bg-ml2-surface-3 text-[11px] font-semibold text-ml2-accent">
             #{shot.seq}
@@ -206,7 +206,7 @@ export function ShotInspector({ projectId, episodeId, shotId }: ShotInspectorPro
       </Section>
 
       {/* LOCKED_FIELDS — system-owned, read-only display (never editable / never sent). */}
-      <Section title="Locked (system-owned)">
+      <Section title="锁定字段（系统所有）">
         <div className="space-y-2">
           {LOCKED_FIELDS.map(({ key, label }) => {
             const value = shot[key as keyof Shot];
@@ -318,7 +318,7 @@ export function ShotInspector({ projectId, episodeId, shotId }: ShotInspectorPro
         </div>
       ) : null}
 
-      <Section title="Actions">
+      <Section title="操作">
         <div className="flex items-center justify-between gap-2">
           <span className="text-[10px] text-ml2-text-3">{dirty ? '有未保存更改' : '已同步'}</span>
           <Button

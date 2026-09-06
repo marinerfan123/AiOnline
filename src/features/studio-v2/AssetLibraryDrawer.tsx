@@ -79,10 +79,10 @@ const TYPE_ICON: Record<AssetType, React.ElementType> = {
 };
 
 const TYPE_LABEL: Record<AssetType, string> = {
-  IMAGE: 'Image',
-  VIDEO: 'Video',
-  AUDIO: 'Audio',
-  OTHER: 'Other',
+  IMAGE: '图片',
+  VIDEO: '视频',
+  AUDIO: '音频',
+  OTHER: '其他',
 };
 
 export type AssetLibrarySegment =
@@ -95,13 +95,13 @@ export type AssetLibrarySegment =
   | 'generated';
 
 const SEGMENTS: ReadonlyArray<{ id: AssetLibrarySegment; label: string }> = [
-  { id: 'all', label: 'All' },
-  { id: 'images', label: 'Images' },
-  { id: 'videos', label: 'Videos' },
-  { id: 'audio', label: 'Audio' },
-  { id: 'styles', label: 'Styles' },
-  { id: 'references', label: 'References' },
-  { id: 'generated', label: 'Generated' },
+  { id: 'all', label: '全部' },
+  { id: 'images', label: '图片' },
+  { id: 'videos', label: '视频' },
+  { id: 'audio', label: '音频' },
+  { id: 'styles', label: '风格' },
+  { id: 'references', label: '参考' },
+  { id: 'generated', label: '生成' },
 ];
 
 /** Match a segment against summary fields + lazy detail tags (see header notes). */
@@ -128,7 +128,7 @@ function matchesSegment(a: AssetSummary, segment: AssetLibrarySegment, tags: rea
 
 function kindText(a: AssetSummary): string {
   const base = TYPE_LABEL[a.assetType];
-  return a.origin === 'GENERATION' ? `${base} · Generated` : base;
+  return a.origin === 'GENERATION' ? `${base} · 生成` : base;
 }
 
 // ── G-v2.0 must#6 — asset version browsing (read-only) ──────────────────────
@@ -396,7 +396,7 @@ function AssetVersionsPanel({
                       </p>
                       {(detail.model || detail.provider) && (
                         <p className="truncate">
-                          {[detail.model && `model ${detail.model}`, detail.provider && `provider ${detail.provider}`]
+                          {[detail.model && `模型 ${detail.model}`, detail.provider && `提供商 ${detail.provider}`]
                             .filter(Boolean)
                             .join(' · ')}
                         </p>

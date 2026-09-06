@@ -219,12 +219,12 @@ export function StudioComposer({ projectId }: { projectId?: string }) {
         <div className="mb-1 flex items-center gap-1.5 text-[10px] uppercase tracking-wide text-ml2-text-3">
           <span data-test="composer-state">{state}</span>
           {def && <span className="text-ml2-accent">· {def.title}</span>}
-          {isGeneration && <span className="ml-auto flex items-center gap-1 text-ml2-accent"><Sparkles className="size-3" />{(def.capabilityRequirements ?? []).join(', ') || 'generation'}</span>}
+          {isGeneration && <span className="ml-auto flex items-center gap-1 text-ml2-accent"><Sparkles className="size-3" />{(def.capabilityRequirements ?? []).join(', ') || '生成'}</span>}
         </div>
 
         {isGeneration && def?.modelField && (
           <div data-test="composer-model-row" className="mb-1.5 flex items-center gap-2">
-            <span className="shrink-0 text-[10px] text-ml2-text-3">Model</span>
+            <span className="shrink-0 text-[10px] text-ml2-text-3">模型</span>
             <select
               data-test="composer-model-select"
               value={selectedModel}
@@ -308,7 +308,7 @@ export function StudioComposer({ projectId }: { projectId?: string }) {
         <div className="mt-2 flex items-center gap-2">
           <div className="min-w-0 flex-1 truncate text-[10px] text-ml2-text-3">
             {isGeneration
-              ? 'Cost: 生成前 quoteService 估价 · Run 层接线 (G15)'
+              ? '成本：生成前 quoteService 估价 · Run 层接线 (G15)'
               : validation?.ok ? '' : validation?.note}
           </div>
           {savedFlash && <span data-test="composer-saved" className="text-[10px] text-emerald-400">已保存</span>}
@@ -322,7 +322,7 @@ export function StudioComposer({ projectId }: { projectId?: string }) {
             title={isGeneration ? '执行链经 G15 Run 层接入；当前保存节点提示词' : '仅生成类节点可执行'}
             className="flex items-center gap-1.5 rounded-xl bg-ml2-accent px-3 py-1.5 text-[11px] font-medium text-black enabled:hover:brightness-110 disabled:opacity-40"
           >
-            <Send className="size-3" /> Generate
+            <Send className="size-3" /> 生成
           </button>
         </div>
       </div>
