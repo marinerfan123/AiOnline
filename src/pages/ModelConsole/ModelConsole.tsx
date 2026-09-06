@@ -223,7 +223,7 @@ export default function ModelConsole() {
     } catch {}
     try {
       const resp = await apiGenerate({
-        model: selected.id,
+        model: selected.modelId,
         prompt: form.prompt.trim(),
         ratio: form.ratio,
         resolution: form.resolution,
