@@ -100,6 +100,7 @@ import { createOrderExpiryWorker } from './payments/order-expiry.cjs'; // 订单
 import monitorMod from './monitor.cjs'; // 后台「实时监控 · API 活动流」(全路径环形缓冲 + SSE 广播)
 import ossLoggerMod from './oss-logger.cjs'; // OssConfigPanel 专用实时日志（仅 /api/oss/*，含脱敏）
 import ossMod from './oss.cjs';             // OSS 签名/loadOssConfigs/diagnoseOssError/logger 统一模块（被 server.js + dispatcher.cjs/assetFinalize.cjs 共用；Phase 1 主流化抽出）
+import mediaPayloadMod from './media-payload.cjs'; // 历史 data URL 列表瘦身 + 按需内容读取（避免 /api/media 返回数百 MB）
 import logbusMod from './logbus.cjs';   // 后台「实时日志 · 数据库/Redis/控制台」(统一日志总线 + SSE 广播)
 import syslogMod from './syslog.cjs';    // 核心错误持久化 + 进程级异常兜底(system_error_logs)
 import financeMod from './finance.cjs';  // Phase 4 后台账务系统（底层：总览/对账/账本/套餐）
@@ -3073,6 +3074,35 @@ async function handleAPI(req, res) {
     return failedIds.length;
   }
 
+  // 历史 data URL 内容按单项惰性读取；列表接口只返回轻量 URL，避免把同一 2–4MB
+  // base64 在 thumbnail/full_url/oss_url 三列重复序列化到首屏。鉴权与 /api/media 一致。
+  const legacyContentMatch = url.match(/^\/api\/media\/([^/]+)\/content$/);
+  if (legacyContentMatch && method === 'GET') {
+    if (!pgPool) return sendJSON(res, 503, { error: '数据库不可用' });
+    let mediaId = '';
+    try { mediaId = decodeURIComponent(legacyContentMatch[1]); } catch { return sendJSON(res, 400, { error: '无效素材 ID' }); }
+    const params = [mediaId];
+    let ownerWhere = '';
+    if (realUser) { params.push(realUser.id); ownerWhere = ' AND (user_id=$2 OR user_id IS NULL)'; }
+    else { ownerWhere = ' AND user_id IS NULL'; }
+    const r = await pgPool.query(
+      `SELECT thumbnail, full_url, oss_url, provider_url FROM media WHERE id=$1 AND is_deleted=FALSE${ownerWhere} LIMIT 1`,
+      params,
+    );
+    if (!r.rows.length) return sendJSON(res, 404, { error: '素材不存在' });
+    const row = r.rows[0];
+    const raw = [row.thumbnail, row.full_url, row.oss_url, row.provider_url].find((v) => typeof v === 'string' && v.startsWith('data:'));
+    const parsed = mediaPayloadMod.parseLegacyDataUrl(raw);
+    if (!parsed) return sendJSON(res, 404, { error: '素材内容不可用' });
+    res.writeHead(200, {
+      'Content-Type': parsed.contentType,
+      'Content-Length': parsed.body.length,
+      'Cache-Control': 'private, max-age=86400, immutable',
+      'X-Content-Type-Options': 'nosniff',
+    });
+    return res.end(parsed.body);
+  }
+
   if (url === '/api/media' && method === 'GET') {
     if (pgPool) {
       let mediaSql = 'SELECT * FROM media WHERE is_deleted=FALSE';
@@ -3107,9 +3137,10 @@ async function handleAPI(req, res) {
           }
         }
       } catch (_) { /* OSS 未配置则跳过重签，返回原值 */ }
-      // 同步预扫：只阻塞这一批，超出部分由前端 useImageProbe 异步兜底
-      await probeBatchAndMarkFailed(list, pgPool);
-      return sendJSON(res, 200, list);
+      // data URL 存量改为按卡片惰性读取，绝不能随列表响应重复传输。外部 URL 的同步
+      // 服务端预扫同样会拖慢首屏，交给浏览器原生 img + useImageProbe 异步处理。
+      const compactList = mediaPayloadMod.compactMediaPayload(list);
+      return sendJSON(res, 200, compactList);
     }
     return sendJSON(res, 200, readJSON('media'));
   }
@@ -3195,8 +3226,8 @@ async function handleAPI(req, res) {
         // 真实文件大小：前端已带则直接用；否则落库后由服务端异步回探（不受浏览器缓存/CORS 影响）
         const fileSize = (typeof it.fileSize === 'number' && it.fileSize > 0) ? it.fileSize : null;
         await pgPool.query(
-          `INSERT INTO media (id,title,type,thumbnail,full_url,prompt,model,ratio,source,is_favorite,is_deleted,oss_url,oss_object_key,oss_uploaded,category,status,error_message,failed_at,file_size,created_at,user_id,character_id,reference_style_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23) ON CONFLICT (id) DO UPDATE SET title=EXCLUDED.title,full_url=EXCLUDED.full_url,thumbnail=EXCLUDED.thumbnail,oss_url=EXCLUDED.oss_url,oss_object_key=EXCLUDED.oss_object_key,oss_uploaded=EXCLUDED.oss_uploaded,is_deleted=EXCLUDED.is_deleted,status=EXCLUDED.status,error_message=EXCLUDED.error_message,failed_at=EXCLUDED.failed_at,file_size=COALESCE(EXCLUDED.file_size, media.file_size),user_id=EXCLUDED.user_id,character_id=EXCLUDED.character_id,reference_style_id=EXCLUDED.reference_style_id`,
-          [s.id, s.title, s.type, s.thumbnail, s.full_url, s.prompt, s.model, s.ratio, s.source, s.is_favorite || false, s.is_deleted || false, s.oss_url, s.oss_object_key, s.oss_uploaded || false, s.category || 'generated', s.status || 'success', s.error_message || '', s.failed_at || null, fileSize, s.created_at || new Date().toISOString(), ownerId, s.character_id || null, s.reference_style_id || null]
+          `INSERT INTO media (id,title,type,thumbnail,full_url,prompt,model,ratio,source,is_favorite,is_deleted,oss_url,oss_object_key,oss_uploaded,category,status,error_message,failed_at,file_size,created_at,user_id,character_id,reference_style_id,reference_images) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24::jsonb) ON CONFLICT (id) DO UPDATE SET title=EXCLUDED.title,full_url=EXCLUDED.full_url,thumbnail=EXCLUDED.thumbnail,oss_url=EXCLUDED.oss_url,oss_object_key=EXCLUDED.oss_object_key,oss_uploaded=EXCLUDED.oss_uploaded,is_deleted=EXCLUDED.is_deleted,status=EXCLUDED.status,error_message=EXCLUDED.error_message,failed_at=EXCLUDED.failed_at,file_size=COALESCE(EXCLUDED.file_size, media.file_size),user_id=EXCLUDED.user_id,character_id=EXCLUDED.character_id,reference_style_id=EXCLUDED.reference_style_id,reference_images=EXCLUDED.reference_images`,
+          [s.id, s.title, s.type, s.thumbnail, s.full_url, s.prompt, s.model, s.ratio, s.source, s.is_favorite || false, s.is_deleted || false, s.oss_url, s.oss_object_key, s.oss_uploaded || false, s.category || 'generated', s.status || 'success', s.error_message || '', s.failed_at || null, fileSize, s.created_at || new Date().toISOString(), ownerId, s.character_id || null, s.reference_style_id || null, JSON.stringify(Array.isArray(it.referenceImages) ? it.referenceImages.filter(Boolean) : [])]
         );
         // 参考样式分成：客户用样式生图 → 返积分给设计者（奖励池）；幂等且不阻塞主链路
         const chargeCredits = Number(s.credit_cost) || 0;
@@ -3205,8 +3236,8 @@ async function handleAPI(req, res) {
         }
         // 异步回探真实字节数（仅当本次没有显式 fileSize 时）
         if (!fileSize) {
-          const probeUrl = it.ossUrl || it.fullUrl || s.oss_url || s.full_url;
-          if (probeUrl && !probeUrl.startsWith('/') && !probeUrl.startsWith('data:')) {
+          const probeUrl = mediaPayloadMod.pickMediaProbeUrl(it.ossUrl, it.fullUrl, s.oss_url, s.full_url);
+          if (probeUrl) {
             enrichMediaFileSize(pgPool, s.id, probeUrl).catch(() => {});
           }
         }
@@ -3866,6 +3897,7 @@ async function handleAPI(req, res) {
         contentType: body.contentType || 'image',
         duration: Number(body.duration) || 6,
         negative: (body.negative || '').toString().trim(),
+        referenceImages: Array.isArray(body.referenceImages) ? body.referenceImages.filter(Boolean) : [],
       },
     };
     // [Phase 1 主流化 已删] 原兼容 if (body.sync) 同步通道已废弃：
@@ -4855,6 +4887,73 @@ async function handleAPI(req, res) {
 
   // ── OSS 预签名直传（后端零字节：只鉴权 + 锁 userId 前缀 + 签发 PUT/GET 预签名） ──
   // 浏览器拿到 putUrl 后直接 fetch PUT 到 OSS；getUrl 是 7 天有效访问签名。
+
+  if (url === '/api/oss/upload-file' && method === 'POST') {
+    const t0 = Date.now();
+    const userId = req.user?.id;
+    if (!userId) return sendJSON(res, 401, { success: false, message: '请先登录后再上传' });
+    const { enabled, activeId, list } = await ossMod.loadOssConfigs(pgPool);
+    if (!enabled) {
+      ossMod.log('warn', 'upload-file', '服务端上传失败：OSS 总开关未启用', { userId });
+      return sendJSON(res, 200, { success: false, message: 'OSS 总开关未启用' });
+    }
+    const activeCfg = list.find(c => c.id === activeId);
+    if (!activeCfg) return sendJSON(res, 200, { success: false, message: '未配置 active OSS 槽位' });
+    if (!activeCfg.enabled) return sendJSON(res, 200, { success: false, message: 'active OSS 槽位已停用' });
+    if (!activeCfg.accessKeyId || !activeCfg.accessKeySecret || !activeCfg.bucket) {
+      return sendJSON(res, 200, { success: false, message: 'active 配置不完整（缺 AccessKey 或 Bucket）' });
+    }
+
+    const MAX = 100 * 1024 * 1024;
+    const chunks = [];
+    let total = 0;
+    let tooLarge = false;
+    await new Promise((resolve) => {
+      req.on('data', (chunk) => {
+        total += chunk.length;
+        if (total > MAX) {
+          tooLarge = true;
+          req.destroy();
+          return;
+        }
+        chunks.push(chunk);
+      });
+      req.on('end', resolve);
+      req.on('close', resolve);
+      req.on('error', resolve);
+    });
+    if (tooLarge) return sendJSON(res, 413, { success: false, message: '文件超过 100MB 上限' });
+    const buffer = Buffer.concat(chunks);
+    if (!buffer.length) return sendJSON(res, 400, { success: false, message: '空文件' });
+
+    const p = (activeCfg.pathPrefix || 'images/').replace(/^\/+|\/+$/g, '');
+    const headerName = (() => {
+      try { return decodeURIComponent(String(req.headers['x-file-name'] || 'file')); } catch { return 'file'; }
+    })();
+    const rawName = headerName.includes('/') ? headerName.split('/').pop() : headerName;
+    const safeName = String(rawName || 'file').replace(/[^A-Za-z0-9._-]/g, '_');
+    const objectKey = `${p}/${userId}/${Date.now()}_${safeName}`;
+    const contentType = String(req.headers['content-type'] || 'application/octet-stream').split(';')[0].trim() || 'application/octet-stream';
+    try {
+      const uploaded = await ossMod.uploadObject(activeCfg, objectKey, buffer, { contentType });
+      const ossUrl = ossMod.buildOssGetUrl(activeCfg, uploaded.key || objectKey).getUrl;
+      ossMod.log('success', 'upload-file', `服务端上传 ${objectKey} → GET 7d（${Date.now() - t0}ms）`, {
+        userId,
+        providerType: activeCfg.providerType,
+        bucket: activeCfg.bucket,
+        objectKey,
+        contentType,
+        size: buffer.length,
+        durationMs: Date.now() - t0,
+      });
+      return sendJSON(res, 200, { success: true, url: ossUrl, objectKey: uploaded.key || objectKey, providerType: activeCfg.providerType });
+    } catch (e) {
+      const msg = (e instanceof Error ? e.message : String(e)).slice(0, 120);
+      ossMod.log('error', 'upload-file', `服务端上传失败：${activeCfg.providerType} ${activeCfg.bucket}`, { userId, providerType: activeCfg.providerType, bucket: activeCfg.bucket, objectKey, error: msg });
+      return sendJSON(res, 200, { success: false, message: msg });
+    }
+  }
+
   if (url === '/api/oss/sign-upload' && method === 'POST') {
     const t0 = Date.now();
     const body = await parseBody(req);

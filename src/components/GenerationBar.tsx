@@ -428,7 +428,7 @@ function GenerationBar({
   const pollTaskUntilDone = async (
     taskId: string,
     pendingIds: string[],
-    ctx: { prompt: string; model: string; ratio: string; contentType: 'image' | 'video'; createdAt: number; referenceStyleId?: string | null; creditCost?: number },
+    ctx: { prompt: string; model: string; ratio: string; contentType: 'image' | 'video'; createdAt: number; referenceStyleId?: string | null; referenceImages?: string[]; creditCost?: number },
     pendingItemsToRestore: IMediaItem[] | null,
   ): Promise<void> => {
     // [FIX 2026-08-16] 同一 taskId 并发去重：提交轮询与挂载恢复若同时进入，复用同一 Promise，避免生成完成 toast 被触发两次
@@ -444,7 +444,7 @@ function GenerationBar({
   const runPoll = async (
     taskId: string,
     pendingIds: string[],
-    ctx: { prompt: string; model: string; ratio: string; contentType: 'image' | 'video'; createdAt: number; referenceStyleId?: string | null; creditCost?: number },
+    ctx: { prompt: string; model: string; ratio: string; contentType: 'image' | 'video'; createdAt: number; referenceStyleId?: string | null; referenceImages?: string[]; creditCost?: number },
     pendingItemsToRestore: IMediaItem[] | null,
   ): Promise<void> => {
     // 第一次进入轮询：若是恢复路径，先把 pending 占位回插到 mediaList
@@ -498,6 +498,7 @@ function GenerationBar({
             progress: 100,
             characterId: characterIdRef.current,
             referenceStyleId: ctx.referenceStyleId || undefined,
+            referenceImages: ctx.referenceImages && ctx.referenceImages.length ? ctx.referenceImages : undefined,
             creditCost: typeof ctx.creditCost === 'number' ? ctx.creditCost : undefined,
           };
           onGenerate(finalItem);
@@ -526,6 +527,7 @@ function GenerationBar({
           progress: 100,
           characterId: characterIdRef.current,
           referenceStyleId: ctx.referenceStyleId || undefined,
+          referenceImages: ctx.referenceImages && ctx.referenceImages.length ? ctx.referenceImages : undefined,
           creditCost: typeof ctx.creditCost === 'number' ? ctx.creditCost : undefined,
         };
         onGenerate(finalItem);
@@ -550,6 +552,7 @@ function GenerationBar({
           progress: 100,
           characterId: characterIdRef.current,
           referenceStyleId: ctx.referenceStyleId || undefined,
+          referenceImages: ctx.referenceImages && ctx.referenceImages.length ? ctx.referenceImages : undefined,
           creditCost: typeof ctx.creditCost === 'number' ? ctx.creditCost : undefined,
         };
         onGenerate(finalItem);
@@ -1061,6 +1064,7 @@ function GenerationBar({
         isDeleted: false,
         source: 'user',
         status: 'pending',
+        referenceImages: effectiveRefs.length > 0 ? effectiveRefs : undefined,
       });
     }
     onPendingCreate(pendingItems);
@@ -1152,7 +1156,7 @@ function GenerationBar({
           await pollTaskUntilDone(
             r.taskId,
             pendingIds,
-            { prompt: promptText, model: settings.model, ratio: settings.ratio, contentType: settings.contentType, createdAt: now, referenceStyleId: attributedStyleId, creditCost: chargeCredits },
+            { prompt: promptText, model: settings.model, ratio: settings.ratio, contentType: settings.contentType, createdAt: now, referenceStyleId: attributedStyleId, referenceImages: effectiveRefs, creditCost: chargeCredits },
             null,
           );
           return;
@@ -1196,7 +1200,7 @@ function GenerationBar({
 
     // 主路径：localStorage（保留到每任务解决后才移除，避免中途崩溃丢任务）
     const recoverLocal = async () => {
-      for (const t of localTasks) {
+      const recoverOne = async (t: PersistedTask) => {
         if (cancelled) return;
         try {
           // 先到后端查这个 task 真实状态（可能在挂载期间已经完成）
@@ -1214,10 +1218,12 @@ function GenerationBar({
             await pollTaskUntilDone(t.taskId, pendingIds, ctx, t.pendingItems);
           } else if (st.status === 'failed') {
             markPendingAsFailed(pendingIds, st.error || '生成失败');
+            removePersistedTask(t.taskId);
           } else if (st.status === 'not_found') {
             markPendingAsFailed(pendingIds, '任务已被服务端清理（重启或超期）');
+            removePersistedTask(t.taskId);
           } else {
-            // running/unknown：续上轮询
+            // running/unknown：立即回插该任务并独立轮询；不得阻塞其他任务恢复。
             await pollTaskUntilDone(t.taskId, pendingIds, ctx, t.pendingItems);
           }
         } catch (e) {
@@ -1226,25 +1232,24 @@ function GenerationBar({
             t.pendingItems.map((p) => p.id),
             `恢复失败：${e instanceof Error ? e.message : String(e)}`,
           );
-        } finally {
-          // 解决成功/失败后才从 localStorage 清除（取消挂载则保留，下次再试）
-          if (!cancelled) removePersistedTask(t.taskId);
         }
-      }
+      };
+      // 所有任务并发恢复：单个图片可轮询 3.5 分钟、视频 95 分钟，串行会让后续卡片长期消失。
+      await Promise.allSettled(localTasks.map(recoverOne));
     };
 
     // 兜底路径：服务端在途任务（localStorage 未覆盖到的）
     const recoverServer = async () => {
       try {
         const { tasks } = await apiListActiveGenerations();
-        for (const t of tasks || []) {
+        const recoverOne = async (t: (typeof tasks)[number]) => {
           if (cancelled) return;
-          if (localTaskIds.has(t.taskId)) continue; // 已由 localStorage 处理
-          if (t.status !== 'running') continue; // 只恢复在途；done/failed 已由 localStorage 或已落库处理
+          if (localTaskIds.has(t.taskId)) return; // 已由 localStorage 处理
+          if (t.status !== 'running') return; // 只恢复在途；done/failed 已由 localStorage 或已落库处理
           const meta = (t.clientMeta || {}) as Record<string, unknown>;
           const ratio = (typeof meta.ratio === 'string' && meta.ratio) || '1:1';
           const contentType = (t.contentType || 'image') as 'image' | 'video';
-          const pendingItems: IMediaItem[] = (t.pendingIds || []).map((id: string, i: number) => ({
+          const pendingItems: IMediaItem[] = (t.pendingIds || []).map((id: string) => ({
             id,
             title: (t.prompt || '').slice(0, 20) || '生成中...',
             type: contentType,
@@ -1259,18 +1264,22 @@ function GenerationBar({
             source: 'user',
             status: 'pending',
             taskId: t.taskId,
+            referenceImages: Array.isArray(meta.referenceImages) ? (meta.referenceImages as string[]) : undefined,
           }));
-          if (pendingItems.length === 0) continue;
+          if (pendingItems.length === 0) return;
           const pendingIds = pendingItems.map((p) => p.id);
           const ctx = {
             prompt: t.prompt || '',
             model: t.model || '',
             ratio,
             contentType,
+            referenceImages: Array.isArray(meta.referenceImages) ? (meta.referenceImages as string[]) : undefined,
             createdAt: new Date(t.createdAt || Date.now()).getTime(),
           };
           await pollTaskUntilDone(t.taskId, pendingIds, ctx, pendingItems);
-        }
+        };
+        // 服务端可能同时有多条排队任务；并发回插，不能让第一条长轮询挡住其余卡片。
+        await Promise.allSettled((tasks || []).map(recoverOne));
       } catch {
         // 服务端恢复失败不阻塞主路径
       }
@@ -1478,7 +1487,7 @@ function GenerationBar({
 
   return (
     <div className="px-4 pb-7 pt-3">
-      <div className="relative z-30 mx-auto max-w-4xl rounded-3xl bg-zinc-900/90 backdrop-blur-xl border border-zinc-800 shadow-2xl shadow-black/40">
+      <div className="relative z-30 mx-auto w-full max-w-5xl rounded-xl border border-white/[0.08] bg-[#111214]/95 shadow-xl shadow-black/30 backdrop-blur-xl">
         {/* 顶部：类型切换 + 模型 + 数量（紧凑 pill 行）
             - flex-nowrap + overflow-x-auto：窄屏一行水平滑动，不换行
             - 每个 pill 加 shrink-0 + whitespace-nowrap：防止中文被竖排一字一行 */}

@@ -276,7 +276,7 @@ function buildGetUrl(cfg, objectKey) {
  */
 async function finalizeUrl(pgPool, opts) {
   if (!pgPool) throw new Error('数据库不可用，无法最终化资源');
-  const { userId, taskId, idx, providerUrl, type = 'image', prompt = '', model = '', ratio = '1:1', creditCost, pendingId, captureChecksum, expectedChecksum, probe } = opts;
+  const { userId, taskId, idx, providerUrl, type = 'image', prompt = '', model = '', ratio = '1:1', creditCost, pendingId, referenceImages = [], captureChecksum, expectedChecksum, probe } = opts;
   if (!userId) throw new Error('userId 缺失');
   if (!providerUrl) throw new Error('providerUrl 缺失');
 
@@ -306,7 +306,7 @@ async function finalizeUrl(pgPool, opts) {
   } catch (e) {
     // 拉取即失败：写 status=pending_upload（OSS 也跳过）→ 让 reaper 后续重试
     ossLog('warn', 'finalize', `[assetFinalize] ⚠️ 拉取失败 ${tag} → ${e.message}（占位先入库，reaper 后重试）`, { taskId, userId, providerUrl: String(providerUrl).slice(0, 80), error: e.message, durationMs: 0 });
-    await insertMedia(pgPool, { mediaId, userId, taskId, type, prompt, model, ratio, providerUrl, ossUrl, ossObjectKey, ossUploaded, contentType, fileSize: 0, status: 'pending_upload', errorMessage: e.message });
+    await insertMedia(pgPool, { mediaId, userId, taskId, type, prompt, model, ratio, providerUrl, referenceImages, ossUrl, ossObjectKey, ossUploaded, contentType, fileSize: 0, status: 'pending_upload', errorMessage: e.message });
     return { mediaId, pendingId: mediaId, ossUrl: providerUrl, ossObjectKey: '', ossUploaded: false, status: 'pending_upload', providerUrl, contentType, fileSize: 0, type };
   }
 
@@ -334,7 +334,7 @@ async function finalizeUrl(pgPool, opts) {
     } catch (e) {
       // checksum 校验失败：不落 success，写占位（reaper 重试重新拉取 + 重新校验），§79 Job 未成功。
       ossLog('warn', 'finalize', `[assetFinalize] ⚠️ checksum 校验失败 ${tag} → ${e.message}（占位入库，reaper 重试）`, { taskId, userId, error: e.message });
-      await insertMedia(pgPool, { mediaId, userId, taskId, type, prompt, model, ratio, providerUrl, ossUrl, ossObjectKey, ossUploaded: false, contentType, fileSize, status: 'pending_upload', errorMessage: e.message });
+      await insertMedia(pgPool, { mediaId, userId, taskId, type, prompt, model, ratio, providerUrl, referenceImages, ossUrl, ossObjectKey, ossUploaded: false, contentType, fileSize, status: 'pending_upload', errorMessage: e.message });
       return { mediaId, pendingId: mediaId, ossUrl: providerUrl, ossObjectKey: '', ossUploaded: false, status: 'pending_upload', providerUrl, contentType, fileSize, type, sha256: null };
     }
     // 元数据探针（best-effort，宽容：probe 缺失/失败 → metaRaw=null，不炸）
@@ -373,21 +373,21 @@ async function finalizeUrl(pgPool, opts) {
     } catch (e) {
       ossLog('warn', 'finalize', `[assetFinalize] ⚠️ OSS PUT 失败 ${tag} → ${e.message}（仍写占位，reaper 重试）`, { taskId, userId, objectKey: ossObjectKey, providerType: cfg && cfg.providerType, error: e.message });
       // OSS 失败：仍写占位（status=pending_upload），保留 providerUrl 供展示/重试
-      await insertMedia(pgPool, { mediaId, userId, taskId, type, prompt, model, ratio, providerUrl, ossUrl, ossObjectKey, ossUploaded: false, contentType, fileSize, status: 'pending_upload', errorMessage: e.message });
+      await insertMedia(pgPool, { mediaId, userId, taskId, type, prompt, model, ratio, providerUrl, referenceImages, ossUrl, ossObjectKey, ossUploaded: false, contentType, fileSize, status: 'pending_upload', errorMessage: e.message });
       return { mediaId, pendingId: mediaId, ossUrl: providerUrl, ossObjectKey: '', ossUploaded: false, status: 'pending_upload', providerUrl, contentType, fileSize, type };
     }
   } else {
     // OSS 未开：直接用 providerUrl 作为展示 URL，写 success 状态，reaper 不再重试
     // ossUploaded=false：没有真正上传到OSS，前端不应显示OSS角标
     ossLog('info', 'finalize', `[assetFinalize] OSS 未启用，使用 providerUrl 直接展示 ${tag}`, { taskId, userId, providerUrl: String(providerUrl).slice(0, 80), byteLength: fileSize });
-    await insertMedia(pgPool, { mediaId, userId, taskId, type, prompt, model, ratio, providerUrl, thumbnail: '', ossUrl: providerUrl, ossObjectKey: '', ossUploaded: false, contentType, fileSize, status: 'success', errorMessage: '' });
+    await insertMedia(pgPool, { mediaId, userId, taskId, type, prompt, model, ratio, providerUrl, referenceImages, thumbnail: '', ossUrl: providerUrl, ossObjectKey: '', ossUploaded: false, contentType, fileSize, status: 'success', errorMessage: '' });
     // G08 — 生成结果版本化（OSS 未启用：storage_key 为空）
     await recordAssetVersion(pgPool, { mediaId, taskId, model, storageKey: '', sizeBytes: fileSize });
     return { mediaId, pendingId: mediaId, ossUrl: providerUrl, thumbnail: '', ossObjectKey: '', ossUploaded: false, status: 'success', providerUrl, contentType, fileSize, type, sha256, md5Hex, md5Base64, meta: metaRaw };
   }
 
   // ── 3. 写 media 表（成功/已有 OSS URL）──
-  await insertMedia(pgPool, { mediaId, userId, taskId, type, prompt, model, ratio, providerUrl, thumbnail: thumbUrl, ossUrl, ossObjectKey, ossUploaded: true, contentType, fileSize, status: 'success', errorMessage: '' });
+  await insertMedia(pgPool, { mediaId, userId, taskId, type, prompt, model, ratio, providerUrl, referenceImages, thumbnail: thumbUrl, ossUrl, ossObjectKey, ossUploaded: true, contentType, fileSize, status: 'success', errorMessage: '' });
 
   // G08 — 生成结果版本化：落 media 行后补写 asset_versions（kind='generated', status='ready'）
   await recordAssetVersion(pgPool, { mediaId, taskId, model, storageKey: ossObjectKey, sizeBytes: fileSize });
@@ -398,8 +398,8 @@ async function finalizeUrl(pgPool, opts) {
 // media 表 INSERT（或幂等 UPSERT）
 async function insertMedia(pgPool, row) {
   const id = row.mediaId;
-  const fields = `(id, task_id, type, thumbnail, full_url, prompt, model, ratio, source, is_favorite, is_deleted, oss_url, oss_object_key, oss_uploaded, status, error_message, file_size, user_id, category, provider_url)`;
-  const values = `($1,$2,$3,$4,$5,$6,$7,$8,'user',FALSE,FALSE,$9,$10,$11,$12,$13,$14,$15,'generated',$16)`;
+  const fields = `(id, task_id, type, thumbnail, full_url, prompt, model, ratio, source, is_favorite, is_deleted, oss_url, oss_object_key, oss_uploaded, status, error_message, file_size, user_id, category, provider_url, reference_images)`;
+  const values = `($1,$2,$3,$4,$5,$6,$7,$8,'user',FALSE,FALSE,$9,$10,$11,$12,$13,$14,$15,'generated',$16,$17::jsonb)`;
   // 用 ON CONFLICT (id) DO UPDATE 保证幂等（重入不重复插入）
   const params = [
     id, row.taskId, row.type,
@@ -410,6 +410,7 @@ async function insertMedia(pgPool, row) {
     row.status, row.errorMessage || '', row.fileSize || 0,
     row.userId,
     row.providerUrl || '', // P0 修复：持久化 provider_url，供 reaper 续传（此前字段缺失导致 pending_upload 行永久 failed）
+    JSON.stringify(Array.isArray(row.referenceImages) ? row.referenceImages.filter(Boolean) : []),
   ];
   await pgPool.query(
     `INSERT INTO media ${fields} VALUES ${values}
@@ -429,7 +430,8 @@ async function insertMedia(pgPool, row) {
        file_size = EXCLUDED.file_size,
        user_id = EXCLUDED.user_id,
        category = EXCLUDED.category,
-       provider_url = EXCLUDED.provider_url`,
+       provider_url = EXCLUDED.provider_url,
+       reference_images = EXCLUDED.reference_images`,
     params,
   );
 }
@@ -508,6 +510,7 @@ async function finalizeTask(pgPool, ctx, providerImages, providerVideoUrl) {
   if (imgTasks.length) {
     const settled = await Promise.allSettled(imgTasks.map((u, i) => finalizeUrl(pgPool, {
       userId, taskId, idx: i, providerUrl: u, type: 'image', prompt, model, ratio,
+      referenceImages: Array.isArray(ctx.referenceImages) ? ctx.referenceImages : [],
       pendingId: pendingIds[i] || undefined,
     })));
     settled.forEach((r, i) => {
@@ -531,6 +534,7 @@ async function finalizeTask(pgPool, ctx, providerImages, providerVideoUrl) {
     try {
       out.video = await finalizeUrl(pgPool, {
         userId, taskId, idx: 0, providerUrl: providerVideoUrl, type: 'video', prompt, model, ratio,
+        referenceImages: Array.isArray(ctx.referenceImages) ? ctx.referenceImages : [],
         pendingId: pendingIds[0] || undefined,
       });
     } catch (e) {

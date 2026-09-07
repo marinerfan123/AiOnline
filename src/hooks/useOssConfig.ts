@@ -7,7 +7,7 @@ import {
 import {
   apiGetOss, apiSetOssEnabled, apiCreateOssSlot, apiUpdateOssSlot,
   apiDeleteOssSlot, apiActivateOssSlot, apiTestOssSlot, apiTestOss,
-  apiIngestOss, apiSignOssUpload, ensureApi,
+  apiIngestOss, apiSignOssUpload, apiUploadOssFile, ensureApi,
 } from '@/services/api';
 
 // ─── 多槽位 OSS 共享状态（仅内存，持久化全部走后端 API） ────────────
@@ -189,26 +189,11 @@ export function useOssConfig() {
       if (!s.enabled || !active) {
         return { success: false, url: '', objectKey: '', error: 'OSS 未启用或无 active 槽位' };
       }
-      const contentType = (file as File).type || 'application/octet-stream';
-      // 1) 后端签短时 PUT 预签名 URL（命名空间锁 userId，fails-closed）
-      const sign = await apiSignOssUpload({ fileName, contentType });
-      if (!sign.success || !sign.putUrl || !sign.getUrl || !sign.objectKey) {
-        return { success: false, url: '', objectKey: '', providerType: sign.providerType, error: sign.message || '签发直传 URL 失败' };
+      const uploaded = await apiUploadOssFile(file, fileName);
+      if (!uploaded.success || !uploaded.url || !uploaded.objectKey) {
+        return { success: false, url: '', objectKey: uploaded.objectKey || '', providerType: uploaded.providerType, error: uploaded.message || '服务端上传 OSS 失败' };
       }
-      // 2) 浏览器裸二进制直传 OSS（body 直接是 File/Blob，不编码 base64）
-      try {
-        const putRes = await fetch(sign.putUrl, {
-          method: 'PUT',
-          headers: { 'Content-Type': contentType },
-          body: file,
-        });
-        if (!putRes.ok) {
-          return { success: false, url: '', objectKey: sign.objectKey, providerType: sign.providerType, error: `OSS 直传失败 HTTP ${putRes.status}` };
-        }
-      } catch (e) {
-        return { success: false, url: '', objectKey: sign.objectKey, providerType: sign.providerType, error: `OSS 直传异常：${(e instanceof Error ? e.message : String(e)).slice(0, 100)}` };
-      }
-      return { success: true, url: sign.getUrl, objectKey: sign.objectKey, providerType: sign.providerType };
+      return { success: true, url: uploaded.url, objectKey: uploaded.objectKey, providerType: uploaded.providerType };
     },
     [s.enabled, active],
   );

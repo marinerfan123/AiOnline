@@ -1249,6 +1249,7 @@ async function driveGenerateTask(pgPool, runOpts) {
           ratio: runOpts.ratio || (clientMeta && clientMeta.ratio) || '1:1',
           contentType: contentType || 'image',
           pendingIds: Array.isArray(runOpts.pendingIds) ? runOpts.pendingIds : [],
+          referenceImages: Array.isArray(runOpts.referenceImages) ? runOpts.referenceImages : [],
         },
         providerImages: result.images || [],
         providerVideoUrl: result.videoUrl || null,
@@ -1910,23 +1911,34 @@ async function finalizeResumedTask(pgPool, ctx, result) {
 const STUCK_HARD_LIMIT_MS = 90 * 60 * 1000;           // 90 分钟硬上限（与 poll 安全线对齐）
 const STUCK_WATCHDOG_INTERVAL_MS = 10 * 60 * 1000;    // 每 10 分钟扫描一次
 let watchdogStarted = false;
-async function scanStuckTasks(pgPool) {
+async function scanStuckTasks(pgPool, deps = {}) {
+  const releaseCredits = deps.releaseCredits || billing.releaseCredits;
+  const setTaskStatus = deps.updateTaskStatus || updateTaskStatus;
+  const emitTaskUpdate = deps.emitTaskUpdate || realtime.emitTaskUpdate;
   try {
     const r = await pgPool.query(
-      `SELECT task_id, user_id, cost, cost_pool, idempotency_key, status
+      `SELECT task_id, user_id, cost, cost_pool, idempotency_key, status, error, provider_task_id
          FROM generation_tasks
-        WHERE status='running' AND created_at < NOW() - INTERVAL '90 minutes'`,
+        WHERE (status='running' AND created_at < NOW() - INTERVAL '90 minutes')
+           OR (status='waiting'
+               AND provider_task_id IS NULL
+               AND created_at < NOW() - INTERVAL '90 minutes')`,
     );
     for (const row of r.rows) {
-      // 释放 held 积分（按池回退，幂等安全）；仅 running 孤儿才会被选中，already-terminal 任务不会被重复释放。
+      // 无 provider_task_id 的 waiting 表示请求从未触达上游，只是资源长期不可用；
+      // 继续保留不会等来终态，只会形成永久「生成中」。安全关闭并退回 held 积分。
+      const waitingForResource = row.status === 'waiting' && !row.provider_task_id;
+      const message = waitingForResource
+        ? '资源等待超时，任务已自动关闭并退回积分'
+        : '任务超时未完成（看门狗兜底回收孤儿任务）';
       try {
-        await billing.releaseCredits(pgPool, row.user_id, row.cost, row.idempotency_key, row.cost_pool);
+        await releaseCredits(pgPool, row.user_id, row.cost, row.idempotency_key, row.cost_pool);
       } catch (e) { console.warn('[watchdog] 释放积分失败（忽略）:', row.task_id, e.message); }
-      await updateTaskStatus(pgPool, row.task_id, 'failed', null, '任务超时未完成（看门狗兜底回收孤儿任务）', row.user_id);
-      realtime.emitTaskUpdate(row.user_id, { taskId: row.task_id, status: 'failed', error: '任务超时未完成（看门狗兜底回收孤儿任务）' });
-      console.warn(`[watchdog] 回收孤儿 running 任务 ${row.task_id}（创建超 3h），已标 failed 并释放积分`);
+      await setTaskStatus(pgPool, row.task_id, 'failed', null, message, row.user_id);
+      emitTaskUpdate(row.user_id, { taskId: row.task_id, status: 'failed', error: message });
+      console.warn(`[watchdog] 回收超时 ${row.status} 任务 ${row.task_id}，已标 failed 并释放积分`);
     }
-    if (r.rows.length) console.log(`[watchdog] 本轮回收 ${r.rows.length} 个孤儿 running 任务`);
+    if (r.rows.length) console.log(`[watchdog] 本轮回收 ${r.rows.length} 个超时任务`);
   } catch (e) {
     console.warn('[watchdog] 扫描孤儿任务失败:', e.message);
   }
@@ -2187,7 +2199,7 @@ module.exports = {
   dispatchOne, attemptOnAccount, imageGenerate, videoGenerate, completeViaQueue,
   setLogSink, logError,
   resumeRunningTasks, resumeWaitingArea, resumeRunningImageTasks, persistProviderTaskId, finalizeResumedTask, genericVideoPoll, resumeOneTask,
-  startStuckTaskWatchdog,
+  startStuckTaskWatchdog, scanStuckTasks,
   getAcct, normalizeRateLimits, costFor, getAccountStates, setManualState,
   // ── 多 Key 池（同一供应商多把 API Key，各自独立参与生成分配）──
   syncKeyPool, invalidateProviderKeyCache, getKeyStates, pickKey,

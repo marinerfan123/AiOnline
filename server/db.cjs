@@ -136,6 +136,7 @@ async function initDB() {
 
     // 兼容已部署库：补 rate_limits 列（RPM 感知调度用）
     await client.query(`
+      ALTER TABLE media ADD COLUMN IF NOT EXISTS reference_images JSONB NOT NULL DEFAULT '[]'::jsonb;
       ALTER TABLE providers ADD COLUMN IF NOT EXISTS rate_limits JSONB DEFAULT '{"1k":20,"2k":10,"4k":1}';
     `);
     // 兼容已部署库：补容量模型相关列（统一共享 B 桶 / unlimited / 冷却时长）

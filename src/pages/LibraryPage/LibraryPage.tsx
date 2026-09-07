@@ -26,6 +26,7 @@ import { IMediaItem } from '@/data/media';
 import { apiGetMedia, apiSaveMedia, apiUpdateMedia, apiDeleteMedia, apiProxyFetch, ensureApi, stripBlobItems } from '@/services/api';
 import { useOssConfig } from '@/hooks/useOssConfig';
 import { useLayoutOutlet } from '@/components/Layout';
+import { buildPersistedUploadItem } from './uploadPersistence';
 
 const CATEGORY_LABELS: Record<string, { label: string; icon: typeof ImageIcon }> = {
   all: { label: '全部素材', icon: Grid3X3 },
@@ -359,7 +360,9 @@ export default function LibraryPage() {
     }
     setMediaList((prev) => [...newItems, ...prev]);
     setUploadFiles((prev) => [...prev, ...files]);
-    toast.success(`已上传 ${files.length} 个文件`);
+    toast.info(`已选择 ${files.length} 个文件，正在上传到云端…`);
+    let persistedCount = 0;
+    let failedCount = 0;
 
     // 客户上传即自动上 OSS（符合架构铁律：自有资产必须存 OSS）
     // 本地 data: 仅作即时预览，上传成功后替换为 OSS 永久链接并标 ossUploaded
@@ -373,25 +376,40 @@ export default function LibraryPage() {
               : 'jpg';
           const result = await ingestFile(meta.file, `${meta.id}.${ext}`);
           if (result.success) {
-            setMediaList((prev) =>
-              prev.map((m) =>
-                m.id === meta.id
-                  ? {
-                      ...m,
-                      fullUrl: result.url,
-                      thumbnail: result.url,
-                      ossUrl: result.url,
-                      ossObjectKey: result.objectKey,
-                      ossUploaded: true,
-                    }
-                  : m,
-              ),
-            );
+            const persistedItem = newItems.find((m) => m.id === meta.id);
+            if (!persistedItem) continue;
+            const updated = buildPersistedUploadItem(persistedItem, result);
+            if (!updated) {
+              failedCount += 1;
+              toast.error('上传返回缺少 OSS 链接，未保存', { duration: 5000 });
+              continue;
+            }
+            setMediaList((prev) => prev.map((m) => (m.id === meta.id ? updated : m)));
+            const saved = await apiSaveMedia([updated]);
+            if (saved) {
+              persistedCount += 1;
+            } else {
+              failedCount += 1;
+              toast.error('OSS 已上传，但写入素材库失败；刷新后不会出现在列表', { duration: 6000 });
+            }
+          } else {
+            failedCount += 1;
+            toast.error(`上传到云端失败：${result.error || '未知错误'}`, { duration: 5000 });
           }
-        } catch {
-          // 静默：自动补传失败不影响本地预览（data: 仍可用）
+        } catch (e) {
+          failedCount += 1;
+          toast.error(`上传到云端异常：${e instanceof Error ? e.message.slice(0, 80) : String(e).slice(0, 80)}`, { duration: 5000 });
         }
       }
+      if (persistedCount > 0) {
+        toast.success(`已上传并保存 ${persistedCount} 个文件`);
+        refreshMediaCounts();
+      }
+      if (failedCount > 0) {
+        toast.warning(`${failedCount} 个文件未保存，刷新后不会保留，请检查对象存储配置`, { duration: 6000 });
+      }
+    } else {
+      toast.warning('OSS 未启用，文件只做本地预览；刷新后不会保留', { duration: 6000 });
     }
   };
 

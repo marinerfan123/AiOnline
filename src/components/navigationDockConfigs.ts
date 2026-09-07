@@ -45,7 +45,7 @@ function globalNavSection(
       : []),
   ];
   return {
-    title: '全站',
+    title: '更多',
     items,
     ...(opts?.collapsible ? { collapsible: true } : {}),
   };
@@ -62,23 +62,22 @@ export function workspaceDockConfig(
     storageKey: 'workspace',
     // 不再按项目分栏：头部改为通用模块标题，去掉「重命名/删除项目」等项目级菜单
     header: {
-      title: '工作台',
+      title: '创作空间',
       backTo: '/',
       backLabel: '返回主页',
     },
     showSearch: true,
-    searchPlaceholder: '搜索',
+    searchPlaceholder: '搜索素材',
     sections: [
-      // ── 总览（overview）────────────────────────
+      // ── 创作入口 ────────────────────────────────
       {
         items: [
           {
             key: 'workspace',
-            label: '工作台',
+            label: '创作',
             icon: LayoutGrid,
             path: '/workspace',
             end: true,
-            count: counts?.total,
           },
         ],
       },
@@ -89,20 +88,20 @@ export function workspaceDockConfig(
         collapsible: true,
         defaultExpanded: true,
         items: [
-          { key: 'lib-all', label: '全部', icon: LayoutGrid, path: '/library', end: true, count: counts?.total },
+          { key: 'lib-all', label: '全部素材', icon: LayoutGrid, path: '/library', end: true, count: counts?.total },
           { key: 'lib-image', label: '图片', icon: ImageIcon, path: '/library/image', end: true, count: counts?.image },
           { key: 'lib-video', label: '视频', icon: Video, path: '/library/video', end: true, count: counts?.video },
           { key: 'lib-character', label: '角色', icon: User, path: '/library/character', end: true, count: counts?.character },
           { key: 'lib-scene', label: '场景', icon: FolderOpen, path: '/library/scene', end: true, count: counts?.scene },
           { key: 'lib-prop', label: '道具', icon: Sparkles, path: '/library/prop', end: true, count: counts?.prop },
-          { key: 'lib-other', label: '其他', icon: MoreHorizontal, path: '/library/other', end: true, count: counts?.other },
-          { key: 'lib-upload', label: '上传的内容', icon: Upload, path: '/library/upload', end: true, count: counts?.upload },
+          { key: 'lib-other', label: '其他素材', icon: MoreHorizontal, path: '/library/other', end: true, count: counts?.other },
+          { key: 'lib-upload', label: '我的上传', icon: Upload, path: '/library/upload', end: true, count: counts?.upload },
         ],
       },
       // ── 我的（用户与财务 people）────────────────
       // 角色管理是创作者的个人资产维护，与账户设置同属用户侧，避免和素材库「角色」分类混淆。
       {
-        title: '我的',
+        title: '个人',
         collapsible: true,
         items: [
           { key: 'characters', label: '角色管理', icon: User, path: '/characters', end: true },

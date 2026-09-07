@@ -75,8 +75,13 @@ export function ensureApi(): Promise<boolean> {
 export async function apiGetMedia(): Promise<any[]> {
   try { return await apiFetch('/api/media'); } catch { return []; }
 }
-export async function apiSaveMedia(items: any[]) {
-  try { await apiFetch('/api/media', { method: 'POST', body: JSON.stringify(items) }); } catch {}
+export async function apiSaveMedia(items: any[]): Promise<boolean> {
+  try {
+    await apiFetch('/api/media', { method: 'POST', body: JSON.stringify(items) });
+    return true;
+  } catch {
+    return false;
+  }
 }
 export async function apiDeleteMedia(id: string) {
   try { await apiFetch(`/api/media/${id}`, { method: 'DELETE' }); } catch {}
@@ -381,6 +386,39 @@ export async function apiSignOssUpload(body: {
       success: false,
       message: (e instanceof Error ? e.message : String(e)).slice(0, 100),
     };
+  }
+}
+
+
+/**
+ * 本地文件上传：浏览器把原始字节交给同源后端，后端使用 active OSS 凭据上传。
+ * 这样不依赖 Bucket CORS；只有服务端确认 PUT 成功后才返回可落库的永久对象键/GET URL。
+ */
+export async function apiUploadOssFile(file: File | Blob, fileName: string): Promise<{
+  success: boolean;
+  url?: string;
+  objectKey?: string;
+  providerType?: string;
+  message?: string;
+}> {
+  await ensureApi();
+  const contentType = (file as File).type || 'application/octet-stream';
+  try {
+    const res = await fetch(`${API_BASE}/api/oss/upload-file`, {
+      method: 'POST',
+      credentials: 'include',
+      headers: {
+        'Content-Type': contentType,
+        'X-File-Name': encodeURIComponent(fileName || 'file'),
+        ...(API_TOKEN ? { Authorization: `Bearer ${API_TOKEN}` } : {}),
+      },
+      body: file,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) return { success: false, message: data?.message || `API ${res.status}` };
+    return data;
+  } catch (e) {
+    return { success: false, message: (e instanceof Error ? e.message : String(e)).slice(0, 120) };
   }
 }
 

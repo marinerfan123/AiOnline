@@ -1,6 +1,6 @@
 import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
-import { Search, Sparkles } from 'lucide-react';
+import { Search, Sparkles, PanelRightOpen, ArrowUp } from 'lucide-react';
 import { toast } from 'sonner';
 import TopBar from '@/components/TopBar';
 import FilterBar from '@/components/FilterBar';
@@ -20,6 +20,8 @@ import { useMediaUrlStatus } from '@/hooks/useMediaUrl';
 import { useLayoutOutlet } from '@/components/Layout';
 import { apiGetMedia, apiSaveMedia, apiDeleteMedia, apiUpdateMedia, apiGetSettings, apiSaveSettings, ensureApi, stripBlobItems, apiGetReferenceStyles, apiCancelGeneration } from '@/services/api';
 import type { Ratio, Quality, VideoMode } from '@/data/settings';
+import { mergeWorkspaceMediaHydration, upsertTransientWorkspaceMedia } from './workspaceMediaHydration';
+import { normalizeStoredMedia } from './mediaPresentation';
 import type { ReferenceStyle } from '@/services/api';
 import { formatCredits } from '@/utils/format';
 import type { ModelSortMode } from '@/utils/groupModels';
@@ -55,11 +57,14 @@ const DEFAULT_SETTINGS: IGenerationSettings = {
 function WsThumb({ item }: { item: IMediaItem }) {
   // 媒体 URL 同步解析：OSS 主路径 → provider 兜底（无浏览器本地存储）
   const mediaUrl = useMediaUrlStatus(item);
-  const url = mediaUrl.url;
+  const url = item.status === 'pending_upload' && !item.ossUploaded
+    ? (item.providerUrl || item.fullUrl || mediaUrl.url)
+    : mediaUrl.url;
+  const unavailable = !url;
   return (
-    <div className="relative h-16 w-16 shrink-0 overflow-hidden rounded-xl bg-zinc-950">
-      {url ? (
-        <Image src={url} alt={item.title} className="h-full w-full object-cover" />
+    <div className="relative h-14 w-14 shrink-0 overflow-hidden rounded-md bg-zinc-900">
+      {!unavailable ? (
+        <Image src={url} alt={item.title} width={112} height={112} loading="lazy" className="h-full w-full object-cover" />
       ) : (
         <div className="flex h-full w-full items-center justify-center text-zinc-600" title="图片已失效">⚠</div>
       )}
@@ -73,6 +78,8 @@ export default function WorkspacePage() {
   const { user } = useAuth();
   const isAdmin = user?.role === 'admin' || user?.role === 'system';
   const generationBarRef = useRef<GenerationBarHandle>(null);
+  const galleryScrollRef = useRef<HTMLDivElement>(null);
+  const [showBackToTop, setShowBackToTop] = useState(false);
   const [mediaList, setMediaList] = useState<IMediaItem[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
@@ -131,11 +138,14 @@ export default function WorkspacePage() {
       if (ok) {
         try { list = await apiGetMedia(); } catch { list = []; }
       }
-      const validItems = stripBlobItems(list); // 过滤 blob 临时项
+      const validItems = stripBlobItems(list).map(normalizeStoredMedia); // 过滤 blob 临时项 + 归一存储终态
       // 不要再 fallback 到 MOCK——避免 mock 数据被自动写回 PG
       const finalList = validItems;
       if (cancelled) return;
-      setMediaList(finalList);
+      // GenerationBar may restore pending cards from localStorage/server while
+      // /api/media is still in flight. Merge instead of replacing the array,
+      // otherwise those authoritative in-flight tasks disappear after refresh.
+      setMediaList((current) => mergeWorkspaceMediaHydration(current, finalList));
       // 不再自动把 MOCK 写回后端
     })();
 
@@ -337,9 +347,10 @@ export default function WorkspacePage() {
     [mediaList, selectedId],
   );
 
-  // 提交瞬间立即插入 N 个 pending 占位 → 让用户立刻看到进度卡片
+  // 提交/恢复瞬间插入 N 个 pending 占位。按 id 幂等 upsert：React StrictMode
+  // 重挂载、localStorage + server 双恢复均不得生成重复卡片。
   const handlePendingCreate = (items: IMediaItem[]) => {
-    setMediaList((prev) => [...items, ...prev]);
+    setMediaList((prev) => upsertTransientWorkspaceMedia(prev, items));
     setSelectedId(items[0]?.id ?? null);
   };
 
@@ -544,9 +555,19 @@ export default function WorkspacePage() {
     });
   };
 
-  const gridCols = gridSize === 'S' ? 'grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6' :
-    gridSize === 'M' ? 'grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5' :
-    'grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4';
+  const gridCols = gridSize === 'S' ? 'grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 2xl:grid-cols-5' :
+    gridSize === 'M' ? 'grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4' :
+    'grid-cols-1 lg:grid-cols-2 2xl:grid-cols-3';
+
+
+  const handleGalleryScroll = useCallback(() => {
+    const el = galleryScrollRef.current;
+    setShowBackToTop((el?.scrollTop ?? 0) > 360);
+  }, []);
+
+  const handleBackToTop = useCallback(() => {
+    galleryScrollRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
+  }, []);
 
   return (
     <div className="flex h-full flex-col">
@@ -571,7 +592,12 @@ export default function WorkspacePage() {
             onSortModeChange={setSortMode}
           />
 
-          <div className="relative flex-1 overflow-y-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden px-5 pb-6 pt-3">
+          <div className="relative flex-1 min-h-0">
+            <div
+              ref={galleryScrollRef}
+              onScroll={handleGalleryScroll}
+              className="h-full overflow-y-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden px-4 pb-6 pt-2 lg:px-6"
+            >
             {/* 精选推广样式墙：仅「强制推行」的参考样式出现在这里 */}
             {promotedStyles.length > 0 && (
               <section className="mb-7">
@@ -683,7 +709,7 @@ export default function WorkspacePage() {
                 ))}
               </div>
             ) : (
-              <div className={`grid gap-3 ${gridCols}`}>
+              <div className={`grid gap-2.5 ${gridCols}`}>
                 {filtered.map((item, index) => (
                   <MediaCard
                     key={item.id}
@@ -714,6 +740,19 @@ export default function WorkspacePage() {
               onClose={() => setFilterOpen(false)}
               resultCount={filtered.length}
             />
+            </div>
+
+            {showBackToTop && (
+              <button
+                type="button"
+                onClick={handleBackToTop}
+                aria-label="回到顶部"
+                title="回到顶部"
+                className="absolute bottom-5 right-5 z-30 inline-flex h-11 w-11 items-center justify-center rounded-full border border-emerald-400/30 bg-zinc-950/90 text-emerald-300 shadow-2xl shadow-black/50 backdrop-blur transition-all duration-200 hover:-translate-y-0.5 hover:border-emerald-300/60 hover:bg-emerald-400 hover:text-black active:scale-95"
+              >
+                <ArrowUp className="size-5" />
+              </button>
+            )}
           </div>
 
           <div className="relative z-40 px-5 pb-6">
@@ -743,20 +782,26 @@ export default function WorkspacePage() {
           </div>
         </div>
 
-        {/* 右侧详情面板 */}
-        <DetailPanel
-          item={selectedItem}
-          onToggleFavorite={handleToggleFavorite}
-          onDelete={handleDelete}
-          onClose={() => setSelectedId(null)}
-          onUsePrompt={handleUsePrompt}
-          onAddAsReference={handleAddReference}
-          onUpdate={(updated) => {
-            setMediaList((prev) => prev.map((m) => (m.id === updated.id ? updated : m)));
-            apiSaveMedia(stripBlobItems([updated]));
-          }}
-          onMakeVideo={() => selectedItem && handleMakeVideo(selectedItem)}
-        />
+        {/* 右侧详情面板：无选择时不长期占据 320px，主画廊优先 */}
+        {selectedItem ? (
+          <DetailPanel
+            item={selectedItem}
+            onToggleFavorite={handleToggleFavorite}
+            onDelete={handleDelete}
+            onClose={() => setSelectedId(null)}
+            onUsePrompt={handleUsePrompt}
+            onAddAsReference={handleAddReference}
+            onUpdate={(updated) => {
+              setMediaList((prev) => prev.map((m) => (m.id === updated.id ? updated : m)));
+              apiSaveMedia(stripBlobItems([updated]));
+            }}
+            onMakeVideo={() => handleMakeVideo(selectedItem)}
+          />
+        ) : (
+          <div className="hidden w-12 shrink-0 items-start justify-center border-l border-white/[0.06] bg-[#090a0b] pt-4 xl:flex" title="选择作品后打开详情">
+            <PanelRightOpen className="size-4 text-zinc-600" />
+          </div>
+        )}
       </div>
 
       {/* 媒体选择器弹窗 */}

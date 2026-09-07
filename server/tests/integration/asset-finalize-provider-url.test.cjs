@@ -30,22 +30,24 @@ test('insertMedia persists provider_url (reaper recovery)', { concurrency: 1 }, 
   await insertMedia(pg, {
     mediaId, userId: uid, taskId: 'gt-regress', type: 'image',
     prompt: 'p', model: 'm', ratio: '1:1',
-    providerUrl, ossUrl: '', ossObjectKey: '', ossUploaded: false,
+    providerUrl, referenceImages: ['https://ref.example/a.png'], ossUrl: '', ossObjectKey: '', ossUploaded: false,
     status: 'pending_upload', errorMessage: 'transient fetch fail', fileSize: 0,
   });
-  const row1 = await pg.query('SELECT provider_url, status FROM media WHERE id=$1', [mediaId]);
+  const row1 = await pg.query('SELECT provider_url, status, reference_images FROM media WHERE id=$1', [mediaId]);
   assert.equal(row1.rows.length, 1);
   assert.equal(row1.rows[0].provider_url, providerUrl, 'INSERT must persist provider_url');
+  assert.deepEqual(row1.rows[0].reference_images, ['https://ref.example/a.png'], 'INSERT must persist generation reference images');
 
   // UPSERT path: reaper re-finalizes on same mediaId (pendingId) → provider_url must survive
   await insertMedia(pg, {
     mediaId, userId: uid, taskId: 'gt-regress', type: 'image',
     prompt: 'p', model: 'm', ratio: '1:1',
-    providerUrl, ossUrl: providerUrl, ossObjectKey: '', ossUploaded: false,
+    providerUrl, referenceImages: ['https://ref.example/b.png'], ossUrl: providerUrl, ossObjectKey: '', ossUploaded: false,
     status: 'success', errorMessage: '', fileSize: 1234,
   });
-  const row2 = await pg.query('SELECT provider_url, status FROM media WHERE id=$1', [mediaId]);
+  const row2 = await pg.query('SELECT provider_url, status, reference_images FROM media WHERE id=$1', [mediaId]);
   assert.equal(row2.rows[0].provider_url, providerUrl, 'UPSERT must keep provider_url');
+  assert.deepEqual(row2.rows[0].reference_images, ['https://ref.example/b.png'], 'UPSERT must refresh generation reference images');
   assert.equal(row2.rows[0].status, 'success');
 
   await pg.query('DELETE FROM media WHERE id=$1', [mediaId]);

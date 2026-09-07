@@ -58,10 +58,12 @@ export default function DetailPanel({ item, onToggleFavorite, onDelete, onClose,
   //   - reason='oss' → OSS 永久链接（首选），跳过 useImageProbe
   //   - reason='provider' → 模型官方链接兜底，仍走 useImageProbe 探测失效
   const mediaUrl = useMediaUrlStatus(item);
-  // 与 MediaCard 一致：优先用 item.thumbnail（OSS 优化缩略图），否则回退 mediaUrl.url
-  // [FIX 2026-08-15] Request 4 缩略图降本：此前只改了 MediaCard，DetailPanel 漏改，右侧详情一直在拉全图
-  const displayUrl = (item?.thumbnail && /^https?:/i.test(item.thumbnail)) ? item.thumbnail : mediaUrl.url;
-  const previewProbe = useImageProbe(mediaUrl.reason === 'oss' ? '' : displayUrl, { timeoutMs: 4000 });
+  const isSyncPending = item?.status === 'pending_upload' && !item.ossUploaded;
+  // 待同步时优先展示生成端已有结果；已同步后才使用 OSS 主链路。
+  const displayUrl = isSyncPending
+    ? (item?.providerUrl || item?.fullUrl || mediaUrl.url)
+    : ((item?.thumbnail && /^https?:/i.test(item.thumbnail)) ? item.thumbnail : mediaUrl.url);
+  const previewProbe = useImageProbe(mediaUrl.reason === 'oss' && !isSyncPending ? '' : displayUrl, { timeoutMs: 4000 });
 
   // ── pending 真实等待计时：用 item.createdAt 计算实际已等待时间（不再显示虚假百分比）
   const isPending = item?.status === 'pending';
@@ -76,6 +78,7 @@ export default function DetailPanel({ item, onToggleFavorite, onDelete, onClose,
   }, [isPending, item?.createdAt]);
   const fmtElapsed = (s: number) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
   const isVideo = item?.type === 'video';
+  const referenceImages = (item?.referenceImages || []).filter(Boolean);
 
   // 复制成功后 2s 内变对号, 然后自动复位
   const flashCopied = () => {
@@ -106,7 +109,7 @@ export default function DetailPanel({ item, onToggleFavorite, onDelete, onClose,
   const handleDownload = async () => {
     try {
       // 强制下载（不打开图片）：fetch → blob → objectURL 再 click
-      const url = item.ossUrl || item.fullUrl;
+      const url = item.ossUploaded && item.ossUrl ? item.ossUrl : item.fullUrl;
       if (!url) {
         toast.error('没有可下载的图片链接');
         return;
@@ -175,9 +178,14 @@ export default function DetailPanel({ item, onToggleFavorite, onDelete, onClose,
     }
     setUploadingToOss(true);
     try {
-      const result = item.fullUrl.startsWith('data:')
-        ? await ingestFile(dataUrlToFile(item.fullUrl, `${item.id}.jpg`), `${item.id}.jpg`)
-        : await ingestFromUrl(item.fullUrl, `${item.id}.jpg`);
+      const url = isSyncPending ? (item.providerUrl || item.fullUrl) : item.fullUrl;
+      if (!url) {
+        toast.error('生成结果链接已失效，无法重试同步');
+        return;
+      }
+      const result = url.startsWith('data:')
+        ? await ingestFile(dataUrlToFile(url, `${item.id}.jpg`), `${item.id}.jpg`)
+        : await ingestFromUrl(url, `${item.id}.jpg`);
       if (result.success) {
         // 更新当前 item：OSS 字段 + 替换 fullUrl/thumbnail 为 OSS 永久 URL
         if (onUpdate) {
@@ -186,6 +194,8 @@ export default function DetailPanel({ item, onToggleFavorite, onDelete, onClose,
             ossUrl: result.url,
             ossObjectKey: result.objectKey,
             ossUploaded: true,
+            status: 'success',
+            errorMessage: undefined,
             fullUrl: result.url,
             thumbnail: result.url,
           });
@@ -394,6 +404,30 @@ export default function DetailPanel({ item, onToggleFavorite, onDelete, onClose,
           <p className="text-sm leading-relaxed text-zinc-300 line-clamp-6">{item.prompt}</p>
         </div>
 
+        {/* 参考图模式 */}
+        {referenceImages.length > 0 && (
+          <div className="px-4 pb-4">
+            <div className="mb-2 flex items-center justify-between">
+              <span className="text-[10px] font-bold uppercase tracking-widest text-zinc-500">参考图</span>
+              <span className="rounded-full bg-emerald-500/10 px-2 py-0.5 text-[10px] font-semibold text-emerald-300 ring-1 ring-emerald-500/20">参考图模式 · {referenceImages.length} 张</span>
+            </div>
+            <div className="grid grid-cols-4 gap-2">
+              {referenceImages.map((url, idx) => (
+                <button
+                  key={`${url}-${idx}`}
+                  type="button"
+                  onClick={() => onAddAsReference?.(url)}
+                  className="group relative aspect-square overflow-hidden rounded-xl border border-zinc-800 bg-zinc-900 transition-colors hover:border-emerald-500/50"
+                  title="再次添加为参考图"
+                >
+                  <Image src={url} alt={`参考图 ${idx + 1}`} className="h-full w-full object-cover" />
+                  <span className="absolute inset-x-0 bottom-0 bg-black/60 py-0.5 text-[9px] font-semibold text-zinc-200 opacity-0 transition-opacity group-hover:opacity-100">复用</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
         {/* 信息列表 */}
         <div className="px-4 pb-4 space-y-3">
           <div className="flex items-center justify-between">
@@ -431,13 +465,15 @@ export default function DetailPanel({ item, onToggleFavorite, onDelete, onClose,
               <span className="text-xs font-medium text-emerald-400 flex items-center gap-1">
                 已同步 OSS
               </span>
+            ) : isSyncPending ? (
+              <span className="text-xs font-medium text-amber-300 flex items-center gap-1">等待云端同步</span>
             ) : ossConfig.enabled ? (
-              <span className="text-xs font-medium text-zinc-400">待上传</span>
+              <span className="text-xs font-medium text-zinc-400">未同步</span>
             ) : (
               <span className="text-xs font-medium text-zinc-600">未配置</span>
             )}
           </div>
-          {item.ossUrl && (
+          {item.ossUrl && item.ossUploaded && (
             <div className="rounded-xl bg-zinc-900 border border-zinc-800 p-3">
               <div className="mb-1 text-[10px] font-bold uppercase tracking-widest text-zinc-500">OSS 链接</div>
               <div className="flex items-center gap-2">
@@ -457,6 +493,27 @@ export default function DetailPanel({ item, onToggleFavorite, onDelete, onClose,
             </div>
           )}
         </div>
+
+        {/* 云端同步失败时给出明确恢复动作；生成结果仍可查看，不误报为生成失败 */}
+        {isSyncPending && (
+          <div className="mx-4 mb-3 rounded-lg border border-amber-400/20 bg-amber-400/[0.06] p-3">
+            <div className="flex items-start gap-2">
+              <UploadCloud className="mt-0.5 size-4 shrink-0 text-amber-300" />
+              <div className="min-w-0 flex-1">
+                <p className="text-xs font-medium text-amber-200">图片已生成，云端同步未完成</p>
+                <p className="mt-1 text-[11px] leading-relaxed text-zinc-500">可继续查看或下载，也可以立即重试同步。</p>
+              </div>
+            </div>
+            <button
+              onClick={handleUploadToOss}
+              disabled={uploadingToOss}
+              className="mt-3 flex h-8 w-full items-center justify-center gap-1.5 rounded-md bg-amber-300 text-xs font-semibold text-black transition-colors hover:bg-amber-200 disabled:cursor-wait disabled:opacity-60"
+            >
+              {uploadingToOss ? <Loader2 className="size-3.5 animate-spin" /> : <UploadCloud className="size-3.5" />}
+              {uploadingToOss ? '正在同步…' : '重试云端同步'}
+            </button>
+          </div>
+        )}
 
         {/* 操作按钮 */}
         <div className="px-4 pb-6 space-y-2">

@@ -128,7 +128,7 @@ function DockNavItem({
       <Icon
         className={cn(
           'size-4 shrink-0 transition-colors',
-          active ? 'text-emerald-400' : 'text-zinc-400 group-hover:text-white',
+          active ? 'text-zinc-100' : 'text-zinc-500 group-hover:text-zinc-200',
         )}
       />
       {!collapsed && (
@@ -139,8 +139,8 @@ function DockNavItem({
               className={cn(
                 'ml-auto text-[10px] font-semibold tabular-nums px-1.5 min-w-[20px] text-center rounded-full transition-colors',
                 active
-                  ? 'bg-emerald-500/25 text-emerald-300'
-                  : 'bg-zinc-800 text-zinc-400 group-hover:bg-zinc-700',
+                  ? 'bg-white/10 text-zinc-200'
+                  : 'bg-white/[0.05] text-zinc-500 group-hover:bg-white/[0.08]',
               )}
             >
               {item.count}
@@ -152,15 +152,15 @@ function DockNavItem({
   );
 
   const className = cn(
-    'group flex items-center gap-3 rounded-2xl transition-all duration-200 border',
+    'group flex items-center gap-2.5 rounded-md border transition-colors duration-150',
     collapsed
-      ? 'justify-center px-2 py-2.5'
+      ? 'justify-center px-2 py-2'
       : indent
-        ? 'ml-2 pl-6 pr-3 py-2.5'
-        : 'px-3 py-2.5',
+        ? 'ml-2 px-3 py-2'
+        : 'px-3 py-2',
     active
-      ? 'bg-emerald-500/10 text-emerald-300 font-medium border-emerald-500/20'
-      : 'text-zinc-400 hover:bg-zinc-800/60 hover:text-white border-transparent',
+      ? 'border-white/[0.08] bg-white/[0.07] text-zinc-100 font-medium'
+      : 'border-transparent text-zinc-400 hover:bg-white/[0.04] hover:text-zinc-100',
   );
 
   if (item.path) {
@@ -456,7 +456,7 @@ function DockBody({
                   onSearch?.(e.target.value);
                 }}
                 placeholder={searchPlaceholder}
-                className="w-full rounded-2xl bg-zinc-900 pl-9 pr-3 py-2 text-sm text-white placeholder:text-zinc-600 border border-zinc-800 focus:outline-none focus:border-emerald-500/50 transition-colors"
+                className="h-9 w-full rounded-md border border-white/[0.08] bg-white/[0.03] pl-9 pr-3 text-sm text-zinc-100 placeholder:text-zinc-600 focus:border-white/20 focus:outline-none"
               />
             </div>
           )}
@@ -477,14 +477,14 @@ function DockBody({
                   <button
                     type="button"
                     onClick={() => setOpenSection(isOpen ? null : sectionKey)}
-                    className="mt-5 mb-1.5 flex w-full items-center justify-between rounded-lg px-3 py-2 text-[11px] font-semibold uppercase tracking-[0.08em] text-zinc-500 transition-colors hover:text-zinc-200"
+                    className="mb-1 mt-3 flex w-full items-center justify-between rounded px-3 py-1.5 text-[11px] font-medium tracking-wide text-zinc-600 transition-colors hover:text-zinc-300"
                     aria-expanded={isOpen}
                   >
                     <span className="truncate">{section.title}</span>
                     <ChevronDown
                       className={cn(
                         'size-4 shrink-0 transition-transform duration-200',
-                        isOpen && 'rotate-180 text-emerald-400',
+                        isOpen && 'rotate-180 text-zinc-300',
                       )}
                     />
                   </button>
@@ -578,7 +578,7 @@ export function NavigationDock({
     <>
       {/* 桌面端：inline aside */}
       <aside
-        className="hidden md:flex h-full shrink-0 flex-col border-r border-zinc-800 bg-black transition-[width] duration-300 ease-out"
+        className="hidden md:flex h-full shrink-0 flex-col border-r border-white/[0.06] bg-[#090a0b] transition-[width] duration-200 ease-out"
         style={{ width }}
       >
         <DockBody

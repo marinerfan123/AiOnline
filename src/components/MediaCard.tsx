@@ -15,6 +15,7 @@ import {
   Palette,
   Film,
   Cloud,
+  UploadCloud,
   Maximize2,
   AlertCircle,
   RotateCw,
@@ -27,9 +28,11 @@ import { useNavigate } from 'react-router-dom';
 import Image from '@/components/ui/image';
 import VideoPlayer from '@/components/VideoPlayer';
 import { IMediaItem } from '@/data/media';
+import { formatCredits } from '@/utils/format';
 import { useImageProbe } from '@/hooks/useImageProbe';
 import { useMediaUrlStatus } from '@/hooks/useMediaUrl';
 import { useInView } from '@/hooks/useInView';
+import { getMediaPresentationState } from '@/pages/WorkspacePage/mediaPresentation';
 
 interface MediaCardProps {
   item: IMediaItem;
@@ -105,16 +108,11 @@ export default function MediaCard({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [moreOpen]);
 
-  // ── 视口懒加载：离屏卡片不探测、不下载，进入视口前 300px 才激活 ──
-  // 兜底 1：hover 强制加载（用户鼠标划过去必须出来）
-  // 兜底 2：挂载 600ms 后强制加载（防止 IntersectionObserver 漏判已可见卡片）
+  // ── 视口懒加载：只加载可见区及其前后 300px。禁止定时把全部卡片强制唤醒，
+  // 否则 27 张历史高清图会在首屏同时解码/下载，直接造成工作区长时间空白和卡顿。
+  // hover 仍可主动唤醒鼠标指向的卡片。
   const { ref: inViewRef, inView } = useInView<HTMLDivElement>({ rootMargin: '300px' });
-  const [safetyLoad, setSafetyLoad] = useState(false);
-  useEffect(() => {
-    const t = setTimeout(() => setSafetyLoad(true), 600);
-    return () => clearTimeout(t);
-  }, []);
-  const shouldProbe = inView || hovered || safetyLoad;
+  const shouldProbe = inView || hovered;
 
   // ── 探测图片可用性 ──
   // item.status === 'failed' → 直接渲染占位，不探测
@@ -123,12 +121,15 @@ export default function MediaCard({
   // useMediaUrlStatus 返回 { url, isLoading, isFailed, reason }
   //   - reason='oss'：OSS 永久链接（首选），跳过 useImageProbe（可靠）
   //   - reason='provider'：模型官方链接兜底，仍走 useImageProbe 探测失效
+  const presentationState = getMediaPresentationState(item);
+  const isSyncPending = presentationState === 'sync-pending';
   const mediaUrl = useMediaUrlStatus(item);
-  // 网格卡优先展示 OSS 缩略图（服务端 resize+webp，实测 6.5MB→27KB），降低 OSS 出流量与成本；
-  // 查看器(ImageViewer)走 useMediaUrl 全图，不受影响。
-  const displayUrl = (item.thumbnail && /^https?:/i.test(item.thumbnail)) ? item.thumbnail : mediaUrl.url;
+  const displayUrl = isSyncPending
+    ? (item.providerUrl || item.fullUrl || mediaUrl.url)
+    : ((item.thumbnail && /^https?:/i.test(item.thumbnail)) ? item.thumbnail : mediaUrl.url);
+  const probeUrl = isSyncPending ? displayUrl : mediaUrl.url;
   const probe = useImageProbe(
-    mediaUrl.reason === 'oss' ? '' : mediaUrl.url,
+    mediaUrl.reason === 'oss' && !isSyncPending ? '' : probeUrl,
     item.status === 'pending' || item.status === 'failed' ? undefined : {
       // 严格懒加载：仅当卡片进入视口/悬停/安全超时后才发起探测请求，避免离屏图一次性全部下载
       enabled: shouldProbe,
@@ -143,10 +144,12 @@ export default function MediaCard({
     const t = setTimeout(() => setShowImageAnyway(true), 2500);
     return () => clearTimeout(t);
   }, [probe.status]);
-  const isFailed = item.status === 'failed' || probe.status === 'failed';
-  const isPending = item.status === 'pending';
+  const isFailed = presentationState === 'failed'
+    || probe.status === 'failed'
+    || (!displayUrl && !mediaUrl.isLoading);
+  const isPending = presentationState === 'generating';
   const failedError = isFailed
-    ? (item.status === 'failed' ? item.errorMessage : probe.error)
+    ? (item.status === 'failed' ? item.errorMessage : (probe.error || '图片内容不可用'))
     : undefined;
   const failedAt = item.status === 'failed' ? item.failedAt : undefined;
 
@@ -177,18 +180,18 @@ export default function MediaCard({
   ];
 
   const sizeClasses = {
-    S: 'aspect-[3/4]',
-    M: 'aspect-[4/5]',
+    S: 'aspect-[4/3]',
+    M: 'aspect-[4/3]',
     L: 'aspect-square',
   };
 
   return (
     <div
       ref={inViewRef}
-      className={`group relative overflow-hidden rounded-2xl border bg-zinc-900/50 transition-all duration-300 will-change-transform ${
+      className={`group relative overflow-hidden rounded-lg border bg-[#111214] transition-colors duration-150 ${
         selected
-          ? `border-emerald-500/60 shadow-[0_0_28px_-6px_rgba(16,185,129,0.45)] ${!isPending ? 'scale-[1.015]' : ''} z-10`
-          : 'border-zinc-800 hover:border-zinc-600/80 hover:shadow-2xl hover:shadow-black/40 hover:z-10'
+          ? 'border-zinc-400 z-10'
+          : 'border-white/[0.08] hover:border-white/20 hover:z-10'
       } ${isPending ? 'cursor-default' : 'cursor-pointer'}`}
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => {
@@ -315,6 +318,8 @@ export default function MediaCard({
             </div>
             <p className="relative z-10 text-[11px] font-medium text-zinc-300">检测链接中…</p>
           </div>
+        ) : !shouldProbe ? (
+          <div className="h-full w-full animate-pulse bg-white/[0.035]" aria-label="图片等待加载" />
         ) : item.type === 'video' ? (
           /* ─── 视频：默认暂停 + 中央播放按钮 + 底部进度条（不自动播放，避免与收藏角标重叠、省资源）─── */
           <div
@@ -343,9 +348,22 @@ export default function MediaCard({
           >
             <Image
               src={displayUrl}
-              alt={item.title}
-              className="h-full w-full object-cover duration-700 ease-out group-hover:scale-105"
+              alt={item.title || item.prompt.slice(0, 40) || '生成图片'}
+              width={768}
+              height={576}
+              sizes="(max-width: 640px) 100vw, (max-width: 1280px) 50vw, 33vw"
+              loading={inView ? 'eager' : 'lazy'}
+              fetchPriority={inView ? 'high' : 'auto'}
+              className="h-full w-full object-cover transition-transform duration-300 ease-out group-hover:scale-[1.02]"
             />
+          </div>
+        )}
+
+        {/* 云端同步待重试：生成结果继续可见，只标注存储状态，绝不误报“生成失败” */}
+        {isSyncPending && (
+          <div className="absolute left-2 top-2 z-20 inline-flex items-center gap-1 rounded-md border border-amber-300/20 bg-black/65 px-2 py-1 text-[10px] font-medium text-amber-200 backdrop-blur-sm" title="图片已生成，正在等待云端同步">
+            <UploadCloud className="size-3" />
+            待同步
           </div>
         )}
 
@@ -366,11 +384,11 @@ export default function MediaCard({
 
         {/* 选中态边框 */}
         {selected && (
-          <div className="absolute inset-0 ring-2 ring-emerald-500 ring-inset rounded-2xl z-10" />
+          <div className="pointer-events-none absolute inset-0 rounded-lg ring-1 ring-zinc-300/80 ring-inset z-10" />
         )}
 
         {/* 顶部操作栏 - hover 显示（仅成功状态显示，失败状态用占位里的"重新生成"） */}
-        {(!item.status || item.status === 'success') && (
+        {(!isPending && !isFailed) && (
           <div
             className={`absolute inset-x-0 top-0 z-10 flex items-start justify-between p-2.5 transition-opacity duration-300 ${
               hovered ? 'opacity-100' : 'opacity-0'
@@ -426,24 +444,27 @@ export default function MediaCard({
         </div>
         )}
 
-        {/* 底部信息栏 - hover 显示（仅成功状态显示，失败用占位里的"重新生成"） */}
-        {(!item.status || item.status === 'success') && (
-          <div
-            className={`absolute inset-x-0 bottom-0 z-10 p-2.5 transition-opacity duration-300 ${
-              hovered ? 'opacity-100' : 'opacity-0'
-            }`}
-          >
-            <div className="flex items-center justify-between gap-2">
-              <span className="truncate text-xs font-medium text-white drop-shadow">
-                {item.title}
-              </span>
-            </div>
-          </div>
-        )}
+        {/* 图片上不重复显示标题；名称与模型信息统一放在卡片底部信息区 */}
 
-        {/* 底部渐变蒙层 */}
-        <div className="absolute inset-x-0 bottom-0 h-20 bg-gradient-to-t from-black/60 to-transparent pointer-events-none" />
+        {/* 图片底部对比度蒙层 */}
+        <div className="absolute inset-x-0 bottom-0 h-14 bg-gradient-to-t from-black/45 to-transparent pointer-events-none" />
       </div>
+
+      {(!isPending && !isFailed) && (
+        <div className="border-t border-white/[0.06] bg-[#111214] px-3 py-2.5">
+          <p className="truncate text-xs font-medium text-zinc-200">
+            {item.title || item.prompt.slice(0, 48) || '未命名作品'}
+          </p>
+          <div className="mt-1 flex items-center gap-1.5 text-[10px] text-zinc-500">
+            <span className="truncate">{item.model || '未知模型'}</span>
+            <span>·</span>
+            <span className="shrink-0">{item.ratio || '—'}</span>
+            {typeof item.creditCost === 'number' && item.creditCost > 0 && (
+              <><span>·</span><span className="shrink-0">{formatCredits(item.creditCost)} 积分</span></>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* 更多菜单：Portal 到 body，避免被 overflow-hidden 裁剪 / will-change 包含块 / 生成栏 z-40 遮挡 */}
       {moreOpen && menuPos && createPortal(

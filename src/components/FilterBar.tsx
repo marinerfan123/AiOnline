@@ -38,34 +38,34 @@ export default function FilterBar({
   const [sortMenuOpen, setSortMenuOpen] = useState(false);
 
   return (
-    <div className="flex items-center gap-2 px-4 py-3">
-      <div className="relative flex-1 max-w-2xl mx-auto">
-        <Search className="pointer-events-none absolute left-4 top-1/2 size-4 -translate-y-1/2 text-zinc-500" />
+    <div className="flex flex-wrap items-center gap-2 border-b border-white/[0.06] px-4 py-2.5 lg:px-6">
+      <div className="relative min-w-[180px] flex-1 lg:max-w-md">
+        <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-zinc-500" />
         <input
           type="search"
           value={searchQuery}
           onChange={(e) => onSearchChange(e.target.value)}
-          placeholder="搜索"
-          className="w-full rounded-full bg-zinc-900 pl-11 pr-4 py-2.5 text-sm text-white placeholder:text-zinc-600 border border-zinc-800 focus:outline-none focus:border-emerald-500/50 transition-colors"
+          placeholder="搜索素材或提示词"
+          className="h-9 w-full rounded-md border border-white/[0.08] bg-white/[0.03] pl-9 pr-3 text-sm text-zinc-100 placeholder:text-zinc-600 focus:border-white/20 focus:outline-none"
         />
       </div>
 
       <button
         onClick={onToggleFilter}
-        className={`flex items-center gap-2 rounded-full px-4 py-2.5 text-sm transition-all duration-300 ${
+        className={`flex h-9 items-center gap-2 rounded-md border px-3 text-sm transition-colors ${
           filterOpen
-            ? 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/30'
-            : 'bg-zinc-900 text-white border border-zinc-800 hover:border-zinc-700'
+            ? 'border-white/20 bg-white/[0.07] text-white'
+            : 'border-white/[0.08] bg-white/[0.03] text-zinc-300 hover:bg-white/[0.06]'
         }`}
       >
         <Filter className="size-4" />
       </button>
 
-      <div className="flex items-center rounded-full bg-zinc-900 p-1.5 border border-zinc-800">
+      <div className="flex h-9 items-center rounded-md border border-white/[0.08] bg-white/[0.03] p-1">
         <button
           onClick={() => onViewModeChange('grid')}
-          className={`flex h-8 w-8 items-center justify-center rounded-full transition-all duration-300 ${
-            viewMode === 'grid' ? 'bg-zinc-800 text-white' : 'text-zinc-500 hover:text-white'
+          className={`flex h-7 w-7 items-center justify-center rounded transition-colors ${
+            viewMode === 'grid' ? 'bg-white/10 text-white' : 'text-zinc-500 hover:text-white'
           }`}
           title="网格视图"
         >
@@ -73,8 +73,8 @@ export default function FilterBar({
         </button>
         <button
           onClick={() => onViewModeChange('batch')}
-          className={`flex h-8 w-8 items-center justify-center rounded-full transition-all duration-300 ${
-            viewMode === 'batch' ? 'bg-zinc-800 text-white' : 'text-zinc-500 hover:text-white'
+          className={`flex h-7 w-7 items-center justify-center rounded transition-colors ${
+            viewMode === 'batch' ? 'bg-white/10 text-white' : 'text-zinc-500 hover:text-white'
           }`}
           title="批量视图"
         >
@@ -87,10 +87,10 @@ export default function FilterBar({
         <div className="relative">
           <button
             onClick={() => setSortMenuOpen(!sortMenuOpen)}
-            className={`flex items-center gap-1.5 rounded-full px-4 py-2.5 text-sm border transition-all duration-300 ${
+            className={`flex h-9 items-center gap-1.5 rounded-md border px-3 text-sm transition-colors ${
               sortMenuOpen
-                ? 'bg-emerald-500/15 text-emerald-400 border-emerald-500/30'
-                : 'bg-zinc-900 text-white border-zinc-800 hover:border-zinc-700'
+                ? 'border-white/20 bg-white/[0.07] text-white'
+                : 'border-white/[0.08] bg-white/[0.03] text-zinc-300 hover:bg-white/[0.06]'
             }`}
             title="排序方式"
           >
@@ -133,7 +133,7 @@ export default function FilterBar({
       <div className="relative">
         <button
           onClick={() => setSizeMenuOpen(!sizeMenuOpen)}
-          className="flex items-center gap-1.5 rounded-full bg-zinc-900 px-4 py-2.5 text-sm text-white border border-zinc-800 hover:border-zinc-700 transition-colors"
+          className="flex h-9 items-center gap-1.5 rounded-md border border-white/[0.08] bg-white/[0.03] px-3 text-sm text-zinc-300 transition-colors hover:bg-white/[0.06]"
         >
           <span className="text-xs font-bold">{gridSize}</span>
           <ChevronDown className="size-3.5 text-zinc-500" />

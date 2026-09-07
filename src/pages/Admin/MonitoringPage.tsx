@@ -82,22 +82,27 @@ function useMonitorTab<T>(apiFn: (p: any) => Promise<{ total: number; items: T[]
   const [items, setItems] = useState<T[]>([]);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(false);
+  const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
   const cursorRef = useRef<string | null>(null);
   const reqIdRef = useRef(0);
   const loadingRef = useRef(false);
+  const itemsRef = useRef<T[]>([]);
+  itemsRef.current = items;
 
   const load = useCallback(
-    async (reset: boolean) => {
-      if (loadingRef.current) return; // 防止并发
+    async (reset: boolean, refreshLimit?: number) => {
+      if (loadingRef.current) return; // 防止并发；自动刷新不打断手动翻页/筛选
       const myId = ++reqIdRef.current;
       loadingRef.current = true;
       setLoading(true);
       try {
-        const res = await apiFn({ ...filters, limit, before: reset ? undefined : cursorRef.current ?? undefined });
+        const pageLimit = refreshLimit ?? limit;
+        const res = await apiFn({ ...filters, limit: pageLimit, before: reset ? undefined : cursorRef.current ?? undefined });
         if (myId !== reqIdRef.current) return; // 丢弃过期响应
         setTotal(res.total);
         setItems((prev) => (reset ? res.items : [...prev, ...(res.items as T[])]));
         cursorRef.current = res.nextCursor ?? null;
+        setLastUpdated(new Date());
       } finally {
         loadingRef.current = false;
         setLoading(false);
@@ -115,8 +120,22 @@ function useMonitorTab<T>(apiFn: (p: any) => Promise<{ total: number; items: T[]
   }, [filters, limit, apiFn]);
 
   const loadMore = useCallback(() => load(false), [load]);
+  const refresh = useCallback(() => {
+    const keepLoaded = Math.max(itemsRef.current.length, limit);
+    cursorRef.current = null;
+    return load(true, keepLoaded);
+  }, [load, limit]);
+
+  // 动态更新：静默刷新当前已加载范围，保持当前 tab/筛选/每页数量/滚动位置，不退回第一页。
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      if (document.visibilityState === 'visible') refresh();
+    }, 7000);
+    return () => window.clearInterval(id);
+  }, [refresh]);
+
   const reset = useCallback(() => load(true), [load]);
-  return { items, total, loading, loadMore, reset };
+  return { items, total, loading, loadMore, reset, refresh, lastUpdated };
 }
 
 /* 表格容器滚动到底自动加载（带 300ms 节流） */
@@ -154,6 +173,11 @@ function fmtDateTime(iso?: string) {
   const p = (n: number) => String(n).padStart(2, '0');
   return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
+function fmtTimeOnly(d?: Date | null) {
+  if (!d) return '—';
+  const p = (n: number) => String(n).padStart(2, '0');
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
 function fmtDuration(ms?: number | null) {
   if (ms == null) return '—';
   if (ms < 1000) return `${ms}ms`;
@@ -184,7 +208,7 @@ export function GenerationsTab() {
   const [user, setUser] = useState('');
   const [limit, setLimit] = useState(DEFAULT_PAGE);
   const filters = useMemo(() => ({ status, content_type: contentType, model, user }), [status, contentType, model, user]);
-  const { items, total, loading, loadMore } = useMonitorTab<GenerationItem>(apiGetGenerations, filters, limit);
+  const { items, total, loading, loadMore, refresh, lastUpdated } = useMonitorTab<GenerationItem>(apiGetGenerations, filters, limit);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const scrollRef = useScrollLoad(loadMore, items.length < total, loading);
 
@@ -223,6 +247,9 @@ export function GenerationsTab() {
               <input value={user} onChange={(e) => setUser(e.target.value)} placeholder="用户(昵称)" className="w-28 bg-transparent text-zinc-200 placeholder:text-zinc-600 outline-none" />
             </div>
             <LimitSelector value={limit} onChange={setLimit} />
+            <button onClick={refresh} disabled={loading} title="立即刷新，保留当前页" className="inline-flex items-center gap-1 rounded-lg bg-emerald-500/10 px-2 py-1 text-xs text-emerald-300 ring-1 ring-emerald-500/25 hover:bg-emerald-500/20 disabled:opacity-50">
+              <RefreshCw className={cn("size-3", loading && "animate-spin")} /> 动态更新中
+            </button>
             <PopOutButton tab="generations" />
           </div>
         }
@@ -271,7 +298,7 @@ export function GenerationsTab() {
           )}
         </div>
         <div className="mt-3 flex shrink-0 items-center justify-between">
-          <span className="text-xs text-zinc-500">已加载 {items.length} / {total}</span>
+          <span className="text-xs text-zinc-500">已加载 {items.length} / {total} · 自动更新 · {fmtTimeOnly(lastUpdated)}</span>
           {items.length < total && (
             <button onClick={loadMore} disabled={loading} className="inline-flex items-center gap-1 rounded-lg bg-zinc-800 px-3 py-1 text-xs text-zinc-300 hover:bg-zinc-700 disabled:opacity-50">
               <Filter className="size-3" /> {loading ? '加载中…' : '加载更多'}
@@ -291,7 +318,7 @@ export function AssetsTab() {
   const [isDeleted, setIsDeleted] = useState('');
   const [limit, setLimit] = useState(DEFAULT_PAGE);
   const filters = useMemo(() => ({ type, user, q, is_deleted: isDeleted }), [type, user, q, isDeleted]);
-  const { items, total, loading, loadMore } = useMonitorTab<AssetItem>(apiGetAssets, filters, limit);
+  const { items, total, loading, loadMore, refresh, lastUpdated } = useMonitorTab<AssetItem>(apiGetAssets, filters, limit);
   const deletedOnPage = items.filter((i) => i.isDeleted).length;
   const scrollRef = useScrollLoad(loadMore, items.length < total, loading);
 
@@ -327,6 +354,9 @@ export function AssetsTab() {
               <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="标题/URL" className="w-32 bg-transparent text-zinc-200 placeholder:text-zinc-600 outline-none" />
             </div>
             <LimitSelector value={limit} onChange={setLimit} />
+            <button onClick={refresh} disabled={loading} title="立即刷新，保留当前页" className="inline-flex items-center gap-1 rounded-lg bg-emerald-500/10 px-2 py-1 text-xs text-emerald-300 ring-1 ring-emerald-500/25 hover:bg-emerald-500/20 disabled:opacity-50">
+              <RefreshCw className={cn("size-3", loading && "animate-spin")} /> 动态更新中
+            </button>
             <PopOutButton tab="assets" />
           </div>
         }
@@ -373,7 +403,7 @@ export function AssetsTab() {
           {items.length === 0 && <div className="px-3 py-10 text-center text-zinc-600">{loading ? '加载中…' : '暂无资产'}</div>}
         </div>
         <div className="mt-3 flex shrink-0 items-center justify-between">
-          <span className="text-xs text-zinc-500">已加载 {items.length} / {total}</span>
+          <span className="text-xs text-zinc-500">已加载 {items.length} / {total} · 自动更新 · {fmtTimeOnly(lastUpdated)}</span>
           {items.length < total && (
             <button onClick={loadMore} disabled={loading} className="inline-flex items-center gap-1 rounded-lg bg-zinc-800 px-3 py-1 text-xs text-zinc-300 hover:bg-zinc-700 disabled:opacity-50">
               <Filter className="size-3" /> {loading ? '加载中…' : '加载更多'}
@@ -392,7 +422,7 @@ export function IssuesTab() {
   const [category, setCategory] = useState('');
   const [limit, setLimit] = useState(DEFAULT_PAGE);
   const filters = useMemo(() => ({ scope, keyword, category }), [scope, keyword, category]);
-  const { items, total, loading, loadMore } = useMonitorTab<IssueItem>(apiGetIssues, filters, limit);
+  const { items, total, loading, loadMore, refresh, lastUpdated } = useMonitorTab<IssueItem>(apiGetIssues, filters, limit);
   const [expanded, setExpanded] = useState<Set<string | number>>(new Set());
   const scrollRef = useScrollLoad(loadMore, items.length < total, loading);
 
@@ -423,6 +453,9 @@ export function IssuesTab() {
               <input value={keyword} onChange={(e) => setKeyword(e.target.value)} placeholder="关键字" className="w-32 bg-transparent text-zinc-200 placeholder:text-zinc-600 outline-none" />
             </div>
             <LimitSelector value={limit} onChange={setLimit} />
+            <button onClick={refresh} disabled={loading} title="立即刷新，保留当前页" className="inline-flex items-center gap-1 rounded-lg bg-emerald-500/10 px-2 py-1 text-xs text-emerald-300 ring-1 ring-emerald-500/25 hover:bg-emerald-500/20 disabled:opacity-50">
+              <RefreshCw className={cn("size-3", loading && "animate-spin")} /> 动态更新中
+            </button>
             <PopOutButton tab="issues" />
           </div>
         }
@@ -463,7 +496,7 @@ export function IssuesTab() {
           {items.length === 0 && <div className="px-3 py-10 text-center text-zinc-600">{loading ? '加载中…' : '暂无报错 🎉'}</div>}
         </div>
         <div className="mt-3 flex shrink-0 items-center justify-between">
-          <span className="text-xs text-zinc-500">已加载 {items.length} / {total}</span>
+          <span className="text-xs text-zinc-500">已加载 {items.length} / {total} · 自动更新 · {fmtTimeOnly(lastUpdated)}</span>
           {items.length < total && (
             <button onClick={loadMore} disabled={loading} className="inline-flex items-center gap-1 rounded-lg bg-zinc-800 px-3 py-1 text-xs text-zinc-300 hover:bg-zinc-700 disabled:opacity-50">
               <Filter className="size-3" /> {loading ? '加载中…' : '加载更多'}

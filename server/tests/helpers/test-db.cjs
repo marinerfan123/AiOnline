@@ -173,6 +173,7 @@ async function initTestSchema(pg) {
       file_size BIGINT,
       task_id TEXT DEFAULT '',
       provider_url TEXT DEFAULT '',
+      reference_images JSONB NOT NULL DEFAULT '[]'::jsonb,
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
 
