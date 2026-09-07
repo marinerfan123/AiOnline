@@ -126,10 +126,9 @@ export default function SystemSettingsPage() {
   const handleSave = useCallback(async () => {
     setSaving(true);
     try {
-      const cur = (await apiGetSettings().catch(() => ({}))) || {};
       const next = snapshot();
-      await apiSaveSettings({ ...cur, ...next });
-      setLoaded({ ...loaded, ...next });
+      await apiSaveSettings(next);
+      setLoaded((prev) => ({ ...prev, ...next }));
       setLoadedSort(sortMode);
       toast.success('已保存系统设置');
     } catch (e) {
@@ -137,7 +136,7 @@ export default function SystemSettingsPage() {
     } finally {
       setSaving(false);
     }
-  }, [snapshot, loaded, sortMode]);
+  }, [snapshot, sortMode]);
 
   const numInput = (value: number, set: (n: number) => void, min: number, max: number) => (
     <input

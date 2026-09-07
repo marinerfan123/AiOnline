@@ -1,4 +1,4 @@
-import { useEffect, type ReactNode, lazy, Suspense } from 'react';
+import { useEffect, useState, type ReactNode, lazy, Suspense } from 'react';
 import { Routes, Route, useNavigate } from 'react-router-dom';
 import { Layout } from '@/components/Layout';
 import { ErrorBoundary } from '@/components/ErrorBoundary';
@@ -21,73 +21,90 @@ function V2Suspense({ children }: { children: ReactNode }) {
     </Suspense>
   );
 }
-import LandingPage from '@/pages/LandingPage/LandingPage';
-import WorkspacePage from '@/pages/WorkspacePage/WorkspacePage';
-import ImageEditorPage from '@/pages/ImageEditorPage/ImageEditorPage';
-import LibraryPage from '@/pages/LibraryPage/LibraryPage';
-import CharactersPage from '@/pages/CharactersPage/CharactersPage';
-import ModelHubPage from '@/pages/ModelHubPage/ModelHubPage';
-import ModelConsole from '@/pages/ModelConsole/ModelConsole';
-import ModelPricePage from '@/pages/Admin/ModelPricePage';
-import RoutingPage from '@/pages/Admin/RoutingPage';
-import AccountPage from '@/pages/AccountPage/AccountPage';
-import UserPage from '@/pages/UserPage/UserPage';
-import NotFoundPage from '@/pages/NotFoundPage/NotFoundPage';
-import AuthModal from '@/components/AuthModal';
+const LandingPage = lazy(() => import('@/pages/LandingPage/LandingPage'));
+const WorkspacePage = lazy(() => import('@/pages/WorkspacePage/WorkspacePage'));
+const ImageEditorPage = lazy(() => import('@/pages/ImageEditorPage/ImageEditorPage'));
+const LibraryPage = lazy(() => import('@/pages/LibraryPage/LibraryPage'));
+const CharactersPage = lazy(() => import('@/pages/CharactersPage/CharactersPage'));
+const ModelHubPage = lazy(() => import('@/pages/ModelHubPage/ModelHubPage'));
+const ModelConsole = lazy(() => import('@/pages/ModelConsole/ModelConsole'));
+const ModelPricePage = lazy(() => import('@/pages/Admin/ModelPricePage'));
+const RoutingPage = lazy(() => import('@/pages/Admin/RoutingPage'));
+const AccountPage = lazy(() => import('@/pages/AccountPage/AccountPage'));
+const UserPage = lazy(() => import('@/pages/UserPage/UserPage'));
+const NotFoundPage = lazy(() => import('@/pages/NotFoundPage/NotFoundPage'));
+const AuthModal = lazy(() => import('@/components/AuthModal'));
 import { Toaster } from '@/components/ui/sonner';
 import { RequireAdmin } from '@/components/RequireAdmin';
 import { RequireAuth } from '@/components/RequireAuth';
-import CustomerServiceFloat from '@/components/CustomerServiceFloat';
+const CustomerServiceFloat = lazy(() => import('@/components/CustomerServiceFloat'));
 
-// 后台（M3 总控台 / M4 智能体 / M2 流水 / 用户 / 技能 / 电商后台）
-import { AdminLayout } from '@/components/layouts/AdminLayout';
-import ConsolePage from '@/pages/Admin/ConsolePage';
-import AgentsPage from '@/pages/Admin/AgentsPage';
-import UsersPage from '@/pages/Admin/UsersPage';
-import SamplesPage from '@/pages/Admin/SamplesPage';
-import ReferenceStylesReviewPage from '@/pages/Admin/ReferenceStylesReviewPage';
-import TransactionsPage from '@/pages/Admin/TransactionsPage';
-import SkillsPage from '@/pages/Admin/SkillsPage';
-import EcommerceAdminPage from '@/pages/Admin/EcommerceAdminPage';
-import MonitorPage from '@/pages/Admin/MonitorPage';
-import LogsPage from '@/pages/Admin/LogsPage';
-import ErrorLogsPage from '@/pages/Admin/ErrorLogsPage';
-import MonitoringPage from '@/pages/Admin/MonitoringPage';
-import MonitoringStandalonePage from '@/pages/Admin/MonitoringStandalonePage';
-import FinancePage from '@/pages/Admin/FinancePage';
-import PaymentSettingsPage from '@/pages/Admin/PaymentSettingsPage';
-import AdminPlaceholderPage from '@/pages/Admin/AdminPlaceholderPage';
-import SystemSettingsPage from '@/pages/Admin/SystemSettingsPage';
-import LedgerPage from '@/pages/Admin/LedgerPage';
+// 后台按路由切块：未进入后台时不下载后台页面及图表/编辑器依赖。
+const AdminLayout = lazy(() => import('@/components/layouts/AdminLayout').then(m => ({ default: m.AdminLayout })));
+const ConsolePage = lazy(() => import('@/pages/Admin/ConsolePage'));
+const AgentsPage = lazy(() => import('@/pages/Admin/AgentsPage'));
+const UsersPage = lazy(() => import('@/pages/Admin/UsersPage'));
+const SamplesPage = lazy(() => import('@/pages/Admin/SamplesPage'));
+const ReferenceStylesReviewPage = lazy(() => import('@/pages/Admin/ReferenceStylesReviewPage'));
+const TransactionsPage = lazy(() => import('@/pages/Admin/TransactionsPage'));
+const SkillsPage = lazy(() => import('@/pages/Admin/SkillsPage'));
+const EcommerceAdminPage = lazy(() => import('@/pages/Admin/EcommerceAdminPage'));
+const MonitorPage = lazy(() => import('@/pages/Admin/MonitorPage'));
+const LogsPage = lazy(() => import('@/pages/Admin/LogsPage'));
+const ErrorLogsPage = lazy(() => import('@/pages/Admin/ErrorLogsPage'));
+const MonitoringPage = lazy(() => import('@/pages/Admin/MonitoringPage'));
+const MonitoringStandalonePage = lazy(() => import('@/pages/Admin/MonitoringStandalonePage'));
+const FinancePage = lazy(() => import('@/pages/Admin/FinancePage'));
+const PaymentSettingsPage = lazy(() => import('@/pages/Admin/PaymentSettingsPage'));
+const AdminPlaceholderPage = lazy(() => import('@/pages/Admin/AdminPlaceholderPage'));
+const SystemSettingsPage = lazy(() => import('@/pages/Admin/SystemSettingsPage'));
+const LedgerPage = lazy(() => import('@/pages/Admin/LedgerPage'));
 
-// 创作工作室（M5 流水线）
-import { StudioLayout } from '@/components/layouts/StudioLayout';
-import StudioListPage from '@/pages/Studio/StudioListPage';
-import StudioCanvasPage from '@/pages/Studio/StudioCanvasPage';
+// 创作工作室 / 电商按访问加载。
+const StudioLayout = lazy(() => import('@/components/layouts/StudioLayout').then(m => ({ default: m.StudioLayout })));
+const StudioListPage = lazy(() => import('@/pages/Studio/StudioListPage'));
+const StudioCanvasPage = lazy(() => import('@/pages/Studio/StudioCanvasPage'));
+const ShopLayout = lazy(() => import('@/components/layouts/ShopLayout').then(m => ({ default: m.ShopLayout })));
+const ShopHomePage = lazy(() => import('@/pages/Shop/ShopHomePage'));
+const ProductDetailPage = lazy(() => import('@/pages/Shop/ProductDetailPage'));
+const CartPage = lazy(() => import('@/pages/Shop/CartPage'));
+const CheckoutPage = lazy(() => import('@/pages/Shop/CheckoutPage'));
+const OrdersPage = lazy(() => import('@/pages/Shop/OrdersPage'));
+const SellerPage = lazy(() => import('@/pages/Shop/SellerPage'));
+const ScopeDeniedPage = lazy(() => import('@/pages/ScopeDeniedPage'));
+const AuthPage = lazy(() => import('@/pages/Auth/AuthPage'));
+const SetupWizardPage = lazy(() => import('@/pages/Setup/SetupWizardPage'));
+const RechargePage = lazy(() => import('@/pages/RechargePage/RechargePage'));
 
-// 电商（M6）
-import { ShopLayout } from '@/components/layouts/ShopLayout';
-import ShopHomePage from '@/pages/Shop/ShopHomePage';
-import ProductDetailPage from '@/pages/Shop/ProductDetailPage';
-import CartPage from '@/pages/Shop/CartPage';
-import CheckoutPage from '@/pages/Shop/CheckoutPage';
-import OrdersPage from '@/pages/Shop/OrdersPage';
-import SellerPage from '@/pages/Shop/SellerPage';
-import ScopeDeniedPage from '@/pages/ScopeDeniedPage';
-
-// 登录 / 注册
-import AuthPage from '@/pages/Auth/AuthPage';
-
-// 首次部署初始化向导
-import SetupWizardPage from '@/pages/Setup/SetupWizardPage';
-import RechargePage from '@/pages/RechargePage/RechargePage';
+const HelpCenterPage = lazy(() => import('@/pages/Support').then(m => ({ default: m.HelpCenterPage })));
+const DocsPage = lazy(() => import('@/pages/Support').then(m => ({ default: m.DocsPage })));
+const ChangelogPage = lazy(() => import('@/pages/Support').then(m => ({ default: m.ChangelogPage })));
+const TutorialsPage = lazy(() => import('@/pages/Support').then(m => ({ default: m.TutorialsPage })));
+const AboutPage = lazy(() => import('@/pages/Support').then(m => ({ default: m.AboutPage })));
+const GuidePage = lazy(() => import('@/pages/Support').then(m => ({ default: m.GuidePage })));
+const FeedbackPage = lazy(() => import('@/pages/Support').then(m => ({ default: m.FeedbackPage })));
+const ReportPage = lazy(() => import('@/pages/Support').then(m => ({ default: m.ReportPage })));
+const PrivacyPage = lazy(() => import('@/pages/Support').then(m => ({ default: m.PrivacyPage })));
 import { getSetupStatus } from '@/services/api';
 
-// 帮助 / 文档 / 反馈 / 法律 / 关于
-import {
-  HelpCenterPage, DocsPage, ChangelogPage, TutorialsPage,
-  AboutPage, GuidePage, FeedbackPage, ReportPage, PrivacyPage,
-} from '@/pages/Support';
+function DeferredGlobalUi() {
+  const [ready, setReady] = useState(false);
+  useEffect(() => {
+    const win = window as Window & { requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => number; cancelIdleCallback?: (id: number) => void };
+    if (win.requestIdleCallback) {
+      const id = win.requestIdleCallback(() => setReady(true), { timeout: 1500 });
+      return () => win.cancelIdleCallback?.(id);
+    }
+    const id = window.setTimeout(() => setReady(true), 500);
+    return () => window.clearTimeout(id);
+  }, []);
+  if (!ready) return null;
+  return <><AuthModal /><CustomerServiceFloat /></>;
+}
+
+function RouteSuspense({ children }: { children: ReactNode }) {
+  return <Suspense fallback={<div className="grid h-screen place-items-center bg-black text-sm text-zinc-500">正在加载…</div>}>{children}</Suspense>;
+}
 
 // 首次部署：未初始化时访问站点根路径自动跳到 /setup 向导（完成后恢复着陆页）
 function FirstRunGate({ children }: { children: ReactNode }) {
@@ -103,6 +120,7 @@ function FirstRunGate({ children }: { children: ReactNode }) {
 export default function App() {
   return (
     <ErrorBoundary>
+      <RouteSuspense>
       <Routes>
         {/* 独立承接页（未初始化时自动跳转初始化向导） */}
         <Route path="/" element={<FirstRunGate><LandingPage /></FirstRunGate>} />
@@ -205,9 +223,9 @@ export default function App() {
 
         <Route path="*" element={<NotFoundPage />} />
       </Routes>
-      <AuthModal />
+      <DeferredGlobalUi />
       <Toaster />
-      <CustomerServiceFloat />
+      </RouteSuspense>
     </ErrorBoundary>
   );
 }

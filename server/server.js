@@ -5,6 +5,7 @@ import http from 'http';
 import express from 'express'; // 框架化：HTTP 服务 + 中间件 + 路由由 Express 承载
 import fs from 'fs';
 import crypto from 'crypto';
+import zlib from 'zlib';
 import { asyncCheckUrl } from './ssrf.cjs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -1344,33 +1345,61 @@ const MIME = {
 };
 
 function serveStatic(req, res) {
-  const urlPath = req.url === '/' ? 'index.html' : req.url;
-  // 优先从 public 目录读取（可热替换资源，如客服二维码）；命中则直接返回
-  const publicFile = path.join(__dirname, '..', 'public', urlPath);
-  if (fs.existsSync(publicFile) && !fs.statSync(publicFile).isDirectory()) {
-    const ext = path.extname(publicFile);
-    applySecurityHeaders(res);
-    res.writeHead(200, {
-      'Content-Type': MIME[ext] || 'application/octet-stream',
-      'Access-Control-Allow-Origin': '*',
-      'Cache-Control': 'no-cache, no-store, must-revalidate',
-    });
-    return res.end(fs.readFileSync(publicFile));
+  let pathname;
+  try { pathname = decodeURIComponent(new URL(req.url, 'http://local').pathname); }
+  catch { pathname = '/'; }
+  const urlPath = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '');
+  // 只允许解析到 public/dist 根内，避免 URL 路径穿越。
+  const resolveInside = (root, rel) => {
+    const base = path.resolve(root);
+    const candidate = path.resolve(base, rel);
+    return candidate === base || candidate.startsWith(base + path.sep) ? candidate : null;
+  };
+  const publicFile = resolveInside(path.join(__dirname, '..', 'public'), urlPath);
+  let filePath = publicFile && fs.existsSync(publicFile) && !fs.statSync(publicFile).isDirectory()
+    ? publicFile
+    : resolveInside(CLIENT_DIR, urlPath);
+  let isSpaFallback = false;
+  if (!filePath || !fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {
+    filePath = path.join(CLIENT_DIR, 'index.html');
+    isSpaFallback = true;
   }
-  let filePath = path.join(CLIENT_DIR, urlPath);
   try {
-    if (!fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {
-      filePath = path.join(CLIENT_DIR, 'index.html');
-    }
     const ext = path.extname(filePath);
+    const isHashedAsset = !isSpaFallback && /^\/assets\/.+-[A-Za-z0-9_-]{6,}\.[^.]+$/.test(pathname);
+    const cacheControl = isHashedAsset
+      ? 'public, max-age=31536000, immutable'
+      : ext === '.html' || isSpaFallback
+        ? 'no-cache'
+        : 'public, max-age=3600';
+    const accept = String(req.headers['accept-encoding'] || '');
+    const compressible = ext === '.js' || ext === '.css' || ext === '.html' || ext === '.json' || ext === '.svg';
+    const stat = fs.statSync(filePath);
+    const useGzip = compressible && stat.size >= 1024 && accept.includes('gzip');
     applySecurityHeaders(res);
-    res.writeHead(200, {
+    const headers = {
       'Content-Type': MIME[ext] || 'application/octet-stream',
       'Access-Control-Allow-Origin': '*',
-      'Cache-Control': 'no-cache, no-store, must-revalidate',
-    });
-    res.end(fs.readFileSync(filePath));
-  } catch { res.end(); }
+      'Cache-Control': cacheControl,
+      'Vary': 'Accept-Encoding',
+      'X-Content-Type-Options': 'nosniff',
+    };
+    if (isHashedAsset) headers.ETag = `W/"${stat.size}-${Math.trunc(stat.mtimeMs)}"`;
+    if (req.headers['if-none-match'] && headers.ETag === req.headers['if-none-match']) {
+      res.writeHead(304, headers); return res.end();
+    }
+    if (useGzip) headers['Content-Encoding'] = 'gzip';
+    else headers['Content-Length'] = stat.size;
+    res.writeHead(200, headers);
+    if (req.method === 'HEAD') return res.end();
+    const stream = fs.createReadStream(filePath);
+    stream.on('error', () => { if (!res.headersSent) res.writeHead(500); res.end(); });
+    if (useGzip) return stream.pipe(zlib.createGzip({ level: zlib.constants.Z_BEST_SPEED })).pipe(res);
+    return stream.pipe(res);
+  } catch {
+    if (!res.headersSent) res.writeHead(404);
+    res.end();
+  }
 }
 
 // ─── 本地静态文件（/media/ 上传 & /samples/ 公共示例，非 /api 路由，必须早于 SPA fallback）───
@@ -4673,9 +4702,8 @@ async function handleAPI(req, res) {
     // 合并写入：只更新传入字段，保留 settings.app 中其它键（如 signupBonusCredits / maxThreads /
     // promptOptimizeModel），避免前端局部保存（生成默认参数等）整值覆盖把后台配置误删。
     if (pgPool) {
-      const existing = (await pgPool.query("SELECT value FROM settings WHERE key='app'")).rows[0]?.value || {};
-      const merged = { ...existing, ...data };
-      await pgPool.query("INSERT INTO settings (key,value) VALUES ('app',$1) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value", [JSON.stringify(merged)]);
+      // PostgreSQL 原子 JSON 合并，避免「先 SELECT、后 UPDATE」并发保存互相覆盖。
+      await pgPool.query("INSERT INTO settings (key,value) VALUES ('app',$1::jsonb) ON CONFLICT (key) DO UPDATE SET value=settings.value || EXCLUDED.value", [JSON.stringify(data)]);
       return sendJSON(res, 200, { ok: true });
     }
     let cur = {};
