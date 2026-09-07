@@ -127,6 +127,6 @@ describe('Schema-driven ParameterInspector', () => {
     cleanup();
     vi.mocked(v2ai.listModels).mockResolvedValueOnce([] as any);
     render(qc(<ParameterInspector node={n} def={getNodeDef('image-generation')!} projectId="proj-1" />));
-    expect(await screen.findByText('No compatible model configured')).toBeTruthy();
+    expect(await screen.findByText('未配置兼容模型')).toBeTruthy();
   });
 });
