@@ -13,8 +13,9 @@
 
 const realtime = require('./realtime.cjs');
 const assetFinalize = require('./assetFinalize.cjs');
+const runtimeSettings = require('./runtimeSettings.cjs');
 
-const WORKER_BATCH = 4;            // 每轮最多并发处理的任务数（限制事件循环负载）
+const DEFAULT_WORKER_BATCH = 4;   // 每轮默认并发（可被 settings.app.uploadFinalizeConcurrency 覆盖）
 const POLL_MS = 1000;              // worker 轮询间隔
 const REAPER_POLL_MS = 30000;      // pending_upload reaper 间隔
 const REAPER_LIMIT = 8;            // 每轮 reaper 重试上限
@@ -163,13 +164,15 @@ async function processOne(pgPool, jobRow) {
 async function workerTick(pgPool) {
   const client = await pgPool.connect();
   let rows = [];
+  let batch = DEFAULT_WORKER_BATCH;
+  try { batch = (await runtimeSettings.getRuntimeSettings(pgPool)).uploadFinalizeConcurrency; } catch (_) { /* 默认 */ }
   try {
     await client.query('BEGIN');
     const r = await client.query(
       `SELECT id, task_id, user_id, payload FROM asset_upload_jobs
        WHERE state='queued' ORDER BY created_at ASC LIMIT $1
        FOR UPDATE SKIP LOCKED`,
-      [WORKER_BATCH],
+      [batch],
     );
     rows = r.rows;
     if (rows.length === 0) { await client.query('COMMIT'); client.release(); return; }
@@ -257,7 +260,7 @@ function startUploadWorker(pgPool) {
     workerTick(pgPool).catch((e) => console.warn('[uploadQueue] worker tick 异常:', e.message));
   }, POLL_MS);
   reaperTimer = setInterval(() => reaperTick(pgPool), REAPER_POLL_MS);
-  console.log(`[uploadQueue] 后台上传 worker 已启动（batch=${WORKER_BATCH}, poll=${POLL_MS}ms, reaper=${REAPER_POLL_MS}ms）`);
+  console.log(`[uploadQueue] 后台上传 worker 已启动（batch=${DEFAULT_WORKER_BATCH}, poll=${POLL_MS}ms, reaper=${REAPER_POLL_MS}ms）`);
 }
 
 function stopUploadWorker() {

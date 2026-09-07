@@ -104,14 +104,22 @@ function createMediaWorker({ pg, executors = {}, kind, workerId, pollMs = 500, m
 
     const fn = executors[kindOverride || kind] || executors[job.kind];
     let outcome;
+    // ffmpeg/ffprobe 是 CPU 密集子进程：全局信号量内排队（上限 settings.app.ffmpegConcurrency），
+    // 避免批量时多 worker 背靠背 spawn 打满 CPU、饿死 HTTP/SSE。
+    const ffmpegPool = require('./ffmpegPool.cjs');
+    await ffmpegPool.acquire();
     try {
-      outcome = await fn(ctx);
-    } catch (err) {
-      outcome = {
-        ok: false,
-        code: EXCEPTION_CODE,
-        message: err && err.message != null ? String(err.message) : String(err),
-      };
+      try {
+        outcome = await fn(ctx);
+      } catch (err) {
+        outcome = {
+          ok: false,
+          code: EXCEPTION_CODE,
+          message: err && err.message != null ? String(err.message) : String(err),
+        };
+      }
+    } finally {
+      ffmpegPool.release();
     }
 
     const ok = !!(outcome && outcome.ok === true);

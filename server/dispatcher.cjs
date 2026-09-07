@@ -40,6 +40,11 @@ function logError(source, message, meta) {
 // ─── 全局并发状态（跨请求共享，实现真正全局信号量）───
 let GLOBAL_ACTIVE = 0;
 let GLOBAL_MAX = 10;
+// 单服务商聚合并发硬顶（settings.app.providerAggregateConcCap，默认 24）：
+// 多 key 池总并发按「每 key 并发 × active key 数」线性扩展会放大到数百（476 key → ~952），
+// 一次批量就能把同一服务商打到几百并发、连带 finalize/ffmpeg 打满 CPU。此硬顶钳制该放大，
+// 与每 key 并发、全局 maxThreads 三层叠加，保证「量大也不打爆」。
+let PROVIDER_AGGREGATE_CAP = 24;
 
 // ── 智能路由（Phase 3.4，非阻断接入）──
 // 路由算法本身是纯函数（router.cjs）；这里只持有可热改的权重与指标缓存。
@@ -592,7 +597,8 @@ async function attemptOnAccount(p, tier, input, contentType, recorder) {
   const pool = AKEYS[p.provider.id];
   const poolExists = !!(pool && pool.size > 0);
   const activeKeyCount = poolExists ? pool.size : 1;
-  const aggCap = Math.max(keyConcCap, keyConcCap * activeKeyCount); // 多 key → 容量线性扩展
+  const rawAgg = Math.max(keyConcCap, keyConcCap * activeKeyCount); // 多 key → 容量线性扩展
+  const aggCap = PROVIDER_AGGREGATE_CAP > 0 ? Math.min(rawAgg, PROVIDER_AGGREGATE_CAP) : rawAgg; // 硬顶钳制放大
   // ── 选 key：优先池内轮转；池为空（legacy）回退 providers.api_key；池存在但全不可用 → 本账号不可用 ──
   const selKey = poolExists ? pickKey(p.provider.id, now, keyConcCap) : null;
   // 原子占位：选 key 即同步占用其并发槽（不等下方 await），否则并行子任务会在 await 窗口内选到同一把 key。
@@ -740,7 +746,8 @@ function snapshotAcct(pair) {
   const activeKeyCount = pool
     ? [...pool.values()].filter((ks) => ks.status === KEY_STATUS_ACTIVE).length
     : 1;
-  const concCap = Math.max(perKeyCap, perKeyCap * Math.max(1, activeKeyCount));
+  const rawConcCap = Math.max(perKeyCap, perKeyCap * Math.max(1, activeKeyCount));
+  const concCap = PROVIDER_AGGREGATE_CAP > 0 ? Math.min(rawConcCap, PROVIDER_AGGREGATE_CAP) : rawConcCap;
   const a = ACCT[pid];
   if (!a) {
     return {
@@ -783,6 +790,7 @@ function getRoutingV3Enabled() { return ROUTING_V3_ENABLED; }
 function applyRuntimeSettings(v) {
   if (!v || typeof v !== 'object') return;
   if (v.maxThreads) GLOBAL_MAX = Number(v.maxThreads) || 10;
+  if (v.providerAggregateConcCap) PROVIDER_AGGREGATE_CAP = Number(v.providerAggregateConcCap) || 24;
   if (typeof v.waitingAreaThreshold === 'number' && v.waitingAreaThreshold > 0) {
     WAITING_THRESHOLD = Math.floor(v.waitingAreaThreshold);
   }

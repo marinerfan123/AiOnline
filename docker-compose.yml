@@ -99,6 +99,36 @@ services:
       - ./deploy/generation-v2:/run/generation-v2:ro
     restart: unless-stopped
 
+  # 媒体归一化独立 worker（settings.app.mediaNormalizationPlacement='worker' 时启用）：
+  # 把 ffmpeg/ffprobe 探针/缩略图/转码从 API 进程剥离，避免与 HTTP 抢 CPU（"卡前后台"治理）。
+  # 启用：docker compose --profile media-worker up -d；同时把 settings.app.mediaNormalizationPlacement 设为 'worker'。
+  # 回退：设为 'api'（API 进程内跑）或 'off'，再 docker compose --profile media-worker down。
+  media-worker:
+    profiles: ["media-worker"]
+    build: .
+    command: ["node", "server/media-worker-entry.cjs"]
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 768M
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      NODE_ID: media-worker-01
+      MEDIA_JOBS_WORKER: "1"
+      PG_HOST: postgres
+      PG_PORT: 5432
+      PG_DATABASE: ${PG_DATABASE:-huabu}
+      PG_USER: ${PG_USER:-postgres}
+      PG_PASSWORD: ${PG_PASSWORD:?PG_PASSWORD 必须显式设置强密码}
+      PG_POOL_MAX: ${PG_POOL_MAX:-10}
+    restart: unless-stopped
+
   # 可选 nginx 反代（取消注释启用；启用后建议把 app 的 3001 端口改为不对外暴露）
   # nginx:
   #   image: nginx:alpine

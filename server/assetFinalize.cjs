@@ -19,6 +19,7 @@
 const ossMod = require('./oss.cjs');
 const crypto = require('crypto');
 const { Transform, PassThrough, Readable } = require('stream');
+const runtimeSettings = require('./runtimeSettings.cjs');
 // L29 — Media Metadata 扩展：checksum 完整性 + 元数据捕获（纯函数，落点见 outputMeta.cjs 头部裁决）。
 const {
   computeSha256,
@@ -189,7 +190,7 @@ async function streamToPassThroughWithMd5(webStream) {
 //   - 腾讯云：纯流式（body 直接是下载流，零整图驻留）
 //   - 阿里云：两段式算 MD5 后流式发出
 //   - 无 stream（data: URI / chunked 无 content-length）：退回整图 buffer 旧路径，双兼容
-async function putObject(cfg, objectKey, fetched, contentType) {
+async function putObject(cfg, objectKey, fetched, contentType, { streamMode = false } = {}) {
   // local-disk provider（测试/离线真链后端）：写本地存储，无签名。
   if (String(cfg.providerType || cfg.provider || cfg.type || '') === 'local-disk') {
     const store = ossMod.localStoreFor(cfg);
@@ -221,9 +222,17 @@ async function putObject(cfg, objectKey, fetched, contentType) {
     const host = ossMod.aliyunHost(cfg);
     putUrl = `https://${host}/${objectKey}`;
     if (canStream) {
-      const { md5, stream } = await streamToPassThroughWithMd5(fetched.stream);
-      const h = ossMod.aliyunPutHeadersStream(cfg, objectKey, { md5, contentType, contentLength: fetched.contentLength });
-      headers = h.headers; body = stream;
+      // streamMode（settings.app.mediaFinalizeMode='stream'）：纯流式直传，不整文件缓冲、不预算 MD5。
+      // 阿里云 header 签名在 Content-MD5 为空时照样接受（oss.cjs aliyunPutHeadersStream 已支持），
+      // 牺牲上传完整性校验，换取低内存/低 CPU——适合大批量、大文件场景，客户可在后台切换。
+      if (streamMode) {
+        const h = ossMod.aliyunPutHeadersStream(cfg, objectKey, { md5: '', contentType, contentLength: fetched.contentLength });
+        headers = h.headers; body = fetched.stream;
+      } else {
+        const { md5, stream } = await streamToPassThroughWithMd5(fetched.stream);
+        const h = ossMod.aliyunPutHeadersStream(cfg, objectKey, { md5, contentType, contentLength: fetched.contentLength });
+        headers = h.headers; body = stream;
+      }
     } else {
       const h = ossMod.aliyunPutHeaders(cfg, objectKey, fetched.buffer, contentType);
       headers = h.headers; body = fetched.buffer;
@@ -353,7 +362,9 @@ async function finalizeUrl(pgPool, opts) {
     try {
       const safeName = `${type === 'video' ? 'video' : 'img'}-${taskId}-${idx}.${contentType.split('/')[1] || (type === 'video' ? 'mp4' : 'jpg')}`;
       ossObjectKey = buildObjectKey(cfg, userId, safeName);
-      await putObject(cfg, ossObjectKey, fetched, contentType);
+      let streamMode = false;
+      try { streamMode = (await runtimeSettings.getRuntimeSettings(pgPool)).mediaFinalizeMode === 'stream'; } catch (_) { /* 默认 buffer */ }
+      await putObject(cfg, ossObjectKey, fetched, contentType, { streamMode });
       ossUrl = buildGetUrl(cfg, ossObjectKey);
       thumbUrl = '';
       if (type === 'image') {
