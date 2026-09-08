@@ -148,6 +148,12 @@ services:
       V2_UPLOAD_CONCURRENCY: ${V2_UPLOAD_CONCURRENCY:-4}
     volumes:
       - ./generation-v2/evidence.json:/run/generation-v2/evidence.json:ro
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"const{Pool}=require('pg');const r=new Pool({host:process.env.PG_HOST,port:Number(process.env.PG_PORT),database:process.env.PG_DATABASE,user:process.env.PG_USER,password:process.env.PG_PASSWORD});r.query('SELECT 1').then(()=>{r.end();process.exit(0)}).catch(()=>process.exit(1))\" 2>/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
     restart: unless-stopped
 
   # Worker-02 (generation only, no HTTP)
@@ -180,6 +186,12 @@ services:
       V2_UPLOAD_CONCURRENCY: ${V2_UPLOAD_CONCURRENCY:-4}
     volumes:
       - ./generation-v2/evidence.json:/run/generation-v2/evidence.json:ro
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"const{Pool}=require('pg');const r=new Pool({host:process.env.PG_HOST,port:Number(process.env.PG_PORT),database:process.env.PG_DATABASE,user:process.env.PG_USER,password:process.env.PG_PASSWORD});r.query('SELECT 1').then(()=>{r.end();process.exit(0)}).catch(()=>process.exit(1))\" 2>/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
     restart: unless-stopped
 
   # Nginx Load Balancer

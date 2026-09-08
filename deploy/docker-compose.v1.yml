@@ -110,6 +110,12 @@ services:
     volumes:
       - /opt/moling-v1/v2-evidence.json:/app/v2-evidence.json:ro
       - /opt/moling-v1/v1-data:/app/server/data
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"const ioredis=require('ioredis');const r=new ioredis({host:'redis',port:6379});r.ping().then(()=>{r.disconnect();process.exit(0)}).catch(()=>process.exit(1))\" 2>/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
     restart: unless-stopped
 
   worker-02:
@@ -137,4 +143,10 @@ services:
     volumes:
       - /opt/moling-v1/v2-evidence.json:/app/v2-evidence.json:ro
       - /opt/moling-v1/v1-data:/app/server/data
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"const ioredis=require('ioredis');const r=new ioredis({host:'redis',port:6379});r.ping().then(()=>{r.disconnect();process.exit(0)}).catch(()=>process.exit(1))\" 2>/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
     restart: unless-stopped
