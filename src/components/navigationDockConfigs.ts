@@ -7,7 +7,6 @@ import {
   Video,
   User,
   FolderOpen,
-  Loader2,
   Sparkles,
   MoreHorizontal,
   Upload,
@@ -73,12 +72,6 @@ export function workspaceDockConfig(
       // ── 创作入口 ────────────────────────────────
       {
         items: [
-          {
-            key: 'workspace-generating',
-            label: '正在生成',
-            icon: Loader2,
-            path: '/workspace?view=generating',
-          },
           {
             key: 'workspace',
             label: '创作',

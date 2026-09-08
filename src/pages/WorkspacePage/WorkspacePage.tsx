@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
-import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
+import { useLocation, useNavigate } from 'react-router-dom';
 import { Search, Sparkles, PanelRightOpen, ArrowUp } from 'lucide-react';
 import { toast } from 'sonner';
 import TopBar from '@/components/TopBar';
@@ -22,8 +22,6 @@ import { apiGetMedia, apiSaveMedia, apiDeleteMedia, apiUpdateMedia, apiGetSettin
 import type { Ratio, Quality, VideoMode } from '@/data/settings';
 import { mergeWorkspaceMediaHydration, upsertTransientWorkspaceMedia } from './workspaceMediaHydration';
 import { normalizeStoredMedia } from './mediaPresentation';
-import { PromotedStylesSection } from './PromotedStylesSection';
-import { filterWorkspaceMedia } from './workspaceView';
 import type { ReferenceStyle } from '@/services/api';
 import { formatCredits } from '@/utils/format';
 import type { ModelSortMode } from '@/utils/groupModels';
@@ -77,8 +75,6 @@ function WsThumb({ item }: { item: IMediaItem }) {
 export default function WorkspacePage() {
   const location = useLocation();
   const navigate = useNavigate();
-  const [searchParams] = useSearchParams();
-  const generatingOnly = searchParams.get('view') === 'generating';
   const { user } = useAuth();
   const isAdmin = user?.role === 'admin' || user?.role === 'system';
   const generationBarRef = useRef<GenerationBarHandle>(null);
@@ -334,10 +330,17 @@ export default function WorkspacePage() {
     apiSaveSettings(settings);
   }, [settings, user?.role]);
 
-  const filtered = useMemo(
-    () => filterWorkspaceMedia(mediaList, searchQuery, sortMode, generatingOnly),
-    [mediaList, searchQuery, sortMode, generatingOnly],
-  );
+  const filtered = useMemo(() => {
+    const list = mediaList.filter(
+      (m) => !m.isDeleted && m.title.toLowerCase().includes(searchQuery.toLowerCase()),
+    );
+    // 排序：最新在前（默认）或最早在前
+    return [...list].sort((a, b) => {
+      const ta = new Date(a.createdAt).getTime();
+      const tb = new Date(b.createdAt).getTime();
+      return sortMode === 'newest' ? tb - ta : ta - tb;
+    });
+  }, [mediaList, searchQuery, sortMode]);
 
   const selectedItem = useMemo(
     () => mediaList.find((m) => m.id === selectedId) ?? null,
@@ -595,7 +598,48 @@ export default function WorkspacePage() {
               onScroll={handleGalleryScroll}
               className="h-full overflow-y-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden px-4 pb-6 pt-2 lg:px-6"
             >
-            <PromotedStylesSection styles={promotedStyles} onUse={handleUsePromotedStyle} />
+            {/* 精选推广样式墙：仅「强制推行」的参考样式出现在这里 */}
+            {promotedStyles.length > 0 && (
+              <section className="mb-7">
+                <div className="mb-3 flex items-center gap-2">
+                  <span className="inline-flex items-center gap-1.5 rounded-full bg-gradient-to-r from-amber-500/20 to-emerald-500/10 px-3 py-1 text-xs font-semibold text-amber-300 ring-1 ring-amber-500/30">
+                    <Sparkles className="size-3.5" /> 精选推广样式
+                  </span>
+                  <span className="text-xs text-zinc-500">由社区设计者创作，点按即可一键生成并给设计者分成</span>
+                </div>
+                <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6">
+                  {promotedStyles.map((style) => (
+                    <div
+                      key={style.id}
+                      className="group relative flex flex-col overflow-hidden rounded-2xl border border-amber-500/20 bg-gradient-to-b from-amber-500/[0.06] to-zinc-900/40 transition-all duration-200 hover:border-amber-500/40"
+                    >
+                      <div className="relative aspect-square w-full overflow-hidden bg-zinc-950">
+                        {style.previewUrl ? (
+                          <Image src={style.previewUrl} alt={style.name} className="h-full w-full object-cover" />
+                        ) : (
+                          <div className="flex h-full w-full items-center justify-center text-zinc-600">
+                            <Sparkles className="size-8" />
+                          </div>
+                        )}
+                        <span className="absolute left-2 top-2 rounded-full bg-amber-500 px-2 py-0.5 text-[10px] font-bold text-black">
+                          推广
+                        </span>
+                      </div>
+                      <div className="flex flex-1 flex-col p-2.5">
+                        <p className="truncate text-xs font-medium text-zinc-200">{style.name || '未命名样式'}</p>
+                        <p className="mt-0.5 truncate text-[10px] text-zinc-500">by {style.userDisplayName || style.userEmail || '匿名设计者'}</p>
+                        <button
+                          onClick={() => handleUsePromotedStyle(style)}
+                          className="mt-2 inline-flex items-center justify-center gap-1 rounded-lg bg-amber-500/90 px-2 py-1.5 text-[11px] font-semibold text-black transition-all duration-200 hover:bg-amber-400 active:scale-95"
+                        >
+                          <Sparkles className="size-3" /> 用此样式创作
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </section>
+            )}
 
             {filtered.length === 0 ? (
               searchQuery ? (

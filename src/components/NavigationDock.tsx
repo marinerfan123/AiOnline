@@ -95,12 +95,10 @@ function usePersistedExpanded(storageKey: string, defaultValue = true) {
   return [expanded, set] as const;
 }
 
-function isPathActive(path: string | undefined, locationPath: string, end = false, locationSearch = '') {
+function isPathActive(path: string | undefined, locationPath: string, end = false) {
   if (!path) return false;
-  const [pathname, search = ''] = path.split('?');
-  const pathMatches = end ? locationPath === pathname : locationPath === pathname || locationPath.startsWith(`${pathname}/`);
-  if (!pathMatches) return false;
-  return search ? locationSearch === `?${search}` : true;
+  if (end) return locationPath === path;
+  return locationPath === path || locationPath.startsWith(`${path}/`);
 }
 
 function filterVisible(items: NavMenuItem[]) {
@@ -507,7 +505,7 @@ function DockBody({
                     key={item.key}
                     item={item}
                     collapsed={collapsed}
-                    active={isPathActive(item.path, location.pathname, item.end, location.search)}
+                    active={isPathActive(item.path, location.pathname, item.end)}
                     onNavigate={onNavigate}
                     indent={isCollapsible && isOpen && !collapsed}
                   />
