@@ -150,6 +150,8 @@ interface StudioState {
   paste: () => void;
   alignSelection: (kind: 'left' | 'middle' | 'right') => void;
   groupSelection: () => string | null;
+  /** Empty-canvas starter: create a connected, executable workflow as one undoable action. */
+  createStarterWorkflow: (kind: 'image') => void;
   /** W6④ — layered DAG auto-layout of all non-frame, non-locked nodes (undoable). */
   autoLayout: () => void;
   beginEdit: () => void;
@@ -550,6 +552,56 @@ export const useStudioStore = create<StudioState>((set, get) => ({
       ],
     }));
     return id;
+  },
+
+  createStarterWorkflow: (kind) => {
+    if (kind !== 'image') return;
+    const s = get();
+    // This action is intentionally empty-canvas-only: a starter must never
+    // overwrite or silently merge into the user's existing graph.
+    if (s.nodes.length > 0 || s.edges.length > 0) return;
+
+    const promptDef = getNodeDef('prompt')!;
+    const imageDef = getNodeDef('image-generation')!;
+    const outputDef = getNodeDef('output')!;
+    const promptId = mintNodeId('prompt');
+    const imageId = mintNodeId('image-generation');
+    const outputId = mintNodeId('output');
+    const nodes: StudioNode[] = [
+      {
+        id: promptId,
+        type: 'studio',
+        position: { x: -460, y: -80 },
+        data: { ...promptDef.defaultData, title: promptDef.title },
+        width: promptDef.width,
+        selected: true,
+      },
+      {
+        id: imageId,
+        type: 'studio',
+        position: { x: -80, y: -80 },
+        data: { ...imageDef.defaultData, title: imageDef.title },
+        width: imageDef.width,
+        selected: false,
+      },
+      {
+        id: outputId,
+        type: 'studio',
+        position: { x: 300, y: -80 },
+        data: { ...outputDef.defaultData, title: outputDef.title },
+        width: outputDef.width,
+        selected: false,
+      },
+    ];
+    const edges: StudioEdge[] = [
+      buildEdge({ source: promptId, sourceHandle: 'text', target: imageId, targetHandle: 'text' }, 'TEXT'),
+      buildEdge({ source: imageId, sourceHandle: 'image', target: outputId, targetHandle: 'image' }, 'IMAGE'),
+    ];
+    set({
+      ...pushUndo(s, snapshot(s)),
+      nodes: recomputeStatus(nodes, [promptId, imageId, outputId], edges),
+      edges,
+    });
   },
 
   autoLayout: () => {

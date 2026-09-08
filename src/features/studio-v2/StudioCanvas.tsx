@@ -158,18 +158,21 @@ function InvalidConnectionToast() {
   );
 }
 
-function EmptyState({ onAdd }: { onAdd: (k: StudioNodeKind) => void }) {
+function EmptyState({ onAdd, onCreateWorkflow }: { onAdd: (k: StudioNodeKind) => void; onCreateWorkflow: () => void }) {
   return (
     <div data-test="studio-empty-state" className="pointer-events-none absolute inset-0 grid place-items-center">
-      <div className="pointer-events-auto w-80 rounded-xl border border-ml2-border bg-ml2-surface-1/95 p-5 text-center shadow-xl backdrop-blur">
-        <h2 className="text-sm font-semibold text-ml2-text">开始搭建你的 Creative Flow</h2>
-        <p className="mt-1 text-[11px] text-ml2-text-3">从 Prompt 出发，连接参考素材与媒体节点（会话态，M05-C 接入正式保存）。</p>
-        <div className="mt-4 grid grid-cols-3 gap-1.5">
-          <Button size="sm" variant="primary" data-test="empty-add-prompt" onClick={() => onAdd('prompt')}>从提示词开始</Button>
-          <Button size="sm" variant="secondary" data-test="empty-add-reference" onClick={() => onAdd('reference')}>添加参考</Button>
-          <Button size="sm" variant="secondary" data-test="empty-add-image" onClick={() => onAdd('image-generation')}>添加图像生成</Button>
+      <div className="pointer-events-auto w-[26rem] rounded-xl border border-ml2-border bg-ml2-surface-1/95 p-5 text-center shadow-xl backdrop-blur">
+        <h2 className="text-sm font-semibold text-ml2-text">开始创作</h2>
+        <p className="mt-1 text-[11px] text-ml2-text-3">直接建立一条可编辑的图像生成链，或从单个节点开始。</p>
+        <Button size="sm" variant="primary" data-test="empty-create-image-workflow" className="mt-4 w-full" onClick={onCreateWorkflow}>
+          一键创建图像工作流
+        </Button>
+        <div className="mt-2 grid grid-cols-3 gap-1.5">
+          <Button size="sm" variant="secondary" data-test="empty-add-prompt" onClick={() => onAdd('prompt')}>提示词</Button>
+          <Button size="sm" variant="secondary" data-test="empty-add-reference" onClick={() => onAdd('reference')}>参考素材</Button>
+          <Button size="sm" variant="secondary" data-test="empty-add-image" onClick={() => onAdd('image-generation')}>图像生成</Button>
         </div>
-        <p className="mt-3 text-[10px] text-ml2-text-3">或在左侧 Node Library 拖拽 · 或双击画布空白处快速添加</p>
+        <p className="mt-3 text-[10px] text-ml2-text-3">工作流会自动连线，选中提示词节点后即可在下方输入内容。</p>
       </div>
     </div>
   );
@@ -183,6 +186,7 @@ function CanvasCore({ projectId, canvasRevision }: { projectId?: string; canvasR
   const onConnect = useStudioStore((s) => s.onConnect);
   const addNode = useStudioStore((s) => s.addNode);
   const updateNodeParameter = useStudioStore((s) => s.updateNodeParameter);
+  const createStarterWorkflow = useStudioStore((s) => s.createStarterWorkflow);
   const undo = useStudioStore((s) => s.undo);
   const redo = useStudioStore((s) => s.redo);
   const canUndo = useStudioStore(selectCanUndo);
@@ -417,7 +421,15 @@ function CanvasCore({ projectId, canvasRevision }: { projectId?: string; canvasR
 
       <InvalidConnectionToast />
       <PresenceBar peers={presence.peers} />
-      {nodes.length === 0 && <EmptyState onAdd={addAtCenter} />}
+      {nodes.length === 0 && (
+        <EmptyState
+          onAdd={addAtCenter}
+          onCreateWorkflow={() => {
+            createStarterWorkflow('image');
+            requestAnimationFrame(() => fitView({ padding: 0.18, duration: 250, maxZoom: 1 }));
+          }}
+        />
+      )}
       {previewNode !== null && (
         <NodePreviewModal
           open

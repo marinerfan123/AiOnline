@@ -137,6 +137,40 @@ describe('G00/G05 store — loadGraph 清栈与本地状态来源', () => {
   });
 });
 
+describe('画布起步工作流 — 一键创建可执行图像链', () => {
+  beforeEach(reset);
+
+  it('空画布一次创建 Prompt→Image Generation→Output，并作为一个 undo 操作', () => {
+    const st = () => useStudioStore.getState();
+
+    st().createStarterWorkflow('image');
+
+    expect(st().nodes.map((n) => n.data.nodeKind)).toEqual(['prompt', 'image-generation', 'output']);
+    expect(st().edges).toHaveLength(2);
+    expect(st().edges.map((e) => [e.sourceHandle, e.targetHandle])).toEqual([
+      ['text', 'text'],
+      ['image', 'image'],
+    ]);
+    expect(st().nodes.filter((n) => n.selected)).toHaveLength(1);
+    expect(st().nodes.find((n) => n.selected)?.data.nodeKind).toBe('prompt');
+    expect(st().undoStack).toHaveLength(1);
+
+    st().undo();
+    expect(st().nodes).toHaveLength(0);
+    expect(st().edges).toHaveLength(0);
+  });
+
+  it('非空画布拒绝覆盖已有内容', () => {
+    const st = () => useStudioStore.getState();
+    st().addNode('text', { x: 0, y: 0 });
+    const before = st().nodes.map((n) => n.id);
+
+    st().createStarterWorkflow('image');
+
+    expect(st().nodes.map((n) => n.id)).toEqual(before);
+  });
+});
+
 describe('G03 registry — kind 计数与 id 稳定性', () => {
   it('五类 G03 base kinds + 十类 legacy = 15 个稳定 id；def.id === 注册键', () => {
     const G03_BASE: StudioNodeKind[] = ['text', 'image', 'audio', 'storyboard', 'video-clip'];
