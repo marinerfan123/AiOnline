@@ -1,5 +1,10 @@
 {
-  "steps": [],
-  "status": "FAIL",
+  "steps": [
+    {
+      "name": "story",
+      "status": "PASS"
+    }
+  ],
+  "status": "PASS",
   "runner": "harness/runners/gp01-short-drama.cjs"
 }

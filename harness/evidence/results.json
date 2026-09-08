@@ -1,38 +1,46 @@
 {
-  "run_id": "2026-08-31T17-50-44-360Z-12708",
-  "ts": "2026-08-31T17:50:44.360Z",
+  "run_id": "2026-08-31T17-52-07-260Z-20024",
+  "ts": "2026-08-31T17:52:07.260Z",
   "version": "1.0.0",
   "summary": {
     "total": 3,
-    "pass": 0,
-    "fail": 3,
-    "not_ready": 0,
-    "overall": "FAIL"
+    "pass": 1,
+    "fail": 0,
+    "not_ready": 2,
+    "overall": "NOT_READY"
   },
   "paths": {
     "GP01_short_drama_full": {
-      "status": "FAIL",
+      "status": "PASS",
       "runner": "harness/runners/gp01-short-drama.cjs",
       "label": "Short Drama FULL",
-      "steps": []
+      "evidence_file": null,
+      "steps": [
+        {
+          "name": "story",
+          "status": "PASS"
+        }
+      ]
     },
     "GP02_commercial_smoke": {
-      "status": "FAIL",
+      "status": "NOT_READY",
       "runner": "harness/runners/gp02-commercial.cjs",
       "label": "Commercial Smoke",
+      "evidence_file": null,
       "steps": []
     },
     "GP03_ecommerce_smoke": {
-      "status": "FAIL",
+      "status": "NOT_READY",
       "runner": "harness/runners/gp03-ecommerce.cjs",
       "label": "E-commerce Smoke",
+      "evidence_file": null,
       "steps": []
     }
   },
   "metrics": {
-    "GOLDEN_PATH_GP01": "FAIL",
-    "SMOKE_GP02": "FAIL",
-    "SMOKE_GP03": "FAIL",
+    "GOLDEN_PATH_GP01": "PASS",
+    "SMOKE_GP02": "NOT_READY",
+    "SMOKE_GP03": "NOT_READY",
     "BROWSER_E2E": null,
     "P0_COUNT": null,
     "P1_COUNT": null,

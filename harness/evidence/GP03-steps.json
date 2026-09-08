@@ -1,5 +1,5 @@
 {
   "steps": [],
-  "status": "FAIL",
+  "status": "NOT_READY",
   "runner": "harness/runners/gp03-ecommerce.cjs"
 }
