@@ -54,6 +54,9 @@ export default function SystemSettingsPage() {
   // 全局生成并发数
   const [maxThreads, setMaxThreads] = useState(10);
 
+  // 单用户在途任务上限
+  const [userActiveLimit, setUserActiveLimit] = useState(8);
+
   // 单服务商聚合并发硬顶
   const [aggCap, setAggCap] = useState(24);
 
@@ -76,6 +79,7 @@ export default function SystemSettingsPage() {
     workspaceModelSort: sortMode,
     genRateLimit: { limit: genLimit, windowSec: genWindow },
     maxThreads,
+    userGenerationActiveLimit: userActiveLimit,
     providerAggregateConcCap: aggCap,
     ffmpegConcurrency: ffmpegConc,
     uploadFinalizeConcurrency: finalizeConc,
@@ -97,12 +101,13 @@ export default function SystemSettingsPage() {
         setGenLimit(lim);
         setGenWindow(win);
         setMaxThreads(toInt(s.maxThreads, 10, 1, 1000));
+        setUserActiveLimit(toInt(s.userGenerationActiveLimit, 8, 1, 64));
         setAggCap(toInt(s.providerAggregateConcCap, 24, 1, 1000));
         setFfmpegConc(toInt(s.ffmpegConcurrency, 2, 1, 16));
         setFinalizeConc(toInt(s.uploadFinalizeConcurrency, 4, 1, 32));
         setFinalizeMode(s.mediaFinalizeMode === 'stream' ? 'stream' : 'buffer');
         setPlacement(['api', 'worker', 'off'].includes(s.mediaNormalizationPlacement) ? s.mediaNormalizationPlacement : 'api');
-        setLoaded({ ...s, workspaceModelSort: m, genRateLimit: { limit: lim, windowSec: win }, maxThreads: toInt(s.maxThreads, 10, 1, 1000), providerAggregateConcCap: toInt(s.providerAggregateConcCap, 24, 1, 1000), ffmpegConcurrency: toInt(s.ffmpegConcurrency, 2, 1, 16), uploadFinalizeConcurrency: toInt(s.uploadFinalizeConcurrency, 4, 1, 32), mediaFinalizeMode: s.mediaFinalizeMode === 'stream' ? 'stream' : 'buffer', mediaNormalizationPlacement: ['api', 'worker', 'off'].includes(s.mediaNormalizationPlacement) ? s.mediaNormalizationPlacement : 'api' });
+        setLoaded({ ...s, workspaceModelSort: m, genRateLimit: { limit: lim, windowSec: win }, maxThreads: toInt(s.maxThreads, 10, 1, 1000), userGenerationActiveLimit: toInt(s.userGenerationActiveLimit, 8, 1, 64), providerAggregateConcCap: toInt(s.providerAggregateConcCap, 24, 1, 1000), ffmpegConcurrency: toInt(s.ffmpegConcurrency, 2, 1, 16), uploadFinalizeConcurrency: toInt(s.uploadFinalizeConcurrency, 4, 1, 32), mediaFinalizeMode: s.mediaFinalizeMode === 'stream' ? 'stream' : 'buffer', mediaNormalizationPlacement: ['api', 'worker', 'off'].includes(s.mediaNormalizationPlacement) ? s.mediaNormalizationPlacement : 'api' });
       } catch {
         // 读不到配置不阻断
       } finally {
@@ -116,6 +121,7 @@ export default function SystemSettingsPage() {
     workspaceModelSort: loaded.workspaceModelSort,
     genRateLimit: { limit: (loaded.genRateLimit as { limit?: number })?.limit ?? 30, windowSec: (loaded.genRateLimit as { windowSec?: number })?.windowSec ?? 60 },
     maxThreads: loaded.maxThreads ?? 10,
+    userGenerationActiveLimit: loaded.userGenerationActiveLimit ?? 8,
     providerAggregateConcCap: loaded.providerAggregateConcCap ?? 24,
     ffmpegConcurrency: loaded.ffmpegConcurrency ?? 2,
     uploadFinalizeConcurrency: loaded.uploadFinalizeConcurrency ?? 4,
@@ -226,6 +232,20 @@ export default function SystemSettingsPage() {
           <label className="mb-1.5 flex items-center gap-1.5 text-xs font-medium text-zinc-300"><Gauge className="h-3.5 w-3.5 text-zinc-500" />最大并发任务数（maxThreads）</label>
           {numInput(maxThreads, setMaxThreads, 1, 1000)}
           <p className="mt-1 text-[11px] text-zinc-600">取值范围 1 – 1000，默认 10</p>
+        </div>
+      </section>
+
+      {/* 单用户在途任务上限 */}
+      <section className="mt-6 rounded-2xl border border-zinc-800 bg-zinc-900/40 p-5">
+        <div className="mb-1 flex items-center gap-2"><Gauge className="h-4 w-4 text-emerald-400" /><h2 className="text-sm font-medium text-zinc-100">单用户在途任务上限</h2></div>
+        <p className="mb-4 text-xs text-zinc-500">
+          <span className="text-zinc-300">功能：</span>同一用户同时处于「生成中 / 排队中」状态的任务数量上限。<br />
+          <span className="text-zinc-300">作用：</span>防止连续点击、脚本或异常前端在同一时刻堆积大量生成与上传，把 CPU / 内存 / 供应商配额一次性打满导致「卡前后台甚至宕机」。超过上限时新的生成请求返回 429，提示等待。修改后 30 秒内生效。
+        </p>
+        <div>
+          <label className="mb-1.5 flex items-center gap-1.5 text-xs font-medium text-zinc-300"><Gauge className="h-3.5 w-3.5 text-zinc-500" />单用户在途任务数上限</label>
+          {numInput(userActiveLimit, setUserActiveLimit, 1, 64)}
+          <p className="mt-1 text-[11px] text-zinc-600">取值范围 1 – 64，默认 8</p>
         </div>
       </section>
 

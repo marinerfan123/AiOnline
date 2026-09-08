@@ -192,3 +192,18 @@ storybook-static/
 # Playwright artifacts
 playwright-report/
 test-results/
+
+# ===== 工作树副本（其它 worktree 的完整项目，绝不入主仓） =====
+.worktrees/
+
+# ===== 运行时媒体文件（本地生成/上传产物，绝不入库） =====
+server/data/media/
+
+# ===== 根目录临时调试脚本（本地复现用，不入库） =====
+/inspect_pending.cjs
+/repro_pending_refresh.cjs
+/repro_studio_500.cjs
+
+# ===== Hermes Agent 工作目录（本机会话状态，绝不入库） =====
+.hermes/
+

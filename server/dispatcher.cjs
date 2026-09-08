@@ -15,6 +15,7 @@ const { loadDispatchPairs } = require('./modules/modelhub/bindings.cjs');
 const { makeJobRecorder, NULL_RECORDER, recordResumeJob } = require('./modules/modelhub/jobs.cjs');
 const router = require('./modules/modelhub/router.cjs'); // Phase 3.4 确定性智能路由（纯函数，非阻断接入）
 const assetFinalize = require('./assetFinalize.cjs'); // Phase 1 主流化：服务端最终化 provider 资源到 OSS + 写 media（替代前端 processResultImages）
+const { sanitizeGenerationResultForList } = require('./modules/media/persistenceGuard.cjs'); // P0 Base64 Kill：active 列表脱敏
 const uploadQueue = require('./uploadQueue.cjs'); // 搬运与 API 解耦：终态上传移出请求/SSE 关键路径，后台队列异步搬
 const rateLimit = require('./rateLimitRedis.cjs'); // Redis 共享限流（多 worker/多实例安全，#360 解法）
 const cpuMonitor = require('./cpuMonitor.cjs'); // CPU 自适应负载降级（80% 阈值进入 SHED，返 503）
@@ -151,6 +152,7 @@ function getKeyStates(pid) {
     id: ks.id, status: ks.status, conc: ks.conc, consecutiveFailures: ks.consecutiveFailures,
     lastUsedAt: ks.lastUsedAt ? new Date(ks.lastUsedAt).toISOString() : null,
     cbState: ks.cbState ? ks.cbState.state : null,
+    cooldownUntilMs: ks.cooldownUntil || 0,   // 429 冷却到期时刻(ms epoch, 0=未冷却)，供模型状态页判「冷却中」
   }));
 }
 
@@ -414,7 +416,9 @@ function toDataUri(raw) {
   if (!raw) return '';
   const s = String(raw).trim();
   if (s.startsWith('data:') || s.startsWith('http://') || s.startsWith('https://')) return s;
-  // provider 返回的 b64_json 是裸 base64，必须包装成 data URI 才能作为 img.src / 持久化 URL 使用
+  // provider 返回的 b64_json 是裸 base64，必须包装成 data URI 才能作为 img.src / 内存态传递。
+  // P0 Base64 Kill：此处仅为「内存内解码适配」（provider b64_json → data URI），
+  // 绝不直接持久化——最终化前 assetFinalize/uploadQueue 会先落 managed local 再写库（见 persistenceGuard）。
   return `data:image/png;base64,${s}`;
 }
 
@@ -1047,9 +1051,8 @@ async function completeViaQueue(pgPool, { userId, taskId, cost, costPool, idempo
   }
 }
 
-// 启动后台上传队列（仅 IS_LEADER 调用）：建表 + 崩溃恢复 + 起 worker
+// 启动后台上传队列（仅 IS_LEADER 调用）：崩溃恢复 + 起 worker（表结构已由迁移 0075 管理）
 async function startUploadQueue(pgPool) {
-  await uploadQueue.ensureUploadJobsTable(pgPool);
   await uploadQueue.recoverUploadJobs(pgPool);
   uploadQueue.startUploadWorker(pgPool);
   console.log('[dispatcher] 上传队列 worker 已挂载（搬运已解耦至后台）');
@@ -1650,7 +1653,7 @@ async function resumeRunningImageTasks(pgPool) {
           AND (provider_task_id IS NULL OR provider_task_id = '')
           AND resume_meta->'waitingOpts' IS NULL
           AND created_at < NOW() - INTERVAL '1 minute'
-          AND created_at > NOW() - INTERVAL '6 hours'`,
+          AND created_at > NOW() - INTERVAL '90 minutes'`,
     );
     let resumed = 0;
     let reviewCount = 0;
@@ -2012,7 +2015,8 @@ async function listActiveTasks(pgPool, userId) {
       tasks: r.rows.map((row) => ({
         taskId: row.task_id,
         status: row.status,
-        result: row.result || null,
+        // P0 Base64 Kill：列表接口绝不吐内联 base64/data URI（脱敏后仍保留 summary 结构）。
+        result: sanitizeGenerationResultForList(row.result || null),
         error: row.error || '',
         pendingIds: row.pending_ids || [],
         clientMeta: row.client_meta || {},

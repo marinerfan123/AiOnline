@@ -27,7 +27,7 @@ const fsp = fs.promises;
 const path = require('path');
 const crypto = require('crypto');
 
-const DEFAULT_ROOT_DIR = '/app/data/media';
+const DEFAULT_ROOT_DIR = process.env.MEDIA_LOCAL_DIR || '/app/data/media';
 
 // get() 未命中哨兵：与「空 buffer」可区分（Buffer.alloc(0) 也是合法内容）。
 const MEDIA_NOT_FOUND = Symbol('localMediaStore.notFound');

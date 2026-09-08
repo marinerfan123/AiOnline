@@ -10,6 +10,7 @@ test('normalize 缺省/非法值回退默认', () => {
   assert.equal(r.uploadFinalizeConcurrency, DEFAULTS.uploadFinalizeConcurrency);
   assert.equal(r.mediaFinalizeMode, 'buffer');
   assert.equal(r.mediaNormalizationPlacement, 'api');
+  assert.equal(r.userGenerationActiveLimit, DEFAULTS.userGenerationActiveLimit);
 });
 
 test('normalize 读入合法值并钳制范围', () => {
@@ -17,6 +18,7 @@ test('normalize 读入合法值并钳制范围', () => {
     providerAggregateConcCap: 5000,  // 合法范围 [1,100000] 内 → 原样
     ffmpegConcurrency: 0,          // 低于下限 → 钳到 1（下限）
     uploadFinalizeConcurrency: 99, // 越界 → 钳到 32
+    userGenerationActiveLimit: 32,
     mediaFinalizeMode: 'stream',
     mediaNormalizationPlacement: 'worker',
   });
@@ -25,6 +27,7 @@ test('normalize 读入合法值并钳制范围', () => {
   assert.equal(r.uploadFinalizeConcurrency, 32);
   assert.equal(r.mediaFinalizeMode, 'stream');
   assert.equal(r.mediaNormalizationPlacement, 'worker');
+  assert.equal(r.userGenerationActiveLimit, 32);
 
   const over = normalize({ providerAggregateConcCap: 999999 });
   assert.equal(over.providerAggregateConcCap, 100000); // 越界 → 钳到上限

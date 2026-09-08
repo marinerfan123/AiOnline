@@ -31,6 +31,7 @@ import {
   CreditCard,
   Receipt,
   Route,
+  Gauge,
 } from 'lucide-react';
 
 /** 后台模块归属的层级分组（对应长期架构的 L0~L3 + 总览） */
@@ -74,6 +75,7 @@ export const ADMIN_MODULES: AdminModule[] = [
   { key: 'admin-model-hub', label: '模型 Hub', icon: Cpu, path: '/model-hub', group: 'supply', end: true },
   { key: 'admin-models', label: '模型价格', icon: SlidersHorizontal, path: '/admin/models', group: 'supply' },
   { key: 'admin-routing', label: '智能路由', icon: Route, path: '/admin/routing', group: 'supply' },
+  { key: 'admin-key-pool', label: '模型状态', icon: Gauge, path: '/admin/key-pool', group: 'supply' },
   // 技能注册原本错挂"财务与电商"，后端实属 shop 域的能力注册表（市集+智能体共用），
   // 归到供给侧更贴切。
   { key: 'admin-skills', label: '技能注册', icon: Boxes, path: '/admin/skills', group: 'supply' },

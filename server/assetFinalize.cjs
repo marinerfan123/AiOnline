@@ -29,6 +29,7 @@ const {
   normalizeOutputMetadata,
   probeBufferWithFfprobe,
 } = require('./modules/media/outputMeta.cjs');
+const { isInlineDataUri, assertNotInlinePayload } = require('./modules/media/persistenceGuard.cjs');
 
 const MAX_BYTES = 50 * 1024 * 1024; // 50 MB
 const FETCH_TIMEOUT_MS = 30000;
@@ -37,6 +38,50 @@ function genMediaId(prefix = 'mf') {
   // 主流生成算法：prefix + 时间戳 + 16 hex 随机；保证 PG id 唯一且时间序
   const rnd = require('crypto').randomBytes(8).toString('hex');
   return `${prefix}-${Date.now().toString(36)}-${rnd}`;
+}
+
+// ─── P0 Base64 Kill：内联 data URI → managed local 落盘 ──────────────────
+// 复用 localMediaStore 原子写（tmp→rename）。store 可注入（测试用临时目录）。
+function managedLocalStore() {
+  return ossMod.localStoreFor({ providerType: 'local-disk' });
+}
+
+function extForMime(mimeType) {
+  const m = String(mimeType || '').toLowerCase();
+  if (m.includes('png')) return 'png';
+  if (m.includes('jpeg') || m.includes('jpg')) return 'jpg';
+  if (m.includes('webp')) return 'webp';
+  if (m.includes('gif')) return 'gif';
+  if (m.includes('mp4')) return 'mp4';
+  if (m.includes('webm')) return 'webm';
+  if (m.includes('mov')) return 'mov';
+  return 'bin';
+}
+
+// 把已解码的 Buffer 落到 managed local，返回 { url, key, sha256, sizeBytes, mimeType }。
+// 抛错 = managed local 不可写（调用方据此 fail-closed）。
+async function putManagedLocal(buffer, { userId, taskId, idx, contentType, store }) {
+  const safeUid = String(userId || 'anon').replace(/[^A-Za-z0-9._-]/g, '_');
+  const key = `managed/${safeUid}/${taskId}-${idx}.${extForMime(contentType)}`;
+  const s = store || managedLocalStore();
+  const r = await s.put({ objectKey: key, buffer });
+  return { url: s.urlFor(r.key), key: r.key, sizeBytes: buffer.length, mimeType: contentType || 'application/octet-stream' };
+}
+
+// P0 Base64 Kill：把单个 provider URL 里的内联 data URI 落 managed local，返回替换后的 URL。
+// 非内联 URL 原样返回；落盘失败抛错（调用方 fail-closed）。
+// ctx: { userId, taskId, idx, store }（store 可选，测试注入临时目录）。
+async function materializeInlineUrl(url, ctx) {
+  if (!isInlineDataUri(url)) return url;
+  const comma = String(url).indexOf(',');
+  if (comma === -1) throw new Error('data URI 格式错误');
+  const meta = String(url).slice(5, comma);
+  const mimeType = (meta.split(';')[0] || 'application/octet-stream').trim();
+  const buffer = Buffer.from(String(url).slice(comma + 1), 'base64');
+  if (buffer.length === 0) throw new Error('内联 data URI 为空');
+  if (buffer.length > MAX_BYTES) throw new Error('超过 50MB 上限');
+  const stored = await putManagedLocal(buffer, { userId: ctx.userId, taskId: ctx.taskId, idx: ctx.idx, contentType: mimeType, store: ctx.store });
+  return stored.url;
 }
 
 function isBlockedHost(host) {
@@ -85,6 +130,19 @@ async function webStreamToBuffer(webStream) {
 }
 
 async function fetchBytes(url) {
+  // P0 Base64 Kill：managed local URL（/local-media/<key>）→ 直接从本地 store 读，不走 HTTP/SSRF。
+  if (typeof url === 'string' && url.startsWith('/local-media/')) {
+    const key = ossMod.decodeUrlKey(url);
+    if (!key) throw new Error('非法 managed local key');
+    const store = managedLocalStore();
+    const buf = await store.get({ objectKey: key });
+    if (ossMod.isMediaNotFound(buf)) throw new Error('managed local 资源不存在');
+    if (buf.length === 0) throw new Error('空文件');
+    if (buf.length > MAX_BYTES) throw new Error('超过 50MB 上限');
+    const ext = String(key.split('.').pop() || 'bin').toLowerCase();
+    const ct = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp', gif: 'image/gif', mp4: 'video/mp4', webm: 'video/webm', mov: 'video/quicktime', bin: 'application/octet-stream' }[ext] || 'application/octet-stream';
+    return { buffer: buf, contentType: ct, byteLength: buf.length, isStream: false };
+  }
   let parsed;
   try { parsed = new URL(String(url)); } catch { throw new Error('非法 URL'); }
 
@@ -285,13 +343,15 @@ function buildGetUrl(cfg, objectKey) {
  */
 async function finalizeUrl(pgPool, opts) {
   if (!pgPool) throw new Error('数据库不可用，无法最终化资源');
-  const { userId, taskId, idx, providerUrl, type = 'image', prompt = '', model = '', ratio = '1:1', creditCost, pendingId, referenceImages = [], captureChecksum, expectedChecksum, probe } = opts;
+  const { userId, taskId, idx, providerUrl, type = 'image', prompt = '', model = '', ratio = '1:1', creditCost, pendingId, referenceImages = [], captureChecksum, expectedChecksum, probe, managedStore } = opts;
   if (!userId) throw new Error('userId 缺失');
   if (!providerUrl) throw new Error('providerUrl 缺失');
 
   const ossLog = ossMod.log;
   const tag = `task=${taskId} idx=${idx}`;
   const mediaId = pendingId || genMediaId(type === 'video' ? 'v' : 'm');
+  // P0 Base64 Kill：provider 源可能是内联 data URI。命中即必须在任何持久化前落到 managed local。
+  const wasInline = isInlineDataUri(providerUrl);
 
   let ossUrl = '';
   let ossObjectKey = '';
@@ -305,6 +365,9 @@ async function finalizeUrl(pgPool, opts) {
   let md5Hex = null;
   let md5Base64 = null;
   let metaRaw = null;
+  // P0：内联 base64 的 managed local 副本引用；null = 尚未落盘或落盘失败。
+  let managedLocal = null;
+  let managedLocalError = '';
 
   // ── 1. 拉字节 ──
   let fetched = null;
@@ -313,6 +376,12 @@ async function finalizeUrl(pgPool, opts) {
     contentType = fetched.contentType;
     fileSize = fetched.byteLength || (fetched.buffer ? fetched.buffer.length : 0);
   } catch (e) {
+    // P0 Base64 Kill：内联 data URI 解码失败 → 显式失败，绝不把 data URI 写进 media/provider_url。
+    if (wasInline) {
+      ossLog('warn', 'finalize', `[assetFinalize] ⚠️ 内联 data URI 解码失败 ${tag} → ${e.message}（显式失败，不持久化 base64）`, { taskId, userId, error: e.message });
+      await insertMedia(pgPool, { mediaId, userId, taskId, type, prompt, model, ratio, providerUrl: '', referenceImages, ossUrl: '', ossObjectKey: '', ossUploaded: false, contentType, fileSize: 0, status: 'failed', errorMessage: e.message });
+      return { mediaId, pendingId: mediaId, ossUrl: '', ossObjectKey: '', ossUploaded: false, status: 'failed', providerUrl: '', contentType, fileSize: 0, type };
+    }
     // 拉取即失败：写 status=pending_upload（OSS 也跳过）→ 让 reaper 后续重试
     ossLog('warn', 'finalize', `[assetFinalize] ⚠️ 拉取失败 ${tag} → ${e.message}（占位先入库，reaper 后重试）`, { taskId, userId, providerUrl: String(providerUrl).slice(0, 80), error: e.message, durationMs: 0 });
     await insertMedia(pgPool, { mediaId, userId, taskId, type, prompt, model, ratio, providerUrl, referenceImages, ossUrl, ossObjectKey, ossUploaded, contentType, fileSize: 0, status: 'pending_upload', errorMessage: e.message });
@@ -355,6 +424,31 @@ async function finalizeUrl(pgPool, opts) {
     }
   }
 
+  // ── 1.6 P0 Base64 Kill：内联 data URI 只算 sha256，落盘改为 LAZY ──
+  // OSS 成功路径不写 managed local（避免孤儿副本占盘）；仅 OSS 失败/未启用时才落 managed local 兜底。
+  if (wasInline && fetched && fetched.buffer) {
+    try {
+      if (!sha256) sha256 = computeSha256(fetched.buffer);
+      fileSize = fetched.buffer.length;
+    } catch (_) {}
+  }
+  // lazy materialize（幂等：只落一次；失败返回 null 且记录 managedLocalError → 上层 fail-closed）
+  async function ensureManagedLocal() {
+    if (managedLocal) return managedLocal;
+    if (!fetched || !fetched.buffer) return null;
+    try {
+      const stored = await putManagedLocal(fetched.buffer, { userId, taskId, idx, contentType, store: managedStore });
+      managedLocal = { url: stored.url, key: stored.key, sizeBytes: stored.sizeBytes, mimeType: stored.mimeType };
+      ossLog('info', 'finalize', `[assetFinalize] 内联 base64 已落 managed local ${tag}`, { taskId, userId, byteLength: stored.sizeBytes });
+      return managedLocal;
+    } catch (e) {
+      managedLocal = null;
+      managedLocalError = e && e.message ? e.message : String(e);
+      ossLog('warn', 'finalize', `[assetFinalize] ⚠️ managed local 落盘失败 ${tag} → ${managedLocalError}`, { taskId, userId });
+      return null;
+    }
+  }
+
   // ── 2. OSS 直传 ──
   const cfg = await pickActiveCfg(pgPool, ossLog);
   const t0 = Date.now();
@@ -383,13 +477,35 @@ async function finalizeUrl(pgPool, opts) {
       ossLog('success', 'finalize', `[assetFinalize] [${providerTag}] ✅ 直传 ${ossObjectKey} → GET 7d（${Date.now() - t0}ms）`, { taskId, userId, providerType: cfg.providerType, bucket: cfg.bucket, objectKey: ossObjectKey, byteLength: fileSize, contentType, durationMs: Date.now() - t0 });
     } catch (e) {
       ossLog('warn', 'finalize', `[assetFinalize] ⚠️ OSS PUT 失败 ${tag} → ${e.message}（仍写占位，reaper 重试）`, { taskId, userId, objectKey: ossObjectKey, providerType: cfg && cfg.providerType, error: e.message });
+      // P0 Base64 Kill：内联 base64 → OSS 失败用 managed local 兜底；managed local 也失败 → 显式失败（fail-closed）。
+      if (wasInline) {
+        const ml = await ensureManagedLocal();
+        if (ml) {
+          await insertMedia(pgPool, { mediaId, userId, taskId, type, prompt, model, ratio, providerUrl: ml.url, referenceImages, ossUrl: ml.url, ossObjectKey: '', ossUploaded: false, contentType, fileSize, status: 'pending_upload', errorMessage: e.message });
+          return { mediaId, pendingId: mediaId, ossUrl: ml.url, ossObjectKey: '', ossUploaded: false, status: 'pending_upload', providerUrl: ml.url, contentType, fileSize, type, sha256 };
+        }
+        await insertMedia(pgPool, { mediaId, userId, taskId, type, prompt, model, ratio, providerUrl: '', referenceImages, ossUrl: '', ossObjectKey: '', ossUploaded: false, contentType, fileSize, status: 'failed', errorMessage: `OSS 与 managed local 均失败：${e.message}${managedLocalError ? ' / ' + managedLocalError : ''}` });
+        return { mediaId, pendingId: mediaId, ossUrl: '', ossObjectKey: '', ossUploaded: false, status: 'failed', providerUrl: '', contentType, fileSize, type };
+      }
       // OSS 失败：仍写占位（status=pending_upload），保留 providerUrl 供展示/重试
       await insertMedia(pgPool, { mediaId, userId, taskId, type, prompt, model, ratio, providerUrl, referenceImages, ossUrl, ossObjectKey, ossUploaded: false, contentType, fileSize, status: 'pending_upload', errorMessage: e.message });
       return { mediaId, pendingId: mediaId, ossUrl: providerUrl, ossObjectKey: '', ossUploaded: false, status: 'pending_upload', providerUrl, contentType, fileSize, type };
     }
   } else {
-    // OSS 未开：直接用 providerUrl 作为展示 URL，写 success 状态，reaper 不再重试
-    // ossUploaded=false：没有真正上传到OSS，前端不应显示OSS角标
+    // OSS 未开：HTTP providerUrl 直接展示（现有行为）；内联 base64 走 managed local（P0 修复）。
+    if (wasInline) {
+      const ml = await ensureManagedLocal();
+      if (ml) {
+        // OSS disabled + managed local 就绪 → finalize 成功（managed local 为 durable 引用，绝不 data URI）。
+        await insertMedia(pgPool, { mediaId, userId, taskId, type, prompt, model, ratio, providerUrl: ml.url, referenceImages, thumbnail: '', ossUrl: ml.url, ossObjectKey: '', ossUploaded: false, contentType, fileSize, status: 'success', errorMessage: '' });
+        await recordAssetVersion(pgPool, { mediaId, taskId, model, storageKey: ml.key, sizeBytes: fileSize });
+        return { mediaId, pendingId: mediaId, ossUrl: ml.url, thumbnail: '', ossObjectKey: '', ossUploaded: false, status: 'success', providerUrl: ml.url, contentType, fileSize, type, sha256, md5Hex, md5Base64, meta: metaRaw };
+      }
+      // OSS disabled + managed local 也失败 → 显式存储失败（fail-closed，绝不 persist data URI）。
+      await insertMedia(pgPool, { mediaId, userId, taskId, type, prompt, model, ratio, providerUrl: '', referenceImages, ossUrl: '', ossObjectKey: '', ossUploaded: false, contentType, fileSize, status: 'failed', errorMessage: `OSS 未启用且 managed local 落盘失败：${managedLocalError || 'unknown'}` });
+      return { mediaId, pendingId: mediaId, ossUrl: '', thumbnail: '', ossObjectKey: '', ossUploaded: false, status: 'failed', providerUrl: '', contentType, fileSize, type };
+    }
+    // 非内联（HTTP URL）+ OSS 未开：沿用 providerUrl 直接展示
     ossLog('info', 'finalize', `[assetFinalize] OSS 未启用，使用 providerUrl 直接展示 ${tag}`, { taskId, userId, providerUrl: String(providerUrl).slice(0, 80), byteLength: fileSize });
     await insertMedia(pgPool, { mediaId, userId, taskId, type, prompt, model, ratio, providerUrl, referenceImages, thumbnail: '', ossUrl: providerUrl, ossObjectKey: '', ossUploaded: false, contentType, fileSize, status: 'success', errorMessage: '' });
     // G08 — 生成结果版本化（OSS 未启用：storage_key 为空）
@@ -409,6 +525,10 @@ async function finalizeUrl(pgPool, opts) {
 // media 表 INSERT（或幂等 UPSERT）
 async function insertMedia(pgPool, row) {
   const id = row.mediaId;
+  // P0 Base64 Kill 写边界守卫：任何内联 data URI 出现在持久化字段都 fail-closed。
+  assertNotInlinePayload(row.thumbnail, 'media.thumbnail');
+  assertNotInlinePayload(row.ossUrl, 'media.oss_url');
+  assertNotInlinePayload(row.providerUrl, 'media.provider_url');
   const fields = `(id, task_id, type, thumbnail, full_url, prompt, model, ratio, source, is_favorite, is_deleted, oss_url, oss_object_key, oss_uploaded, status, error_message, file_size, user_id, category, provider_url, reference_images)`;
   const values = `($1,$2,$3,$4,$5,$6,$7,$8,'user',FALSE,FALSE,$9,$10,$11,$12,$13,$14,$15,'generated',$16,$17::jsonb)`;
   // 用 ON CONFLICT (id) DO UPDATE 保证幂等（重入不重复插入）
@@ -891,6 +1011,12 @@ module.exports = {
   insertMedia,
   insertAssetVersion,
   recordAssetVersion,
+  // P0 Base64 Kill 出口（uploadQueue/dispatcher 复用）
+  materializeInlineUrl,
+  putManagedLocal,
+  managedLocalStore,
+  isInlineDataUri,
+  assertNotInlinePayload,
   // L27 OutputManifest（§78-80）
   normalizeOutputArtifact,
   normalizeOutputArtifacts,

@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { compactMediaPayload, parseLegacyDataUrl, pickMediaProbeUrl } = require('../../media-payload.cjs');
+const { compactMediaPayload, parseLegacyDataUrl, pickMediaProbeUrl, mediaListSelectColumns } = require('../../media-payload.cjs');
 
 test('media list replaces duplicated legacy data URLs with lazy authenticated content URL', () => {
   const data = 'data:image/png;base64,aGVsbG8=';
@@ -26,6 +26,13 @@ test('file-size probe ignores structured/non-public URL values and falls back to
     'https://oss.example/signed',
   );
   assert.equal(pickMediaProbeUrl('/api/media/m/content', 'data:image/png;base64,aA=='), '');
+});
+
+test('media list SQL projection excludes heavyweight provider_url', () => {
+  const columns = mediaListSelectColumns();
+  assert.match(columns, /\bid\b/);
+  assert.match(columns, /\bthumbnail\b/);
+  assert.doesNotMatch(columns, /\bprovider_url\b/);
 });
 
 test('legacy content parser validates and decodes image data URL', () => {

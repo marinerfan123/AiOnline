@@ -108,6 +108,32 @@ export async function apiGetMediaCounts(): Promise<MediaCounts | null> {
   try { return await apiFetch<MediaCounts>('/api/media/counts'); } catch { return null; }
 }
 
+// ─── 模型状态（密钥池待命/冷却）───
+export interface KeyPoolInfo {
+  total: number; active: number; isolated: number; ready: number; cooling: number; cbOpen: number;
+}
+export interface CoolingKeyInfo {
+  id: string; label: string; coolingLeftSec: number; cbState: string | null; lastUsedAt: string | null;
+}
+export interface KeyPoolProvider {
+  providerId: string; name: string; enabled: boolean; validKey: boolean;
+  keyMasked: string; maxConcurrent: number | null;
+  pool: KeyPoolInfo; coolingKeys: CoolingKeyInfo[];
+}
+export interface ModelKeyPoolRow {
+  modelId: string; displayName: string; type: string; enabled: boolean;
+  providers: { providerId: string; name: string; pool: KeyPoolInfo; coolingKeys: CoolingKeyInfo[] }[];
+  readyKeys: number; coolingKeys: number; canGenerate: boolean; allCooling: boolean;
+}
+export interface KeyPoolStatusPayload {
+  ts: string; pools: KeyPoolProvider[]; models: ModelKeyPoolRow[];
+  agg: { total: number; ready: number; cooling: number; isolated: number };
+  modelsTotal: number; modelsReady: number; modelsCooling: number;
+}
+export async function apiAdminKeyPoolStatus(): Promise<KeyPoolStatusPayload | null> {
+  try { return await apiFetch<KeyPoolStatusPayload>('/api/admin/key-pool-status'); } catch { return null; }
+}
+
 // ─── Providers ──────────────────────────────────
 export async function apiGetProviders(): Promise<any[]> {
   try { return await apiFetch('/api/providers'); } catch { return []; }

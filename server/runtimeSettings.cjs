@@ -7,6 +7,7 @@
 //   providerAggregateConcCap    单服务商聚合并发硬顶（防止「每 key 并发 × key 数」无限放大）
 //   ffmpegConcurrency           ffmpeg/ffprobe 全局并发数（媒体归一化 worker 信号量）
 //   uploadFinalizeConcurrency   生成产物 finalize（拉取→哈希→OSS）并发数
+//   userGenerationActiveLimit   单用户 running/waiting 任务硬上限（连续提交防洪）
 //   mediaFinalizeMode           产物最终化方式：buffer(整文件缓冲+MD5，完整性优先) | stream(纯流式直传，省内存/CPU)
 //   mediaNormalizationPlacement 媒体归一化(ffmpeg)运行位置：api | worker | off
 
@@ -14,6 +15,7 @@ const DEFAULTS = Object.freeze({
   providerAggregateConcCap: 24,
   ffmpegConcurrency: 2,
   uploadFinalizeConcurrency: 4,
+  userGenerationActiveLimit: 8,
   mediaFinalizeMode: 'buffer',
   mediaNormalizationPlacement: 'api',
 });
@@ -30,6 +32,7 @@ function normalize(appValue) {
     providerAggregateConcCap: clampInt(v.providerAggregateConcCap, DEFAULTS.providerAggregateConcCap, 1, 100000),
     ffmpegConcurrency: clampInt(v.ffmpegConcurrency, DEFAULTS.ffmpegConcurrency, 1, 64),
     uploadFinalizeConcurrency: clampInt(v.uploadFinalizeConcurrency, DEFAULTS.uploadFinalizeConcurrency, 1, 32),
+    userGenerationActiveLimit: clampInt(v.userGenerationActiveLimit, DEFAULTS.userGenerationActiveLimit, 1, 64),
     mediaFinalizeMode: v.mediaFinalizeMode === 'stream' ? 'stream' : 'buffer',
     mediaNormalizationPlacement: ['api', 'worker', 'off'].includes(v.mediaNormalizationPlacement) ? v.mediaNormalizationPlacement : 'api',
   };

@@ -3,13 +3,14 @@
 import { useState, useEffect, useCallback } from 'react';
 import { toast } from 'sonner';
 import {
-  Check, X, Loader2, AlertTriangle, Search, Eye, User, Calendar, Filter,
+  Check, X, Loader2, AlertTriangle, Search, Eye, User, Calendar, Filter, Trash2,
 } from 'lucide-react';
 import Image from '@/components/ui/image';
 import {
   apiAdminGetReferenceStyles,
   apiAdminReviewReferenceStyle,
   apiAdminPromoteReferenceStyle,
+  apiDeleteReferenceStyle,
   type ReferenceStyle,
 } from '@/services/api';
 
@@ -48,6 +49,8 @@ export default function ReferenceStylesReviewPage() {
   // 推行设置（强制推行 + 分成比例）的本地编辑态，按 id 覆盖
   const [promoteMap, setPromoteMap] = useState<Record<string, { isPromoted: boolean; commissionRate: number }>>({});
   const [busyPromoteId, setBusyPromoteId] = useState<string | null>(null);
+  const [deleting, setDeleting] = useState<ReferenceStyle | null>(null);
+  const [busyDeleteId, setBusyDeleteId] = useState<string | null>(null);
 
   const getPV = (item: ReferenceStyle) =>
     promoteMap[item.id] ?? { isPromoted: !!item.isPromoted, commissionRate: item.commissionRate ?? 0 };
@@ -115,6 +118,30 @@ export default function ReferenceStylesReviewPage() {
       toast.error('审核失败：' + (e?.message || e));
     } finally {
       setBusyId(null);
+    }
+  };
+
+  const removeStyle = async (item: ReferenceStyle) => {
+    setBusyDeleteId(item.id);
+    try {
+      const result = await apiDeleteReferenceStyle(item.id);
+      if (!result.ok) {
+        toast.error('删除失败，请重试');
+        return;
+      }
+      setItems((current) => current.filter((entry) => entry.id !== item.id));
+      setTotal((current) => Math.max(0, current - 1));
+      setPromoteMap((current) => {
+        const next = { ...current };
+        delete next[item.id];
+        return next;
+      });
+      setDeleting(null);
+      toast.success('参考样式已删除');
+    } catch (error) {
+      toast.error('删除失败：' + (error instanceof Error ? error.message : String(error)));
+    } finally {
+      setBusyDeleteId(null);
     }
   };
 
@@ -292,8 +319,20 @@ export default function ReferenceStylesReviewPage() {
                           </button>
                         </div>
                       ) : (
-                        <div className="text-xs text-zinc-500">
-                          已终审：{item.reviewedAt ? new Date(item.reviewedAt).toLocaleString('zh-CN') : '-'}
+                        <div className="flex flex-col items-end gap-2">
+                          <div className="text-xs text-zinc-500">
+                            已终审：{item.reviewedAt ? new Date(item.reviewedAt).toLocaleString('zh-CN') : '-'}
+                          </div>
+                          <button
+                            type="button"
+                            aria-label={`删除${item.name || '未命名样式'}`}
+                            disabled={busyDeleteId === item.id}
+                            onClick={() => setDeleting(item)}
+                            className="inline-flex items-center gap-1 rounded-lg border border-rose-500/30 px-2.5 py-1.5 text-xs text-rose-400 transition-colors hover:bg-rose-500/10 disabled:opacity-40"
+                          >
+                            {busyDeleteId === item.id ? <Loader2 className="size-3.5 animate-spin" /> : <Trash2 className="size-3.5" />}
+                            删除
+                          </button>
                         </div>
                       )}
                     </div>
@@ -325,6 +364,37 @@ export default function ReferenceStylesReviewPage() {
           </div>
         )}
       </div>
+
+      {deleting && (
+        <div className="fixed inset-0 z-[9999] flex items-center justify-center p-4">
+          <div className="absolute inset-0 bg-black/70 backdrop-blur-sm" onClick={() => !busyDeleteId && setDeleting(null)} />
+          <div role="dialog" aria-modal="true" className="relative z-10 w-full max-w-sm rounded-2xl border border-zinc-800 bg-zinc-950 p-5 shadow-2xl">
+            <h3 className="text-base font-medium text-zinc-100">确认删除参考样式？</h3>
+            <p className="mt-2 text-sm leading-6 text-zinc-500">
+              “{deleting.name || '未命名样式'}”将从审核列表和前台精选中永久移除，此操作不可撤销。
+            </p>
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                type="button"
+                disabled={busyDeleteId === deleting.id}
+                onClick={() => setDeleting(null)}
+                className="rounded-xl bg-zinc-800 px-4 py-2 text-sm text-zinc-200 hover:bg-zinc-700 disabled:opacity-50"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                disabled={busyDeleteId === deleting.id}
+                onClick={() => removeStyle(deleting)}
+                className="inline-flex items-center gap-1.5 rounded-xl bg-rose-500 px-4 py-2 text-sm font-medium text-white hover:bg-rose-400 disabled:opacity-50"
+              >
+                {busyDeleteId === deleting.id && <Loader2 className="size-4 animate-spin" />}
+                确认删除
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Reject modal */}
       {reviewing && (

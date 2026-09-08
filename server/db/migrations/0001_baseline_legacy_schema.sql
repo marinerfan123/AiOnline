@@ -61,7 +61,6 @@ CREATE TABLE IF NOT EXISTS media (
   file_size BIGINT,
   task_id TEXT DEFAULT '',
   provider_url TEXT DEFAULT '',
-  reference_images JSONB NOT NULL DEFAULT '[]'::jsonb,
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
@@ -74,7 +73,6 @@ DO $$ BEGIN
   IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='media' AND column_name='character_id') THEN ALTER TABLE media ADD COLUMN character_id TEXT DEFAULT NULL; END IF;
   IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='media' AND column_name='task_id') THEN ALTER TABLE media ADD COLUMN task_id TEXT DEFAULT ''; END IF;
   IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='media' AND column_name='provider_url') THEN ALTER TABLE media ADD COLUMN provider_url TEXT DEFAULT ''; END IF;
-  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='media' AND column_name='reference_images') THEN ALTER TABLE media ADD COLUMN reference_images JSONB NOT NULL DEFAULT '[]'::jsonb; END IF;
   IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='models' AND column_name='mapping_name') THEN ALTER TABLE models ADD COLUMN mapping_name TEXT DEFAULT ''; END IF;
   IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='models' AND column_name='credit_cost') THEN ALTER TABLE models ADD COLUMN credit_cost NUMERIC(18,4) DEFAULT 0; END IF;
   IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='models' AND column_name='estimated_seconds') THEN ALTER TABLE models ADD COLUMN estimated_seconds INT; END IF;

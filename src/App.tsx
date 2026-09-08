@@ -30,6 +30,7 @@ const ModelHubPage = lazy(() => import('@/pages/ModelHubPage/ModelHubPage'));
 const ModelConsole = lazy(() => import('@/pages/ModelConsole/ModelConsole'));
 const ModelPricePage = lazy(() => import('@/pages/Admin/ModelPricePage'));
 const RoutingPage = lazy(() => import('@/pages/Admin/RoutingPage'));
+const KeyPoolPage = lazy(() => import('@/pages/Admin/KeyPoolPage'));
 const AccountPage = lazy(() => import('@/pages/AccountPage/AccountPage'));
 const UserPage = lazy(() => import('@/pages/UserPage/UserPage'));
 const NotFoundPage = lazy(() => import('@/pages/NotFoundPage/NotFoundPage'));
@@ -180,6 +181,8 @@ export default function App() {
           <Route path="logs" element={<LogsPage />} />
           <Route path="errors" element={<ErrorLogsPage />} />
           <Route path="monitoring" element={<MonitoringPage />} />
+          {/* 模型状态：密钥池待命/冷却实时态 */}
+          <Route path="key-pool" element={<KeyPoolPage />} />
           {/* 系统设置：平台级配置聚合（当前承载工作台模型排序） */}
           <Route path="settings" element={<SystemSettingsPage />} />
           <Route path="storage" element={<AdminPlaceholderPage title="存储管理" note="OSS  bucket、CDN、配额与资产生命周期管理（oss_config 表已就绪）。" />} />

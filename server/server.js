@@ -103,6 +103,8 @@ import monitorMod from './monitor.cjs'; // 后台「实时监控 · API 活动�
 import ossLoggerMod from './oss-logger.cjs'; // OssConfigPanel 专用实时日志（仅 /api/oss/*，含脱敏）
 import ossMod from './oss.cjs';             // OSS 签名/loadOssConfigs/diagnoseOssError/logger 统一模块（被 server.js + dispatcher.cjs/assetFinalize.cjs 共用；Phase 1 主流化抽出）
 import mediaPayloadMod from './media-payload.cjs'; // 历史 data URL 列表瘦身 + 按需内容读取（避免 /api/media 返回数百 MB）
+import requestBodyMod from './request-body.cjs'; // 有界 JSON body 解析：超限立即 413，避免并发大请求耗尽堆
+import generationAdmissionMod from './generation-admission.cjs'; // 每用户在途任务准入上限，防连续提交拖垮实例
 import logbusMod from './logbus.cjs';   // 后台「实时日志 · 数据库/Redis/控制台」(统一日志总线 + SSE 广播)
 import syslogMod from './syslog.cjs';    // 核心错误持久化 + 进程级异常兜底(system_error_logs)
 import financeMod from './finance.cjs';  // Phase 4 后台账务系统（底层：总览/对账/账本/套餐）
@@ -1193,13 +1195,11 @@ async function ensureUserDefaults(userId) {
 
 // ─── 请求解析 ───────────────────────────────────
 function parseBody(req) {
-  return new Promise((resolve) => {
-    let body = '';
-    req.on('data', c => { body += c; if (body.length > 50 * 1024 * 1024) body = ''; });
-    req.on('end', () => {
-      try { resolve(body ? JSON.parse(body) : null); }
-      catch { resolve(null); }
-    });
+  return requestBodyMod.parseJsonBody(req).catch((error) => {
+    // Existing handlers expect invalid JSON as null. Preserve that contract,
+    // but let overload protection reach the top-level HTTP error handler.
+    if (error && error.code === 'PAYLOAD_TOO_LARGE') throw error;
+    return null;
   });
 }
 
@@ -2536,6 +2536,137 @@ async function handleAPI(req, res) {
   // 参与口径严格对齐 dispatcher.loadDispatchPairs (server/modules/modelhub/bindings.cjs)：
   //   参与 = 存在 enabled 绑定（或 legacy models.provider_id 回退）且对应服务商 enabled + api_key 有效（>=6 位）。
   //   冷却/熔断 = dispatcher.getAccountStates() 内存态（与 generate 同源），cold 或 cbState∈{OPEN,HALF_OPEN}。
+  if (url === '/api/admin/key-pool-status' && method === 'GET') {
+    // 模型状态页数据源：密钥池内每模型「待命(可立即生成)/冷却(429冷却/熔断)」实时态。
+    // 权威源：api_keys(DB 成员/status/label) + dispatcher 内存 AKEYS(冷却/CB/最近使用, 与 generate 同源)。
+    if (!admin.requireAdmin(req)) return sendJSON(res, 403, { error: '需要管理员权限' });
+    if (!pgPool) return sendJSON(res, 503, { error: '数据库不可用' });
+    try {
+      const now = Date.now();
+      // 1) providers
+      const provRows = await pgPool.query('SELECT id, name, enabled, max_concurrent, api_key FROM providers');
+      // 2) api_keys（DB 权威成员表：id/label/status/DB 冷却）
+      const keyRows = await pgPool.query(
+        `SELECT id, provider_id, label, status, cooldown_until FROM api_keys ORDER BY label NULLS LAST, created_at`
+      );
+      const keysByProvider = {};
+      for (const k of keyRows.rows) {
+        (keysByProvider[k.provider_id] = keysByProvider[k.provider_id] || []).push(k);
+      }
+      // 3) dispatcher 运行时态（每 key 冷却/CB/最近使用）
+      const rtByProvider = {};
+      for (const p of provRows.rows) {
+        const rt = dispatcher.getKeyStates(p.id) || [];
+        const map = {};
+        for (const s of rt) map[s.id] = s;
+        rtByProvider[p.id] = map;
+      }
+      // 4) per-provider 密钥池聚合 + 冷却 key 明细
+      const providerPools = {};
+      for (const p of provRows.rows) {
+        const dbKeys = keysByProvider[p.id] || [];
+        const rtMap = rtByProvider[p.id] || {};
+        let active = 0, isolated = 0, ready = 0, cooling = 0, cbOpen = 0;
+        const coolingKeys = [];
+        for (const k of dbKeys) {
+          const st = rtMap[k.id];
+          const rtCooling = st && st.cooldownUntilMs ? st.cooldownUntilMs > now : false;
+          const cb = st && st.cbState ? st.cbState : 'CLOSED';
+          const dbCooling = k.cooldown_until && new Date(k.cooldown_until).getTime() > now;
+          const isCooling = rtCooling || cb === 'OPEN' || cb === 'HALF_OPEN' || dbCooling;
+          if (k.status === 'active') {
+            active++;
+            if (!isCooling) ready++;
+            else cooling++;
+            if (cb === 'OPEN' || cb === 'HALF_OPEN') cbOpen++;
+          } else {
+            isolated++;
+          }
+          if (isCooling && k.status === 'active') {
+            const untilMs = Math.max(
+              (st && st.cooldownUntilMs) || 0,
+              dbCooling ? new Date(k.cooldown_until).getTime() : 0,
+            );
+            coolingKeys.push({
+              id: k.id,
+              label: k.label || '',
+              coolingLeftSec: Math.max(1, Math.ceil((untilMs - now) / 1000)),
+              cbState: cb === 'CLOSED' ? null : cb,
+              lastUsedAt: st && st.lastUsedAt ? st.lastUsedAt : null,
+            });
+          }
+        }
+        providerPools[p.id] = {
+          providerId: p.id, name: p.name || '', enabled: p.enabled,
+          validKey: !!(p.enabled && p.api_key && p.api_key.length >= 6),
+          keyMasked: p.api_key && p.api_key.length > 4 ? '***' + String(p.api_key).slice(-4) : '***',
+          maxConcurrent: p.max_concurrent,
+          pool: { total: dbKeys.length, active, isolated, ready, cooling, cbOpen },
+          coolingKeys: coolingKeys.sort((a, b) => a.coolingLeftSec - b.coolingLeftSec),
+        };
+      }
+      // 5) 模型 → 候选提供商（对齐 model-participation：legacy enabled + enabled 绑定）
+      const modelRows = await pgPool.query('SELECT id, model_id, display_name, type, provider_id, enabled FROM models');
+      const bindRows = await pgPool.query('SELECT model_id, provider_id, enabled FROM provider_model_bindings');
+      const boundByModel = {};
+      for (const b of bindRows.rows) if (b.enabled) (boundByModel[b.model_id] = boundByModel[b.model_id] || []).push(b.provider_id);
+      const validProviderIds = new Set(Object.values(providerPools).filter((pp) => pp.validKey).map((pp) => pp.providerId));
+      const modelAgg = {};
+      for (const m of modelRows.rows) {
+        const a = (modelAgg[m.model_id] = modelAgg[m.model_id] || { modelId: m.model_id, rows: [], enabledAny: false });
+        a.rows.push(m);
+        if (m.enabled) a.enabledAny = true;
+      }
+      const models = Object.values(modelAgg).map((a) => {
+        const first = a.rows[0];
+        const mappingRow = a.rows.find((r) => r.mapping_name) || first;
+        const legacy = [];
+        const seenLegacy = new Set();
+        for (const r of a.rows) {
+          if (r.enabled && r.provider_id && validProviderIds.has(r.provider_id) && !seenLegacy.has(r.provider_id)) {
+            legacy.push(r.provider_id); seenLegacy.add(r.provider_id);
+          }
+        }
+        const seen = new Set();
+        const cands = [];
+        for (const lp of legacy) if (!seen.has(lp)) { cands.push(lp); seen.add(lp); }
+        for (const bp of (boundByModel[a.modelId] || [])) if (validProviderIds.has(bp) && !seen.has(bp)) { cands.push(bp); seen.add(bp); }
+        const providers = cands.map((pid) => providerPools[pid] ? {
+          providerId: pid, name: providerPools[pid].name,
+          pool: providerPools[pid].pool, coolingKeys: providerPools[pid].coolingKeys,
+        } : null).filter(Boolean);
+        const totalReady = providers.reduce((s, x) => s + (x.pool.ready || 0), 0);
+        const totalCooling = providers.reduce((s, x) => s + (x.pool.cooling || 0), 0);
+        return {
+          modelId: a.modelId,
+          displayName: (mappingRow && (mappingRow.display_name || mappingRow.mapping_name)) || first.model_id,
+          type: first.type,
+          enabled: a.enabledAny,
+          providers,
+          readyKeys: totalReady,
+          coolingKeys: totalCooling,
+          canGenerate: totalReady > 0,               // 有待命 key 可立即生成
+          allCooling: cands.length > 0 && totalReady === 0 && totalCooling > 0,
+        };
+      });
+      models.sort((x, y) => Number(y.enabled) - Number(x.enabled) || (y.coolingKeys - x.coolingKeys) || x.displayName.localeCompare(y.displayName));
+      const aggAll = Object.values(providerPools).reduce((s, p) => ({
+        total: s.total + p.pool.total, ready: s.ready + p.pool.ready, cooling: s.cooling + p.pool.cooling,
+        isolated: s.isolated + p.pool.isolated,
+      }), { total: 0, ready: 0, cooling: 0, isolated: 0 });
+      return sendJSON(res, 200, {
+        ts: new Date(now).toISOString(),
+        pools: Object.values(providerPools),
+        models,
+        agg: aggAll,
+        modelsTotal: models.length,
+        modelsReady: models.filter((m) => m.canGenerate).length,
+        modelsCooling: models.filter((m) => m.allCooling || m.coolingKeys > 0).length,
+      });
+    } catch (e) {
+      return sendJSON(res, 500, { error: e.message });
+    }
+  }
   if (url === '/api/admin/model-participation' && method === 'GET') {
     if (!admin.requireAdmin(req)) return sendJSON(res, 403, { error: '需要管理员权限' });
     if (!pgPool) return sendJSON(res, 503, { error: '数据库不可用' });
@@ -3135,7 +3266,7 @@ async function handleAPI(req, res) {
 
   if (url === '/api/media' && method === 'GET') {
     if (pgPool) {
-      let mediaSql = 'SELECT * FROM media WHERE is_deleted=FALSE';
+      let mediaSql = `SELECT ${mediaPayloadMod.mediaListSelectColumns()} FROM media WHERE is_deleted=FALSE`;
       const mediaParams = [];
       if (realUser) { mediaSql += ' AND (user_id=$1 OR user_id IS NULL)'; mediaParams.push(realUser.id); } // G2 owner 隔离；历史 NULL 行全员可见
       mediaSql += ' ORDER BY created_at DESC';
@@ -3815,9 +3946,10 @@ async function handleAPI(req, res) {
     const idemKey = (body.idempotencyKey || '').toString().trim();
     if (!idemKey) return sendJSON(res, 400, { error: '缺少 idempotencyKey' });
 
-    // 幂等：已存在同键任务？
+    // 幂等必须先于容量准入：同键网络重试应返回原任务，不能因该任务本身占满
+    // active limit 而误报 429。
     const ex = await pgPool.query(
-      'SELECT task_id, status, cost FROM generation_tasks WHERE idempotency_key=$1', [idemKey]);
+      'SELECT task_id, status, cost, cost_pool FROM generation_tasks WHERE idempotency_key=$1', [idemKey]);
     if (ex.rows.length) {
       const row = ex.rows[0];
       if (row.status === 'failed') {
@@ -3831,6 +3963,23 @@ async function handleAPI(req, res) {
           taskId: row.task_id, idempotent: true,
         });
       }
+    }
+
+    // 连续点击/脚本洪泛保护：单用户在途任务有硬上限。旧实现每次点击都生成新 UUID，
+    // IP 限流仍允许一分钟 30 次，足以同时启动大量生成与上传，拖垮 API 进程。
+    // 上限可由后台「系统设置 → 单用户在途任务上限」实时调整（settings.app.userGenerationActiveLimit）。
+    const rt = await runtimeSettingsMod.getRuntimeSettings(pgPool);
+    const admission = await generationAdmissionMod.checkUserGenerationCapacity(pgPool, realUser.id, rt.userGenerationActiveLimit);
+    if (!admission.allowed) {
+      res.setHeader('Retry-After', '10');
+      return sendJSON(res, 429, {
+        status: 'overloaded',
+        code: 'TOO_MANY_ACTIVE_GENERATIONS',
+        error: `当前已有 ${admission.active} 个任务处理中，请等待完成后再提交`,
+        active: admission.active,
+        limit: admission.limit,
+        retryAfterSec: 10,
+      });
     }
 
     // 模型身份解析（Phase 1）：优先 modelId，回退 model（displayName / 遗留字符串）→ canonical model_id
@@ -5233,7 +5382,10 @@ app.use((err, req, res, next) => {
   console.error('[ERROR] Unhandled middleware error:', err && err.message || err);
   console.error('[ERROR] Stack:', err && err.stack);
   if (!res.headersSent) {
-    sendJSON(res, 500, { error: 'Internal Server Error' });
+    const statusCode = Number.isInteger(err && err.statusCode) ? err.statusCode : 500;
+    sendJSON(res, statusCode, statusCode === 413
+      ? { error: 'Payload Too Large' }
+      : { error: 'Internal Server Error' });
   }
 });
 
@@ -5295,6 +5447,13 @@ if (pgPool && IS_LEADER) {
   dispatcher.resumeWaitingArea(pgPool)
     .then((r) => { if (r && r.resumed) console.log(`[startup] 等待区恢复：重试 ${r.resumed} 个排队任务`); })
     .catch((e) => console.warn('[startup] 等待区恢复扫描失败（不影响启动）:', e.message));
+  // 图片任务崩溃恢复：重驱崩溃前在途的同步图片任务（cr-only、未触达 provider）。
+  // 图片走同步 POST 不写 provider_task_id，resumeRunningTasks（视频）覆盖不到；此前漏掉此调用，
+  // 导致崩溃后图片任务永久卡 running、只能等 90 分钟看门狗兜底。与 resumeWaitingArea 互斥
+  // （后者只处理 waitingOpts 非空的行），安全并行。
+  dispatcher.resumeRunningImageTasks(pgPool)
+    .then((r) => { if (r && (r.resumed || r.reviewBlocked)) console.log(`[startup] 图片崩溃恢复：重驱 ${r.resumed} 个，${r.reviewBlocked} 个进入 review_required`); })
+    .catch((e) => console.warn('[startup] 图片崩溃恢复扫描失败（不影响启动）:', e.message));
   // 搬运与 API 解耦：启动后台上传队列 worker（建表 + 崩溃恢复 + 起 worker），仅 leader worker 跑
   dispatcher.startUploadQueue(pgPool)
     .then(() => console.log('[startup] 上传队列 worker 已启动'))
