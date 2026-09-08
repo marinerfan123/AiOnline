@@ -1,6 +1,6 @@
 'use strict';
 /**
- * M02-A AI Control Plane — Service (API projection boundary)
+ * M02-A/C AI Control Plane — Service (API projection boundary)
  *
  * 把 repository 的领域投影变成 API response。安全铁律在此强制：
  *  - 任何 key 相关字段只出 masked/fingerprint；完整 secret 永不进入 response。
@@ -8,12 +8,19 @@
  *  - admin 端点与 internal（机器对机器）端点分开设计，权限由调用方（server 中间件）保证。
  *
  * 本 service 不直接碰 req/res —— 纯函数 + repository 依赖注入，便于单测。
+ *
+ * M02-C 新增：
+ *  - 模型 revision 管理（publish/retire/list）
+ *  - 能力授权检查（grant CRUD + entitlement resolution）
+ *  - 路由策略管理（create/update/list）
  */
 
 const repo = require('../repositories/aiControlRepository.cjs');
 const keypool = require('../domain/keypool.cjs');
 const pricing = require('../domain/pricing.cjs');
 const { toRoutingDecision } = require('../domain/routing.cjs');
+const grantDomain = require('../domain/grant.cjs');
+const routingPolicyDomain = require('../domain/routing-policy.cjs');
 
 function isViewerAdmin(viewer) {
   return !!(viewer && viewer.role === 'admin');
@@ -23,7 +30,6 @@ function isViewerAdmin(viewer) {
 async function listProvidersForAdmin(pg) {
   const providers = await repo.listProviders(pg);
   await repo.attachKeyPool(pg, providers);
-  // 双重保险：redact 任何意外泄漏的 secret 字段
   return providers.map((p) => keypool.redactCredentialFields(p));
 }
 
@@ -48,7 +54,6 @@ async function listModelsForUser(pg, viewer) {
     capability_version: m.capability_version,
     parameter_schema: m.ai_parameter_schemas || {},
     credit_cost: m.credit_cost,
-    // 用户可见：线路的“数量与 provider 名”，不含逐线路成本
     bindings: (m.provider_bindings || []).map((b) => ({
       binding_id: b.id,
       provider_id: b.provider_id,
@@ -58,7 +63,6 @@ async function listModelsForUser(pg, viewer) {
       weight: b.weight,
       legacy_fallback: b.legacy_fallback,
     })),
-    // admin 额外可见逐线路成本来源（不含原始 cost 数字本身，数字走 quote 接口）
     ...(admin ? { has_pricing_rules: true } : {}),
   }));
 }
@@ -85,7 +89,6 @@ async function getModelForUser(pg, modelId, viewer) {
       priority: b.priority,
       weight: b.weight,
       legacy_fallback: b.legacy_fallback,
-      // binding 特定参数仅 admin 可见（endpoint/param 模板可能含敏感配置）
       ...(admin ? { parameter_overrides: b.parameter_overrides, endpoint: b.endpoint, base_url: b.base_url } : {}),
     })),
   };
@@ -98,7 +101,6 @@ async function listCapabilities(pg) {
     .filter((m) => m.ai_capabilities && Object.keys(m.ai_capabilities).length)
     .map((m) => ({
       model_id: m.model_id,
-      // type 取自 capability doc（如 text_to_video），不是 models.type 内容类型列（如 video）
       type: m.ai_capabilities.type || m.type,
       content_type: m.type,
       capabilities: m.ai_capabilities.capabilities || {},
@@ -109,11 +111,7 @@ async function listCapabilities(pg) {
 }
 
 /**
- * 生成报价。输入为原始价格数字（providerCost/platformPrice/currency/...），
- * 内部先构造完整报价，普通用户拿 user projection（剥离成本/margin），
- * admin 拿完整（含 provider cost）。两条路径对同一输入。
- * @param {object} viewer  { role }
- * @param {object} q  { providerCost, platformPrice, currency, pricingRuleId, pricingSource }
+ * 生成报价。
  */
 function quoteForViewer(viewer, q) {
   const full = pricing.quoteGeneration(q);
@@ -130,9 +128,144 @@ async function recordRouting(pg, routeResult, ctx, { requestId, generationTaskId
   return decision;
 }
 
+// ── M02-C: Model Revisions ───────────────────────────────────────────────────
+
+/**
+ * 发布模型 revision。
+ * @param {object} pg
+ * @param {string} modelId
+ * @param {object} manifest  要发布的 manifest（含 capabilities、parameter_schema 等）
+ * @param {string} actor     当前操作者 ID
+ * @returns {object} 发布的 revision 对象
+ */
+async function publishModelRevision(pg, modelId, manifest, actor) {
+  return repo.publishRevision(pg, modelId, manifest, actor);
+}
+
+/**
+ * 获取模型的活跃 revision。
+ */
+async function getActiveModelRevision(pg, modelId) {
+  return repo.getActiveRevision(pg, modelId);
+}
+
+/**
+ * 列出模型的所有 revision。
+ */
+async function listModelRevisions(pg, modelId) {
+  return repo.listModelRevisions(pg, modelId);
+}
+
+/**
+ * 退役某 revision。
+ */
+async function retireModelRevision(pg, revisionId) {
+  return repo.retireRevision(pg, revisionId);
+}
+
+// ── M02-C: Capability Grants ─────────────────────────────────────────────────
+
+/**
+ * 检查某用户/workspace 对某模型是否有某能力的授权。
+ * @param {object} pg
+ * @param {string} modelId
+ * @param {object} checker { userId?, workspaceId? }
+ * @returns {boolean}
+ */
+async function checkModelEntitlement(pg, modelId, checker = {}) {
+  const grants = await repo.listGrantsForModel(pg, modelId);
+  return grantDomain.hasCapability(grants, checker);
+}
+
+/**
+ * 列出某模型的所有授权。
+ */
+async function listModelGrants(pg, modelId) {
+  return repo.listGrantsForModel(pg, modelId);
+}
+
+/**
+ * 创建授权。
+ */
+async function createModelGrant(pg, grantInput, actor) {
+  return repo.createGrant(pg, grantInput, actor);
+}
+
+/**
+ * 撤销授权。
+ */
+async function revokeModelGrant(pg, grantId) {
+  return repo.revokeGrant(pg, grantId);
+}
+
+/**
+ * 删除授权。
+ */
+async function deleteModelGrant(pg, grantId) {
+  return repo.deleteGrant(pg, grantId);
+}
+
+// ── M02-C: Routing Policies ──────────────────────────────────────────────────
+
+/**
+ * 创建路由策略。
+ */
+async function createRoutingPolicy(pg, policyInput, actor) {
+  return repo.createRoutingPolicy(pg, policyInput, actor);
+}
+
+/**
+ * 更新路由策略。
+ */
+async function updateRoutingPolicy(pg, policyId, patch, actor) {
+  return repo.updateRoutingPolicy(pg, policyId, patch, actor);
+}
+
+/**
+ * 列出某模型的路由策略。
+ */
+async function listRoutingPolicies(pg, modelId) {
+  return repo.listRoutingPolicies(pg, modelId);
+}
+
+/**
+ * 解析路由决策（结合 DB 中的 canary policy）。
+ * @param {object} pg
+ * @param {string} modelId
+ * @param {string} capability
+ * @param {string} bindingId  用户请求的目标 binding
+ * @param {number} seed       请求随机种子
+ * @returns {{selected: string|null, policyId: string|null}}
+ */
+async function resolveRouting(pg, modelId, capability, bindingId, seed) {
+  const policies = await repo.listRoutingPolicies(pg, modelId);
+  const activePolicies = policies.filter((p) => p.status === 'active');
+  const result = routingPolicyDomain.resolveRouting(activePolicies, modelId, capability, seed);
+  if (result) {
+    return { selected: result.bindingId, policyId: result.policyId };
+  }
+  // No policy or not in canary → return the requested binding
+  return { selected: bindingId, policyId: null };
+}
+
+/**
+ * 记录带 revision 绑定的路由决策。
+ */
+async function recordRoutingWithRevision(pg, decision, { requestId, generationTaskId, modelRevisionId, routingPolicyId } = {}) {
+  return repo.recordRoutingDecisionWithRevision(pg, decision, { requestId, generationTaskId, modelRevisionId, routingPolicyId });
+}
+
 module.exports = {
   isViewerAdmin,
   listProvidersForAdmin, getProviderForAdmin,
   listModelsForUser, getModelForUser, listCapabilities,
   quoteForViewer, recordRouting,
+  // M02-C: Revisions
+  publishModelRevision, getActiveModelRevision, listModelRevisions, retireModelRevision,
+  // M02-C: Grants
+  checkModelEntitlement, listModelGrants, createModelGrant, revokeModelGrant, deleteModelGrant,
+  // M02-C: Routing Policies
+  createRoutingPolicy, updateRoutingPolicy, listRoutingPolicies, resolveRouting,
+  // M02-C: Decisions with revision
+  recordRoutingWithRevision,
 };
