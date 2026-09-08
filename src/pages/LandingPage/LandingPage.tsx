@@ -19,6 +19,7 @@ import {
 } from 'lucide-react';
 import { useAuth, logout, setAuthModalOpen, refreshUser } from '@/services/authStore';
 import { formatCredits } from '@/utils/format';
+import { isFeatureEnabled, FF } from '@/shared/config/featureFlags';
 
 /* ── 整个计划：创意生产流水线（M5：点子→剧本→分镜→视频→剧集，五阶段可回退）──
    生图/视频生成是驱动第 3–4 步产出的引擎，而非独立终点。
@@ -277,12 +278,14 @@ export default function LandingPage() {
           >
             进入创作工作室 <ArrowRight className="size-3.5" />
           </Link>
-          <Link
-            to="/shop"
-            className="flex items-center gap-1.5 rounded-full border border-white/15 bg-white/5 px-4 py-1.5 text-xs font-semibold text-white transition-colors hover:bg-white/10"
-          >
-            逛 AI 市集 <ArrowRight className="size-3.5" />
-          </Link>
+          {isFeatureEnabled(FF.SHOP_ENABLED) && (
+            <Link
+              to="/shop"
+              className="flex items-center gap-1.5 rounded-full border border-white/15 bg-white/5 px-4 py-1.5 text-xs font-semibold text-white transition-colors hover:bg-white/10"
+            >
+              逛 AI 市集 <ArrowRight className="size-3.5" />
+            </Link>
+          )}
           <span className="text-xs text-zinc-600">
             /studio 五阶段工作台为 Phase 4 规划，骨架已就位。
           </span>

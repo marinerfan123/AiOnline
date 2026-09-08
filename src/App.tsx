@@ -2,6 +2,8 @@ import { useEffect, type ReactNode, lazy, Suspense } from 'react';
 import { Routes, Route, useNavigate } from 'react-router-dom';
 import { Layout } from '@/components/Layout';
 import { ErrorBoundary } from '@/components/ErrorBoundary';
+import { isFeatureEnabled } from '@/shared/config/featureFlags';
+import { FF } from '@/shared/config/featureFlags';
 
 // V2 (M00 platform foundation) — lazy-loaded preview shell. Additive only:
 // lives behind /__v2/* and the V2_APP_SHELL flag (default OFF in prod), so the
@@ -70,6 +72,7 @@ import CartPage from '@/pages/Shop/CartPage';
 import CheckoutPage from '@/pages/Shop/CheckoutPage';
 import OrdersPage from '@/pages/Shop/OrdersPage';
 import SellerPage from '@/pages/Shop/SellerPage';
+import ScopeDeniedPage from '@/pages/ScopeDeniedPage';
 
 // 登录 / 注册
 import AuthPage from '@/pages/Auth/AuthPage';
@@ -180,15 +183,21 @@ export default function App() {
           <Route path=":projectId" element={<StudioStagePage />} />
         </Route>
 
-        {/* 电商商城壳（首页/商品详情公开浏览；下单相关需登录） */}
-        <Route path="/shop" element={<ShopLayout />}>
-          <Route index element={<ShopHomePage />} />
-          <Route path="product/:id" element={<ProductDetailPage />} />
-          <Route path="cart" element={<RequireAuth><CartPage /></RequireAuth>} />
-          <Route path="checkout" element={<RequireAuth><CheckoutPage /></RequireAuth>} />
-          <Route path="orders" element={<RequireAuth><OrdersPage /></RequireAuth>} />
-          <Route path="seller" element={<RequireAuth><SellerPage /></RequireAuth>} />
-        </Route>
+        {/* 电商商城壳（M6）— S1 scope firewall: SHOP_ENABLED flag OFF by default.
+            When OFF, direct access to /shop/* shows ScopeDeniedPage; code is preserved.
+            Set VITE_FF_SHOP_ENABLED=1 to re-enable (dev/UAT only). */}
+        {isFeatureEnabled(FF.SHOP_ENABLED) ? (
+          <Route path="/shop" element={<ShopLayout />}>
+            <Route index element={<ShopHomePage />} />
+            <Route path="product/:id" element={<ProductDetailPage />} />
+            <Route path="cart" element={<RequireAuth><CartPage /></RequireAuth>} />
+            <Route path="checkout" element={<RequireAuth><CheckoutPage /></RequireAuth>} />
+            <Route path="orders" element={<RequireAuth><OrdersPage /></RequireAuth>} />
+            <Route path="seller" element={<RequireAuth><SellerPage /></RequireAuth>} />
+          </Route>
+        ) : (
+          <Route path="/shop" element={<ScopeDeniedPage title="AI 市集（已锁定）" desc="电商/市集功能不在当前 1.0 产品方向内，代码已保留但默认关闭。" />} />
+        )}
 
         {/* V2 preview shell (M00) — additive, feature-flag + dev gated. */}
         <Route path="/__v2/*" element={<V2Suspense><V2App /></V2Suspense>} />
