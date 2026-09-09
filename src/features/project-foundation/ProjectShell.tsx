@@ -57,7 +57,7 @@ function statusBadgeStatus(status: string) {
   }
 }
 
-function ProjectShellInner({ children, bareContent = false }: { children?: ReactNode; bareContent?: boolean }) {
+function ProjectShellInner({ children, bareContent = false, immersive = false }: { children?: ReactNode; bareContent?: boolean; immersive?: boolean }) {
   const { projectId } = useParams();
   const ctx = useProjectContext();
 
@@ -79,6 +79,14 @@ function ProjectShellInner({ children, bareContent = false }: { children?: React
         <Button variant="secondary" size="sm" onClick={ctx.reload}>
           重试
         </Button>
+      </div>
+    );
+  }
+
+  if (immersive) {
+    return (
+      <div className="h-full min-h-0 overflow-hidden">
+        {children ?? <Outlet />}
       </div>
     );
   }
@@ -156,10 +164,10 @@ function ProjectShellInner({ children, bareContent = false }: { children?: React
   );
 }
 
-export function ProjectShell({ children, bareContent = false }: { children?: ReactNode; bareContent?: boolean }) {
+export function ProjectShell({ children, bareContent = false, immersive = false }: { children?: ReactNode; bareContent?: boolean; immersive?: boolean }) {
   return (
     <ProjectProvider>
-      <ProjectShellInner bareContent={bareContent}>{children}</ProjectShellInner>
+      <ProjectShellInner bareContent={bareContent} immersive={immersive}>{children}</ProjectShellInner>
     </ProjectProvider>
   );
 }

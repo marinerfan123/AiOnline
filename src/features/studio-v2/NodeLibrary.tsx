@@ -16,7 +16,6 @@ import {
 import type { StudioNodeKind } from './types';
 import { NodeIcon } from './NodeIcon';
 import { Input } from '@/shared/ui/v2/Input';
-import { cn } from '@/lib/utils';
 
 interface NodeLibraryProps {
   onAdd: (kind: StudioNodeKind) => void;
@@ -34,14 +33,13 @@ function LibraryItem({ def, onAdd }: { def: NodeDef; onAdd: (k: StudioNodeKind) 
       }}
       onClick={() => onAdd(def.id)}
       title={def.description}
-      className="group flex w-full items-start gap-2 rounded-md border border-transparent px-2 py-1.5 text-left transition-colors hover:border-ml2-border hover:bg-ml2-surface-2"
+      className="group flex w-full items-center gap-2 rounded-md border border-transparent px-2 py-2 text-left transition-colors hover:border-ml2-border hover:bg-ml2-surface-2"
     >
       <span className="mt-px grid size-6 shrink-0 place-items-center rounded bg-ml2-surface-3 text-ml2-text-2 group-hover:text-ml2-accent">
         <NodeIcon name={def.icon} className="size-3.5" />
       </span>
-      <span className="min-w-0">
+      <span className="min-w-0 flex-1">
         <span className="block truncate text-xs font-medium text-ml2-text">{def.title}</span>
-        <span className="mt-0.5 block line-clamp-2 text-[10px] leading-snug text-ml2-text-3">{def.description}</span>
       </span>
     </button>
   );
@@ -74,9 +72,10 @@ export function NodeLibrary({ onAdd }: NodeLibraryProps) {
   return (
     <aside
       data-test="studio-node-library"
-      className="flex h-full w-48 shrink-0 flex-col border-r border-ml2-border bg-ml2-surface-1 2xl:w-56"
+      className="flex h-full w-64 shrink-0 flex-col border-r border-ml2-border bg-ml2-surface-1 2xl:w-72"
     >
-      <div className="border-b border-ml2-border p-2">
+      <div className="border-b border-ml2-border p-3 pr-11">
+        <div className="mb-2 text-xs font-medium text-ml2-text">添加节点</div>
         <div className="relative">
           <Search className="pointer-events-none absolute left-2 top-1/2 size-3.5 -translate-y-1/2 text-ml2-text-3" />
           <Input
@@ -88,7 +87,7 @@ export function NodeLibrary({ onAdd }: NodeLibraryProps) {
           />
         </div>
       </div>
-      <div className="flex-1 overflow-y-auto p-1.5">
+      <div className="flex-1 overflow-y-auto p-2">
         {groups.length === 0 && (
           <p className="px-2 py-6 text-center text-[11px] text-ml2-text-3">没有匹配的节点</p>
         )}
@@ -115,9 +114,6 @@ export function NodeLibrary({ onAdd }: NodeLibraryProps) {
             </div>
           );
         })}
-      </div>
-      <div className={cn('border-t border-ml2-border px-2 py-1.5 text-[10px] text-ml2-text-3')}>
-        拖拽或点击添加 · 节点来自 Node Registry
       </div>
     </aside>
   );

@@ -46,7 +46,13 @@ vi.mock('./AssetLibraryDrawer', () => ({
   AssetLibraryToggle: () => <div />,
 }));
 vi.mock('./CanvasConflictBanner', () => ({ CanvasConflictBanner: () => <div /> }));
-vi.mock('./store', () => ({ studioCanvasActions: { addAtViewportCenter: vi.fn() } }));
+vi.mock('./store', () => ({
+  studioCanvasActions: { addAtViewportCenter: vi.fn() },
+  useStudioStore: Object.assign(
+    (selector: (state: { nodes: never[] }) => unknown) => selector({ nodes: [] }),
+    { subscribe: vi.fn(() => vi.fn()) },
+  ),
+}));
 vi.mock('./useStudioCanvasPersistence', () => ({
   useStudioCanvasPersistence: () => ({
     status: 'Saved',

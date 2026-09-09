@@ -7,10 +7,11 @@
 // Layout: Top Toolbar / Left Node Library / Center Infinite Canvas /
 // Right Inspector / Bottom Dock. Canvas is the visual subject.
 
-import { useCallback, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
+import { PanelLeft, PanelRight, X } from 'lucide-react';
 import { ProjectShell } from '@/features/project-foundation/ProjectShell';
 import { useProjectContext } from '@/features/project-foundation/ProjectContext';
-import { studioCanvasActions } from './store';
+import { studioCanvasActions, useStudioStore } from './store';
 import { StudioCanvas } from './StudioCanvas';
 import { StudioComposer } from './StudioComposer';
 import { NodeLibrary } from './NodeLibrary';
@@ -41,6 +42,14 @@ function StudioLayout() {
   const persistence = useStudioCanvasPersistence(projectId, Boolean(projectId));
   // G06 Asset Library drawer open state (toggle lives in the TopToolbar).
   const [assetLibraryOpen, setAssetLibraryOpen] = useState(false);
+  const [libraryOpen, setLibraryOpen] = useState(false);
+  const hasSelectedNode = useStudioStore((state) => state.nodes.some((node) => node.selected));
+  const [inspectorDismissed, setInspectorDismissed] = useState(false);
+  const inspectorOpen = hasSelectedNode && !inspectorDismissed;
+
+  useEffect(() => {
+    if (!hasSelectedNode) setInspectorDismissed(false);
+  }, [hasSelectedNode]);
 
   // Library click-to-add: place at the CURRENT viewport center via the bridge
   // populated by CanvasCore (only it knows the live viewport). This keeps new
@@ -61,9 +70,18 @@ function StudioLayout() {
         onReload={persistence.reloadFromServer}
         assetLibraryOpen={assetLibraryOpen}
         onToggleAssetLibrary={() => setAssetLibraryOpen((v) => !v)}
+        libraryOpen={libraryOpen}
+        inspectorOpen={inspectorOpen}
+        onToggleLibrary={() => setLibraryOpen((value) => !value)}
+        onToggleInspector={() => setInspectorDismissed((value) => !value)}
       />
-      <div className="flex min-h-0 flex-1">
-        <NodeLibrary onAdd={addFromLibrary} />
+      <div className="relative flex min-h-0 flex-1 overflow-hidden">
+        {libraryOpen && (
+          <div className="absolute inset-y-0 left-0 z-40 flex shadow-[16px_0_40px_rgba(0,0,0,0.3)]">
+            <NodeLibrary onAdd={(kind) => { addFromLibrary(kind); setLibraryOpen(false); }} />
+            <button type="button" aria-label="关闭节点库" onClick={() => setLibraryOpen(false)} className="absolute right-2 top-2 grid size-7 place-items-center rounded-md text-ml2-text-3 hover:bg-ml2-surface-3 hover:text-ml2-text"><X className="size-3.5" /></button>
+          </div>
+        )}
         <div className="relative min-w-0 flex-1">
           <StudioCanvas projectId={projectId} canvasRevision={persistence.revision} />
           <StudioComposer projectId={projectId} />
@@ -77,7 +95,12 @@ function StudioLayout() {
               append neutral). */}
           <CanvasConflictBanner conflict={persistence.conflict} onReload={persistence.reloadFromServer} />
         </div>
-        <Inspector projectId={projectId} />
+        {inspectorOpen && (
+          <div className="absolute inset-y-0 right-0 z-40 shadow-[-16px_0_40px_rgba(0,0,0,0.3)]">
+            <button type="button" aria-label="关闭检查器" onClick={() => setInspectorDismissed(true)} className="absolute right-2 top-2 z-10 grid size-7 place-items-center rounded-md text-ml2-text-3 hover:bg-ml2-surface-3 hover:text-ml2-text"><X className="size-3.5" /></button>
+            <Inspector projectId={projectId} />
+          </div>
+        )}
       </div>
       <BottomDock projectId={projectId} scriptId={scriptId} revision={persistence.revision} onRestored={persistence.reloadFromServer} />
     </div>
@@ -86,7 +109,7 @@ function StudioLayout() {
 
 export default function StudioPage() {
   return (
-    <ProjectShell bareContent>
+    <ProjectShell bareContent immersive>
       <StudioLayout />
     </ProjectShell>
   );

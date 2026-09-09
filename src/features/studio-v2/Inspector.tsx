@@ -12,7 +12,7 @@
 
 import { useEffect, useMemo } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { Trash2, Copy, Group, AlignStartVertical, AlignCenterVertical, AlignEndVertical, Play, Network } from 'lucide-react';
+import { Trash2, Copy, Group, AlignStartVertical, AlignCenterVertical, AlignEndVertical, Network, PanelRight } from 'lucide-react';
 import { useStudioStore } from './store';
 import { getNodeDef } from './registry';
 import { NodeIcon } from './NodeIcon';
@@ -126,34 +126,27 @@ export function Inspector({
   }, [single, def, edges]);
 
   return (
-    <aside data-test="studio-inspector" className="flex h-full w-60 shrink-0 flex-col overflow-y-auto border-l border-ml2-border bg-ml2-surface-1 xl:w-64 2xl:w-72">
+    <aside data-test="studio-inspector" className="flex h-full w-72 shrink-0 flex-col overflow-y-auto border-l border-ml2-border bg-ml2-surface-1/98 pt-10 2xl:w-80">
       {showingShot ? (
         <ShotInspector projectId={projectId} episodeId={episodeId!} shotId={selectedShotId!} />
       ) : (
         <>
           {selected.length === 0 && (
-            <>
-              <Section title="画布">
-                <div className="space-y-1 text-[11px] text-ml2-text-2">
-                  <p>节点：{nodes.length}</p>
-                  <p>连接：{edges.length}</p>
-                  <p>Project：{projectId || '—'}</p>
-                </div>
-                <Button data-test="inspector-auto-layout" size="sm" variant="ghost" className="mt-2 w-full justify-start" onClick={autoLayout}>
-                  <Network className="size-3" />自动布局（DAG 分层）
-                </Button>
-              </Section>
-              <Section title="持久化">
-                <p data-test="inspector-persistence-note" className="text-[11px] leading-relaxed text-ml2-text-3">
-                  自动保存已开启：编辑后约 900ms 自动保存，刷新页面不丢失。
-                  多人同时编辑冲突时，画布顶部会弹出冲突提示横幅，可按策略重试或重载。
-                </p>
-              </Section>
-              <Section title="运行">
-                <Button data-test="inspector-run-button" size="sm" variant="primary" disabled><Play className="size-3" />运行</Button>
-                <p className="mt-1.5 text-[10px] text-ml2-text-3">选择节点后可运行。</p>
-              </Section>
-            </>
+            <div className="grid min-h-full place-items-center px-6 text-center">
+              <div>
+                <PanelRight className="mx-auto mb-3 size-5 text-ml2-text-3" />
+                <p className="text-xs text-ml2-text-2">选择节点以编辑</p>
+                <p className="mt-1 text-[10px] text-ml2-text-3">属性、输入与运行操作将在这里显示</p>
+                <p data-test="inspector-persistence-note" className="sr-only">自动保存已开启；多人编辑冲突时会显示冲突提示。</p>
+                <Button data-test="inspector-run-button" size="sm" variant="primary" disabled className="sr-only">运行</Button>
+                <span className="sr-only">选择节点后可运行。</span>
+                {nodes.length > 1 && (
+                  <Button data-test="inspector-auto-layout" size="sm" variant="ghost" className="mt-4" onClick={autoLayout}>
+                    <Network className="size-3" />整理画布
+                  </Button>
+                )}
+              </div>
+            </div>
           )}
 
           {selected.length >= 2 && (
@@ -171,7 +164,7 @@ export function Inspector({
 
           {single && def && (
             <>
-              <Section title="节点标识">
+              <Section title="节点">
                 <div className="flex items-center gap-2">
                   <span className="grid size-7 place-items-center rounded bg-ml2-surface-3">
                     <NodeIcon name={def.icon} className="size-4 text-ml2-accent" />
@@ -186,7 +179,7 @@ export function Inspector({
                       className="h-6 px-1.5 text-[11px]"
                     />
                     <p className="mt-1 text-[10px] text-ml2-text-3">
-                      {def.title} · {def.executionKind} · schema v{single.data.schemaVersion ?? def.version}
+                      {def.title}
                     </p>
                   </div>
                 </div>
@@ -204,7 +197,7 @@ export function Inspector({
                     ) : (
                       <p className="text-ml2-text-3">加载中…</p>
                     )}
-                    <p className="text-[10px] text-ml2-text-3">模型目录、线路路由与 Run 执行链已接入；运行结果在 Runs 面板查看。</p>
+                    <p className="text-[10px] text-ml2-text-3">运行结果可在底部“运行”面板查看。</p>
                   </div>
                 </Section>
               )}
@@ -249,14 +242,13 @@ export function Inspector({
                 <ParameterInspector node={single} def={def} projectId={projectId} />
               </Section>
 
-              <Section title="输出">
-                <div className="space-y-1 text-[11px] text-ml2-text-2">
-                  <p data-test="inspector-output-type">
-                    输出：{def.outputPorts.length ? def.outputPorts.map((p) => `${p.label}:${p.type}`).join(' · ') : '无'}
+              {def.outputPorts.length > 0 && (
+                <Section title="输出">
+                  <p data-test="inspector-output-type" className="text-[11px] text-ml2-text-2">
+                    {def.outputPorts.map((p) => p.label).join(' · ')}
                   </p>
-                  <p className="text-[10px] text-ml2-text-3">结果契约：仅持久化 assetId（provider 临时 URL 不作为最终权威）</p>
-                </div>
-              </Section>
+                </Section>
+              )}
 
               <Section title="运行">
                 <Button
@@ -310,9 +302,6 @@ export function Inspector({
         </>
       )}
 
-      <div className="mt-auto px-3 py-2 text-[10px] leading-relaxed text-ml2-text-3">
-        快捷键：Del 删除 · Ctrl+D 复制 · Ctrl+C/V 拷贝粘贴 · Ctrl+Z / Ctrl+Shift+Z undo/redo
-      </div>
     </aside>
   );
 }

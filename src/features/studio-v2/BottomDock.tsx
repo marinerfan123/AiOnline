@@ -27,14 +27,14 @@ export function BottomDock({ projectId, scriptId, revision, onRestored }: { proj
 
   const closed = !tab;
   return (
-    <div data-test="studio-bottom-dock" className={cn('shrink-0 border-t border-ml2-border bg-ml2-surface-1', closed ? 'flex h-9 items-center gap-1 px-2' : 'flex h-32 flex-col')}>
+    <div data-test="studio-bottom-dock" className={cn('shrink-0 bg-ml2-surface-1/95', closed ? 'flex h-8 items-center justify-center gap-0.5 border-t border-ml2-border px-2' : 'flex h-32 flex-col border-t border-ml2-border')}>
       <div className={cn('flex items-center gap-1', closed ? '' : 'px-2 pt-1')}>
         {TABS.map((t) => (
-          <button key={t.id} data-test={`dock-tab-${t.id}`} onClick={() => setActive(t.id)} title={`${t.label} — ${t.phase}`} className={cn('flex items-center gap-1.5 rounded-md px-2.5 py-1 text-[11px] font-medium', active === t.id ? 'bg-ml2-surface-3 text-ml2-text' : 'text-ml2-text-3 hover:bg-ml2-surface-3 hover:text-ml2-text-2')}>
-            <t.icon className="size-3.5" />{t.label}
+          <button key={t.id} data-test={`dock-tab-${t.id}`} onClick={() => setActive(t.id)} title={`${t.label} — ${t.phase}`} aria-label={t.label} className={cn('flex items-center gap-1 rounded-md px-2 py-1 text-[10px] font-medium', active === t.id ? 'bg-ml2-surface-3 text-ml2-text' : 'text-ml2-text-3 hover:bg-ml2-surface-3 hover:text-ml2-text-2')}>
+            <t.icon className="size-3.5" /><span className="hidden xl:inline">{t.label}</span>
           </button>
         ))}
-        {closed ? <span className="ml-auto text-[10px] text-ml2-text-3">版本/运行已启用 · 时间线预留</span> : <button data-test="dock-close" onClick={() => setActive(null)} aria-label="收起 Dock" className="ml-auto rounded p-1 text-ml2-text-3 hover:bg-ml2-surface-3 hover:text-ml2-text"><span className="block text-sm leading-none">×</span></button>}
+        {closed ? null : <button data-test="dock-close" onClick={() => setActive(null)} aria-label="收起 Dock" className="ml-auto rounded p-1 text-ml2-text-3 hover:bg-ml2-surface-3 hover:text-ml2-text"><span className="block text-sm leading-none">×</span></button>}
       </div>
       {!closed && <div className="min-h-0 flex-1 px-3 py-2">
         {active === 'versions' ? (

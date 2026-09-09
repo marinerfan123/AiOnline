@@ -30,7 +30,7 @@ import type { StudioNodeKind } from './types';
 import type { PortType } from './types';
 import { Button } from '@/shared/ui/v2/Button';
 import { IconButton } from '@/shared/ui/v2/IconButton';
-import { Undo2, Redo2, Maximize2, Scan, X, Copy, Trash2 } from "lucide-react";
+import { Plus, Undo2, Redo2, Maximize2, Scan, X, Copy, Trash2 } from "lucide-react";
 
 const nodeTypes: NodeTypes = { studio: StudioNodeComponent };
 
@@ -408,7 +408,15 @@ function CanvasCore({ projectId, canvasRevision }: { projectId?: string; canvasR
         <Controls position="bottom-right" showInteractive={false} />
       </ReactFlow>
 
-      <div className="absolute left-1/2 top-2 z-40 flex -translate-x-1/2 items-center gap-0.5 rounded-lg border border-ml2-border bg-ml2-surface-1/95 px-1 py-0.5 shadow-md backdrop-blur">
+      <button type="button" data-test="canvas-quick-add" aria-label="添加节点" onClick={() => {
+        const rect = canvasRef.current?.getBoundingClientRect();
+        const x = rect ? rect.width / 2 : 320;
+        const y = rect ? rect.height / 2 : 240;
+        const f = screenToFlowPosition({ x: (rect?.left ?? 0) + x, y: (rect?.top ?? 0) + y });
+        setMenu({ x: 16, y: 16, fx: f.x, fy: f.y });
+      }} className="absolute left-3 top-3 z-40 grid size-9 place-items-center rounded-lg border border-ml2-border bg-ml2-surface-1/95 text-ml2-text-2 shadow-md backdrop-blur hover:bg-ml2-surface-2 hover:text-ml2-text"><Plus className="size-4" /></button>
+
+      <div className="absolute left-1/2 top-3 z-40 flex -translate-x-1/2 items-center gap-0.5 rounded-lg border border-ml2-border bg-ml2-surface-1/95 px-1 py-0.5 shadow-md backdrop-blur">
         <IconButton data-test="canvas-undo" label="撤销 (Ctrl+Z)" size="sm" disabled={!canUndo} onClick={undo}><Undo2 className="size-3.5" /></IconButton>
         <IconButton data-test="canvas-redo" label="重做 (Ctrl+Shift+Z)" size="sm" disabled={!canRedo} onClick={redo}><Redo2 className="size-3.5" /></IconButton>
         <IconButton data-test="canvas-copy" label="复制 (Ctrl+C)" size="sm" onClick={copySelection}><Copy className="size-3.5" /></IconButton>
