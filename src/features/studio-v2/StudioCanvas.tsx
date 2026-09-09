@@ -122,16 +122,16 @@ function ContextMenu({
   return (
     <div
       data-test="canvas-context-menu"
-      className="absolute z-50 w-44 overflow-hidden rounded-lg border border-ml2-border bg-ml2-surface-1 py-1 shadow-2xl"
+      className="absolute z-50 w-52 overflow-hidden rounded-xl border border-ml2-border-strong bg-ml2-surface-overlay py-1.5 shadow-[0_18px_48px_rgba(0,0,0,0.72)] ring-1 ring-white/10"
       style={{ left: at.x, top: at.y }}
       onContextMenu={(e) => { e.preventDefault(); onClose(); }}
     >
-      <div className="px-3 py-1 text-[10px] text-ml2-text-3">{header ?? '在此处添加节点'}</div>
+      <div className="border-b border-ml2-border-strong px-3 py-2 text-[10px] font-semibold uppercase tracking-wide text-ml2-text-2">{header ?? '在此处添加节点'}</div>
       {list.map((k) => {
         const def = NODE_DEFS_LIST.find((d) => d.id === k);
         return (
           <button key={k} data-test={`context-menu-${k}`} onClick={() => { onAdd(k); onClose(); }}
-            className="block w-full px-3 py-1.5 text-left text-xs text-ml2-text-2 hover:bg-ml2-surface-2 hover:text-ml2-text">
+            className="block w-full border-b border-white/5 px-3 py-2 text-left text-xs font-medium text-ml2-text last:border-b-0 hover:bg-ml2-accent/20 hover:text-white focus:bg-ml2-accent/20 focus:text-white focus:outline-none">
             {def?.title ?? k}
           </button>
         );

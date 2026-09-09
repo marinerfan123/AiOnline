@@ -36,7 +36,13 @@ function fakePg() {
   ];
 
   return {
+    models,
+    providers,
+    apiKeys,
+    bindings,
+    calls: [],
     async query(sql, params = []) {
+      this.calls.push({ sql, params });
       const T = sql.toUpperCase();
       if (T.includes('FROM PROVIDERS') && T.includes('ORDER BY')) return { rows: providers };
       if (T.startsWith('SELECT * FROM PROVIDERS WHERE ID=')) return { rows: params[0] === 'p1' ? providers : [] };
@@ -50,6 +56,21 @@ function fakePg() {
     },
   };
 }
+
+test('repo: listLogicalModels passes provider ids as one ANY($1) array parameter', async () => {
+  const pg = fakePg();
+  await repo.listLogicalModels(pg, { includeBindings: true });
+  const call = pg.calls.find((c) => /SELECT ID, NAME, BASE_URL, ENABLED FROM PROVIDERS/i.test(c.sql));
+  assert.ok(call, 'provider metadata query must run');
+  assert.deepEqual(call.params, [['p1']], 'ANY($1) receives one PostgreSQL array parameter, not one bind per provider');
+});
+
+test('service: listModelsForUser falls back to legacy model type when AI capability doc is empty', async () => {
+  const pg = fakePg();
+  pg.models[0] = { ...pg.models[0], type: 'image', ai_capabilities: {} };
+  const [m] = await svc.listModelsForUser(pg, { role: 'user' });
+  assert.equal(m.capabilities.type, 'text_to_image');
+});
 
 test('service: listProvidersForAdmin masks keys, exposes pool counts', async () => {
   const pg = fakePg();

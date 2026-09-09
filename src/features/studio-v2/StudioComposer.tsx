@@ -7,10 +7,11 @@
 // planner) — this surface NEVER fabricates a queued/completed run.
 
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Sparkles, Send, AlertTriangle } from 'lucide-react';
+import { Sparkles, Send, AlertTriangle, Loader2 } from 'lucide-react';
 import { useStudioStore } from './store';
 import { getNodeDef } from './registry';
 import { deriveComposerState, detectSlashCommand, parseRefTokens, filterAvailableModels, type ModelAvailability } from './composerModel';
+import { generateCanvasNode } from './canvasGeneration';
 import { cn } from '@/lib/utils';
 
 // Legacy registry capability vocabulary → blueprint-canonical capability keys
@@ -68,6 +69,8 @@ export function StudioComposer({ projectId }: { projectId?: string }) {
   const [slashHints, setSlashHints] = useState<string[]>([]);
   const [resolutions, setResolutions] = useState<Record<string, ResolvedRef>>({});
   const [boundRefs, setBoundRefs] = useState<Record<string, ResolvedRef['binding']>>({});
+  const [generating, setGenerating] = useState(false);
+  const [generationError, setGenerationError] = useState<string | null>(null);
 
   const selected = nodes.filter((n) => n.selected && n.data.nodeKind !== 'frame');
   const state = deriveComposerState({ selection: { count: selected.length, nodeKind: selected[0]?.data.nodeKind } });
@@ -203,6 +206,48 @@ export function StudioComposer({ projectId }: { projectId?: string }) {
         ? { ok: false as const, note: '请输入提示词' }
         : null;
 
+  // W1③ — wire the composer Generate button to the real canvas generation
+  // façade (canvasGeneration.generateCanvasNode). Honest contract: it submits
+  // through the existing generation API and writes durable asset ids back to
+  // the node (outputAssetIds + status). Nothing is fabricated here — a failed
+  // submit surfaces the backend error; a success writes only what the API
+  // actually returned.
+  const handleGenerate = async () => {
+    if (!node || !isGeneration || generating) return;
+    const modelId = def?.modelField ? String(params[def.modelField] ?? '') : '';
+    if (!modelId) {
+      setGenerationError('请先选择模型');
+      return;
+    }
+    if (text.trim().length === 0) {
+      setGenerationError('请输入提示词');
+      return;
+    }
+    const contentType = node.data.nodeKind === 'image-generation' ? 'image' : 'video';
+    const nonce = Date.now().toString(36);
+    setGenerating(true);
+    setGenerationError(null);
+    try {
+      const result = await generateCanvasNode({
+        modelId,
+        prompt: text,
+        contentType,
+        ratio: String(params.aspectRatio ?? '') || undefined,
+        resolution: String(params.resolution ?? '') || undefined,
+        negative: typeof params.negativePrompt === 'string' ? params.negativePrompt : undefined,
+        idempotencyKey: `canvas-gen-${node.id}-${nonce}`,
+        pendingId: `canvas-pending-${node.id}-${nonce}`,
+      });
+      updateNodeData(node.id, { outputAssetIds: result.mediaIds, status: 'SUCCEEDED' });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setGenerationError(msg || '生成失败，请稍后重试');
+      updateNodeData(node.id, { status: 'FAILED' });
+    } finally {
+      setGenerating(false);
+    }
+  };
+
   if (state === 'NO_SELECTION') {
     return (
       <div data-test="studio-composer" className="pointer-events-none absolute inset-x-0 bottom-3 z-30 flex justify-center">
@@ -315,14 +360,17 @@ export function StudioComposer({ projectId }: { projectId?: string }) {
           {validation && !validation.ok && (
             <span data-test="composer-validation" className="flex items-center gap-1 text-[10px] text-amber-400"><AlertTriangle className="size-3" />{validation.note}</span>
           )}
+          {generationError && (
+            <span data-test="composer-generation-error" className="flex items-center gap-1 text-[10px] text-red-400"><AlertTriangle className="size-3" />{generationError}</span>
+          )}
           <button
             data-test="composer-generate"
-            disabled={!isGeneration || text.trim().length === 0}
-            onClick={() => { flush(); }}
-            title={isGeneration ? '执行链经 G15 Run 层接入；当前保存节点提示词' : '仅生成类节点可执行'}
+            disabled={!isGeneration || text.trim().length === 0 || generating}
+            onClick={() => { flush(); void handleGenerate(); }}
+            title={isGeneration ? '生成并写入节点持久化资产' : '仅生成类节点可执行'}
             className="flex items-center gap-1.5 rounded-xl bg-ml2-accent px-3 py-1.5 text-[11px] font-medium text-black enabled:hover:brightness-110 disabled:opacity-40"
           >
-            <Send className="size-3" /> 生成
+            {generating ? <Loader2 className="size-3 animate-spin" /> : <Send className="size-3" />} {generating ? '生成中' : '生成'}
           </button>
         </div>
       </div>

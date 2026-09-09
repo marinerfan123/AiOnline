@@ -52,9 +52,22 @@ function normalizeCapabilities(rawCapabilities = {}, raw = {}) {
   return out;
 }
 
+function inferredLegacyCapability(row) {
+  const type = String(row.type || '').toLowerCase();
+  if (type === 'image') return { text_to_image: true };
+  if (type === 'video') return { text_to_video: true, image_to_video: true };
+  if (type === 'text') return { 'text.generate': true };
+  return {};
+}
+
 /** Project one raw model row → blueprint public binding shape. */
 function projectModelBinding(row, providerRow = {}) {
-  const caps = normalizeCapabilities(row.capabilities, row);
+  const declared = {
+    ...inferredLegacyCapability(row),
+    ...(row.ai_capabilities && typeof row.ai_capabilities === 'object' ? row.ai_capabilities : {}),
+    ...(row.capabilities && typeof row.capabilities === 'object' ? row.capabilities : {}),
+  };
+  const caps = normalizeCapabilities(declared, row);
   const template = row.param_template && typeof row.param_template === 'object'
     ? row.param_template
     : (typeof row.parameters === 'object' ? row.parameters : {});

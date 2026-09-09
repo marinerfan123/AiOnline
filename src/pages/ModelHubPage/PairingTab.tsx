@@ -3,14 +3,13 @@
 //   - 推理模型 → 视觉输入模型（多模态模型 vision+asVisionInput）
 
 import { useState, useMemo } from 'react';
-import { Link2, Video, Image as ImageIcon, MessageSquare, ArrowRight, X, Plus, Sparkles } from 'lucide-react';
+import { Link2, Video, Image as ImageIcon, MessageSquare, ArrowRight, X, Sparkles, AlertTriangle, ListChecks } from 'lucide-react';
 import { toast } from 'sonner';
 import type { IModelProvider, IAiModel, ModelType, IModelPaired } from '@/data/models';
 
 interface Props {
   providers: IModelProvider[];
   models: IAiModel[];
-  setModels: (updater: (prev: IAiModel[]) => IAiModel[]) => void;
   getProviderName: (id: string) => string;
 }
 
@@ -37,7 +36,7 @@ const KIND_META: Record<PairingKind, { title: string; desc: string; sourceType: 
   },
 };
 
-export default function PairingTab({ providers, models, setModels, getProviderName }: Props) {
+export default function PairingTab({ providers, models, getProviderName }: Props) {
   const [activeKind, setActiveKind] = useState<PairingKind>('video-baseImage');
   const meta = KIND_META[activeKind];
 
@@ -52,22 +51,30 @@ export default function PairingTab({ providers, models, setModels, getProviderNa
     [models, meta],
   );
 
-  const setPaired = (sourceId: string, targetId: string | undefined) => {
-    setModels((prev) =>
-      prev.map((m) =>
-        m.id === sourceId
-          ? { ...m, paired: { ...(m.paired || {}), [meta.pairedKey]: targetId || undefined } }
-          : m,
-      ),
-    );
-    if (targetId) toast.success('配套关系已建立');
-    else toast.success('已解除配套');
+  const setPaired = (_sourceId: string, _targetId: string | undefined) => {
+    toast.info('模型协作仍是预览功能，尚未接入可持久化的执行链路');
   };
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-5">
+      <div className="grid gap-3 lg:grid-cols-[1fr_360px]">
+        <div className="rounded-xl border border-zinc-800 bg-zinc-900/35 p-4">
+          <div className="flex items-start gap-3">
+            <div className="mt-0.5 flex size-8 shrink-0 items-center justify-center rounded-lg bg-emerald-500/10 text-emerald-300"><Link2 className="size-4" /></div>
+            <div>
+              <div className="flex items-center gap-2"><h3 className="text-sm font-bold text-white">模型协作</h3><span className="rounded border border-amber-500/25 bg-amber-500/10 px-1.5 py-0.5 text-[9px] text-amber-300">实验配置</span></div>
+              <p className="mt-1 text-[11px] leading-5 text-zinc-500">为一个模型指定前置辅助模型，例如先生成视频首帧，或先读取图片再交给推理模型。</p>
+              <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-[10px] text-zinc-600"><span>1. 在模型页标记能力</span><span>2. 选择协作场景</span><span>3. 为源模型选择辅助模型</span></div>
+            </div>
+          </div>
+        </div>
+        <div className="rounded-xl border border-amber-500/20 bg-amber-500/[0.04] p-4">
+          <div className="flex items-start gap-2"><AlertTriangle className="mt-0.5 size-3.5 shrink-0 text-amber-300" /><p className="text-[10px] leading-5 text-amber-100/65">当前是能力关系预览：后端尚未提供关系字段的持久化和执行器接线，因此暂不能保存，也不会改变线上生成链路。</p></div>
+        </div>
+      </div>
+
       {/* 类型切换 */}
-      <div className="flex items-center gap-2">
+      <div className="grid gap-2 sm:grid-cols-2">
         {(['video-baseImage', 'text-vision'] as const).map((k) => {
           const Icon = k === 'video-baseImage' ? Video : MessageSquare;
           const m = KIND_META[k];
@@ -75,32 +82,27 @@ export default function PairingTab({ providers, models, setModels, getProviderNa
             <button
               key={k}
               onClick={() => setActiveKind(k)}
-              className={`flex items-center gap-2 rounded-2xl px-4 py-2 text-xs transition-colors ${
+              className={`flex items-start gap-3 rounded-xl px-4 py-3 text-left transition-colors ${
                 activeKind === k
-                  ? 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/30'
-                  : 'bg-zinc-900/40 text-zinc-400 border border-zinc-800 hover:text-white'
+                  ? 'border border-emerald-500/30 bg-emerald-500/10 text-white'
+                  : 'border border-zinc-800 bg-zinc-900/30 text-zinc-400 hover:border-zinc-700 hover:text-white'
               }`}
             >
-              <Icon className="size-3.5" />
-              {m.title}
+              <Icon className={`mt-0.5 size-4 shrink-0 ${activeKind === k ? 'text-emerald-400' : 'text-zinc-600'}`} />
+              <span><span className="block text-xs font-semibold">{m.title}</span><span className="mt-0.5 block text-[10px] font-normal text-zinc-500">{m.desc}</span></span>
             </button>
           );
         })}
       </div>
 
-      {/* 顶部说明 */}
-      <div className="rounded-2xl border border-zinc-800 bg-zinc-900/40 p-4 flex items-start gap-3">
-        <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl bg-emerald-500/10 text-emerald-400">
-          <Link2 className="size-5" />
+      {/* 当前场景摘要 */}
+      <div className="rounded-xl border border-zinc-800 bg-zinc-900/30 px-4 py-3 flex items-center gap-3">
+        <ListChecks className="size-4 shrink-0 text-zinc-500" />
+        <div className="min-w-0 flex-1">
+          <div className="text-xs font-semibold text-zinc-200">{meta.title}</div>
+          <div className="mt-0.5 text-[10px] text-zinc-600">源模型需启用 {meta.sourceCap}；辅助模型需启用 {meta.targetCap}</div>
         </div>
-        <div className="flex-1">
-          <div className="text-sm font-bold text-white">{meta.title}</div>
-          <div className="text-xs text-zinc-500 mt-0.5">{meta.desc}</div>
-          <div className="mt-2 text-[10px] text-zinc-600">
-            已启用 {meta.sourceCap} 的源模型：<span className="text-emerald-400 font-semibold">{sourceModels.length}</span>
-            ；可作为目标的 {meta.targetCap} 模型：<span className="text-emerald-400 font-semibold">{targetModels.length}</span>
-          </div>
-        </div>
+        <div className="flex shrink-0 items-center gap-4 text-[10px] text-zinc-500"><span>源模型 <b className="text-zinc-200">{sourceModels.length}</b></span><span>辅助模型 <b className="text-zinc-200">{targetModels.length}</b></span></div>
       </div>
 
       {/* 源模型列表 + 配套 */}
@@ -110,7 +112,7 @@ export default function PairingTab({ providers, models, setModels, getProviderNa
             <Sparkles className="mx-auto mb-2 size-8 text-zinc-600" />
             <p className="text-sm text-zinc-500">没有可配对的源模型</p>
             <p className="text-[11px] text-zinc-600 mt-1">
-              请先在「模型列表」Tab 把模型的「能力」标志打开（imageInput / vision）
+              请先在「模型」中编辑能力：源模型打开 {meta.sourceCap}，辅助模型打开 {meta.targetCap}
             </p>
           </div>
         )}

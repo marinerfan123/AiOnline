@@ -57,6 +57,7 @@ import AddModelDialog from './AddModelDialog';
 import { OssConfigPanel } from '@/components/OssConfigPanel';
 import ProviderModelsPanel from './ProviderModelsPanel';
 import ModelProtocolDrawer, { type DrawerModelGroup } from '@/components/ModelProtocolDrawer';
+import { MODEL_HUB_NAV_GROUPS, findModelHubNavItem, type ModelHubTab } from './ModelHubNavigation';
 
 const TYPE_LABELS: Record<ModelType, string> = {
   image: '图片',
@@ -86,7 +87,7 @@ export default function ModelHubPage() {
   const { providers, models, setProviders, setModels, patchModel, deleteProvider, deleteModel, cleanupOrphanModels, reloadProviders, getProviderName } = useModelHub();
   const navigate = useNavigate();
   const { enabled: ossEnabled, ingestFromUrl, ingestFile } = useOssConfig();
-  const [activeTab, setActiveTab] = useState<'providers' | 'models' | 'endpoints' | 'pairing' | 'storage'>('models');
+  const [activeTab, setActiveTab] = useState<ModelHubTab>('models');
   const [asyncAddOpen, setAsyncAddOpen] = useState(false);
   const [addModelOpen, setAddModelOpen] = useState(false);
   // 模型行「⚙ 协议」抽屉：保存当前要编辑的模型组快照
@@ -992,115 +993,90 @@ export default function ModelHubPage() {
 
   return (
     <div className="flex h-full flex-col">
-      {/* 顶部标题栏 */}
-      <div className="flex items-center justify-between border-b border-zinc-800 px-6 py-4">
-        <div>
-          <h1 className="text-xl font-bold text-white">模型 Hub</h1>
-          <p className="mt-0.5 text-xs text-zinc-500">管理多服务商模型路由与 API 配置</p>
-        </div>
-        <div className="flex items-center gap-2">
-          {/* Tab 切换 —— 固定宽度（不被其他按钮挤压） */}
-          <div className="flex items-center rounded-full bg-zinc-900 p-1 border border-zinc-800 shrink-0">
-            <button
-              onClick={() => setActiveTab('models')}
-              className={`rounded-full px-3.5 py-1.5 text-xs font-semibold transition-all duration-200 ${
-                activeTab === 'models'
-                  ? 'bg-emerald-500/15 text-emerald-400'
-                  : 'text-zinc-400 hover:text-white'
-              }`}
-            >
-              模型列表
-            </button>
-            <button
-              onClick={() => setActiveTab('providers')}
-              className={`rounded-full px-3.5 py-1.5 text-xs font-semibold transition-all duration-200 ${
-                activeTab === 'providers'
-                  ? 'bg-emerald-500/15 text-emerald-400'
-                  : 'text-zinc-400 hover:text-white'
-              }`}
-            >
-              服务商
-            </button>
-            <button
-              onClick={() => setActiveTab('endpoints')}
-              className={`rounded-full px-3.5 py-1.5 text-xs font-semibold transition-all duration-200 ${
-                activeTab === 'endpoints'
-                  ? 'bg-emerald-500/15 text-emerald-400'
-                  : 'text-zinc-400 hover:text-white'
-              }`}
-            >
-              自定义协议
-            </button>
-            <button
-              onClick={() => setActiveTab('pairing')}
-              className={`rounded-full px-3.5 py-1.5 text-xs font-semibold transition-all duration-200 ${
-                activeTab === 'pairing'
-                  ? 'bg-emerald-500/15 text-emerald-400'
-                  : 'text-zinc-400 hover:text-white'
-              }`}
-            >
-              配套关系
-            </button>
-            <button
-              onClick={() => setActiveTab('storage')}
-              className={`rounded-full px-3.5 py-1.5 text-xs font-semibold transition-all duration-200 ${
-                activeTab === 'storage'
-                  ? 'bg-emerald-500/15 text-emerald-400'
-                  : 'text-zinc-400 hover:text-white'
-              }`}
-            >
-              存储配置
-            </button>
+      {/* 页面标题与分类导航 */}
+      <div className="border-b border-zinc-800 px-6 pt-4">
+        <div className="flex items-center justify-between gap-4 pb-4">
+          <div>
+            <h1 className="text-xl font-bold text-white">模型 Hub</h1>
+            <p className="mt-0.5 text-xs text-zinc-500">管理多服务商模型路由与 API 配置</p>
           </div>
-
-          {/* 跳转到前台「模型控制台」：已配置模型自动渲染表单并可直接生成 */}
-          <button
-            onClick={() => navigate('/model-console')}
-            className="flex items-center gap-1.5 rounded-full border border-indigo-400/40 bg-indigo-500/10 px-4 py-2 text-xs font-bold text-indigo-200 hover:bg-indigo-500/20 transition-colors shrink-0 whitespace-nowrap"
-          >
-            <Sparkles className="size-3.5" />
-            <span>打开模型控制台</span>
-          </button>
-
-          {/* 固定右侧：所有 Tab 共用一个「添加」按钮（storage 例外：保存配置） */}
-          {/* Tab-专属按钮（如「从模板添加」「异步添加」）已移到内容区内部，避免按钮数变化导致 Tab 错位 */}
-
-          {activeTab !== 'storage' && (
+          <div className="flex items-center gap-2">
             <button
-              onClick={() => {
-                if (activeTab === 'models') {
+              onClick={() => navigate('/model-console')}
+              className="flex items-center gap-1.5 rounded-full border border-indigo-400/40 bg-indigo-500/10 px-4 py-2 text-xs font-bold text-indigo-200 transition-colors hover:bg-indigo-500/20"
+            >
+              <Sparkles className="size-3.5" />
+              <span>打开模型控制台</span>
+            </button>
+            {activeTab === 'models' && (
+              <button
+                onClick={() => {
                   if (providers.length === 0) {
-                    toast.error('请先到「服务商」Tab 添加服务商');
+                    toast.error('请先添加服务商');
                     setActiveTab('providers');
                     return;
                   }
                   setAddModelOpen(true);
-                } else {
-                  openAddDialog();
-                }
-              }}
-              className="flex items-center gap-1.5 rounded-full bg-emerald-500 px-4 py-2 text-xs font-bold text-black hover:bg-emerald-400 transition-colors shrink-0 whitespace-nowrap"
-            >
-              <Plus className="size-3.5" />
-              <span>
-            {activeTab === 'providers' && '添加服务商'}
-            {activeTab === 'models' && '添加模型'}
-            {(activeTab as string) === 'endpoints' && '添加模型'}
-            {(activeTab as string) === 'pairing' && '添加模型'}
-            {(activeTab as string) === 'storage' && '存储'}
-          </span>
-            </button>
-          )}
-          {activeTab === 'storage' && (
-            <button
-              onClick={() => document.getElementById('oss-bulk-upload-section')?.scrollIntoView({ behavior: 'smooth' })}
-              disabled={!ossEnabled}
-              className="flex items-center gap-1.5 rounded-full bg-emerald-500 px-4 py-2 text-xs font-bold text-black hover:bg-emerald-400 transition-colors shrink-0 whitespace-nowrap disabled:opacity-50"
-            >
-              <UploadCloud className="size-3.5" />
-              上传现有图片
-            </button>
-          )}
+                }}
+                className="flex items-center gap-1.5 rounded-full bg-emerald-500 px-4 py-2 text-xs font-bold text-black transition-colors hover:bg-emerald-400"
+              >
+                <Plus className="size-3.5" />添加模型
+              </button>
+            )}
+            {activeTab === 'providers' && (
+              <button onClick={openAddDialog} className="flex items-center gap-1.5 rounded-full bg-emerald-500 px-4 py-2 text-xs font-bold text-black transition-colors hover:bg-emerald-400">
+                <Plus className="size-3.5" />添加服务商
+              </button>
+            )}
+            {activeTab === 'storage' && (
+              <button
+                onClick={() => document.getElementById('oss-bulk-upload-section')?.scrollIntoView({ behavior: 'smooth' })}
+                disabled={!ossEnabled}
+                className="flex items-center gap-1.5 rounded-full bg-emerald-500 px-4 py-2 text-xs font-bold text-black transition-colors hover:bg-emerald-400 disabled:opacity-50"
+              >
+                <UploadCloud className="size-3.5" />上传现有图片
+              </button>
+            )}
+          </div>
+        </div>
+
+        <nav aria-label="模型 Hub 功能分类" className="flex items-end gap-7 overflow-x-auto">
+          {MODEL_HUB_NAV_GROUPS.map((group) => (
+            <div key={group.label} className="shrink-0 pb-3">
+              <div className="mb-1.5 px-1 text-[9px] font-bold uppercase tracking-[0.18em] text-zinc-600">{group.label}</div>
+              <div className="flex items-center gap-1">
+                {group.items.map((item) => {
+                  const Icon = item.icon;
+                  const active = activeTab === item.id;
+                  return (
+                    <button
+                      key={item.id}
+                      type="button"
+                      onClick={() => setActiveTab(item.id)}
+                      title={item.description}
+                      aria-current={active ? 'page' : undefined}
+                      className={`group relative flex items-center gap-1.5 rounded-lg px-3 py-2 text-xs font-semibold transition-colors ${active ? 'bg-zinc-800 text-white' : 'text-zinc-400 hover:bg-zinc-900 hover:text-white'}`}
+                    >
+                      <Icon className={`size-3.5 ${active ? 'text-emerald-400' : 'text-zinc-600 group-hover:text-zinc-400'}`} />
+                      {item.label}
+                      {item.badge && <span className="rounded border border-amber-500/25 bg-amber-500/10 px-1 py-0.5 text-[8px] text-amber-300">{item.badge}</span>}
+                      {active && <span className="absolute inset-x-2 -bottom-3 h-px bg-emerald-400" />}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          ))}
+        </nav>
+      </div>
+
+      <div className="border-b border-zinc-800/70 bg-zinc-950/50 px-6 py-2.5">
+        <div className="flex items-center gap-2">
+          {(() => {
+            const current = findModelHubNavItem(activeTab);
+            const Icon = current.icon;
+            return <><Icon className="size-3.5 text-emerald-400" /><span className="text-xs font-semibold text-zinc-200">{current.label}</span><span className="text-[11px] text-zinc-600">{current.description}</span></>;
+          })()}
         </div>
       </div>
 
@@ -2205,7 +2181,6 @@ export default function ModelHubPage() {
           <PairingTab
             providers={providers}
             models={models}
-            setModels={setModels}
             getProviderName={getProviderName}
           />
         </div>

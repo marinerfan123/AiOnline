@@ -98,7 +98,10 @@ async function listLogicalModels(pg, { includeBindings = true } = {}) {
       'SELECT b.id, b.model_id, b.provider_id, b.upstream_model_name, b.enabled, b.priority, b.weight, m.endpoint, m.param_template, p.base_url, p.enabled AS p_enabled, p.name AS p_name FROM provider_model_bindings b LEFT JOIN models m ON m.model_id=b.model_id AND m.provider_id=b.provider_id AND m.enabled=true LEFT JOIN providers p ON p.id=b.provider_id WHERE b.model_id=ANY($1) AND b.enabled=true ORDER BY b.model_id, b.priority DESC, b.weight DESC',
       [modelIds],
     );
-    const pr = await pg.query('SELECT id, name, base_url, enabled FROM providers WHERE id=ANY($1)', [...new Set((br.rows || []).map((x) => x.provider_id))]);
+    const pr = await pg.query(
+      'SELECT id, name, base_url, enabled FROM providers WHERE id=ANY($1)',
+      [[...new Set((br.rows || []).map((x) => x.provider_id))]],
+    );
     const provById = new Map((pr.rows || []).map((x) => [x.id, x]));
     const byModel = {};
     for (const row of br.rows || []) {

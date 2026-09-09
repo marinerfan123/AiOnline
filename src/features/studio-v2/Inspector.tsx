@@ -200,11 +200,11 @@ export function Inspector({
                     ) : validation && !validation.valid ? (
                       <p className="text-red-400">配置无效</p>
                     ) : readiness ? (
-                      <p className={cn('text-emerald-400')}>可运行（就绪 · 本阶段不执行）</p>
+                      <p className={cn('text-emerald-400')}>已连接模型 · 可运行</p>
                     ) : (
                       <p className="text-ml2-text-3">加载中…</p>
                     )}
-                    <p className="text-[10px] text-ml2-text-3">M05-B2：纯配置图，不触发真实生成。</p>
+                    <p className="text-[10px] text-ml2-text-3">模型目录、线路路由与 Run 执行链已接入；运行结果在 Runs 面板查看。</p>
                   </div>
                 </Section>
               )}

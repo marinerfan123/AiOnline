@@ -66,3 +66,20 @@
 [data-test='studio-page'] .react-flow__handle {
   z-index: 10;
 }
+
+/* Native select popups otherwise inherit OS/browser colors inconsistently.
+   Pin the popup rows to a high-contrast opaque palette so every option stays
+   readable in Chromium/Windows dark mode. */
+[data-test='studio-page'] .studio-select {
+  color-scheme: dark;
+  cursor: pointer;
+}
+[data-test='studio-page'] .studio-select option,
+[data-test='studio-page'] .studio-select optgroup {
+  background: #272d37;
+  color: #f7f8fb;
+}
+[data-test='studio-page'] .studio-select option:checked {
+  background: #5665e6;
+  color: #ffffff;
+}

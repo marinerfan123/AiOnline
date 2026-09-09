@@ -41,6 +41,21 @@ async function getProviderForAdmin(pg, providerId) {
   return keypool.redactCredentialFields(p);
 }
 
+function inferredCapability(model) {
+  const doc = (model.ai_capabilities && Object.keys(model.ai_capabilities).length)
+    ? model.ai_capabilities
+    : {};
+  if (doc.type) return doc;
+  const type = model.type === 'image'
+    ? 'text_to_image'
+    : model.type === 'video'
+      ? 'text_to_video'
+      : model.type === 'text'
+        ? 'text_generation'
+        : '';
+  return type ? { ...doc, type, capabilities: { ...(doc.capabilities || {}), [type]: true } } : doc;
+}
+
 /** GET models（逻辑模型目录；用户可见，不含 provider cost）。 */
 async function listModelsForUser(pg, viewer) {
   const models = await repo.listLogicalModels(pg, { includeBindings: true });
@@ -50,7 +65,7 @@ async function listModelsForUser(pg, viewer) {
     display_name: m.display_name,
     type: m.type,
     enabled: m.enabled,
-    capabilities: m.ai_capabilities || {},
+    capabilities: inferredCapability(m),
     capability_version: m.capability_version,
     parameter_schema: m.ai_parameter_schemas || {},
     credit_cost: m.credit_cost,
@@ -77,7 +92,7 @@ async function getModelForUser(pg, modelId, viewer) {
     display_name: m.display_name,
     type: m.type,
     enabled: m.enabled,
-    capabilities: m.ai_capabilities || {},
+    capabilities: inferredCapability(m),
     capability_version: m.capability_version,
     parameter_schema: m.ai_parameter_schemas || {},
     credit_cost: m.credit_cost,

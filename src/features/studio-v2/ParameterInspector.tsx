@@ -92,7 +92,7 @@ function ModelField({ field, value, onChange }: { field: ParameterField; value: 
           onChange(e.target.value, next);
         }}
         aria-invalid={validateParameterValue(field, value).errors.length > 0 || unknownSelected || undefined}
-        className="h-8 w-full rounded-md bg-ml2-surface-3 px-2 text-xs text-ml2-text outline-none focus:ring-1 focus:ring-ml2-accent"
+        className="studio-select h-9 w-full rounded-md border border-ml2-border-strong bg-ml2-surface-overlay px-2.5 text-xs font-medium text-ml2-text outline-none focus:border-ml2-accent focus:ring-2 focus:ring-ml2-accent/25"
       >
         <option value="">选择逻辑模型…</option>
         {models.map((m) => <option key={m.model_id} value={m.model_id}>{m.display_name || m.model_id}</option>)}
@@ -166,14 +166,14 @@ function ParameterControl({ field, node, projectId }: { field: ParameterField; n
   }
   if (['select', 'aspect-ratio', 'resolution'].includes(field.type)) {
     return (
-      <select {...common} value={String(value ?? '')} onChange={(e) => set(e.target.value)} className="h-8 w-full rounded-md bg-ml2-surface-3 px-2 text-xs text-ml2-text outline-none focus:ring-1 focus:ring-ml2-accent">
+      <select {...common} value={String(value ?? '')} onChange={(e) => set(e.target.value)} className="studio-select h-9 w-full rounded-md border border-ml2-border-strong bg-ml2-surface-overlay px-2.5 text-xs font-medium text-ml2-text outline-none focus:border-ml2-accent focus:ring-2 focus:ring-ml2-accent/25">
         {field.options?.map((o) => <option key={String(o.value)} value={String(o.value)}>{o.label}</option>)}
       </select>
     );
   }
   if (field.type === 'multi-select') {
     const arr = Array.isArray(value) ? value.map(String) : [];
-    return <select {...common} multiple value={arr} onChange={(e) => set(Array.from(e.currentTarget.selectedOptions).map((o) => o.value))} className="min-h-16 w-full rounded-md bg-ml2-surface-3 px-2 text-xs text-ml2-text outline-none focus:ring-1 focus:ring-ml2-accent">{field.options?.map((o) => <option key={String(o.value)} value={String(o.value)}>{o.label}</option>)}</select>;
+    return <select {...common} multiple value={arr} onChange={(e) => set(Array.from(e.currentTarget.selectedOptions).map((o) => o.value))} className="studio-select min-h-20 w-full rounded-md border border-ml2-border-strong bg-ml2-surface-overlay px-2.5 py-1.5 text-xs font-medium text-ml2-text outline-none focus:border-ml2-accent focus:ring-2 focus:ring-ml2-accent/25">{field.options?.map((o) => <option key={String(o.value)} value={String(o.value)}>{o.label}</option>)}</select>;
   }
   if (['number', 'integer', 'slider', 'seed', 'duration'].includes(field.type)) {
     const type = field.type === 'slider' ? 'range' : 'number';
@@ -244,8 +244,8 @@ export function ParameterInspector({ node, def, projectId }: { node: StudioNode;
         </div>
       )}
       {def.isGeneration && (
-        <p data-test="cost-contract" className="text-[10px] leading-snug text-ml2-text-3">
-          成本估算需待 Run Engine（M05-D+）。本阶段不计算真实 credit / 不调用计费。
+        <p data-test="cost-contract" className="rounded-md border border-ml2-border bg-ml2-surface-2 px-2 py-1.5 text-[10px] leading-snug text-ml2-text-2">
+          已接入模型目录与真实 Run 执行链；实际积分与供应商线路由后端在运行时解析。
         </p>
       )}
     </div>

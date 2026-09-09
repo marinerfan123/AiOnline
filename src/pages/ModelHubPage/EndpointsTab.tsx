@@ -2,7 +2,7 @@
 // 支持 JSONPath 解析响应、模板 body 变量替换
 
 import { useState, useMemo } from 'react';
-import { Settings2, Plus, X, Check, Loader2, FlaskConical, ChevronRight, ChevronDown, AlertTriangle, FileCode, Trash2, Sparkles } from 'lucide-react';
+import { Plus, Loader2, FlaskConical, ChevronRight, ChevronDown, AlertTriangle, FileCode, Trash2, Sparkles } from 'lucide-react';
 import { toast } from 'sonner';
 import type { IModelProvider, IAiModel, IEndpoint, IModelEndpoint, ProtocolType } from '@/data/models';
 import { apiTestProviderEndpoint, apiTestProviderDefault } from '@/services/api';
@@ -193,22 +193,26 @@ export default function EndpointsTab({ providers, setProviders, setModels, model
 
   return (
     <div className="space-y-4">
-      {/* 顶部操作栏：异步添加（粘贴 cURL） */}
-      <div className="flex items-center justify-between">
-        <div>
-          <h3 className="text-sm font-bold text-white">自定义协议配置</h3>
-          <p className="text-[11px] text-zinc-500 mt-0.5">为服务商或单个模型自定义获取/生成/拉取接口</p>
+      {/* 功能说明与操作入口 */}
+      <div className="grid gap-3 lg:grid-cols-[1fr_auto] lg:items-start">
+        <div className="rounded-xl border border-zinc-800 bg-zinc-900/35 p-4">
+          <div className="flex items-start gap-3">
+            <div className="mt-0.5 flex size-8 shrink-0 items-center justify-center rounded-lg bg-blue-500/10 text-blue-300"><FileCode className="size-4" /></div>
+            <div>
+              <h3 className="text-sm font-bold text-white">接口协议</h3>
+              <p className="mt-1 text-[11px] leading-5 text-zinc-500">当服务商不完全兼容 OpenAI 接口时，在这里定义请求路径、请求体模板和响应字段。优先配置服务商默认值，只为例外模型添加覆盖。</p>
+              <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-[10px] text-zinc-600">
+                <span>1. 选择服务商或模型</span><span>2. 选择协议模式</span><span>3. 配置生成/轮询端点</span><span>4. 测试后生效</span>
+              </div>
+            </div>
+          </div>
         </div>
         <button
-          onClick={() => {
-            // 触发全局异步添加向导（由父组件提供）
-            const ev = new CustomEvent('open-async-add');
-            window.dispatchEvent(ev);
-          }}
-          className="flex items-center gap-1.5 rounded-full border border-amber-500/30 bg-amber-500/10 px-4 py-2 text-xs text-amber-400 hover:bg-amber-500/20 transition-colors"
+          onClick={() => window.dispatchEvent(new CustomEvent('open-async-add'))}
+          className="flex items-center gap-1.5 rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-2.5 text-xs text-amber-300 transition-colors hover:bg-amber-500/20"
         >
           <Sparkles className="size-3.5" />
-          异步添加（粘贴 cURL）
+          从 cURL 导入
         </button>
       </div>
 
@@ -286,7 +290,7 @@ export default function EndpointsTab({ providers, setProviders, setModels, model
             </div>
 
             {/* 协议切换 */}
-            <div className="rounded-2xl border border-zinc-800 bg-zinc-900/40 p-4">
+            <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-4">
               <div className="flex items-center justify-between">
                 <div>
                   <div className="text-xs font-bold text-white">协议模式</div>

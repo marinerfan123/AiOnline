@@ -9,21 +9,21 @@
 :root,
 .ml2 {
   /* ── Surface (dark-first) ────────────────────────────────── */
-  --ml2-surface-0: #0a0b0e;
-  --ml2-surface-1: #101216;
-  --ml2-surface-2: #16191f;
-  --ml2-surface-3: #1d2129;
-  --ml2-surface-overlay: #232833;
+  --ml2-surface-0: #111318;
+  --ml2-surface-1: #171a20;
+  --ml2-surface-2: #20242c;
+  --ml2-surface-3: #292f39;
+  --ml2-surface-overlay: #313845;
 
   /* ── Border ──────────────────────────────────────────────── */
-  --ml2-border: #262b35;
-  --ml2-border-strong: #343b48;
-  --ml2-border-focus: #6c7cff;
+  --ml2-border: #3a4250;
+  --ml2-border-strong: #566172;
+  --ml2-border-focus: #8592ff;
 
   /* ── Text ────────────────────────────────────────────────── */
-  --ml2-text-primary: #f2f4f8;
-  --ml2-text-secondary: #9aa3b2;
-  --ml2-text-muted: #5c6572;
+  --ml2-text-primary: #f7f8fb;
+  --ml2-text-secondary: #c4cad4;
+  --ml2-text-muted: #929cab;
   --ml2-text-inverse: #0a0b0e;
 
   /* ── Accent (brand, indigo-violet) ───────────────────────── */

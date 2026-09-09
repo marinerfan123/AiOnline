@@ -31,13 +31,36 @@ const TYPE_META: Record<ModelType, { label: string; color: string; Icon: typeof 
   text: { label: '文本', color: 'bg-purple-500/10 text-purple-400 border-purple-500/20', Icon: MessageSquare },
 };
 
-// 智能识别模型类型（基于 modelId 关键词）
-function detectType(modelId: string): ModelType {
-  const id = modelId.toLowerCase();
-  const img = ['dall-e', 'dall_e', 'dalle', 'sd-', 'sd_', 'stable', 'midjourney', 'mj-', 'flux', 'imagen', 'nano-banana', 'sdxl', 'sd3', 'image', 'img', 'draw', 'paint'];
-  const vid = ['sora', 'runway', 'pika', 'kling', 'veo', 'video', 'mov', 'gen-3', 'gen-2', 'animate', 'luma', 'dream-machine', 'hailuo', 'hunyuan'];
-  if (img.some((k) => id.includes(k))) return 'image';
-  if (vid.some((k) => id.includes(k))) return 'video';
+// 智能识别模型类型（基于 modelId 关键词）。
+// 供应商常把 Seedream/Seedance 返回在同一个模型列表里；两者不能
+// 依赖通用的 dream/dao 象征词，必须用明确的产品前缀优先判定。
+export function detectType(modelId: string, metadata: Record<string, unknown> = {}): ModelType {
+  const id = modelId.trim().toLowerCase();
+  const meta = Object.entries(metadata)
+    .filter(([key]) => /^(modality|modalities|input.?modalit|output.?modalit|task|tasks|capabilit|architecture)$/i.test(key))
+    .flatMap(([, value]) => Array.isArray(value) ? value : [value])
+    .filter(Boolean).join(' ').toLowerCase();
+  if (/(video|text.?to.?video|image.?to.?video|i2v|t2v|video.?generation)/i.test(meta)) return 'video';
+  if (/(image|text.?to.?image|image.?generation|t2i|image.?editing|vision)/i.test(meta)) return 'image';
+  const explicitImage = [
+    'seedream', 'agnes-image', 'gpt-image', 'dall-e', 'dall_e', 'dalle',
+    'sd-', 'sd_', 'stable', 'midjourney', 'mj-', 'flux', 'imagen', 'nano-banana', 'sdxl',
+    'sd3', 'image', 'img', 'draw', 'paint', 't2i',
+  ];
+  const explicitVideo = [
+    'seedance', 'sora', 'runway', 'pika', 'kling', 'veo', 'video', 't2v', 'i2v',
+    'mov', 'gen-3', 'gen-2', 'animate', 'luma', 'dream-machine', 'hailuo',
+    'hunyuan-video',
+  ];
+  // 先判定视频，再判定图片，避免明确的视频标识落入文本兜底。
+  if (explicitVideo.some((k) => id.includes(k))) return 'video';
+  if (explicitImage.some((k) => id.includes(k))) return 'image';
+  // 通用/火山大模型族默认文本，不能被历史 type 或服务商类型提升为图片。
+  const textFamilies = [
+    'doubao', 'deepseek', 'qwen', 'kimi', 'glm-', 'mistral', 'codex',
+    'gpt-', 'chatgpt', 'llama', 'yi-', 'ernie', 'hunyuan',
+  ];
+  if (textFamilies.some((k) => id.includes(k))) return 'text';
   return 'text';
 }
 
@@ -97,7 +120,7 @@ export default function AddModelDialog({ open, onClose, providers, models, setMo
         return;
       }
       const items: FetchedItem[] = result.models.map((m, i) => {
-        const type = detectType(m.id);
+        const type = detectType(m.id, m);
         return {
           id: `fetched-${Date.now()}-${i}`,
           modelId: m.id,

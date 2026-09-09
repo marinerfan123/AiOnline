@@ -91,6 +91,23 @@ test('G07 models API: list projects canonical bindings (no provider secrets)', a
   assert.equal('legacyCapabilities' in models[0], false);
 });
 
+test('G07 models API: legacy model type and ai_capabilities backfill canvas capability projection', async () => {
+  const h = harness({
+    modelRows: [{
+      ...MODEL_ROW,
+      type: 'image',
+      capabilities: {},
+      ai_capabilities: {},
+      provider_name: PROVIDER_ROW.name,
+      provider_row_id: PROVIDER_ROW.id,
+    }],
+  });
+  await h.api.handle({}, {}, '/api/studio/models', 'GET');
+  const m = h.responses[0].body.models[0];
+  assert.equal(m.capabilities['image.text2image'], true);
+  assert.equal(m.available['image.text2image'], true);
+});
+
 test('G07 models API: bindings-aware view → available true + lineCount with live line', async () => {
   const h = harness();
   await h.api.handle({}, {}, '/api/studio/models', 'GET');

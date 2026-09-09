@@ -7,6 +7,7 @@ import fs from 'fs';
 import crypto from 'crypto';
 import zlib from 'zlib';
 import { asyncCheckUrl } from './ssrf.cjs';
+import { inferModelType } from './model-type.cjs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import cluster from 'node:cluster';
@@ -163,11 +164,11 @@ async function initDB() {
         pgSsl = { rejectUnauthorized: true, servername: pgHostForSsl };
       }
       pgPool = new Pool({
-        host: process.env.PG_HOST || 'localhost',
-        port: parseInt(process.env.PG_PORT || '5432', 10),
-        database: process.env.PG_DATABASE || 'huabu',
-        user: process.env.PG_USER || 'postgres',
-        password: process.env.PG_PASSWORD || '0.0.1abcd',
+        host: process.env.PG_HOST ?? process.env.PGHOST ?? 'localhost',
+        port: parseInt(process.env.PG_PORT ?? process.env.PGPORT ?? '5432', 10),
+        database: process.env.PG_DATABASE ?? process.env.PGDATABASE ?? 'huabu',
+        user: process.env.PG_USER ?? process.env.PGUSER ?? 'postgres',
+        password: process.env.PG_PASSWORD ?? process.env.PGPASSWORD ?? '0.0.1abcd',
         max: parseInt(process.env.PG_POOL_MAX || '10', 10),
         connectionTimeoutMillis: parseInt(process.env.PG_CONN_TIMEOUT_MS || '5000', 10),
         idleTimeoutMillis: parseInt(process.env.PG_IDLE_TIMEOUT_MS || '30000', 10),
@@ -244,6 +245,21 @@ async function initDB() {
         IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='models' AND column_name='updated_at') THEN ALTER TABLE models ADD COLUMN updated_at TIMESTAMPTZ DEFAULT NOW(); END IF;
         IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='models' AND column_name='updated_by') THEN ALTER TABLE models ADD COLUMN updated_by TEXT DEFAULT ''; END IF;
       END $$;
+      -- 模型逻辑键：同一服务商的同一上游模型只能保留一条记录。
+      -- 先清理历史重复（优先保留启用、媒体类型、已有映射名、较早记录），再建立唯一约束。
+      WITH ranked_model_rows AS (
+        SELECT id, row_number() OVER (
+          PARTITION BY provider_id, model_id
+          ORDER BY enabled DESC,
+            CASE WHEN type IN ('image','video','audio') THEN 0 ELSE 1 END,
+            CASE WHEN COALESCE(mapping_name,'') <> '' THEN 0 ELSE 1 END,
+            created_at ASC NULLS LAST, id ASC
+        ) AS rn
+        FROM models
+      )
+      DELETE FROM models m USING ranked_model_rows r
+       WHERE m.id = r.id AND r.rn > 1;
+      CREATE UNIQUE INDEX IF NOT EXISTS models_provider_model_unique ON models (provider_id, model_id);
       -- ── ModelHub V3 Phase 2：逻辑模型 × 服务商 线路绑定 ──
       -- models 收敛为「逻辑模型」（id/model_id/display_name/type/...），
       -- provider_model_bindings 表示「某服务商提供某逻辑模型的具体线路」（含上游真实模型名 upstream_model_name）。
@@ -4507,24 +4523,24 @@ async function handleAPI(req, res) {
         const { status, body } = await dispatcher.callEndpoint(base, defEp.listModels, p.api_key, {});
         if (status >= 400) return sendJSON(res, 200, { success: false, message: `同步失败 HTTP ${status}` });
         const arr = dispatcher.getArrayByPath(body, defEp.listModels.listFieldPath || 'data');
-        models = arr.map((m) => ({ id: String(dispatcher.getByPath(m, defEp.listModels.listIdFieldPath || 'id') || ''), name: String(dispatcher.getByPath(m, defEp.listModels.listNameFieldPath || 'name') || '') })).filter((m) => m.id);
+        models = arr.map((m) => ({
+          ...m,
+          id: String(dispatcher.getByPath(m, defEp.listModels.listIdFieldPath || 'id') || ''),
+          name: String(dispatcher.getByPath(m, defEp.listModels.listNameFieldPath || 'name') || ''),
+        })).filter((m) => m.id);
       } else {
         const resp = await fetch(`${base}/models`, { method: 'GET', headers: { Authorization: `Bearer ${p.api_key}` } });
         const data = await resp.json().catch(() => ({}));
         if (!resp.ok) return sendJSON(res, 200, { success: false, message: `同步失败 HTTP ${resp.status}` });
         const arr = Array.isArray(data && data.data) ? data.data : [];
-        models = arr.map((m) => ({ id: String(m.id || ''), name: String(m.id || '') })).filter((m) => m.id);
+        models = arr.map((m) => ({ ...m, id: String(m.id || ''), name: String(m.name || m.id || '') })).filter((m) => m.id);
       }
-      // 持久化：把服务商拉到的模型写库（幂等 upsert），否则刷新后内存态丢失 → "添加服务商后刷新就没了"。
-      // 模型行确定性 id，杜绝重复同步产生僵尸行；provider_id 外键挂在该服务商下，刷新后仍能显示。
-      // 只落服务商 supported_types 内的类型：本产品是图像/视频短剧管线，agnes 这类聚合商
-      // /models 会吐出数百文本 LLM，全落库会把模型台/价格页灌爆（此前涨到 320 行）。
+      // 全量导入服务商返回的模型：不再按 supported_types 过滤，避免聚合服务商
+      // 或服务商声明不完整时静默丢模型。类型由模型元数据/ID识别，未知才保留 text。
       try {
         const slug = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9._-]+/g, '-').slice(0, 60) || 'm';
-        const typeOf = (mid) => (/video/i.test(mid) ? 'video' : /image|img|t2i|sdxl/i.test(mid) ? 'image' : 'text');
-        const allowed = new Set((Array.isArray(p.supported_types) ? p.supported_types : []).map((s) => String(s).toLowerCase()));
+        const typeOf = (model) => inferModelType(model.id, 'text', { ...model, supportedTypes: p.supported_types });
         const rows = models
-          .filter((m) => allowed.size === 0 || allowed.has(typeOf(m.id)))
           .map((m) => ({
             id: `m-${slug(id)}-${slug(m.id)}`,
             model_id: m.id,
@@ -4537,7 +4553,7 @@ async function handleAPI(req, res) {
           await pgPool.query(
             `INSERT INTO models (id, model_id, display_name, type, provider_id, enabled)
              VALUES ($1,$2,$3,$4,$5,TRUE)
-             ON CONFLICT (id) DO UPDATE SET model_id=EXCLUDED.model_id, display_name=EXCLUDED.display_name, type=EXCLUDED.type, provider_id=EXCLUDED.provider_id, enabled=TRUE`,
+             ON CONFLICT (provider_id, model_id) DO UPDATE SET model_id=EXCLUDED.model_id, display_name=EXCLUDED.display_name, type=EXCLUDED.type, provider_id=EXCLUDED.provider_id, enabled=TRUE`,
             [r.id, r.model_id, r.display_name, r.type, r.provider_id],
           );
         }
@@ -4622,8 +4638,11 @@ async function handleAPI(req, res) {
 
   // ── Models ──
   if (url === '/api/models' && method === 'GET') {
-    if (pgPool) { const r = await pgPool.query('SELECT * FROM models ORDER BY sort_order ASC, created_at ASC'); return sendJSON(res, 200, r.rows.map(fromSnake)); }
-    return sendJSON(res, 200, readJSON('models'));
+    if (pgPool) {
+      const r = await pgPool.query('SELECT * FROM models ORDER BY sort_order ASC, created_at ASC');
+      return sendJSON(res, 200, r.rows.map((row) => ({ ...fromSnake(row), type: inferModelType(row.model_id, row.type) })));
+    }
+    return sendJSON(res, 200, readJSON('models').map((row) => ({ ...row, type: inferModelType(row.modelId || row.model_id, row.type) })));
   }
   // ── POST /api/models：单条创建（RESTful，不再是破坏性全量同步）──
   if (url === '/api/models' && method === 'POST') {
