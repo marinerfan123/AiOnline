@@ -174,8 +174,10 @@ function StudioNodeInner({ id, data, selected, width }: NodeProps<StudioNode>) {
       data-test="studio-node-card"
       data-node-kind={def.id}
       className={cn(
-        'relative flex flex-col overflow-hidden rounded-lg border bg-ml2-surface-1 shadow-md transition-shadow',
-        selected ? 'border-ml2-accent ring-2 ring-ml2-accent/40 shadow-lg' : 'border-ml2-border hover:border-ml2-border-strong',
+        'relative flex flex-col overflow-hidden rounded-lg border bg-ml2-surface-1 transition-[border-color,box-shadow,background-color] duration-150',
+        selected
+          ? 'border-ml2-accent bg-ml2-surface-2 shadow-[0_0_0_2px_rgba(113,112,255,0.18)]'
+          : 'border-ml2-border hover:border-ml2-border-strong',
         data.status === 'disabled' && 'opacity-60',
         isFrame && 'w-full',
       )}

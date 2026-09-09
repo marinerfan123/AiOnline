@@ -21,6 +21,7 @@ import { AssetLibraryDrawer } from './AssetLibraryDrawer';
 import { useStudioCanvasPersistence } from './useStudioCanvasPersistence';
 import { CanvasConflictBanner } from './CanvasConflictBanner';
 import type { StudioNodeKind } from './types';
+import '@/shared/ui/tokens.css';
 import './studio.css';
 
 function StudioLayout() {
@@ -52,7 +53,7 @@ function StudioLayout() {
   );
 
   return (
-    <div data-test="studio-page" className="flex h-full min-h-0 flex-col bg-ml2-surface-0">
+    <div data-test="studio-page" className="ml2 flex h-full min-h-0 flex-col bg-ml2-surface-0">
       <TopToolbar
         saveStatus={persistence.status}
         lastSavedAt={persistence.lastSavedAt}

@@ -403,7 +403,7 @@ function CanvasCore({ projectId, canvasRevision }: { projectId?: string; canvasR
             camera-following and borderless, closing the doc30/§33 'Dots, not
             borderless grid' M1 gap. Line grid sits under nodes, edge/connection
             candidates invisible until hover, pan/zoom-native and performant. */}
-        <Background variant={BackgroundVariant.Lines} gap={24} size={1} color="var(--ml2-border, #3f3f46)" />
+        <Background variant={BackgroundVariant.Lines} gap={32} size={1} color="rgba(255, 255, 255, 0.045)" />
         <MiniMap pannable zoomable position="bottom-left" className="!bg-ml2-surface-1 !border !border-ml2-border" maskColor="rgba(0,0,0,0.5)" />
         <Controls position="bottom-right" showInteractive={false} />
       </ReactFlow>

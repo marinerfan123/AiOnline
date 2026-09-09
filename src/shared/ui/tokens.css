@@ -6,6 +6,9 @@
    Prefix: --ml2-
    ════════════════════════════════════════════════════════════════ */
 
+/* The production /studio route is outside V2App; the .ml2 scope below owns
+   the complete runtime token set for that route. */
+
 :root,
 .ml2 {
   /* ── Surface (dark-first) ────────────────────────────────── */
@@ -107,7 +110,8 @@
   --ml2-z-toast: 90;
   --ml2-z-tooltip: 100;
 
-  /* ── Map tokens to Tailwind v4 theme so utilities work ───── */
+  /* ── Map tokens to legacy consumers; Tailwind utilities are declared in
+     the @theme inline block above. ─────────────────────────── */
   --color-ml2-surface-0: var(--ml2-surface-0);
   --color-ml2-surface-1: var(--ml2-surface-1);
   --color-ml2-surface-2: var(--ml2-surface-2);

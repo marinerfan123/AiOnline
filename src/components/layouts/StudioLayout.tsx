@@ -23,7 +23,7 @@ export function StudioLayout() {
   const dockProps = studioDockConfig(user?.role);
 
   return (
-    <div className="flex h-screen w-full overflow-hidden bg-black text-white">
+    <div className="flex h-screen w-full overflow-hidden bg-ml2-surface-0 text-ml2-text">
       <NavigationDock
         {...dockProps}
         mobileOpen={mobileDockOpen}

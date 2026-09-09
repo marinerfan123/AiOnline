@@ -127,6 +127,29 @@
   --color-sidebar-border: var(--sidebar-border);
   --color-sidebar-ring: var(--sidebar-ring);
 
+  /* Moling V2 / Studio palette. Declared in the global Tailwind theme so the
+     production /studio route receives real utilities, not unresolved classes. */
+  --color-ml2-surface-0: var(--ml2-surface-0);
+  --color-ml2-surface-1: var(--ml2-surface-1);
+  --color-ml2-surface-2: var(--ml2-surface-2);
+  --color-ml2-surface-3: var(--ml2-surface-3);
+  --color-ml2-surface-overlay: var(--ml2-surface-overlay);
+  --color-ml2-border: var(--ml2-border);
+  --color-ml2-border-strong: var(--ml2-border-strong);
+  --color-ml2-text: var(--ml2-text-primary);
+  --color-ml2-text-2: var(--ml2-text-secondary);
+  --color-ml2-text-3: var(--ml2-text-muted);
+  --color-ml2-accent: var(--ml2-accent);
+  --color-ml2-accent-hover: var(--ml2-accent-hover);
+  --color-ml2-accent-dim: var(--ml2-accent-dim);
+  --color-ml2-success: var(--ml2-success);
+  --color-ml2-success-dim: var(--ml2-success-dim);
+  --color-ml2-warning: var(--ml2-warning);
+  --color-ml2-warning-dim: var(--ml2-warning-dim);
+  --color-ml2-danger: var(--ml2-danger);
+  --color-ml2-danger-dim: var(--ml2-danger-dim);
+  --color-ml2-info: var(--ml2-info);
+
   --font-sans: 'Inter', 'Noto Sans SC', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;;
   --font-mono: var(--font-mono);
   --font-serif: var(--font-serif);
