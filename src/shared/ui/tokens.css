@@ -9,39 +9,39 @@
 :root,
 .ml2 {
   /* ── Surface (dark-first) ────────────────────────────────── */
-  --ml2-surface-0: #111318;
-  --ml2-surface-1: #171a20;
-  --ml2-surface-2: #20242c;
-  --ml2-surface-3: #292f39;
-  --ml2-surface-overlay: #313845;
+  --ml2-surface-0: #08090a;
+  --ml2-surface-1: #0f1011;
+  --ml2-surface-2: #191a1b;
+  --ml2-surface-3: #28282c;
+  --ml2-surface-overlay: #303136;
 
   /* ── Border ──────────────────────────────────────────────── */
-  --ml2-border: #3a4250;
-  --ml2-border-strong: #566172;
-  --ml2-border-focus: #8592ff;
+  --ml2-border: rgba(255, 255, 255, 0.08);
+  --ml2-border-strong: rgba(255, 255, 255, 0.14);
+  --ml2-border-focus: #8b8cff;
 
   /* ── Text ────────────────────────────────────────────────── */
-  --ml2-text-primary: #f7f8fb;
-  --ml2-text-secondary: #c4cad4;
-  --ml2-text-muted: #929cab;
-  --ml2-text-inverse: #0a0b0e;
+  --ml2-text-primary: #f7f8f8;
+  --ml2-text-secondary: #d0d6e0;
+  --ml2-text-muted: #8a8f98;
+  --ml2-text-inverse: #08090a;
 
-  /* ── Accent (brand, indigo-violet) ───────────────────────── */
-  --ml2-accent: #6c7cff;
-  --ml2-accent-hover: #8490ff;
-  --ml2-accent-pressed: #5665e6;
-  --ml2-accent-dim: rgba(108, 124, 255, 0.14);
+  /* ── Accent (restrained indigo-violet) ───────────────────── */
+  --ml2-accent: #7170ff;
+  --ml2-accent-hover: #828fff;
+  --ml2-accent-pressed: #5e6ad2;
+  --ml2-accent-dim: rgba(113, 112, 255, 0.16);
   --ml2-on-accent: #ffffff;
 
   /* ── Semantic ────────────────────────────────────────────── */
-  --ml2-success: #22c55e;
-  --ml2-success-dim: rgba(34, 197, 94, 0.15);
-  --ml2-warning: #f59e0b;
-  --ml2-warning-dim: rgba(245, 158, 11, 0.15);
-  --ml2-danger: #ef4444;
-  --ml2-danger-dim: rgba(239, 68, 68, 0.15);
-  --ml2-info: #38bdf8;
-  --ml2-info-dim: rgba(56, 189, 248, 0.15);
+  --ml2-success: #34d399;
+  --ml2-success-dim: rgba(52, 211, 153, 0.14);
+  --ml2-warning: #fbbf24;
+  --ml2-warning-dim: rgba(251, 191, 36, 0.14);
+  --ml2-danger: #fb7185;
+  --ml2-danger-dim: rgba(251, 113, 133, 0.14);
+  --ml2-info: #67e8f9;
+  --ml2-info-dim: rgba(103, 232, 249, 0.14);
 
   /* ── Task states ─────────────────────────────────────────── */
   --ml2-state-queued: #9aa3b2;
@@ -118,9 +118,13 @@
   --color-ml2-text-3: var(--ml2-text-muted);
   --color-ml2-accent: var(--ml2-accent);
   --color-ml2-accent-hover: var(--ml2-accent-hover);
+  --color-ml2-accent-dim: var(--ml2-accent-dim);
   --color-ml2-success: var(--ml2-success);
+  --color-ml2-success-dim: var(--ml2-success-dim);
   --color-ml2-warning: var(--ml2-warning);
+  --color-ml2-warning-dim: var(--ml2-warning-dim);
   --color-ml2-danger: var(--ml2-danger);
+  --color-ml2-danger-dim: var(--ml2-danger-dim);
   --color-ml2-info: var(--ml2-info);
 }
 

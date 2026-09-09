@@ -318,7 +318,7 @@ function CanvasCore({ projectId, canvasRevision }: { projectId?: string; canvasR
         onNodeDragStart={onNodeDragStart}
         onNodeDragStop={onNodeDragStop}
         onMoveEnd={(_, v) => onViewportChange(v)}
-        defaultEdgeOptions={{ style: { stroke: '#52525b', strokeWidth: 1.5 }, type: 'smoothstep' }}
+        defaultEdgeOptions={{ style: { stroke: 'rgba(208, 214, 224, 0.34)', strokeWidth: 1.5 }, type: 'smoothstep' }}
         minZoom={0.05}
         maxZoom={2}
         onlyRenderVisibleElements

@@ -4,23 +4,28 @@
 [data-test='studio-page'] .react-flow {
   --xy-color-bg: var(--ml2-surface-0);
   --xy-color-text: var(--ml2-text-primary);
-  --xy-color-edge-stroke: #52525b;
+  --xy-color-edge-stroke: rgba(208, 214, 224, 0.34);
   --xy-color-edge-stroke-selected: var(--ml2-accent);
   background: var(--ml2-surface-0);
 }
 
+/* Linear/Runway-inspired canvas chrome: structure from luminance steps,
+   not saturated fills or heavy shadows. */
+[data-test='studio-page'] .react-flow__pane {
+  background: var(--ml2-surface-0);
+}
 [data-test='studio-page'] .react-flow__controls {
   border-radius: 8px;
   overflow: hidden;
   border: 1px solid var(--ml2-border);
-  box-shadow: none;
+  box-shadow: var(--ml2-elev-2);
 }
 [data-test='studio-page'] .react-flow__controls button {
   background: var(--ml2-surface-1);
   border-bottom: 1px solid var(--ml2-border);
   color: var(--ml2-text-secondary);
-  width: 26px;
-  height: 26px;
+  width: 28px;
+  height: 28px;
   fill: var(--ml2-text-secondary);
 }
 [data-test='studio-page'] .react-flow__controls button:hover {
@@ -35,19 +40,24 @@
 [data-test='studio-page'] .react-flow__minimap {
   border-radius: 8px;
   overflow: hidden;
+  border: 1px solid var(--ml2-border);
+  box-shadow: var(--ml2-elev-1);
 }
 [data-test='studio-page'] .react-flow__minimap .react-flow__minimap-mask {
-  fill: rgba(0, 0, 0, 0.55);
+  fill: rgba(8, 9, 10, 0.72);
 }
 [data-test='studio-page'] .react-flow__minimap-node {
   stroke: var(--ml2-border-strong);
+  fill: var(--ml2-surface-3);
 }
 
 [data-test='studio-page'] .react-flow__edge-path {
-  stroke: #52525b;
+  stroke: rgba(208, 214, 224, 0.34);
+  stroke-width: 1.5;
 }
 [data-test='studio-page'] .react-flow__edge.selected .react-flow__edge-path {
   stroke: var(--ml2-accent);
+  stroke-width: 2;
 }
 [data-test='studio-page'] .react-flow__connection-path {
   stroke: var(--ml2-accent);
