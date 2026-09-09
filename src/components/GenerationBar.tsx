@@ -267,7 +267,9 @@ export interface GenerationBarHandle {
   retry: (payload: RetryPayload) => void;
   /** 聚焦底部提示词输入框（供空状态「立即创作」CTA 使用） */
   focusInput: () => void;
-  /** 配方预填 + 可选变体参考图（T1 配方复用 / T2 变体 Remix） */
+  /** 配方/样式只预填，不提交生成任务 */
+  prefill: (payload: GenerationPayload) => void;
+  /** 仅明确的自动生成入口使用；样式/配方/变体使用 prefill */
   generate: (payload: GenerationPayload) => void;
   /** 取消后在父级已移除卡片时，清掉本地的持久化恢复记录（避免刷新后幽灵 pending） */
   cancelPersistedTask: (taskId: string) => void;
@@ -640,37 +642,26 @@ function GenerationBar({
       inputRef.current?.focus();
     },
     generate: (payload: GenerationPayload) => {
-      // T1 配方复用：预填 prompt + model + ratio（一键复刻）
-      // T2 变体 Remix：额外把示例缩略图当参考图传入 apiGenerate
-      // T3 制作视频：从图片详情页切到视频模式，并把当前图当首帧参考图
+      // 仅保留给明确要求自动提交的角色入口；样式/配方/变体统一使用 prefill。
       onPromptChangeRef.current(payload.prompt);
       const nextSettings = { ...settingsRef.current, model: payload.model, ratio: payload.ratio as Ratio };
-      if (payload.contentType) {
-        nextSettings.contentType = payload.contentType;
-        if (payload.contentType === 'video') {
-          // 按参考图数量给默认视频模式，减少后端推导的歧义
-          const refCount = payload.referenceImages?.length || 0;
-          if (refCount === 0) nextSettings.videoMode = 't2v';
-          else if (refCount === 1) nextSettings.videoMode = 'i2v_first';
-          else if (refCount === 2) nextSettings.videoMode = 'i2v_first_last';
-          else nextSettings.videoMode = 'reference_image';
-        }
-      }
+      if (payload.contentType) nextSettings.contentType = payload.contentType;
+      onSettingsChangeRef.current(nextSettings);
+      if (payload.referenceImages?.length) onSetReferenceImagesRef.current?.(payload.referenceImages);
+      if (payload.referenceStyle !== undefined) setAttributedStyle(payload.referenceStyle || null);
+      setTimeout(() => {
+        handleGenerateRef.current({ referenceImages: payload.referenceImages, attributedStyle: payload.referenceStyle || null });
+      }, 120);
+    },
+    prefill: (payload: GenerationPayload) => {
+      onPromptChangeRef.current(payload.prompt);
+      const nextSettings = { ...settingsRef.current, model: payload.model, ratio: payload.ratio as Ratio };
+      if (payload.contentType) nextSettings.contentType = payload.contentType;
       onSettingsChangeRef.current(nextSettings);
       if (payload.referenceImages && payload.referenceImages.length > 0) {
         onSetReferenceImagesRef.current?.(payload.referenceImages);
       }
-      // 归因样式：工作台「用推广样式创作」时携带，记为本次生成归属（用于给设计者分成）
-      if (payload.referenceStyle !== undefined) {
-        setAttributedStyle(payload.referenceStyle || null);
-      }
-      setTimeout(() => {
-        // auto=false 时只预填不生成；否则立即生成（一键复刻 / 一键变体 / 制作视频）
-        handleGenerateRef.current(payload.auto === false ? undefined : {
-          referenceImages: payload.referenceImages,
-          attributedStyle: payload.referenceStyle || null,
-        });
-      }, 120);
+      if (payload.referenceStyle !== undefined) setAttributedStyle(payload.referenceStyle || null);
     },
     cancelPersistedTask: (taskId: string) => {
       // 父级已移除 pending 卡片后，清掉本地恢复记录（与轮询 cancel 分支一致）

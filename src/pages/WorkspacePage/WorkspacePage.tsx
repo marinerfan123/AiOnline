@@ -468,25 +468,25 @@ export default function WorkspacePage() {
   };
 
   // ── 示例库高级玩法 ──
-  // T1 配方复用：用示例的 prompt + model + ratio 一键预填并立即生成（复刻）
+  // T1 配方复用：只预填，不自动提交；用户在生成栏确认后再点击提交。
   const handleUseRecipe = (item: IMediaItem) => {
-    generationBarRef.current?.generate({
+    generationBarRef.current?.prefill({
       prompt: item.prompt,
       model: item.model,
       ratio: item.ratio,
-      auto: true,
+      auto: false,
     });
-    setViewerOpen(false); // 关闭灯箱，让用户看到生成进度
+    setViewerOpen(false);
   };
-  // T2 变体 Remix：把示例缩略图当参考图，生成同源变体
+  // T2 变体 Remix：只预填参考图，不自动提交。
   const handleRemix = (item: IMediaItem) => {
     const refUrl = item.fullUrl || item.thumbnail;
-    generationBarRef.current?.generate({
+    generationBarRef.current?.prefill({
       prompt: item.prompt,
       model: item.model,
       ratio: item.ratio,
       referenceImages: refUrl ? [refUrl] : [],
-      auto: true,
+      auto: false,
     });
     setViewerOpen(false);
   };
@@ -507,7 +507,7 @@ export default function WorkspacePage() {
       toast.error('视频模型加载中，请稍后再试');
       return;
     }
-    generationBarRef.current?.generate({
+    generationBarRef.current?.prefill({
       prompt: item.prompt,
       model: videoModel,
       ratio: item.ratio,
@@ -540,15 +540,15 @@ export default function WorkspacePage() {
     }
   };
 
-  // T3 推广样式一键创作：把推广样式当参考图 + 归因到样式设计者（用于分成）
+  // T3 推广样式创作：只把样式填入生成栏，用户确认后再提交。
   const handleUsePromotedStyle = (style: ReferenceStyle) => {
-    generationBarRef.current?.generate({
+    generationBarRef.current?.prefill({
       prompt: style.prompt || '',
       model: style.modelId || settings.model,
       ratio: style.ratio || settings.ratio,
       referenceImages: style.previewUrl ? [style.previewUrl] : [],
       referenceStyle: style,
-      auto: true,
+      auto: false,
     });
   };
 
