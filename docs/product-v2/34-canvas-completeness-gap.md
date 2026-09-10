@@ -168,4 +168,6 @@
 - 测试环境 UI 刷新(13001 呈现): 待审批放行(大机预构建 dist + fast 镜像)
 - (17:25) 本轮: 空闲无未合入叶/无在飞委托。复核发现 M1 剩余独立 UI 缺口「无边网格线」确实未完成——StudioCanvas L398 仍 `BackgroundVariant.Dots`(点阵, 非「无边网格线」)。已接线: `Background`→`BackgroundVariant.Lines`(react-flow 内建无限线格, 随视口延伸, 位于节点下层, 关闭 doc30/§33 M1 目标准备)。提交 23873d7;  studio-v2 子集 23 files/189 tests 绿 + tsc 0。
 - 诚实注记: `canvasViewport.ts`(M1 视口纯数学, 28 tests)仍只被其自测消费、app 零 import——其 `gridLines`/LOD 渲染/`snapToGrid`(拖动吸附)接线属 core store.ts 域(undo/锁定同 alignSelection), 按并行纪律归父线 v4-pro 串行, flash cron 不写, 本轮不动(记录不臆造)。
-- 剩余仍为 2 原则性 deferral(未合入): W6④ 自动布局(核心 store.ts, 父线串行) / 服务端多画布 REST(server+DB+PG, 待容器证据)。
+- (2026-09-10 09:3x) **M1 网格吸附已接线**（6eae226, 父线串行）: `store.onNodeDragStop` 消费 `canvasViewport.snapToGrid`，拖拽结束吸附到 20 单位世界网格（位移取被移动未锁定节点包围盒左上角 → 与数组顺序无关；整批同一 delta → 多选/帧拖拽保持相对间距；锁定节点不动；已在网格上零改动），先吸附再 pushUndo(拖动前快照) → Ctrl+Z 回拖动前位置。同批修正两处**既有**帧联动缺陷（本轮实测复现）：帧与其内含节点同批拖动时子节点双重位移（60→70）、锁定子节点被帧联动平移（违反锁定位置稳定契约）。证据: 新增 `store.snapToGrid.test.ts` 15 例；studio-v2+v2 60 文件/456 用例全绿 + tsc 0。浏览器验证未执行（/studio 在 RequireAuth 后，需登录+全栈）。
+- 剩余未接线: `canvasViewport.gridLines`（可见范围网格线计算，LOD 预留）——react-flow `Background`(Lines) 已提供无边网格（23873d7），按「勿重做已备能力」不重复实现，仅保留为 LOD 备用纯函数。
+- 剩余 deferral: **无**（旧记的 2 原则性 deferral 已落地: W6④ 自动布局 bb031c0 / 服务端多画布 REST 4d8f295 — 均经 commit 核实）。唯一未接线纯函数 = `gridLines`（LOD 预留，见上条）。
