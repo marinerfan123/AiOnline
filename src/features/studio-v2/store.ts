@@ -44,12 +44,14 @@ import {
 import { studioRunClient, type StudioRunStatus } from './run/studioRunClient';
 import { canvasCommandLogClient, type CanvasCommand } from '@/shared/api/contract/canvasCommandLogClient';
 import { computeAutoLayout } from './dagLayout';
+import { snapToGrid } from './canvasViewport';
 
 export type StudioNode = Node<StudioNodeData>;
 export type StudioEdge = Edge<StudioEdgeData>;
 
 export const UNDO_LIMIT = 100; // bounded: 100 ops keeps memory flat on large canvases
 export const PASTE_OFFSET = 32;
+const EMPTY_LOCKED: ReadonlySet<string> = new Set();
 
 interface Snapshot {
   nodes: StudioNode[];
@@ -281,6 +283,49 @@ function childrenOfFrame(nodes: StudioNode[], frameId: string): Set<string> {
   return out;
 }
 
+/**
+ * M1 wiring — grid snap on drag-end (world GRID_SIZE = 20).
+ *
+ * The snap delta is derived from the moved selection's top-left corner (minimum
+ * x / minimum y of the moved, unlocked nodes) so the result does not depend on
+ * node array order, and is applied to every moved, UNLOCKED node — a
+ * multi-select or frame drag therefore keeps its relative arrangement instead
+ * of collapsing node-by-node onto the grid. Locked nodes keep their position
+ * (the same stability guarantee the auto-layout guard gives them). Returns the
+ * input array reference unchanged when there is nothing to snap (no-op → no
+ * extra undo entry).
+ */
+export function snapDraggedNodes(
+  preNodes: StudioNode[],
+  postNodes: StudioNode[],
+  lockedIds: ReadonlySet<string> = EMPTY_LOCKED,
+): StudioNode[] {
+  const preById = new Map(preNodes.map((n) => [n.id, n]));
+  const shiftable = new Set(
+    postNodes
+      .filter((n) => {
+        const before = preById.get(n.id);
+        return (
+          !lockedIds.has(n.id) &&
+          !!before &&
+          (before.position.x !== n.position.x || before.position.y !== n.position.y)
+        );
+      })
+      .map((n) => n.id),
+  );
+  if (shiftable.size === 0) return postNodes;
+  const moved = postNodes.filter((n) => shiftable.has(n.id));
+  const minX = Math.min(...moved.map((n) => n.position.x));
+  const minY = Math.min(...moved.map((n) => n.position.y));
+  const snapped = snapToGrid({ x: minX, y: minY });
+  const dx = snapped.x - minX;
+  const dy = snapped.y - minY;
+  if (dx === 0 && dy === 0) return postNodes;
+  return postNodes.map((n) =>
+    shiftable.has(n.id) ? { ...n, position: { x: n.position.x + dx, y: n.position.y + dy } } : n,
+  );
+}
+
 export const useStudioStore = create<StudioState>((set, get) => ({
   nodes: [],
   edges: [],
@@ -305,6 +350,12 @@ export const useStudioStore = create<StudioState>((set, get) => ({
     set((s) => {
       // Frame grouping: dragging a frame moves all contained nodes by the same delta.
       let nodes = applyNodeChanges(changes, s.nodes) as StudioNode[];
+      // React Flow already repositioned every node in this batch (a multi-select
+      // drag emits one position change per selected node). Shifting those again
+      // via frame linkage would move a child twice for the same drag.
+      const movedByBatch = new Set(
+        changes.filter((c) => c.type === 'position').map((c) => c.id),
+      );
       for (const ch of changes) {
         if (ch.type === 'position' && ch.position && ch.dragging === false) {
           const frame = nodes.find((n) => n.id === ch.id && n.data.nodeKind === 'frame');
@@ -316,9 +367,12 @@ export const useStudioStore = create<StudioState>((set, get) => ({
             if (dx === 0 && dy === 0) continue;
             const kids = childrenOfFrame(nodes, frame.id);
             if (kids.size > 0) {
-              nodes = nodes.map((n) =>
-                kids.has(n.id) ? { ...n, position: { x: n.position.x + dx, y: n.position.y + dy } } : n,
-              );
+              nodes = nodes.map((n) => {
+                if (!kids.has(n.id)) return n;
+                if (movedByBatch.has(n.id)) return n; // already moved by the drag itself
+                if (isNodeLocked(s, n.id)) return n; // locked = pinned in place
+                return { ...n, position: { x: n.position.x + dx, y: n.position.y + dy } };
+              });
             }
           }
         }
@@ -378,8 +432,15 @@ export const useStudioStore = create<StudioState>((set, get) => ({
 
   onViewportChange: (v) => set({ viewport: v }),
   onNodeDragStart: () => set((s) => ({ dragSnapshot: snapshot(s) })),
+  // M1 — drag-end: snap the moved nodes onto the world grid, then push ONE undo
+  // entry (the pre-drag snapshot), so Ctrl+Z returns the node(s) to where the
+  // drag started rather than to the snapped position.
   onNodeDragStop: () =>
-    set((s) => (s.dragSnapshot ? { ...pushUndo(s, s.dragSnapshot), dragSnapshot: null } : { dragSnapshot: null })),
+    set((s) => {
+      if (!s.dragSnapshot) return { dragSnapshot: null };
+      const nodes = snapDraggedNodes(s.dragSnapshot.nodes, s.nodes, s.lockedNodeIds);
+      return { ...pushUndo(s, s.dragSnapshot), nodes, dragSnapshot: null };
+    }),
 
   addNode: (kind, position) => {
     const def: NodeDef | undefined = getNodeDef(kind);
