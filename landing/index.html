@@ -1,0 +1,452 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="color-scheme" content="dark light" />
+<title>墨灵 · 把灵感，即时变为作品</title>
+<style>
+/* ============================================================
+   设计令牌 — 统一尺度 (4pt) + 双主题
+   反 AI-slop：单一强调渐变 + 细描边 + 大留白
+   ============================================================ */
+:root{
+  --space-1:4px; --space-2:8px; --space-3:12px; --space-4:16px;
+  --space-5:24px; --space-6:32px; --space-7:48px; --space-8:64px; --space-9:96px; --space-10:128px;
+  --r-xs:10px; --r-sm:14px; --r-md:20px; --r-lg:28px; --r-pill:999px;
+  --ease:cubic-bezier(.16,1,.3,1);
+  --accent-1:#7c5cff; --accent-2:#36d6ff; --warm:#ff8a5c;
+  --font-sans:"Inter","PingFang SC","Hiragino Sans GB","Microsoft YaHei",system-ui,-apple-system,"Segoe UI",sans-serif;
+  --grad:linear-gradient(135deg,var(--accent-1),var(--accent-2));
+}
+html[data-theme="dark"]{
+  --bg:#07070b; --bg-2:#0c0c14; --surface:rgba(255,255,255,.04);
+  --surface-2:rgba(255,255,255,.06); --border:rgba(255,255,255,.09);
+  --text:#f4f4f8; --muted:rgba(244,244,248,.60); --hair:rgba(255,255,255,.06);
+  --glass:rgba(14,14,22,.66);
+}
+html[data-theme="light"]{
+  --bg:#f6f6fb; --bg-2:#ffffff; --surface:rgba(12,12,24,.035);
+  --surface-2:rgba(12,12,24,.05); --border:rgba(12,12,24,.10);
+  --text:#0b0b12; --muted:rgba(11,11,18,.58); --hair:rgba(12,12,24,.07);
+  --glass:rgba(255,255,255,.72);
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{
+  font-family:var(--font-sans); background:var(--bg); color:var(--text);
+  line-height:1.6; -webkit-font-smoothing:antialiased; overflow-x:hidden;
+  transition:background .5s var(--ease),color .5s var(--ease);
+}
+a{color:inherit;text-decoration:none}
+.wrap{max-width:1180px;margin:0 auto;padding:0 var(--space-5)}
+.grad-text{background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent}
+.eyebrow{font-size:13px;letter-spacing:.18em;text-transform:uppercase;color:var(--muted);font-weight:600}
+.section{padding:var(--space-9) 0}
+.h-xs{font-size:clamp(12px,1.2vw,14px)}
+.h2{font-size:clamp(28px,4.4vw,46px);line-height:1.12;font-weight:700;letter-spacing:-.02em}
+.lead{font-size:clamp(16px,1.8vw,19px);color:var(--muted);max-width:60ch}
+
+/* 背景粒子 canvas */
+#bg{position:fixed;inset:0;z-index:0;pointer-events:none;opacity:.55}
+.tint{position:fixed;inset:0;z-index:0;pointer-events:none;
+  background:radial-gradient(60% 50% at 75% 0%,rgba(124,92,255,.16),transparent 60%),
+             radial-gradient(50% 40% at 10% 20%,rgba(54,214,255,.12),transparent 55%);}
+
+/* 玻璃导航 */
+header{position:sticky;top:0;z-index:50;backdrop-filter:blur(18px) saturate(160%);
+  background:var(--glass);border-bottom:1px solid var(--border);transition:background .5s var(--ease)}
+.nav{display:flex;align-items:center;justify-content:space-between;height:68px}
+.brand{display:flex;align-items:center;gap:var(--space-3);font-weight:700;font-size:18px;letter-spacing:-.01em}
+.logo{width:30px;height:30px;border-radius:9px;background:var(--grad);position:relative;flex:0 0 auto;
+  box-shadow:0 6px 20px rgba(124,92,255,.4)}
+.logo::after{content:"";position:absolute;inset:7px;border-radius:5px;background:var(--bg);opacity:.9}
+.nav-links{display:flex;gap:var(--space-6);font-size:14.5px;color:var(--muted)}
+.nav-links a{transition:color .25s var(--ease)}
+.nav-links a:hover{color:var(--text)}
+.nav-right{display:flex;align-items:center;gap:var(--space-3)}
+.theme-switch{display:flex;background:var(--surface);border:1px solid var(--border);border-radius:var(--r-pill);padding:3px}
+.theme-switch button{width:30px;height:30px;border:0;background:transparent;color:var(--muted);border-radius:var(--r-pill);
+  cursor:pointer;display:grid;place-items:center;transition:all .3s var(--ease);font-size:14px}
+.theme-switch button[aria-pressed="true"]{background:var(--grad);color:#fff;box-shadow:0 4px 14px rgba(124,92,255,.4)}
+.btn{display:inline-flex;align-items:center;gap:var(--space-2);font-weight:600;font-size:14.5px;
+  padding:11px 20px;border-radius:var(--r-pill);border:1px solid var(--border);cursor:pointer;
+  background:var(--surface);color:var(--text);transition:transform .4s var(--ease),background .3s var(--ease),box-shadow .4s var(--ease);will-change:transform}
+.btn:hover{background:var(--surface-2)}
+.btn-primary{background:var(--grad);color:#fff;border:0;box-shadow:0 10px 30px rgba(124,92,255,.35)}
+.btn-primary:hover{box-shadow:0 14px 40px rgba(124,92,255,.5)}
+.btn-ghost{background:transparent}
+.menu-btn{display:none}
+
+/* HERO */
+.hero{position:relative;z-index:1;padding:var(--space-10) 0 var(--space-9);text-align:center}
+.hero .pill{display:inline-flex;align-items:center;gap:var(--space-2);padding:7px 16px;border-radius:var(--r-pill);
+  border:1px solid var(--border);background:var(--surface);font-size:13px;color:var(--muted);margin-bottom:var(--space-5)}
+.hero .pill .dot{width:7px;height:7px;border-radius:50%;background:var(--accent-2);box-shadow:0 0 10px var(--accent-2)}
+.hero h1{font-size:clamp(40px,7vw,82px);line-height:1.02;font-weight:800;letter-spacing:-.03em;margin:var(--space-4) auto var(--space-5);max-width:16ch}
+.hero .lead{margin:0 auto var(--space-6);text-align:center}
+.hero-cta{display:flex;gap:var(--space-3);justify-content:center;flex-wrap:wrap}
+.hero-note{margin-top:var(--space-5);font-size:13px;color:var(--muted)}
+
+/* 信任条 */
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:var(--space-4);margin-top:var(--space-9);
+  border-top:1px solid var(--hair);border-bottom:1px solid var(--hair);padding:var(--space-6) 0}
+.stat{text-align:center}
+.stat .num{font-size:clamp(28px,3.6vw,42px);font-weight:800;letter-spacing:-.02em}
+.stat .lbl{font-size:13px;color:var(--muted);margin-top:var(--space-1)}
+
+/* 区块头 */
+.sec-head{text-align:center;max-width:48ch;margin:0 auto var(--space-7)}
+.sec-head .h2{margin:var(--space-3) 0}
+
+/* 特性卡 */
+.features{display:grid;grid-template-columns:repeat(3,1fr);gap:var(--space-5)}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--r-md);padding:var(--space-6);
+  transition:transform .5s var(--ease),border-color .4s var(--ease),background .4s var(--ease);position:relative;overflow:hidden}
+.card:hover{transform:translateY(-6px);border-color:rgba(124,92,255,.45);background:var(--surface-2)}
+.card .ic{width:46px;height:46px;border-radius:13px;background:var(--surface-2);border:1px solid var(--border);
+  display:grid;place-items:center;font-size:22px;margin-bottom:var(--space-4)}
+.card h3{font-size:19px;font-weight:700;margin-bottom:var(--space-2);letter-spacing:-.01em}
+.card p{font-size:14.5px;color:var(--muted)}
+.card .tag{position:absolute;top:var(--space-5);right:var(--space-5);font-size:11px;letter-spacing:.1em;
+  text-transform:uppercase;color:var(--muted);border:1px solid var(--border);padding:3px 9px;border-radius:var(--r-pill)}
+
+/* 作品展示 — 渐变艺术瓦片(离线安全) */
+.gallery{display:grid;grid-template-columns:repeat(4,1fr);gap:var(--space-4)}
+.tile{position:relative;border-radius:var(--r-md);overflow:hidden;aspect-ratio:3/4;border:1px solid var(--border);
+  transition:transform .6s var(--ease);cursor:pointer}
+.tile:hover{transform:translateY(-4px) scale(1.015)}
+.tile .art{position:absolute;inset:0}
+.tile .meta{position:absolute;left:0;right:0;bottom:0;padding:var(--space-4);
+  background:linear-gradient(to top,rgba(0,0,0,.72),transparent);color:#fff;opacity:0;transform:translateY(8px);
+  transition:opacity .4s var(--ease),transform .4s var(--ease)}
+.tile:hover .meta{opacity:1;transform:none}
+.tile .meta .t{font-size:14px;font-weight:600}
+.tile .meta .p{font-size:12px;opacity:.8;margin-top:2px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.t1{background:linear-gradient(140deg,#7c5cff,#36d6ff)}
+.t2{background:linear-gradient(140deg,#ff8a5c,#ff5c9d)}
+.t3{background:linear-gradient(140deg,#36d6ff,#3affb0)}
+.t4{background:linear-gradient(140deg,#9b5cff,#5c7bff)}
+.t5{background:linear-gradient(140deg,#ffd15c,#ff8a5c)}
+.t6{background:linear-gradient(140deg,#5cffd1,#36d6ff)}
+.t7{background:linear-gradient(140deg,#ff5c7b,#9b5cff)}
+.t8{background:linear-gradient(140deg,#5c9dff,#3affd1)}
+
+/* 定价 */
+.plans{display:grid;grid-template-columns:repeat(3,1fr);gap:var(--space-5);align-items:stretch}
+.plan{background:var(--surface);border:1px solid var(--border);border-radius:var(--r-lg);padding:var(--space-7) var(--space-6);
+  display:flex;flex-direction:column;transition:transform .5s var(--ease),border-color .4s var(--ease)}
+.plan:hover{transform:translateY(-6px)}
+.plan.featured{border-color:rgba(124,92,255,.6);background:linear-gradient(180deg,var(--surface-2),var(--surface));
+  box-shadow:0 20px 60px rgba(124,92,255,.18)}
+.plan .name{font-size:15px;font-weight:700;letter-spacing:.02em}
+.plan .price{font-size:clamp(34px,4vw,46px);font-weight:800;letter-spacing:-.02em;margin:var(--space-3) 0}
+.plan .price small{font-size:14px;font-weight:500;color:var(--muted)}
+.plan ul{list-style:none;margin:var(--space-5) 0;display:grid;gap:var(--space-3);font-size:14.5px;color:var(--muted)}
+.plan li{display:flex;gap:var(--space-2);align-items:flex-start}
+.plan li::before{content:"✓";color:var(--accent-2);font-weight:700}
+.plan .btn{margin-top:auto;justify-content:center}
+
+/* FAQ */
+.faq{max-width:780px;margin:0 auto;display:grid;gap:var(--space-3)}
+.qa{border:1px solid var(--border);border-radius:var(--r-sm);background:var(--surface);overflow:hidden}
+.qa button{width:100%;text-align:left;background:transparent;border:0;color:var(--text);cursor:pointer;
+  padding:var(--space-4) var(--space-5);font-size:16px;font-weight:600;display:flex;justify-content:space-between;align-items:center;gap:var(--space-4)}
+.qa .sign{transition:transform .3s var(--ease);color:var(--muted);font-size:20px}
+.qa.open .sign{transform:rotate(45deg)}
+.qa .ans{max-height:0;overflow:hidden;transition:max-height .4s var(--ease);color:var(--muted);font-size:14.5px}
+.qa .ans p{padding:0 var(--space-5) var(--space-4)}
+
+/* 终极 CTA */
+.cta{position:relative;text-align:center;border:1px solid var(--border);border-radius:var(--r-lg);
+  padding:var(--space-9) var(--space-5);overflow:hidden;background:var(--surface)}
+.cta::before{content:"";position:absolute;inset:0;background:var(--grad);opacity:.10}
+.cta>*{position:relative}
+.cta h2{font-size:clamp(30px,5vw,54px);font-weight:800;letter-spacing:-.02em;margin-bottom:var(--space-4)}
+.cta .lead{margin:0 auto var(--space-6)}
+
+/* 页脚 */
+footer{border-top:1px solid var(--border);padding:var(--space-7) 0 var(--space-6);margin-top:var(--space-9)}
+.foot{display:flex;justify-content:space-between;flex-wrap:wrap;gap:var(--space-5);align-items:center}
+.foot .muted{color:var(--muted);font-size:13.5px}
+.foot-links{display:flex;gap:var(--space-5);font-size:14px;color:var(--muted)}
+.foot-links a:hover{color:var(--text)}
+
+/* 滚动揭示 */
+.reveal{opacity:0;transform:translateY(24px);transition:opacity .8s var(--ease),transform .8s var(--ease)}
+.reveal.in{opacity:1;transform:none}
+.reveal.d1{transition-delay:.08s}.reveal.d2{transition-delay:.16s}.reveal.d3{transition-delay:.24s}
+
+/* 响应式 */
+@media(max-width:920px){
+  .features,.plans{grid-template-columns:1fr 1fr}
+  .gallery{grid-template-columns:1fr 1fr}
+  .stats{grid-template-columns:1fr 1fr;gap:var(--space-6)}
+}
+@media(max-width:640px){
+  .nav-links{display:none}
+  .menu-btn{display:grid;place-items:center;width:40px;height:40px;border-radius:var(--r-sm);
+    border:1px solid var(--border);background:var(--surface);color:var(--text);cursor:pointer}
+  .features,.plans,.gallery{grid-template-columns:1fr}
+  .hero{padding:var(--space-8) 0 var(--space-7)}
+}
+@media(prefers-reduced-motion:reduce){
+  *{animation:none!important;transition:none!important}
+  .reveal{opacity:1;transform:none}
+  #bg{display:none}
+}
+</style>
+</head>
+<body>
+<canvas id="bg"></canvas>
+<div class="tint"></div>
+
+<header>
+  <div class="wrap nav">
+    <div class="brand"><span class="logo"></span>墨灵</div>
+    <nav class="nav-links">
+      <a href="#features">能力</a>
+      <a href="#showcase">作品</a>
+      <a href="#pricing">套餐</a>
+      <a href="#faq">问答</a>
+    </nav>
+    <div class="nav-right">
+      <div class="theme-switch" role="group" aria-label="主题切换">
+        <button data-theme-btn="light" title="亮色" aria-pressed="false">☀</button>
+        <button data-theme-btn="dark" title="暗色" aria-pressed="true">☾</button>
+        <button data-theme-btn="system" title="跟随系统" aria-pressed="false">◐</button>
+      </div>
+      <a href="#" class="btn btn-primary magnetic">免费开始</a>
+      <button class="menu-btn" id="menuBtn" aria-label="菜单">≡</button>
+    </div>
+  </div>
+</header>
+
+<main class="wrap">
+  <!-- HERO -->
+  <section class="hero">
+    <span class="pill"><span class="dot"></span>全新 AI 创作引擎 · 图像 / 视频 / 智能体一体</span>
+    <h1>把灵感，<span class="grad-text">即时</span>变为作品</h1>
+    <p class="lead">一个工作台，承载从一句话提示词到成片、从个人创作到内容市集与商业分发的完整链路。多模型智能调度，按量计费，零门槛上手。</p>
+    <div class="hero-cta">
+      <a href="#" class="btn btn-primary magnetic">✨ 立即免费创作</a>
+      <a href="#showcase" class="btn btn-ghost magnetic">浏览作品市集 →</a>
+    </div>
+    <p class="hero-note">无需信用卡 · 新用户赠送创作额度 · 支持商用授权</p>
+
+    <div class="stats reveal">
+      <div class="stat"><div class="num" data-count="1200000">0</div><div class="lbl">累计生成作品</div></div>
+      <div class="stat"><div class="num" data-count="38">0</div><div class="lbl">接入大模型</div></div>
+      <div class="stat"><div class="num" data-count="99" data-suffix="%">0</div><div class="lbl">任务稳定完成</div></div>
+      <div class="stat"><div class="num" data-count="1.2" data-dec="1">0</div><div class="lbl">平均出图(秒)</div></div>
+    </div>
+  </section>
+
+  <!-- FEATURES -->
+  <section class="section" id="features">
+    <div class="sec-head reveal">
+      <span class="eyebrow">核心能力</span>
+      <h2 class="h2">为创作而生的<br>完整工作流</h2>
+      <p class="lead" style="margin:var(--space-3) auto 0">不是又一个玩具模型箱，而是一整套从构思、生成到分发的生产系统。</p>
+    </div>
+    <div class="features">
+      <div class="card reveal d1"><div class="tag">Studio</div><div class="ic">🎨</div>
+        <h3>智能创作工作室</h3><p>画布式分镜、参考图引导、批量生成。把复杂项目拆成可编排的步骤，一次出一组同源变体。</p></div>
+      <div class="card reveal d2"><div class="ic">🧩</div>
+        <h3>AI 技能市集</h3><p> prompt 配方、风格预设、技能智能体即装即用。官方与创作者共建，试用台一键体验再下单。</p></div>
+      <div class="card reveal d3"><div class="ic">⚡</div>
+        <h3>多模型智能调度</h3><p>全局兜底模型 + 按成本自动均衡，高峰不拥堵、单点故障秒级切换，创作永不断流。</p></div>
+      <div class="card reveal d1"><div class="ic">💎</div>
+        <h3>商业生态</h3><p>作品上架市集、会员订阅、按量计费与分销收益，让创作直接产生回报。</p></div>
+      <div class="card reveal d2"><div class="ic">🛡️</div>
+        <h3>企业级隔离</h3><p>每用户存储命名空间隔离、支付 fails-closed 校验、账务双边精确算量，安全可审计。</p></div>
+      <div class="card reveal d3"><div class="ic">🌐</div>
+        <h3>创作者主页</h3><p>公开主页 /user/:id 展示作品与套餐，自带流量承接，把观众变成客户。</p></div>
+    </div>
+  </section>
+
+  <!-- SHOWCASE -->
+  <section class="section" id="showcase">
+    <div class="sec-head reveal">
+      <span class="eyebrow">作品市集</span>
+      <h2 class="h2">看看大家用墨灵做了什么</h2>
+    </div>
+    <div class="gallery">
+      <div class="tile reveal d1"><div class="art t1"></div><div class="meta"><div class="t">霓虹都市</div><div class="p">赛博朋克夜景，电影感宽幅构图 · 模型 Seedance</div></div></div>
+      <div class="tile reveal d1"><div class="art t2"></div><div class="meta"><div class="t">暖光人像</div><div class="p">自然光人像，柔和高光 · 古风人像预设</div></div></div>
+      <div class="tile reveal d2"><div class="art t3"></div><div class="meta"><div class="t">极简产品</div><div class="p">电商静物，纯净背景 · 商用授权</div></div></div>
+      <div class="tile reveal d2"><div class="art t4"></div><div class="meta"><div class="t">幻境插画</div><div class="p">概念艺术，细腻笔触 · 工作室出品</div></div></div>
+      <div class="tile reveal d1"><div class="art t5"></div><div class="meta"><div class="t">落日海岸</div><div class="p">风景摄影风，黄金时刻 · 参考图引导</div></div></div>
+      <div class="tile reveal d1"><div class="art t6"></div><div class="meta"><div class="t">抽象流体</div><div class="p">动态渐变艺术，可作视频封面</div></div></div>
+      <div class="tile reveal d2"><div class="art t7"></div><div class="meta"><div class="t">角色设定</div><div class="p">二次元角色三视图 · 角色库复用</div></div></div>
+      <div class="tile reveal d2"><div class="art t8"></div><div class="meta"><div class="t">科技蓝图</div><div class="p">UI/科技概念图，冷色调 · 商用</div></div></div>
+    </div>
+  </section>
+
+  <!-- PRICING -->
+  <section class="section" id="pricing">
+    <div class="sec-head reveal">
+      <span class="eyebrow">套餐</span>
+      <h2 class="h2">按你的节奏付费</h2>
+    </div>
+    <div class="plans">
+      <div class="plan reveal d1">
+        <div class="name">体验版</div>
+        <div class="price">¥0<small> / 永久</small></div>
+        <ul><li>每日赠送创作额度</li><li>基础模型阵容</li><li>标准分辨率出图</li><li>社区支持</li></ul>
+        <a href="#" class="btn magnetic">免费开始</a>
+      </div>
+      <div class="plan featured reveal d2">
+        <div class="name">创作者会员</div>
+        <div class="price">¥39<small> / 月</small></div>
+        <ul><li>高额月度额度</li><li>全部高级模型</li><li>高清 / 视频生成</li><li>作品市集零佣金上架</li><li>优先队列</li></ul>
+        <a href="#" class="btn btn-primary magnetic">升级会员</a>
+      </div>
+      <div class="plan reveal d3">
+        <div class="name">团队版</div>
+        <div class="price">按量<small> / 定制</small></div>
+        <ul><li>多人协作空间</li><li>API 与批量调度</li><li>企业级隔离与审计</li><li>专属客户经理</li></ul>
+        <a href="#" class="btn magnetic">联系我们</a>
+      </div>
+    </div>
+  </section>
+
+  <!-- FAQ -->
+  <section class="section" id="faq">
+    <div class="sec-head reveal">
+      <span class="eyebrow">常见问答</span>
+      <h2 class="h2">开始前，先弄清楚</h2>
+    </div>
+    <div class="faq reveal">
+      <div class="qa"><button>生成的图片可以商用吗？<span class="sign">+</span></button><div class="ans"><p>可以。会员及以上套餐明确包含商用授权，作品可上架市集分发或用于商业项目，具体以所选模型的授权条款为准。</p></div></div>
+      <div class="qa"><button>没有 GPU 也能流畅创作吗？<span class="sign">+</span></button><div class="ans"><p>创作算力全部在云端，你只需浏览器即可。多模型智能调度会自动选择最优通道，弱网也不会中断任务。</p></div></div>
+      <div class="qa"><button>额度用完了怎么办？<span class="sign">+</span></button><div class="ans"><p>可随时充值按量包，或升级会员获取更高月度额度。全局兜底模型确保即使某模型拥堵也能完成生成。</p></div></div>
+      <div class="qa"><button>我的作品数据安全吗？<span class="sign">+</span></button><div class="ans"><p>每用户存储命名空间严格隔离，支付与账务采用 fails-closed 校验与双边精确算量，全程可审计。</p></div></div>
+    </div>
+  </section>
+
+  <!-- CTA -->
+  <section class="section">
+    <div class="cta reveal">
+      <h2>准备好把灵感变成作品了吗？</h2>
+      <p class="lead">30 秒注册，立即领取创作额度。无需信用卡，随时可退。</p>
+      <div class="hero-cta">
+        <a href="#" class="btn btn-primary magnetic">🚀 免费创建账户</a>
+        <a href="#features" class="btn btn-ghost magnetic">再看看能力</a>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap foot">
+    <div class="brand"><span class="logo"></span>墨灵</div>
+    <div class="foot-links"><a href="#features">能力</a><a href="#showcase">作品</a><a href="#pricing">套餐</a><a href="#">文档</a><a href="#">联系</a></div>
+    <div class="muted">© 2026 墨灵 · 把灵感即时变为作品</div>
+  </div>
+</footer>
+
+<script>
+/* ===== 主题切换(亮/暗/系统) ===== */
+(function(){
+  const root=document.documentElement;
+  const btns=document.querySelectorAll('[data-theme-btn]');
+  const KEY='wa-theme';
+  function apply(t){
+    if(t==='system'){const m=matchMedia('(prefers-color-scheme: light)').matches?'light':'dark';root.setAttribute('data-theme',m);}
+    else root.setAttribute('data-theme',t);
+    btns.forEach(b=>b.setAttribute('aria-pressed',b.dataset.themeBtn===t));
+  }
+  let saved=localStorage.getItem(KEY)||'dark';
+  apply(saved);
+  btns.forEach(b=>b.onclick=()=>{saved=b.dataset.themeBtn;localStorage.setItem(KEY,saved);apply(saved);});
+  matchMedia('(prefers-color-scheme: dark)').addEventListener('change',()=>{if(saved==='system')apply('system');});
+})();
+
+/* ===== 磁吸按钮 ===== */
+(function(){
+  if(matchMedia('(prefers-reduced-motion: reduce)').matches)return;
+  document.querySelectorAll('.magnetic').forEach(el=>{
+    el.addEventListener('pointermove',e=>{
+      const r=el.getBoundingClientRect();
+      const x=e.clientX-r.left-r.width/2, y=e.clientY-r.top-r.height/2;
+      el.style.transform=`translate(${x*0.18}px,${y*0.28}px)`;
+    });
+    el.addEventListener('pointerleave',()=>{el.style.transform='';});
+  });
+})();
+
+/* ===== 滚动揭示 ===== */
+(function(){
+  const io=new IntersectionObserver((es)=>{
+    es.forEach(en=>{if(en.isIntersecting){en.target.classList.add('in');io.unobserve(en.target);}});
+  },{threshold:.14});
+  document.querySelectorAll('.reveal').forEach(el=>io.observe(el));
+})();
+
+/* ===== 数字滚动计数 ===== */
+(function(){
+  const els=document.querySelectorAll('[data-count]');
+  const io=new IntersectionObserver((es)=>{
+    es.forEach(en=>{
+      if(!en.isIntersecting)return;
+      const el=en.target,target=+el.dataset.count,dec=+(el.dataset.dec||0),suf=el.dataset.suffix||'';
+      const dur=1400,t0=performance.now();
+      function tick(t){
+        const p=Math.min(1,(t-t0)/dur),e=1-Math.pow(1-p,3);
+        const v=(target*e).toFixed(dec);
+        el.textContent=(dec?v:Math.round(target*e).toLocaleString())+suf;
+        if(p<1)requestAnimationFrame(tick);
+      }
+      requestAnimationFrame(tick);io.unobserve(el);
+    });
+  },{threshold:.5});
+  els.forEach(el=>io.observe(el));
+})();
+
+/* ===== FAQ 手风琴 ===== */
+document.querySelectorAll('.qa button').forEach(b=>{
+  b.onclick=()=>{
+    const qa=b.parentElement,ans=qa.querySelector('.ans'),open=qa.classList.contains('open');
+    document.querySelectorAll('.qa.open').forEach(o=>{if(o!==qa){o.classList.remove('open');o.querySelector('.ans').style.maxHeight=null;}});
+    qa.classList.toggle('open',!open);
+    ans.style.maxHeight=open?null:ans.scrollHeight+'px';
+  };
+});
+
+/* ===== 移动端菜单(简易) ===== */
+document.getElementById('menuBtn').onclick=()=>{
+  const n=document.querySelector('.nav-links');
+  const show=n.style.display==='flex';
+  n.style.display=show?'':'flex';
+  n.style.position='absolute';n.style.top='68px';n.style.left='0';n.style.right='0';
+  n.style.flexDirection='column';n.style.background='var(--glass)';n.style.padding='var(--space-4) var(--space-5)';
+  n.style.borderBottom='1px solid var(--border)';
+};
+
+/* ===== 轻量粒子背景(自绘,无需库,尊重 reduced-motion) ===== */
+(function(){
+  if(matchMedia('(prefers-reduced-motion: reduce)').matches)return;
+  const c=document.getElementById('bg'),x=c.getContext('2d');
+  let w,h,dpr,pts,raf,running=true;
+  function resize(){dpr=Math.min(2,devicePixelRatio||1);w=c.width=innerWidth*dpr;h=c.height=innerHeight*dpr;
+    c.style.width=innerWidth+'px';c.style.height=innerHeight+'px';
+    const n=Math.min(70,Math.floor(innerWidth/22));pts=Array.from({length:n},()=>({x:Math.random()*w,y:Math.random()*h,
+      vx:(Math.random()-.5)*.12*dpr,vy:(Math.random()-.5)*.12*dpr,r:(Math.random()*1.6+.6)*dpr}));}
+  function draw(){
+    if(!running)return;
+    x.clearRect(0,0,w,h);
+    for(const p of pts){p.x+=p.vx;p.y+=p.vy;if(p.x<0||p.x>w)p.vx*=-1;if(p.y<0||p.y>h)p.vy*=-1;
+      x.beginPath();x.arc(p.x,p.y,p.r,0,7);x.fillStyle='rgba(124,92,255,.55)';x.fill();}
+    for(let i=0;i<pts.length;i++)for(let j=i+1;j<pts.length;j++){
+      const a=pts[i],b=pts[j],dx=a.x-b.x,dy=a.y-b.y,d=Math.hypot(dx,dy),max=130*dpr;
+      if(d<max){x.globalAlpha=(1-d/max)*.18;x.strokeStyle='#36d6ff';x.lineWidth=dpr*.6;
+        x.beginPath();x.moveTo(a.x,a.y);x.lineTo(b.x,b.y);x.stroke();x.globalAlpha=1;}}
+    raf=requestAnimationFrame(draw);
+  }
+  resize();draw();addEventListener('resize',resize);
+  document.addEventListener('visibilitychange',()=>{running=!document.hidden;if(running)draw();else cancelAnimationFrame(raf);});
+})();
+</script>
+</body>
+</html>

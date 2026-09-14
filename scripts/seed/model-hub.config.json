@@ -1,0 +1,1300 @@
+{
+  "schema_version": "1.0",
+  "generated_at": "2026-08-09",
+  "generator": "WorkBuddy model-hub config builder",
+  "total": 43,
+  "by_category": {
+    "image": 14,
+    "video": 14,
+    "text": 15
+  },
+  "verified_count": 39,
+  "unverified_count": 4,
+  "notes": "所有 base_url / auth / 默认参数基于各厂商官方文档实际核实。verified=false 的模型未能直接访问官方页面，字段以 null 占位并在 notes 说明，未编造 URL 或参数。价格多为参考价，接入前以官方最新计费为准。模型版本迭代快，上线前请复核官方文档。",
+  "models": [
+    {
+      "id": "openai-gpt-image-1",
+      "name": "gpt-image-1",
+      "vendor": "OpenAI",
+      "category": "image",
+      "region": "overseas",
+      "access": "api",
+      "base_url": "https://api.openai.com/v1",
+      "auth": {
+        "type": "bearer",
+        "header": "Authorization",
+        "key_location": "https://platform.openai.com/api-keys",
+        "region_specific": false
+      },
+      "openai_compatible": true,
+      "async": false,
+      "streaming": "none",
+      "default_params": {
+        "model": "gpt-image-1",
+        "size": "1024x1024",
+        "n": 1,
+        "quality": "standard",
+        "format": "png"
+      },
+      "pricing": "按张计费，gpt-image-1 约 $0.011–0.167/张（依尺寸质量）；DALL·E 3 约 $0.040–0.120/张",
+      "verified": true,
+      "official_doc": "https://platform.openai.com/docs/guides/image-generation",
+      "notes": "支持文生图/图生图/编辑；gpt-image-1 尺寸默认 auto，quality 默认 auto，格式默认 png（base64）。DALL·E 3 同端点（model=dall-e-3，仅 n=1，尺寸 1024x1024/1792x1024/1024x1792，quality standard|hd）。Azure OpenAI 需另配 endpoint。Image API 与 Responses API 支持流式（partial_images）。"
+    },
+    {
+      "id": "google-imagen-4",
+      "name": "imagen-4.0-generate-001",
+      "vendor": "Google",
+      "category": "image",
+      "region": "overseas",
+      "access": "api",
+      "base_url": "https://generativelanguage.googleapis.com/v1beta",
+      "auth": {
+        "type": "x-api-key",
+        "header": "x-goog-api-key",
+        "key_location": "https://aistudio.google.com/apikey",
+        "region_specific": false
+      },
+      "openai_compatible": false,
+      "async": false,
+      "streaming": "none",
+      "default_params": {
+        "model": "imagen-4.0-generate-001",
+        "size": null,
+        "n": 4,
+        "quality": null,
+        "format": "png",
+        "aspect_ratio": "1:1"
+      },
+      "pricing": "按张计费（Gemini API 按图片数/像素计费，具体以 Google 账单为准）；Vertex AI 另按区域定价",
+      "verified": true,
+      "official_doc": "https://ai.google.dev/gemini-api/docs/imagen",
+      "notes": "调用路径为 {base_url}/models/{model}:predict。鉴权亦可用 OAuth2 Bearer（Vertex AI：https://{region}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/publishers/google/models/{model}:predict，auth=oauth）。⚠️ Imagen 3 已关停（shut down）；Imagen 4 已标记 deprecated，预计 2026-08-17 停止服务，官方建议迁移至 Gemini 原生图像（Nano Banana / gemini-*-image）。支持模型：imagen-4.0-generate-001 / ultra-generate-001 / fast-generate-001。"
+    },
+    {
+      "id": "midjourney",
+      "name": "Midjourney",
+      "vendor": "Midjourney",
+      "category": "image",
+      "region": "overseas",
+      "access": "third-party",
+      "base_url": null,
+      "auth": {
+        "type": null,
+        "header": null,
+        "key_location": null,
+        "region_specific": false
+      },
+      "openai_compatible": false,
+      "async": true,
+      "streaming": "none",
+      "default_params": {
+        "model": null,
+        "size": null,
+        "n": null,
+        "quality": null,
+        "format": null
+      },
+      "pricing": "订阅制（$10–$120/月，依档位不限量或有限额度）；无按张官方计费",
+      "verified": false,
+      "official_doc": "https://docs.midjourney.com/",
+      "notes": "Midjourney 无官方公开 API。接入方式仅为：1) 官方 Discord 机器人（/imagine 等 slash 命令，异步）；2) 第三方代理服务（如 midjourney-api 类封装，需自行承担合规与稳定性风险）。本配置无法核实 base_url 与鉴权头，故置 null。请勿为 Midjourney 编造官方 endpoint。"
+    },
+    {
+      "id": "stability-sd3.5",
+      "name": "sd3.5-large",
+      "vendor": "Stability AI",
+      "category": "image",
+      "region": "overseas",
+      "access": "api",
+      "base_url": "https://api.stability.ai/v2beta",
+      "auth": {
+        "type": "bearer",
+        "header": "Authorization",
+        "key_location": "https://platform.stability.ai/",
+        "region_specific": false
+      },
+      "openai_compatible": false,
+      "async": false,
+      "streaming": "none",
+      "default_params": {
+        "model": "sd3.5-large",
+        "size": "1024x1024",
+        "n": 1,
+        "quality": null,
+        "format": "png",
+        "aspect_ratio": "1:1",
+        "output_format": "png"
+      },
+      "pricing": "Stable Image Core 约 $0.03/张；SD3.5 约 $0.035/张；Ultra 约 $0.08/张；按 credit 计费（1 credit=$0.01）",
+      "verified": true,
+      "official_doc": "https://platform.stability.ai/docs/api-reference",
+      "notes": "v2beta REST 接口，请求体为 multipart/form-data，非 OpenAI 兼容。SD3.5 路径：{base_url}/stable-image/generate/sd3；SDXL 旧 v1 路径：{base_url}/generation/sdxl-1.0/text-to-image。SD3.5 变体：sd3.5-large / sd3.5-large-turbo / sd3.5-medium / sd3.5-flash。默认分辨率 1024x1024（1MP）。accept 头设为 image/* 直接返回图片字节，application/json 返回 base64。"
+    },
+    {
+      "id": "bfl-flux",
+      "name": "flux1.1-pro",
+      "vendor": "Black Forest Labs",
+      "category": "image",
+      "region": "overseas",
+      "access": "api",
+      "base_url": "https://api.bfl.ai",
+      "auth": {
+        "type": "api-key",
+        "header": "x-key",
+        "key_location": "https://dashboard.bfl.ai/",
+        "region_specific": false
+      },
+      "openai_compatible": false,
+      "async": true,
+      "streaming": "none",
+      "default_params": {
+        "model": "flux1.1-pro",
+        "size": null,
+        "n": 1,
+        "quality": null,
+        "format": "png",
+        "aspect_ratio": "1:1",
+        "output_format": "png",
+        "num_images": 1
+      },
+      "pricing": "1 credit = $0.01；FLUX1.1 [pro] 约 $0.04–0.06/张，FLUX.1 Pro 约 $0.055/张，schnell/dev 更便宜；FLUX.2 按百万像素计费",
+      "verified": true,
+      "official_doc": "https://docs.bfl.ai/",
+      "notes": "BFL 官方 API 为异步模式：POST 后返回 polling_url，需轮询获取结果（图片 URL 约 10 分钟有效，需立即下载）。区域端点：https://api.eu.bfl.ai（GDPR）、https://api.us.bfl.ai（美国数据驻留）。模型路径形如 {base_url}/v1/flux-pro-1.1、/v1/flux-1.1-pro、/v1/flux-schnell、/v1/flux-dev。fal.ai 等第三方亦提供 FLUX 托管（endpoint 不同）。"
+    },
+    {
+      "id": "adobe-firefly",
+      "name": "firefly-image-3",
+      "vendor": "Adobe",
+      "category": "image",
+      "region": "overseas",
+      "access": "api",
+      "base_url": "https://firefly-api.adobe.io",
+      "auth": {
+        "type": "oauth",
+        "header": "Authorization",
+        "key_location": "https://developer.adobe.com/console/",
+        "region_specific": false
+      },
+      "openai_compatible": false,
+      "async": true,
+      "streaming": "none",
+      "default_params": {
+        "model": "firefly-image-3",
+        "size": "2048x2048",
+        "n": 1,
+        "quality": null,
+        "format": "png",
+        "content_class": "photo"
+      },
+      "pricing": "按生成次数计费（Firefly Services Credits / 企业授权），具体需看 Adobe 合约；公开单价未统一公示",
+      "verified": true,
+      "official_doc": "https://developer.adobe.com/firefly-services/docs/firefly-api/",
+      "notes": "鉴权为 OAuth2 client_credentials：先 POST https://ims-na1.adobelogin.com/ims/token/v3 换取 access_token（scope 含 firefly_api），再在请求头同时带 Authorization: Bearer {token} 与 x-api-key: {client_id}。同步端点 /v3/images/generate 正被弃用，推荐异步 /v3/images/generate-async（返回 jobId + statusUrl 轮询）。size 以 {width,height} 对象传入（如 2048x2048）。"
+    },
+    {
+      "id": "recraft",
+      "name": "recraftv3",
+      "vendor": "Recraft",
+      "category": "image",
+      "region": "overseas",
+      "access": "api",
+      "base_url": "https://external.api.recraft.ai/v1",
+      "auth": {
+        "type": "bearer",
+        "header": "Authorization",
+        "key_location": "https://app.recraft.ai/profile/api",
+        "region_specific": false
+      },
+      "openai_compatible": true,
+      "async": false,
+      "streaming": "none",
+      "default_params": {
+        "model": "recraftv3",
+        "size": "1024x1024",
+        "n": 1,
+        "quality": null,
+        "format": "png"
+      },
+      "pricing": "按 API units 计费（生成约 0.1–0.2 units/张，具体以账户费率表为准）",
+      "verified": true,
+      "official_doc": "https://www.recraft.ai/docs/api-reference",
+      "notes": "可使用 OpenAI Python 客户端通过 base_url 接入（部分参数语义不同）。模型代际：V4.1 / V4 / V3(Red Panda) / V2(Recraft 20B)，含 raster 与 vector(SVG) 变体。默认 1MP；Pro 变体为 4MP。生成接口 /v1/images/generations，另有图生图、inpaint、vectorize、background 等端点。"
+    },
+    {
+      "id": "ideogram",
+      "name": "ideogram-v3",
+      "vendor": "Ideogram",
+      "category": "image",
+      "region": "overseas",
+      "access": "api",
+      "base_url": "https://api.ideogram.ai/v1",
+      "auth": {
+        "type": "api-key",
+        "header": "Api-Key",
+        "key_location": "https://ideogram.ai/user/settings",
+        "region_specific": false
+      },
+      "openai_compatible": false,
+      "async": false,
+      "streaming": "none",
+      "default_params": {
+        "model": "ideogram-v3",
+        "size": null,
+        "n": 1,
+        "quality": null,
+        "format": "png",
+        "rendering_speed": "TURBO"
+      },
+      "pricing": "订阅/按量计费，默认限速 10 个并发 in-flight 请求；企业联系 partnership@ideogram.ai",
+      "verified": true,
+      "official_doc": "https://developer.ideogram.ai/api-reference/api-reference",
+      "notes": "鉴权头为 Api-Key（非 Bearer）。最新模型 Ideogram 4.0，API V3 端点 /v1/ideogram-v3/generate。支持 style_preset、magic prompt、remix、edit、reframe、replace background、face swap。返回结果为图片 URL（需自行下载）。"
+    },
+    {
+      "id": "volcengine-seedream",
+      "name": "doubao-seedream-5.0-pro",
+      "vendor": "字节跳动 (火山引擎方舟)",
+      "category": "image",
+      "region": "china",
+      "access": "api",
+      "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+      "auth": {
+        "type": "bearer",
+        "header": "Authorization",
+        "key_location": "https://console.volcengine.com/ark",
+        "region_specific": true
+      },
+      "openai_compatible": true,
+      "async": false,
+      "streaming": "none",
+      "default_params": {
+        "model": "doubao-seedream-5.0-pro",
+        "size": "1024x1024",
+        "n": 1,
+        "quality": null,
+        "format": "png"
+      },
+      "pricing": "按张计费，Seedream 5.0 pro/lite、4.5、4.0 各档定价不同；以火山方舟控制台为准",
+      "verified": true,
+      "official_doc": "https://www.volcengine.com/docs/82379/1541523",
+      "notes": "图像生成端点 {base_url}/images/generations，与 OpenAI images API 兼容。鉴权用长效 API Key（Authorization: Bearer $ARK_API_KEY）。即梦 AI（JiMeng）同系列，国内通过火山引擎「图像生成大模型(即梦AI)」开通。Seedream 5.0 pro 仅单图（不支持 sequential），4.5/4.0/lite 支持组图（sequential_image_generation=auto）。暂不支持流式。"
+    },
+    {
+      "id": "aliyun-wanx",
+      "name": "wan2.7-image-pro",
+      "vendor": "阿里巴巴 (通义万相)",
+      "category": "image",
+      "region": "china",
+      "access": "api",
+      "base_url": "https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/api/v1",
+      "auth": {
+        "type": "bearer",
+        "header": "Authorization",
+        "key_location": "https://help.aliyun.com/zh/model-studio/get-api-key",
+        "region_specific": true
+      },
+      "openai_compatible": false,
+      "async": true,
+      "streaming": "none",
+      "default_params": {
+        "model": "wan2.7-image-pro",
+        "size": "2K",
+        "n": 1,
+        "quality": null,
+        "format": "png"
+      },
+      "pricing": "按张计费；万相/千问生图各模型定价不同，以百炼控制台为准",
+      "verified": true,
+      "official_doc": "https://help.aliyun.com/zh/model-studio/text-to-image",
+      "notes": "原生 MaaS 路径（非 OpenAI 兼容）：文生图 POST /services/aigc/image-generation/generation，异步轮询 /tasks/{task_id}（需带 X-DashScope-Async: enable）。北京/新加坡等多地域 base_url 不同，{WorkspaceId} 需替换。千问系列 qwen-image-3.0-pro 等支持同步调用且兼容 OpenAI（compat=true）。旧命名 wanx2.1 等已迭代为 wan2.x。默认尺寸：万相 2K(2048*2048)，qwen-image-plus/max 默认 1664*928(16:9)。"
+    },
+    {
+      "id": "zhipu-cogview",
+      "name": "cogview-3-plus",
+      "vendor": "智谱 AI",
+      "category": "image",
+      "region": "china",
+      "access": "api",
+      "base_url": "https://open.bigmodel.cn/api/paas/v4",
+      "auth": {
+        "type": "bearer",
+        "header": "Authorization",
+        "key_location": "https://open.bigmodel.cn/usercenter/apikeys",
+        "region_specific": true
+      },
+      "openai_compatible": true,
+      "async": false,
+      "streaming": "none",
+      "default_params": {
+        "model": "cogview-3-plus",
+        "size": "1024x1024",
+        "n": 1,
+        "quality": null,
+        "format": "png"
+      },
+      "pricing": "按张计费（CogView-3-plus 约 ¥0.06–0.1/张，flash 更便宜），以开放平台计费为准",
+      "verified": false,
+      "official_doc": "https://docs.bigmodel.cn/cn/api/image/cogview",
+      "notes": "⚠️ 本次核查时官方文档站点（docs.bigmodel.cn/cn/api/image/cogview 及其变体）均返回 404，未能二次确认最新端点。下列 base_url / 鉴权 / 模型名（cogview-3-plus、cogview-3、cogview-3-flash）为公开常见值，且与 OpenAI images API 兼容（{base_url}/images/generations）。请上线前以智谱当前官方文档为准核实。亦提供 GLM-Image 开源模型（需自部署）。"
+    },
+    {
+      "id": "tencent-hunyuan-image",
+      "name": "hunyuan-image",
+      "vendor": "腾讯 (混元)",
+      "category": "image",
+      "region": "china",
+      "access": "api",
+      "base_url": "https://hunyuan.tencentcloudapi.com",
+      "auth": {
+        "type": "hmac",
+        "header": "Authorization",
+        "key_location": "https://console.cloud.tencent.com/cam/capi",
+        "region_specific": true
+      },
+      "openai_compatible": false,
+      "async": true,
+      "streaming": "none",
+      "default_params": {
+        "model": null,
+        "size": "1024:1024",
+        "n": 1,
+        "quality": null,
+        "format": "png"
+      },
+      "pricing": "按张计费（混元生图约 ¥0.1–0.3/张，以腾讯云生图产品定价为准）",
+      "verified": true,
+      "official_doc": "https://cloud.tencent.com/document/api/1729/105969",
+      "notes": "腾讯云标准 API，鉴权为 TC3-HMAC-SHA256 签名（Authorization: TC3-HMAC-SHA256 Credential=...）。异步两阶段：Action=SubmitHunyuanImageJob 提交拿任务 ID，再 QueryHunyuanImageJob 轮询结果（默认并发 1）。固定服务无独立 model 字段；参数含 Prompt、NegativePrompt、Style、Resolution（默认 1024:1024，支持 768:768/720:1280/1280:720 等）。国际站域名 hunyuan.intl.tencentcloudapi.com。"
+    },
+    {
+      "id": "meitu-miracle-vision",
+      "name": "MiracleVision",
+      "vendor": "美图 (奇想智能)",
+      "category": "image",
+      "region": "china",
+      "access": "api",
+      "base_url": null,
+      "auth": {
+        "type": null,
+        "header": null,
+        "key_location": "https://www.miraclevision.com/",
+        "region_specific": true
+      },
+      "openai_compatible": false,
+      "async": null,
+      "streaming": "none",
+      "default_params": {
+        "model": null,
+        "size": null,
+        "n": null,
+        "quality": null,
+        "format": null
+      },
+      "pricing": "企业级 API/SDK 需商务申请与签约，公开单价未公示",
+      "verified": false,
+      "official_doc": "https://www.miraclevision.com/",
+      "notes": "⚠️ 未能核实官方公开 endpoint 与鉴权头。检索仅显示 MiracleVision(奇想智能) 已面向企业开放 API/SDK（含文生图、图生图、局部重绘、画面扩展等），需到美图 AI 开放平台申请 API Key；但未发现可公开引用的接口地址与请求头规范，故 base_url / auth / 参数均置 null。请勿编造 endpoint。最新版本 V6（MoE 架构，2026-06 发布）。"
+    },
+    {
+      "id": "baidu-ernie-image",
+      "name": "ernie-vilg-v2",
+      "vendor": "百度 (文心一格 / 千帆)",
+      "category": "image",
+      "region": "china",
+      "access": "api",
+      "base_url": "https://qianfan.baidubce.com/v2",
+      "auth": {
+        "type": "bearer",
+        "header": "Authorization",
+        "key_location": "https://console.bce.baidu.com/iam/#/iam/apikey",
+        "region_specific": true
+      },
+      "openai_compatible": true,
+      "async": false,
+      "streaming": "none",
+      "default_params": {
+        "model": "ernie-vilg-v2",
+        "size": "1024x1024",
+        "n": 1,
+        "quality": null,
+        "format": "png"
+      },
+      "pricing": "按次/按张计费（文心一格相关约 ¥0.1/次，以千帆图像生成产品定价为准）",
+      "verified": true,
+      "official_doc": "https://cloud.baidu.com/doc/qianfan-api/s/jmmot21am",
+      "notes": "千帆图像生成 OpenAI 式端点 {base_url}/images/generations，Authorization: Bearer bce-v3/{token}（API Key 直接作 Bearer 值）。文心一格模型 ernie-vilg-v2；亦支持 irag-1.0（图生图/图像编辑）、qwen-image、stable-diffusion-xl 等。另有旧版 /beta/image/qianfan-image-v1 任务接口与 aip.baidubce.com 的 access_token 式文心一格精调接口（两种鉴权并存）。"
+    },
+    {
+      "id": "openai-sora-2",
+      "name": "Sora 2",
+      "vendor": "OpenAI",
+      "category": "video",
+      "region": "overseas",
+      "access": "api",
+      "base_url": "https://api.openai.com/v1",
+      "auth": {
+        "type": "bearer",
+        "header": "Authorization",
+        "key_location": "https://platform.openai.com/api-keys",
+        "region_specific": false
+      },
+      "openai_compatible": false,
+      "async": true,
+      "async_flow": "POST /videos 提交生成任务 -> 轮询 GET /videos/{video_id} 直至 completed（或配置 webhook）-> GET /videos/{video_id}/content 下载 MP4",
+      "streaming": "none",
+      "default_params": {
+        "model": "sora-2",
+        "duration": "16s",
+        "resolution": "1280x720",
+        "aspect_ratio": "16:9",
+        "n": 1
+      },
+      "pricing": "按秒计费：sora-2 约 $0.10/秒，sora-2-pro 约 $0.30/秒",
+      "verified": true,
+      "official_doc": "https://platform.openai.com/docs/guides/video-generation",
+      "notes": "异步生成；Videos API（sora-2 / sora-2-pro 等）已官方宣布废弃，将于 2026-09-24 停用，需提前规划迁移。sora-2 支持 720x1280/1280x720，sora-2-pro 支持 1080x1920/1920x1080，时长 16–20s。"
+    },
+    {
+      "id": "google-veo-3-1",
+      "name": "Veo 3.1",
+      "vendor": "Google",
+      "category": "video",
+      "region": "overseas",
+      "access": "api",
+      "base_url": "https://generativelanguage.googleapis.com/v1beta",
+      "auth": {
+        "type": "api_key",
+        "header": "x-goog-api-key",
+        "key_location": "https://aistudio.google.com/apikey",
+        "region_specific": true
+      },
+      "openai_compatible": false,
+      "async": true,
+      "async_flow": "POST models/veo-3.1-generate-preview:predictLongRunning 或 :generateVideo 提交 -> 轮询 operation 直至 done -> 取得视频 URL/文件",
+      "streaming": "none",
+      "default_params": {
+        "model": "veo-3.1-generate-preview",
+        "duration": "8s",
+        "resolution": "1080p",
+        "aspect_ratio": "16:9",
+        "n": 1
+      },
+      "pricing": "按秒计费：Standard 约 $0.40/秒，Fast 约 $0.15/秒，Lite 约 $0.05/秒（含音频）",
+      "verified": true,
+      "official_doc": "https://ai.google.dev/gemini-api/docs/veo",
+      "notes": "双通道：Gemini API（x-goog-api-key，base 如上）与 Vertex AI（需 OAuth2/服务账号，region-specific URL，如 us-central1-aiplatform.googleapis.com）。支持原生同步音频，时长 5–8s，最高 1080p（旗舰档可达 4K）。"
+    },
+    {
+      "id": "runway-gen4-5",
+      "name": "Runway Gen-4.5",
+      "vendor": "Runway",
+      "category": "video",
+      "region": "overseas",
+      "access": "api",
+      "base_url": "https://api.dev.runwayml.com/v1",
+      "auth": {
+        "type": "bearer",
+        "header": "Authorization",
+        "key_location": "https://dev.runwayml.com",
+        "region_specific": false
+      },
+      "openai_compatible": false,
+      "async": true,
+      "async_flow": "POST /v1/text_to_video | /v1/image_to_video | /v1/video_to_video 提交返回 taskId -> 轮询 GET /v1/tasks/{taskId} -> SUCCEEDED 返回视频 URL",
+      "streaming": "none",
+      "default_params": {
+        "model": "gen4.5",
+        "duration": 5,
+        "resolution": null,
+        "aspect_ratio": "1280:720",
+        "n": 1
+      },
+      "pricing": "按点数/秒计费：gen4.5 约 12 credits/s，gen4_aleph 约 15 credits/s，seedance2 约 36 credits/s",
+      "verified": true,
+      "official_doc": "https://docs.dev.runwayml.com/",
+      "notes": "所有请求必须带 X-Runway-Version 头（如 2024-11-06）。同系列含 gen4_aleph（视频编辑/视频转视频）、seedance2（Runway 接入的 Seedance 2.0）；时长 2–15s，宽高比以像素值表示（1280:720、720:1280、1104:832 等）。"
+    },
+    {
+      "id": "kuaishou-kling-3",
+      "name": "Kling 3.0",
+      "vendor": "快手 (Kuaishou)",
+      "category": "video",
+      "region": "china",
+      "access": "api",
+      "base_url": "https://api-beijing.klingai.com",
+      "auth": {
+        "type": "bearer",
+        "header": "Authorization",
+        "key_location": "https://klingai.com/dev/api-key",
+        "region_specific": true
+      },
+      "openai_compatible": false,
+      "async": true,
+      "async_flow": "POST /image-to-video/kling-3.0（或 text-to-video 等）提交返回 task id -> 轮询任务状态（submitted/processing/succeeded/failed）-> 取结果 URL",
+      "streaming": "none",
+      "default_params": {
+        "model": "kling-3.0",
+        "duration": 10,
+        "resolution": "4k",
+        "aspect_ratio": "16:9",
+        "n": 1
+      },
+      "pricing": "按秒/点数计费：Pro 约 54 credits/s（无音频）~80 credits/s（含音频），Standard 约 40~60 credits/s",
+      "verified": true,
+      "official_doc": "https://www.klingai.com/document-api/apiReference/model/imageToVideo",
+      "notes": "官方域名为 api-beijing.klingai.com（国内北京节点）；第三方聚合站（如 kling3api.com、aivideoapi.ai）非官方，接入请勿使用。支持图生视频（首帧/尾帧）、动作控制，时长 3–15s，最高 4K。"
+    },
+    {
+      "id": "minimax-hailuo-h3",
+      "name": "MiniMax Hailuo H3",
+      "vendor": "MiniMax (稀宇)",
+      "category": "video",
+      "region": "china",
+      "access": "api",
+      "base_url": "https://api.minimax.io",
+      "auth": {
+        "type": "bearer",
+        "header": "Authorization",
+        "key_location": "https://platform.minimax.io/ (国际站) / https://platform.minimaxi.com (中国站)",
+        "region_specific": true
+      },
+      "openai_compatible": false,
+      "async": true,
+      "async_flow": "H3 新接口 POST /v2/video_generation 提交返回 task_id -> 轮询任务状态 -> 成功直接返回 content.url 下载；旧接口 POST /v1/video_generation 返回 task_id -> GET /v1/query/video_generation -> 成功得 file_id -> GET /v1/files/retrieve 取下载 URL",
+      "streaming": "none",
+      "default_params": {
+        "model": "MiniMax-H3",
+        "duration": 5,
+        "resolution": "2K",
+        "aspect_ratio": "16:9",
+        "n": 1
+      },
+      "pricing": "按生成计费：Hailuo-2.3 768P/6s 约 $0.28，1080P/6s 约 $0.49；H3 以官方报价为准",
+      "verified": true,
+      "official_doc": "https://platform.minimax.io/docs/guides/video-generation",
+      "notes": "H3 为新统一多模态视频模型，使用 /v2/video_generation + content[]（text/image_url/video_url/audio_url 多模态结构），支持文生视频、首尾帧、参考生视频。旧 Hailuo-2.3 用 /v1/video_generation（prompt 形式）。中国站可用 api.minimaxi.com。"
+    },
+    {
+      "id": "pika-2-2",
+      "name": "Pika 2.2",
+      "vendor": "Pika (经 fal.ai)",
+      "category": "video",
+      "region": "overseas",
+      "access": "third-party",
+      "base_url": "https://queue.fal.run",
+      "auth": {
+        "type": "bearer",
+        "header": "Authorization",
+        "key_location": "https://fal.ai/dashboard/keys",
+        "region_specific": false
+      },
+      "openai_compatible": false,
+      "async": true,
+      "async_flow": "POST /fal-ai/pika/v2.2/text-to-video（或 image-to-video）入队返回 request_id -> 轮询 status_url / 取 response_url -> COMPLETED 返回 video.url",
+      "streaming": "none",
+      "default_params": {
+        "model": "fal-ai/pika/v2.2/text-to-video",
+        "duration": 5,
+        "resolution": "720p",
+        "aspect_ratio": "16:9",
+        "n": 1
+      },
+      "pricing": "按 fal.ai 队列计费（具体以 fal.ai 定价为准），分辨率 720p/1080p，时长 5/10s",
+      "verified": true,
+      "official_doc": "https://fal.ai/models/fal-ai/pika/v2.2/text-to-video/api",
+      "notes": "Pika 无官方一手开发者 API，需经 fal.ai 第三方接入（base_url 为 queue.fal.run）。还提供 pikaframes、pikaswaps、pikaffects 等变体。注意此为第三方通道，非 Pika 官方直连。"
+    },
+    {
+      "id": "luma-ray-3-2",
+      "name": "Luma Ray 3.2",
+      "vendor": "Luma AI",
+      "category": "video",
+      "region": "overseas",
+      "access": "api",
+      "base_url": "https://api.lumalabs.ai/dream-machine/v1",
+      "auth": {
+        "type": "bearer",
+        "header": "Authorization",
+        "key_location": "https://platform.lumalabs.ai/",
+        "region_specific": false
+      },
+      "openai_compatible": false,
+      "async": true,
+      "async_flow": "POST /generations 提交返回 id -> 检索/轮询 GET /generations/{id} -> 取视频 URL",
+      "streaming": "none",
+      "default_params": {
+        "model": "ray-3.2",
+        "duration": "5s",
+        "resolution": "720p",
+        "aspect_ratio": "16:9",
+        "n": 1
+      },
+      "pricing": "按生成计费：5s 1080p SDR 约 $1.20，HDR 约 2x，HDR+EXR 约 3x（以官方为准）",
+      "verified": true,
+      "official_doc": "https://docs.agents.lumalabs.ai/guides/videos/generation",
+      "notes": "Ray 3.2 仅在 Luma Agents API（https://agents.lumalabs.ai/v1）提供，支持首尾帧、HDR、EXR 导出、21:9 宽银幕；经典 Dream Machine API（api.lumalabs.ai/dream-machine/v1）提供 ray-2 / ray-flash-2。时长 5s/10s，分辨率 540p–4K。"
+    },
+    {
+      "id": "adobe-firefly-video",
+      "name": "Adobe Firefly Video",
+      "vendor": "Adobe",
+      "category": "video",
+      "region": "overseas",
+      "access": "api",
+      "base_url": "https://audio-video-api.adobe.io/v1",
+      "auth": {
+        "type": "oauth2",
+        "header": "Authorization",
+        "key_location": "https://developer.adobe.com/console",
+        "region_specific": false
+      },
+      "openai_compatible": false,
+      "async": true,
+      "async_flow": "POST /v1/dub | /v1/transcribe | reframe 等提交返回 job id -> 轮询 job 状态（pending/running/succeeded/failed）-> 成功返回签名输出 URL（或经 I/O Events 回调）",
+      "streaming": "none",
+      "default_params": {
+        "model": null,
+        "duration": null,
+        "resolution": "1920x1080",
+        "aspect_ratio": "16:9",
+        "n": 1
+      },
+      "pricing": "按 Firefly Services 订阅/用量计费（具体以 Adobe 报价为准）",
+      "verified": true,
+      "official_doc": "https://developer.adobe.com/audio-video-firefly-services/",
+      "notes": "⚠️ Adobe Firefly 公开视频 API 实为「音视频生产服务」：Reframe 智能重构图、Translate & Lip Sync 配音、Text-to-Speech、Text-to-Avatar、Dynamic Graphics Render——并非文生视频大模型。鉴权为 OAuth2 访问令牌 + x-api-key（Client ID）头。纯文生视频生成能力以 Firefly 网页端/有限服务为主，API 接入口径请以官方最新文档为准。"
+    },
+    {
+      "id": "alibaba-wan-2x",
+      "name": "Tongyi Wanx Wan 2.x",
+      "vendor": "阿里巴巴 (Alibaba)",
+      "category": "video",
+      "region": "china",
+      "access": "api",
+      "base_url": "https://dashscope.aliyuncs.com/api/v1",
+      "auth": {
+        "type": "bearer",
+        "header": "Authorization",
+        "key_location": "https://dashscope.console.aliyun.com/apiKey",
+        "region_specific": true
+      },
+      "openai_compatible": false,
+      "async": true,
+      "async_flow": "POST /api/v1/services/aigc/video-generation/video-synthesis（必须带 X-DashScope-Async: enable）提交返回 task_id -> 轮询任务状态 -> 成功返回 video_url",
+      "streaming": "none",
+      "default_params": {
+        "model": "wan3.0-video",
+        "duration": 5,
+        "resolution": "480P",
+        "aspect_ratio": "adaptive",
+        "n": 1
+      },
+      "pricing": "按生成计费（具体以阿里云百炼视频生成定价为准）",
+      "verified": true,
+      "official_doc": "https://help.aliyun.com/zh/model-studio/wan3-video-generation-api-reference",
+      "notes": "万相 3.0 视频模型 wan3.0-video；旧版含 wan2.6-t2v / wanx-vace（视频编辑统一模型）。必须带 X-DashScope-Async: enable 头，否则报错「current user api does not support synchronous calls」。区域专属域名：北京 {WorkspaceId}.cn-beijing.maas.aliyuncs.com，新加坡 {WorkspaceId}.ap-southeast-1.maas.aliyuncs.com。"
+    },
+    {
+      "id": "bytedance-seedance",
+      "name": "Doubao Seedance / 即梦",
+      "vendor": "字节跳动 (ByteDance)",
+      "category": "video",
+      "region": "china",
+      "access": "api",
+      "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+      "auth": {
+        "type": "bearer",
+        "header": "Authorization",
+        "key_location": "https://console.volcengine.com/ark",
+        "region_specific": true
+      },
+      "openai_compatible": false,
+      "async": true,
+      "async_flow": "POST /api/v3/contents/generations/tasks 提交返回 id -> 轮询 GET /api/v3/contents/generations/tasks/{task_id} -> succeeded 返回 video_url（URL 24h 有效）",
+      "streaming": "none",
+      "default_params": {
+        "model": "doubao-seedance-2-0-260128",
+        "duration": 5,
+        "resolution": "720p",
+        "aspect_ratio": "16:9",
+        "n": 1
+      },
+      "pricing": "按视频时长/分辨率计费（具体以火山方舟 Seedance 资源包定价为准）",
+      "verified": true,
+      "official_doc": "https://www.volcengine.com/docs/82379/1520757",
+      "notes": "火山方舟 Seedance 2.0 / 即梦视频；亦含 Seedance 1.5 Pro、1.0 Pro / Pro Fast 等。支持文生视频、首尾帧、多模态参考生视频（图/视频/音频）。时长 4–15s，分辨率 480p–4K（2.0 支持 10bit 4K H.265）。任务记录仅保留 7 天，结果 URL 24h 过期。"
+    },
+    {
+      "id": "tencent-hunyuanvideo",
+      "name": "HunyuanVideo",
+      "vendor": "腾讯 (Tencent)",
+      "category": "video",
+      "region": "china",
+      "access": "oss",
+      "base_url": null,
+      "auth": {
+        "type": null,
+        "header": null,
+        "key_location": "https://github.com/Tencent/HunyuanVideo",
+        "region_specific": false
+      },
+      "openai_compatible": false,
+      "async": false,
+      "async_flow": null,
+      "streaming": "none",
+      "default_params": {
+        "model": "HunyuanVideo",
+        "duration": 5,
+        "resolution": "720x1280",
+        "aspect_ratio": null,
+        "n": 1
+      },
+      "pricing": "开源权重免费（Community 协议）；自托管需自备 GPU；腾讯云图生视频 API 按云计费（需企业申请）",
+      "verified": false,
+      "official_doc": "https://github.com/Tencent/HunyuanVideo",
+      "notes": "⚠️ HunyuanVideo 主要为开源权重（GitHub / HuggingFace），需本地 GPU 自托管（约 60GB 显存，推荐 80GB）。腾讯云提供图生视频 I2V API 但处内测/企业申请阶段，未公开固定 base_url，故 base_url/auth 标 null。本地推理为同步进程（生成约数分钟），非异步任务轮询模式。"
+    },
+    {
+      "id": "vidu",
+      "name": "Vidu",
+      "vendor": "生数科技 (Shengshu)",
+      "category": "video",
+      "region": "china",
+      "access": "api",
+      "base_url": "https://api.vidu.cn",
+      "auth": {
+        "type": "token",
+        "header": "Authorization",
+        "key_location": "https://platform.vidu.cn",
+        "region_specific": false
+      },
+      "openai_compatible": false,
+      "async": true,
+      "async_flow": "POST /ent/v2/text2video | /img2video | /reference2video 提交返回 task_id -> 轮询 GET /ent/v2/tasks/{id}/creations -> status=success 返回视频 url 与 cover_url",
+      "streaming": "none",
+      "default_params": {
+        "model": "viduq3",
+        "duration": 8,
+        "resolution": null,
+        "aspect_ratio": null,
+        "n": 1
+      },
+      "pricing": "按积分计费（如一次生成约 4 credits），具体以 Vidu 定价为准",
+      "verified": true,
+      "official_doc": "https://docs.platform.vidu.com/",
+      "notes": "生数科技 Vidu。⚠️ 鉴权头为 'Authorization: Token {api_key}'（非 Bearer）。支持文生视频、图生视频、参考生视频（全球首个角色/物体一致性参考生视频，subjects 可传 1–7 张参考图）、首尾帧。可配置 callback_url 接收状态回调。"
+    },
+    {
+      "id": "zhipu-cogvideox",
+      "name": "CogVideoX",
+      "vendor": "智谱 AI (Zhipu)",
+      "category": "video",
+      "region": "china",
+      "access": "api",
+      "base_url": "https://open.bigmodel.cn/api/paas/v4",
+      "auth": {
+        "type": "bearer",
+        "header": "Authorization",
+        "key_location": "https://open.bigmodel.cn/usercenter/apikeys",
+        "region_specific": false
+      },
+      "openai_compatible": false,
+      "async": true,
+      "async_flow": "POST /videos/generations 提交返回 id -> 轮询 GET /async-result/{id} -> task_status=SUCCESS 取 video_result[0].url 与 cover_image_url",
+      "streaming": "none",
+      "default_params": {
+        "model": "cogvideox-3",
+        "duration": null,
+        "resolution": "1080",
+        "aspect_ratio": null,
+        "n": 1
+      },
+      "pricing": "按生成计费（具体以智谱开放平台视频生成定价为准）",
+      "verified": true,
+      "official_doc": "https://docs.bigmodel.cn/api-reference/模型-api/视频生成异步",
+      "notes": "智谱 CogVideoX；模型编码 cogvideox-3 / cogvideox-flash / cogvideox。支持文生视频、图生视频（image_url + prompt），可选 with_audio（AI 音效）、quality（speed/quality）、watermark_enabled。异步结果查询接口为 /async-result/{task_id}。"
+    },
+    {
+      "id": "stability-svd-1-1",
+      "name": "Stable Video Diffusion 1.1",
+      "vendor": "Stability AI",
+      "category": "video",
+      "region": "overseas",
+      "access": "oss",
+      "base_url": null,
+      "auth": {
+        "type": null,
+        "header": null,
+        "key_location": "https://huggingface.co/stabilityai/stable-video-diffusion-img2img",
+        "region_specific": false
+      },
+      "openai_compatible": false,
+      "async": false,
+      "async_flow": null,
+      "streaming": "none",
+      "default_params": {
+        "model": "stable-video-diffusion-img2img",
+        "duration": null,
+        "resolution": null,
+        "aspect_ratio": null,
+        "n": 1
+      },
+      "pricing": "开源权重免费（Community License，非商业/年营收<100万美元可用）；自托管无 SaaS 费用",
+      "verified": true,
+      "official_doc": "https://kb.stability.ai/knowledge-base/how-to-access-stable-video-diffusion",
+      "notes": "⚠️ Stability 官方托管 SVD API（旧 endpoint api.stability.ai/v2beta/image-to-video）已于 2025-07-24 正式停用，base_url/auth 标 null。现仅能自托管：HuggingFace 下载权重 + generative-models 仓库脚本（generative-models/scripts/sampling/simple_video_sample.py），或通过 ComfyUI / NVIDIA NIM 部署。图像转视频，输出约 2–4s（25 帧），无官方 SLA。"
+    },
+    {
+      "id": "openai-gpt",
+      "name": "GPT",
+      "vendor": "OpenAI",
+      "category": "text",
+      "region": "overseas",
+      "access": "api",
+      "base_url": "https://api.openai.com/v1",
+      "auth": {
+        "type": "bearer",
+        "header": "Authorization",
+        "key_location": "https://platform.openai.com/api-keys",
+        "region_specific": false
+      },
+      "openai_compatible": true,
+      "async": false,
+      "streaming": "sse",
+      "default_params": {
+        "model": "gpt-5",
+        "temperature": 1.0,
+        "max_tokens": 16384,
+        "top_p": 1.0,
+        "stream": true
+      },
+      "context_window": "400K",
+      "pricing": "输入 $1.25/1M tok，输出 $10/1M tok（gpt-5 档，参考价）",
+      "verified": true,
+      "official_doc": "https://platform.openai.com/docs/api-reference",
+      "notes": "支持 function calling、json 模式、视觉输入（gpt-4o/gpt-5）。可选组织/项目头：OpenAI-Organization、OpenAI-Project。gpt-5 上下文约 400K，部分模型更长。"
+    },
+    {
+      "id": "anthropic-claude",
+      "name": "Claude",
+      "vendor": "Anthropic",
+      "category": "text",
+      "region": "overseas",
+      "access": "api",
+      "base_url": "https://api.anthropic.com",
+      "auth": {
+        "type": "x-api-key",
+        "header": "x-api-key",
+        "key_location": "https://platform.claude.com/settings/keys",
+        "region_specific": false
+      },
+      "openai_compatible": false,
+      "async": false,
+      "streaming": "sse",
+      "default_params": {
+        "model": "claude-opus-4",
+        "temperature": 1.0,
+        "max_tokens": 8192,
+        "top_p": 1.0,
+        "stream": true
+      },
+      "context_window": "200K",
+      "pricing": "Opus 约 $15/$75、Sonnet 约 $3/$15、Haiku 约 $0.25/$1.25 每 1M tok（参考价，以官网为准）",
+      "verified": true,
+      "official_doc": "https://docs.anthropic.com/en/api/messages",
+      "notes": "非 OpenAI 兼容，使用 POST /v1/messages。除 x-api-key 外必须带 anthropic-version 头（如 2023-06-01）；系统提示用顶层 system 字段。也支持 Authorization: Bearer 短令牌（Workload Identity Federation）。模型：claude-opus / claude-sonnet / claude-haiku。"
+    },
+    {
+      "id": "google-gemini",
+      "name": "Gemini",
+      "vendor": "Google",
+      "category": "text",
+      "region": "overseas",
+      "access": "api",
+      "base_url": "https://generativelanguage.googleapis.com/v1beta",
+      "auth": {
+        "type": "api-key",
+        "header": "x-goog-api-key",
+        "key_location": "https://aistudio.google.com/apikey",
+        "region_specific": false
+      },
+      "openai_compatible": false,
+      "async": false,
+      "streaming": "sse",
+      "default_params": {
+        "model": "gemini-2.5-pro",
+        "temperature": 1.0,
+        "max_tokens": 65536,
+        "top_p": 1.0,
+        "stream": true
+      },
+      "context_window": "1M",
+      "pricing": "Gemini 2.5 Pro 约 $1.25/$10 每 1M tok（参考价，以官网为准）",
+      "verified": true,
+      "official_doc": "https://ai.google.dev/api",
+      "notes": "非 OpenAI 兼容，使用原生 generateContent 协议（POST /v1beta/models/{model}:generateContent）。鉴权三选一：x-goog-api-key 头、Authorization: Bearer、或 URL 查询参数 ?key=。原生参数名为 maxOutputTokens / topP / topK。Vertex AI 另有独立端点。"
+    },
+    {
+      "id": "meta-llama",
+      "name": "Llama",
+      "vendor": "Meta",
+      "category": "text",
+      "region": "overseas",
+      "access": "api",
+      "base_url": "https://api.together.xyz/v1",
+      "auth": {
+        "type": "bearer",
+        "header": "Authorization",
+        "key_location": "https://www.together.ai/settings/api-keys",
+        "region_specific": false
+      },
+      "openai_compatible": true,
+      "async": false,
+      "streaming": "sse",
+      "default_params": {
+        "model": "meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8",
+        "temperature": 1.0,
+        "max_tokens": 4096,
+        "top_p": 1.0,
+        "stream": true
+      },
+      "context_window": "10M (Scout) / 1M (Maverick)",
+      "pricing": "随宿主而定：Together Llama 4 Maverick 约 $0.27/$0.85 起、Scout 约 $0.10/$0.30 每 1M tok（参考价，以宿主官网为准）",
+      "verified": true,
+      "official_doc": "https://www.llama.com/",
+      "notes": "⚠️ Meta 官方托管 API（api.llama.com）已于 2026-07 下线。Llama 为开放权重模型，实际经由官方合作伙伴托管，base_url 取决于宿主：Together.ai=https://api.together.xyz/v1、Groq=https://api.groq.com/openai/v1、OpenRouter=https://openrouter.ai/api/v1、AWS Bedrock/Google Vertex/Azure AI 各有独立端点。各宿主均提供 OpenAI 兼容 chat/completions。模型 ID 为宿主特定（如 meta-llama/Llama-4-*-Instruct-FP8）。"
+    },
+    {
+      "id": "mistral",
+      "name": "Mistral",
+      "vendor": "Mistral AI",
+      "category": "text",
+      "region": "overseas",
+      "access": "api",
+      "base_url": "https://api.mistral.ai/v1",
+      "auth": {
+        "type": "bearer",
+        "header": "Authorization",
+        "key_location": "https://console.mistral.ai/api-keys",
+        "region_specific": false
+      },
+      "openai_compatible": true,
+      "async": false,
+      "streaming": "sse",
+      "default_params": {
+        "model": "mistral-large-latest",
+        "temperature": 0.7,
+        "max_tokens": 4096,
+        "top_p": 1.0,
+        "stream": true
+      },
+      "context_window": "128K",
+      "pricing": "mistral-large 约 $2/$6 每 1M tok（参考价，以官网为准）",
+      "verified": true,
+      "official_doc": "https://docs.mistral.ai/api/",
+      "notes": "OpenAI 兼容 chat/completions。推荐 temperature 0.0–0.7。支持 json_object/json_schema 模式、function calling、prompt caching。"
+    },
+    {
+      "id": "xai-grok",
+      "name": "Grok",
+      "vendor": "xAI",
+      "category": "text",
+      "region": "overseas",
+      "access": "api",
+      "base_url": "https://api.x.ai/v1",
+      "auth": {
+        "type": "bearer",
+        "header": "Authorization",
+        "key_location": "https://console.x.ai/",
+        "region_specific": false
+      },
+      "openai_compatible": true,
+      "async": false,
+      "streaming": "sse",
+      "default_params": {
+        "model": "grok-3",
+        "temperature": 1.0,
+        "max_tokens": 4096,
+        "top_p": 1.0,
+        "stream": true
+      },
+      "context_window": "131K",
+      "pricing": "grok-3 约 $3/$15 每 1M tok（参考价，以官网为准）",
+      "verified": true,
+      "official_doc": "https://docs.x.ai/docs/api-reference",
+      "notes": "OpenAI 兼容 chat/completions（base_url=https://api.x.ai/v1）。另有 /v1/responses 端点，部分 OpenAI 参数（frequency_penalty、presence_penalty）在 Responses API 不支持。文档示例模型含 grok-4.5 等更新版本。"
+    },
+    {
+      "id": "cohere-command",
+      "name": "Command",
+      "vendor": "Cohere",
+      "category": "text",
+      "region": "overseas",
+      "access": "api",
+      "base_url": "https://api.cohere.com/v2",
+      "auth": {
+        "type": "bearer",
+        "header": "Authorization",
+        "key_location": "https://dashboard.cohere.com/api-keys",
+        "region_specific": false
+      },
+      "openai_compatible": false,
+      "async": false,
+      "streaming": "sse",
+      "default_params": {
+        "model": "command-r-plus",
+        "temperature": 0.3,
+        "max_tokens": 4096,
+        "top_p": 0.75,
+        "stream": true
+      },
+      "context_window": "128K",
+      "pricing": "command-r-plus 约 $2.5/$10 每 1M tok（参考价，以官网为准）",
+      "verified": true,
+      "official_doc": "https://docs.cohere.com/reference/chat",
+      "notes": "非 OpenAI 兼容，使用 POST /v2/chat（v2 协议）。默认 temperature=0.3、p(top_p)=0.75、k(top_k)=0。支持引用(citations)、RAG documents、json_object 模式。注意：裸别名 command-r-plus 已被弃用，生产应使用带日期后缀的模型 ID（如 command-r-plus-08-2024）；流终止符为 message-end 而非 [DONE]。"
+    },
+    {
+      "id": "perplexity-sonar",
+      "name": "Sonar",
+      "vendor": "Perplexity",
+      "category": "text",
+      "region": "overseas",
+      "access": "api",
+      "base_url": "https://api.perplexity.ai",
+      "auth": {
+        "type": "bearer",
+        "header": "Authorization",
+        "key_location": "https://www.perplexity.ai/account/api",
+        "region_specific": false
+      },
+      "openai_compatible": true,
+      "async": false,
+      "streaming": "sse",
+      "default_params": {
+        "model": "sonar",
+        "temperature": 0.7,
+        "max_tokens": 4096,
+        "top_p": 1.0,
+        "stream": true
+      },
+      "context_window": "200K (Sonar Pro 达 200K)",
+      "pricing": "sonar $1/$1、sonar-pro $3/$15、sonar-reasoning-pro $3/$15 每 1M tok（参考价，以官网为准）",
+      "verified": true,
+      "official_doc": "https://docs.perplexity.ai/",
+      "notes": "OpenAI 兼容 chat/completions。响应带 citations（来源 URL）。⚠️ 官方 API Reference 子页（如 /api-reference/chat-completions）抓取时一度 404，本配置依据官方概览页与多源一致的 OpenAI 兼容调用示例核实。base_url 即 https://api.perplexity.ai，完整端点 /chat/completions。"
+    },
+    {
+      "id": "qwen",
+      "name": "通义千问 Qwen",
+      "vendor": "Alibaba (DashScope/百炼)",
+      "category": "text",
+      "region": "domestic",
+      "access": "api",
+      "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "auth": {
+        "type": "bearer",
+        "header": "Authorization",
+        "key_location": "https://dashscope.console.aliyun.com/apiKey",
+        "region_specific": false
+      },
+      "openai_compatible": true,
+      "async": false,
+      "streaming": "sse",
+      "default_params": {
+        "model": "qwen-max",
+        "temperature": 0.7,
+        "max_tokens": 4096,
+        "top_p": 1.0,
+        "stream": true
+      },
+      "context_window": "128K",
+      "pricing": "qwen-max 约 ¥20/1M 输入、¥100/1M 输出（参考价，以官网为准）",
+      "verified": true,
+      "official_doc": "https://help.aliyun.com/en/model-studio/what-is-model-studio",
+      "notes": "OpenAI 兼容。base_url 随地域变化：北京=https://dashscope.aliyuncs.com/compatible-mode/v1，新加坡=dashscope-intl.aliyuncs.com，美东=dashscope-us.aliyuncs.com；企业版为 {WorkspaceId}.cn-beijing.maas.aliyuncs.com/compatible-mode/v1。模型含 qwen-max / qwen-plus / qwen-turbo / qwen3 系列 / qwq 等。"
+    },
+    {
+      "id": "zhipu-glm",
+      "name": "智谱 GLM",
+      "vendor": "Zhipu AI (智谱)",
+      "category": "text",
+      "region": "domestic",
+      "access": "api",
+      "base_url": "https://open.bigmodel.cn/api/paas/v4",
+      "auth": {
+        "type": "bearer",
+        "header": "Authorization",
+        "key_location": "https://open.bigmodel.cn/usercenter/apikeys",
+        "region_specific": false
+      },
+      "openai_compatible": true,
+      "async": false,
+      "streaming": "sse",
+      "default_params": {
+        "model": "glm-4.5",
+        "temperature": 0.9,
+        "max_tokens": 4096,
+        "top_p": 0.7,
+        "stream": true
+      },
+      "context_window": "128K",
+      "pricing": "glm-4.5 含免费额度；付费档参考官网（免费模型如 glm-4.5-flash 无需付费）",
+      "verified": true,
+      "official_doc": "https://docs.bigmodel.cn/cn/guide/develop/openai/introduction",
+      "notes": "OpenAI 兼容。GLM-4.5 及以上支持 thinking 参数（thinking 思维链，经 extra_body 传递）。国际站端点 https://api.z.ai/v1 模型相同。模型含 glm-4.5 / glm-4.5-air / glm-4.5-flash / glm-4.7 等。"
+    },
+    {
+      "id": "doubao",
+      "name": "豆包 Doubao",
+      "vendor": "ByteDance (火山引擎方舟)",
+      "category": "text",
+      "region": "domestic",
+      "access": "api",
+      "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+      "auth": {
+        "type": "bearer",
+        "header": "Authorization",
+        "key_location": "https://console.volcengine.com/ark/region:ark+cn-beijing/apikey",
+        "region_specific": false
+      },
+      "openai_compatible": true,
+      "async": false,
+      "streaming": "sse",
+      "default_params": {
+        "model": "doubao-pro",
+        "temperature": 0.7,
+        "max_tokens": 4096,
+        "top_p": 1.0,
+        "stream": true
+      },
+      "context_window": "256K",
+      "pricing": "doubao 系列低价，约 ¥0.0008/1K tok 起（参考价，以官网为准）",
+      "verified": true,
+      "official_doc": "https://www.volcengine.com/docs/82379/1500230",
+      "notes": "OpenAI 兼容。model 可填模型 ID（如 doubao-seed-2-0-pro-260628、doubao-pro-32k 等带版本号字符串）或接入点 Endpoint ID（ep- 开头）。数据面 API 同时支持 API Key 鉴权与 Access Key(TC3) 鉴权；Coding Plan 专用端点 https://ark.cn-beijing.volces.com/api/coding。"
+    },
+    {
+      "id": "kimi",
+      "name": "Kimi",
+      "vendor": "Moonshot AI (月之暗面)",
+      "category": "text",
+      "region": "domestic",
+      "access": "api",
+      "base_url": "https://api.moonshot.cn/v1",
+      "auth": {
+        "type": "bearer",
+        "header": "Authorization",
+        "key_location": "https://platform.moonshot.cn/console/api-keys",
+        "region_specific": false
+      },
+      "openai_compatible": true,
+      "async": false,
+      "streaming": "sse",
+      "default_params": {
+        "model": "kimi-k2",
+        "temperature": 0.7,
+        "max_tokens": 4096,
+        "top_p": 1.0,
+        "stream": true
+      },
+      "context_window": "256K",
+      "pricing": "kimi-k2 约 $0.6/$2.5 每 1M tok（参考价，以官网为准）",
+      "verified": true,
+      "official_doc": "https://platform.moonshot.cn/docs/api/overview",
+      "notes": "OpenAI 兼容。thinking 参数经 SDK extra_body 传递；partial 字段写在 assistant message 上。模型含 kimi-k2 / kimi-k2.5 / moonshot-v1-8k/32k 等。也经 OpenRouter/Together/NVIDIA NIM 分发。"
+    },
+    {
+      "id": "ernie",
+      "name": "文心 ERNIE",
+      "vendor": "Baidu (百度千帆)",
+      "category": "text",
+      "region": "domestic",
+      "access": "api",
+      "base_url": "https://qianfan.baidubce.com/v2",
+      "auth": {
+        "type": "bearer",
+        "header": "Authorization",
+        "key_location": "https://console.bce.baidu.com/iam/#/iam/apikey",
+        "region_specific": false
+      },
+      "openai_compatible": true,
+      "async": false,
+      "streaming": "sse",
+      "default_params": {
+        "model": "ernie-4.5",
+        "temperature": 0.7,
+        "max_tokens": 4096,
+        "top_p": 1.0,
+        "stream": true
+      },
+      "context_window": "128K",
+      "pricing": "ernie-4.5 约 ¥20/1M 输入、¥100/1M 输出（参考价，以官网为准）",
+      "verified": true,
+      "official_doc": "https://cloud.baidu.com/doc/qianfan-docs/s/qm8qxemze",
+      "notes": "v2 起 OpenAI 兼容（base_url=https://qianfan.baidubce.com/v2）。Key 须以 bce-v3/ALTAK- 开头（V2 体系）；可选 appid 头区分账单。模型含 ernie-4.5 / ernie-4.5-turbo-128k / ernie-4.0 等。旧版 ERNIE Bot 原生接口需用 AK/SK 换 access_token（非 OpenAI 兼容）。"
+    },
+    {
+      "id": "tencent-hunyuan",
+      "name": "腾讯混元 Hunyuan",
+      "vendor": "Tencent (腾讯云)",
+      "category": "text",
+      "region": "domestic",
+      "access": "api",
+      "base_url": "https://hunyuan.tencentcloudapi.com",
+      "auth": {
+        "type": "tencent-tc3-signature",
+        "header": "Authorization",
+        "key_location": "https://console.cloud.tencent.com/cam/capi",
+        "region_specific": true
+      },
+      "openai_compatible": false,
+      "async": false,
+      "streaming": "sse",
+      "default_params": {
+        "model": "hunyuan-turbo",
+        "temperature": 0.7,
+        "max_tokens": 4096,
+        "top_p": 1.0,
+        "stream": true
+      },
+      "context_window": "256K",
+      "pricing": "hunyuan-turbo 约 ¥0.03/1K tok（参考价，以官网为准）",
+      "verified": true,
+      "official_doc": "https://cloud.tencent.com/document/product/1729",
+      "notes": "腾讯云 API 3.0 签名（TC3-HMAC-SHA256），非 OpenAI 兼容。需用 SecretId/SecretKey 生成签名串，并经 X-TC-Action、X-TC-Version、X-TC-Timestamp、X-TC-Region 等头传递；建议使用官方 SDK（tencentcloud-sdk-python）。region_specific=true。另有 OpenAI 兼容端点（api.hunyuan.cloud.tencent.com/v1，模型 hy3/hunyuan-turbos-latest，Bearer 鉴权），如走兼容模式可改 base_url 与 openai_compatible=true。"
+    },
+    {
+      "id": "deepseek",
+      "name": "DeepSeek",
+      "vendor": "DeepSeek",
+      "category": "text",
+      "region": "domestic",
+      "access": "api",
+      "base_url": "https://api.deepseek.com/v1",
+      "auth": {
+        "type": "bearer",
+        "header": "Authorization",
+        "key_location": "https://platform.deepseek.com/api_keys",
+        "region_specific": false
+      },
+      "openai_compatible": true,
+      "async": false,
+      "streaming": "sse",
+      "default_params": {
+        "model": "deepseek-v4-flash",
+        "temperature": 1.0,
+        "max_tokens": 4096,
+        "top_p": 1.0,
+        "stream": true
+      },
+      "context_window": "1M",
+      "pricing": "v4-flash 约 $0.27/$1.1、v4-pro 约 $1.3/$5 每 1M tok（参考价，以官网为准）",
+      "verified": true,
+      "official_doc": "https://api-docs.deepseek.com/",
+      "notes": "OpenAI 兼容。⚠️ deepseek-chat 与 deepseek-reasoner 旧模型名已于 2026-07-24 弃用，分别映射为 deepseek-v4-flash 的非思考/思考模式；新调用请用 deepseek-v4-flash / deepseek-v4-pro。官方 V4 推荐 base_url=https://api.deepseek.com（/v1 前缀仍可用但为旧约定）；上下文提升至 1M。思考模式经 thinking / reasoning_effort 参数（extra_body）控制。亦提供 Anthropic 兼容端点 https://api.deepseek.com/anthropic。"
+    }
+  ]
+}

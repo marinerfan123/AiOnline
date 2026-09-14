@@ -1,0 +1,55 @@
+services:
+  redis:
+    image: redis:7.2
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:?REDIS_PASSWORD is required}"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  app:
+    build:
+      context: .
+      args:
+        NPM_REGISTRY: https://registry.npmmirror.com
+        ALPINE_BASE: https://mirrors.aliyun.com/alpine
+    depends_on:
+      redis:
+        condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      NODE_ENV: production
+      PORT: 3001
+      PG_HOST: ${PG_HOST:?PG_HOST is required}
+      PG_PORT: ${PG_PORT:-35432}
+      PG_DATABASE: ${PG_DATABASE:-moling}
+      PG_USER: ${PG_USER:-postgres}
+      PG_PASSWORD: ${PG_PASSWORD:?PG_PASSWORD is required}
+      PG_POOL_MAX: ${PG_POOL_MAX:-20}
+      PG_SSLMODE: ${PG_SSLMODE:-disable}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required}
+      PAYMENT_MASTER_KEY: ${PAYMENT_MASTER_KEY}
+      ADMIN_SEED_EMAIL: ${ADMIN_SEED_EMAIL:?ADMIN_SEED_EMAIL is required}
+      ADMIN_SEED_PASSWORD: ${ADMIN_SEED_PASSWORD:?ADMIN_SEED_PASSWORD is required}
+      API_TOKEN: ${API_TOKEN:?API_TOKEN is required}
+      ENABLE_CLUSTER: "false"
+      GEN_USER_MAX_ACTIVE: "8"
+    ports:
+      - "127.0.0.1:${APP_HOST_PORT:-3001}:3001"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3001/api/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  redisdata:

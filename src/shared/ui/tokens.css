@@ -1,0 +1,159 @@
+/* ════════════════════════════════════════════════════════════════
+   Moling Design System V2 — Tokens (dark-first, high-density)
+   Standalone layer: only imported by the V2 shell. Does NOT touch
+   the legacy index.css / tailwind-theme.css so production UI is
+   unaffected until the V2 modules replace it per feature flag.
+   Prefix: --ml2-
+   ════════════════════════════════════════════════════════════════ */
+
+:root,
+.ml2 {
+  /* ── Surface (dark-first) ────────────────────────────────── */
+  --ml2-surface-0: #0a0b0e;
+  --ml2-surface-1: #101216;
+  --ml2-surface-2: #16191f;
+  --ml2-surface-3: #1d2129;
+  --ml2-surface-overlay: #232833;
+
+  /* ── Border ──────────────────────────────────────────────── */
+  --ml2-border: #262b35;
+  --ml2-border-strong: #343b48;
+  --ml2-border-focus: #6c7cff;
+
+  /* ── Text ────────────────────────────────────────────────── */
+  --ml2-text-primary: #f2f4f8;
+  --ml2-text-secondary: #9aa3b2;
+  --ml2-text-muted: #5c6572;
+  --ml2-text-inverse: #0a0b0e;
+
+  /* ── Accent (brand, indigo-violet) ───────────────────────── */
+  --ml2-accent: #6c7cff;
+  --ml2-accent-hover: #8490ff;
+  --ml2-accent-pressed: #5665e6;
+  --ml2-accent-dim: rgba(108, 124, 255, 0.14);
+  --ml2-on-accent: #ffffff;
+
+  /* ── Semantic ────────────────────────────────────────────── */
+  --ml2-success: #22c55e;
+  --ml2-success-dim: rgba(34, 197, 94, 0.15);
+  --ml2-warning: #f59e0b;
+  --ml2-warning-dim: rgba(245, 158, 11, 0.15);
+  --ml2-danger: #ef4444;
+  --ml2-danger-dim: rgba(239, 68, 68, 0.15);
+  --ml2-info: #38bdf8;
+  --ml2-info-dim: rgba(56, 189, 248, 0.15);
+
+  /* ── Task states ─────────────────────────────────────────── */
+  --ml2-state-queued: #9aa3b2;
+  --ml2-state-generating: #6c7cff;
+  --ml2-state-processing: #22d3ee;
+  --ml2-state-completed: #22c55e;
+  --ml2-state-failed: #ef4444;
+  --ml2-state-canceled: #5c6572;
+
+  /* ── Spacing (4pt base) ──────────────────────────────────── */
+  --ml2-space-1: 4px;
+  --ml2-space-2: 8px;
+  --ml2-space-3: 12px;
+  --ml2-space-4: 16px;
+  --ml2-space-5: 20px;
+  --ml2-space-6: 24px;
+  --ml2-space-8: 32px;
+  --ml2-space-10: 40px;
+  --ml2-space-12: 48px;
+
+  /* ── Radius ──────────────────────────────────────────────── */
+  --ml2-radius-sm: 6px;
+  --ml2-radius-md: 10px;
+  --ml2-radius-lg: 14px;
+  --ml2-radius-full: 9999px;
+
+  /* ── Elevation (dark = border + surface step; no shadow) ─── */
+  --ml2-elev-1: 0 0 0 1px var(--ml2-border);
+  --ml2-elev-2: 0 0 0 1px var(--ml2-border-strong);
+  --ml2-elev-3: 0 8px 24px -12px rgba(0, 0, 0, 0.6), 0 0 0 1px var(--ml2-border-strong);
+  --ml2-elev-popover: 0 12px 32px -12px rgba(0, 0, 0, 0.7), 0 0 0 1px var(--ml2-border-strong);
+
+  /* ── Typography ──────────────────────────────────────────── */
+  --ml2-font-sans: "Inter", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  --ml2-font-mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", monospace;
+  --ml2-text-xs: 12px;
+  --ml2-text-sm: 13px;
+  --ml2-text-base: 14px;
+  --ml2-text-lg: 16px;
+  --ml2-text-xl: 20px;
+  --ml2-text-2xl: 28px;
+  --ml2-leading-tight: 1.2;
+  --ml2-leading-body: 1.5;
+
+  /* ── Density (table/row) ─────────────────────────────────── */
+  --ml2-row-h-sm: 28px;
+  --ml2-row-h-md: 36px;
+  --ml2-row-h-lg: 44px;
+
+  /* ── Motion ──────────────────────────────────────────────── */
+  --ml2-dur-micro: 120ms;
+  --ml2-dur-std: 200ms;
+  --ml2-dur-large: 320ms;
+  --ml2-ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+
+  /* ── Z-index scale ───────────────────────────────────────── */
+  --ml2-z-base: 0;
+  --ml2-z-dropdown: 40;
+  --ml2-z-sticky: 50;
+  --ml2-z-overlay: 60;
+  --ml2-z-modal: 70;
+  --ml2-z-popover: 80;
+  --ml2-z-toast: 90;
+  --ml2-z-tooltip: 100;
+
+  /* ── Map tokens to Tailwind v4 theme so utilities work ───── */
+  --color-ml2-surface-0: var(--ml2-surface-0);
+  --color-ml2-surface-1: var(--ml2-surface-1);
+  --color-ml2-surface-2: var(--ml2-surface-2);
+  --color-ml2-surface-3: var(--ml2-surface-3);
+  --color-ml2-border: var(--ml2-border);
+  --color-ml2-text: var(--ml2-text-primary);
+  --color-ml2-text-2: var(--ml2-text-secondary);
+  --color-ml2-text-3: var(--ml2-text-muted);
+  --color-ml2-accent: var(--ml2-accent);
+  --color-ml2-accent-hover: var(--ml2-accent-hover);
+  --color-ml2-success: var(--ml2-success);
+  --color-ml2-warning: var(--ml2-warning);
+  --color-ml2-danger: var(--ml2-danger);
+  --color-ml2-info: var(--ml2-info);
+}
+
+/* Light variant (compatible, not the primary direction) */
+.ml2-light {
+  --ml2-surface-0: #f5f6f8;
+  --ml2-surface-1: #ffffff;
+  --ml2-surface-2: #ffffff;
+  --ml2-surface-3: #f0f1f4;
+  --ml2-surface-overlay: #ffffff;
+  --ml2-border: #e2e4e9;
+  --ml2-border-strong: #cfd3db;
+  --ml2-text-primary: #14171d;
+  --ml2-text-secondary: #565f6e;
+  --ml2-text-muted: #8b93a1;
+  --ml2-elev-1: 0 0 0 1px var(--ml2-border);
+  --ml2-elev-3: 0 8px 24px -16px rgba(0, 0, 0, 0.18), 0 0 0 1px var(--ml2-border);
+  --ml2-elev-popover: 0 12px 32px -16px rgba(0, 0, 0, 0.22), 0 0 0 1px var(--ml2-border);
+}
+
+.ml2 {
+  font-family: var(--ml2-font-sans);
+  background: var(--ml2-surface-0);
+  color: var(--ml2-text-primary);
+  font-size: var(--ml2-text-base);
+  -webkit-font-smoothing: antialiased;
+}
+.ml2 * {
+  box-sizing: border-box;
+}
+@media (prefers-reduced-motion: reduce) {
+  .ml2 * {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

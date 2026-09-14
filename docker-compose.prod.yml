@@ -1,0 +1,62 @@
+# 生产环境独立编排文件（外部 PostgreSQL + 内网 Redis + app 仅绑定回环地址）
+# 与仓库自带的 docker-compose.yml（本地/一键体验用，内置 PG+Redis）区分开，避免 YAML 合并/覆盖语义
+# 在不同 Docker Compose 版本上的兼容性问题。
+#
+# 用法：
+#   docker compose -f docker-compose.prod.yml up -d --build
+#   docker compose -f docker-compose.prod.yml logs -f app
+#
+# 前提：
+#   - 外部 PostgreSQL 已手动执行 `CREATE DATABASE huabu;`
+#   - 项目根目录下的 .env 已填好：PG_HOST/PG_PORT/PG_USER/PG_PASSWORD、REDIS_PASSWORD、
+#     JWT_SECRET、PAYMENT_MASTER_KEY、ADMIN_SEED_EMAIL、ADMIN_SEED_PASSWORD
+#   - 宝塔 Nginx 站点反代到 127.0.0.1:${APP_HOST_PORT:-3001}，HTTPS 由宝塔证书终结
+
+services:
+  redis:
+    image: redis:7.2
+    # 仅供 app 容器通过 Docker 内网访问，不对宿主机暴露端口
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:?REDIS_PASSWORD is required in production}"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  app:
+    build: .
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: 3001
+      PG_HOST: ${PG_HOST:?PG_HOST is required}
+      PG_PORT: ${PG_PORT:-5432}
+      PG_DATABASE: ${PG_DATABASE:-huabu}
+      PG_USER: ${PG_USER:?PG_USER is required}
+      PG_PASSWORD: ${PG_PASSWORD:?PG_PASSWORD is required}
+      PG_POOL_MAX: ${PG_POOL_MAX:-20}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required in production}
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required in production}
+      PAYMENT_MASTER_KEY: ${PAYMENT_MASTER_KEY:?PAYMENT_MASTER_KEY is required in production}
+      ADMIN_SEED_EMAIL: ${ADMIN_SEED_EMAIL:?ADMIN_SEED_EMAIL is required}
+      ADMIN_SEED_PASSWORD: ${ADMIN_SEED_PASSWORD:?ADMIN_SEED_PASSWORD is required}
+    # 临时：备案完成前用裸 IP 直连 http://8.148.68.47:3001 访问，故暴露到 0.0.0.0。
+    # 备案完成、走 nginx HTTPS 反代后，建议改回 "127.0.0.1:${APP_HOST_PORT:-3001}:3001" 收紧。
+    ports:
+      - "0.0.0.0:${APP_HOST_PORT:-3001}:3001"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3001/api/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  redisdata:

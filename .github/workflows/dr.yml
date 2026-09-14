@@ -1,0 +1,89 @@
+name: DR - Disaster Recovery Validation
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 3 * * 0'  # Weekly Sunday 03:00 UTC
+
+concurrency:
+  group: dr-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  dr-drill:
+    name: Disaster Recovery Drill
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: moling_ci_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Wait for PostgreSQL
+        run: |
+          for i in $(seq 1 30); do
+            pg_isready -h localhost -p 5432 -U postgres && break
+            sleep 2
+          done
+
+      - name: Initialize test DB
+        env:
+          NODE_ENV: test
+          TEST_PG_DATABASE: moling_ci_test
+          PG_HOST: localhost
+          PG_PORT: 5432
+          PG_USER: postgres
+          PG_PASSWORD: postgres
+          PG_DATABASE: moling_ci_test
+        run: |
+          node server/db/migrate.cjs
+
+      - name: Run DR safety and backup tests
+        env:
+          NODE_ENV: test
+          TEST_PG_DATABASE: moling_ci_test
+          PG_HOST: localhost
+          PG_PORT: 5432
+          PG_USER: postgres
+          PG_PASSWORD: postgres
+          PG_DATABASE: moling_ci_test
+        run: npm run test:dr
+
+      - name: Run full DR drill
+        env:
+          NODE_ENV: test
+          TEST_PG_DATABASE: moling_ci_test
+          PG_HOST: localhost
+          PG_PORT: 5432
+          PG_USER: postgres
+          PG_PASSWORD: postgres
+          PG_DATABASE: moling_ci_test
+        run: |
+          node scripts/dr-drill.cjs --no-cleanup

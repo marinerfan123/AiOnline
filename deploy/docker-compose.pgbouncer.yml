@@ -1,0 +1,75 @@
+# deploy/docker-compose.pgbouncer.yml — 启用 PgBouncer 的编排变体
+# 与 docker-compose.yml 的唯一差别：app 的连接指向 pgbouncer(6432) 而非直连 PG
+# 用法：docker compose -f docker-compose.pgbouncer.yml up -d --build
+
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: ${PG_USER:-postgres}
+      POSTGRES_PASSWORD: ${PG_PASSWORD:-0.0.1abcd}
+      POSTGRES_DB: ${PG_DATABASE:-huabu}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PG_USER:-postgres}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7.2
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  pgbouncer:
+    image: pgbouncer/pgbouncer:1.23
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "6432:6432"
+    volumes:
+      - ./deploy/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
+      - ./deploy/userlist.txt:/etc/pgbouncer/userlist.txt:ro
+    restart: unless-stopped
+
+  app:
+    build: .
+    depends_on:
+      pgbouncer:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: 3001
+      # 关键：指向 pgbouncer 而非直连 PG
+      PG_HOST: pgbouncer
+      PG_PORT: 6432
+      PG_DATABASE: ${PG_DATABASE:-huabu}
+      PG_USER: ${PG_USER:-postgres}
+      PG_PASSWORD: ${PG_PASSWORD:-0.0.1abcd}
+      PG_POOL_MAX: ${PG_POOL_MAX:-20}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      JWT_SECRET: ${JWT_SECRET:-change-me-to-a-long-random-string}
+    ports:
+      - "3001:3001"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3001/api/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  redisdata:

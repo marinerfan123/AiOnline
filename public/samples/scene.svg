@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 1000" width="800" height="1000">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0b1220"/>
+      <stop offset="0.55" stop-color="#1e2a5a"/>
+      <stop offset="1" stop-color="#312e81"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.40" r="0.62">
+      <stop offset="0" stop-color="#818cf8" stop-opacity="0.42"/>
+      <stop offset="1" stop-color="#818cf8" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="800" height="1000" fill="url(#bg)"/>
+  <rect width="800" height="1000" fill="url(#glow)"/>
+  <g opacity="0.12" stroke="#c7d2fe" stroke-width="1.5" fill="none">
+    <path d="M180 560 L400 420 L620 560 L620 760 L180 760 Z"/>
+    <path d="M400 420 L400 300"/>
+  </g>
+  <g fill="#c7d2fe" opacity="0.85">
+    <rect x="360" y="300" width="80" height="120" rx="6"/>
+  </g>
+  <text x="400" y="660" text-anchor="middle" font-family="system-ui, -apple-system, 'PingFang SC', sans-serif" font-size="58" font-weight="800" fill="#eef2ff" letter-spacing="2">示例素材</text>
+  <text x="400" y="712" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="22" font-weight="600" fill="#a5b4fc" letter-spacing="4">SCENE</text>
+  <text x="400" y="930" text-anchor="middle" font-family="system-ui, -apple-system, 'PingFang SC', sans-serif" font-size="18" fill="#94a3b8">公共资产 · 可删除，新用户仍默认获得</text>
+</svg>

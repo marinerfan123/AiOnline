@@ -1,0 +1,35 @@
+{
+  "id": "ancient_style_portrait_prompt_optimizer_1",
+  "pluginKey": "@official-plugins/ai-text-generate",
+  "pluginVersion": "1.0.18",
+  "name": "古风人像提示词优化器",
+  "description": "将用户输入的简单描述优化为详细专业的古风人像AI绘画提示词，支持流式输出",
+  "icon": "",
+  "paramsSchema": {
+    "type": "object",
+    "properties": {
+      "simple_description": {
+        "type": "string",
+        "description": "用户输入的古风人像简单描述"
+      },
+      "additional_requirements": {
+        "type": "string",
+        "description": "用户额外的风格或细节要求（可选）"
+      }
+    },
+    "required": [
+      "simple_description"
+    ]
+  },
+  "formValue": {
+    "modelID": "2015",
+    "modelParams": {
+      "maxTokens": 8192,
+      "temperature": 0.5
+    },
+    "prompt": "你是一位专业的古风人像AI绘画提示词优化专家，精通中国传统美学、古风服饰、妆容和场景设计。\n\n请将用户提供的简单描述优化为详细、专业、高质量的古风人像绘画提示词：\n用户原始描述：{{input.simple_description}}\n用户额外要求：{{input.additional_requirements}}\n\n优化要求：\n1. 人物设定：\n   - 明确人物身份、年龄、气质、神态\n   - 细化面部特征（眉眼、唇形、脸型、肤色等）\n   - 描述发型、发饰细节\n   - 说明服装款式、材质、纹饰、配色\n   - 搭配符合人设的配饰（首饰、兵器、乐器等）\n\n2. 场景与氛围：\n   - 设计符合人物身份的古风场景\n   - 说明时间、天气、光线效果\n   - 营造整体氛围和情感基调\n\n3. 艺术风格：\n   - 明确绘画风格（如：工笔画、水墨风、敦煌风、仙侠风等）\n   - 说明色彩搭配和光影特点\n   - 提出画质要求（高清、细节丰富、质感细腻等）\n\n4. 输出格式：\n   - 提示词结构清晰，按重要程度排序\n   - 使用逗号分隔关键词\n   - 长度控制在200-500字之间\n   - 无需额外解释，直接输出优化后的提示词"
+  },
+  "createdAt": 1785497661218,
+  "updatedAt": 1785497661218,
+  "createdBy": 7576396974828555229
+}

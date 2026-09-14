@@ -1,0 +1,476 @@
+// M05-A — Studio Canvas (center). React Flow wrapper with:
+// pan/zoom/minimap/controls, drag-from-library, context menu, invalid
+// connection feedback, empty state, keyboard shortcuts, node error isolation.
+
+import { useCallback, useEffect, useRef, useState, useMemo, Component, type ReactNode } from 'react';
+import {
+  ReactFlow,
+  ReactFlowProvider,
+  Background,
+  BackgroundVariant,
+  MiniMap,
+  Controls,
+  useReactFlow,
+  type NodeTypes,
+} from '@xyflow/react';
+import '@xyflow/react/dist/style.css';
+import {
+  useStudioStore,
+  selectCanUndo,
+  selectCanRedo,
+  studioCanvasActions,
+  type StudioNode,
+} from './store';
+import { StudioNodeComponent } from './StudioNode';
+import { NodePreviewModal } from './NodePreviewModal';
+import { PresenceBar } from './PresenceBar';
+import { useCanvasPresence } from './useCanvasPresence';
+import { NODE_DEFS_LIST, canConnectToPort, getNodeDef } from './registry';
+import type { StudioNodeKind } from './types';
+import type { PortType } from './types';
+import { Button } from '@/shared/ui/v2/Button';
+import { IconButton } from '@/shared/ui/v2/IconButton';
+import { Undo2, Redo2, Maximize2, Scan, X, Copy, Trash2 } from "lucide-react";
+
+const nodeTypes: NodeTypes = { studio: StudioNodeComponent };
+
+// ── G06 asset drag contract ────────────────────────────────────────────────
+// The Asset Library drawer serializes an asset summary into a custom drag MIME
+// type; the canvas parses it on drop and creates a Blueprint ASSET node whose
+// data.assetId references the asset. Asset nodes are NOT generation nodes —
+// executionKind 'ASSET' never enters the DAG execution path; generation nodes
+// are added by the user from the Node Library.
+export const ASSET_DRAG_MIME = 'application/x-studio-asset';
+
+export interface AssetDragPayload {
+  assetId: string;
+  assetType: 'IMAGE' | 'VIDEO' | 'AUDIO' | 'OTHER';
+  url: string;
+  thumbnail: string;
+}
+
+/** Map an M04-S assetType to a Blueprint ASSET node kind (never GENERATION). */
+export function assetTypeToNodeKind(assetType: AssetDragPayload['assetType']): StudioNodeKind {
+  switch (assetType) {
+    case 'IMAGE':
+      return 'image';
+    case 'VIDEO':
+      return 'video';
+    case 'AUDIO':
+      return 'audio';
+    default:
+      return 'reference'; // OTHER / unknown → generic asset reference node
+  }
+}
+
+/** Best-effort parse of the asset drag payload; malformed data → null. */
+export function parseAssetDragPayload(raw: string): AssetDragPayload | null {
+  if (!raw) return null;
+  try {
+    const p = JSON.parse(raw) as Partial<AssetDragPayload>;
+    if (!p || typeof p.assetId !== 'string' || !p.assetId) return null;
+    return {
+      assetId: p.assetId,
+      assetType:
+        p.assetType === 'IMAGE' || p.assetType === 'VIDEO' || p.assetType === 'AUDIO' ? p.assetType : 'OTHER',
+      url: typeof p.url === 'string' ? p.url : '',
+      thumbnail: typeof p.thumbnail === 'string' ? p.thumbnail : '',
+    };
+  } catch {
+    return null;
+  }
+}
+
+// ── Error boundary: one broken node renderer must not white-screen Studio ──
+class StudioErrorBoundary extends Component<{ children: ReactNode }, { hasError: boolean }> {
+  state = { hasError: false };
+  static getDerivedStateFromError() {
+    return { hasError: true };
+  }
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div data-test="studio-error-boundary" className="grid h-full w-full place-items-center bg-ml2-surface-0 p-8">
+          <div className="max-w-sm rounded-lg border border-ml2-border bg-ml2-surface-1 p-5 text-center">
+            <p className="mb-1 text-sm font-medium text-ml2-text">Studio 渲染出现错误</p>
+            <p className="mb-4 text-xs text-ml2-text-3">某个节点渲染器出错已被隔离。可以尝试重新加载 Studio。</p>
+            <Button variant="secondary" size="sm" onClick={() => location.reload()}>重新加载</Button>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+function ContextMenu({
+  at,
+  onAdd,
+  onClose,
+  kinds,
+  header,
+}: {
+  at: { x: number; y: number };
+  onAdd: (k: StudioNodeKind) => void;
+  onClose: () => void;
+  kinds?: StudioNodeKind[]; // G05 edge-to-empty: filtered to compatible targets
+  header?: string;
+}) {
+  // M05-B2: derived from the registry (never a hardcoded second node list).
+  const allKinds = useMemo(() => NODE_DEFS_LIST.map((d) => d.id), []);
+  const list = kinds ?? allKinds;
+  return (
+    <div
+      data-test="canvas-context-menu"
+      className="absolute z-50 w-44 overflow-hidden rounded-lg border border-ml2-border bg-ml2-surface-1 py-1 shadow-2xl"
+      style={{ left: at.x, top: at.y }}
+      onContextMenu={(e) => { e.preventDefault(); onClose(); }}
+    >
+      <div className="px-3 py-1 text-[10px] text-ml2-text-3">{header ?? '在此处添加节点'}</div>
+      {list.map((k) => {
+        const def = NODE_DEFS_LIST.find((d) => d.id === k);
+        return (
+          <button key={k} data-test={`context-menu-${k}`} onClick={() => { onAdd(k); onClose(); }}
+            className="block w-full px-3 py-1.5 text-left text-xs text-ml2-text-2 hover:bg-ml2-surface-2 hover:text-ml2-text">
+            {def?.title ?? k}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function InvalidConnectionToast() {
+  const info = useStudioStore((s) => s.invalidConnection);
+  const clear = useStudioStore((s) => s.clearInvalidConnection);
+  useEffect(() => {
+    if (!info) return;
+    const t = setTimeout(clear, 3000);
+    return () => clearTimeout(t);
+  }, [info, clear]);
+  if (!info) return null;
+  return (
+    <div data-test="invalid-connection-toast" role="alert"
+      className="absolute left-1/2 top-4 z-50 flex -translate-x-1/2 items-center gap-2 rounded-full border border-red-500/40 bg-ml2-surface-1 px-4 py-1.5 text-xs text-red-400 shadow-lg">
+      {info.message}
+      <button onClick={clear} aria-label="关闭" className="rounded p-0.5 hover:bg-ml2-surface-3"><X className="size-3" /></button>
+    </div>
+  );
+}
+
+function EmptyState({ onAdd, onCreateWorkflow }: { onAdd: (k: StudioNodeKind) => void; onCreateWorkflow: () => void }) {
+  return (
+    <div data-test="studio-empty-state" className="pointer-events-none absolute inset-0 grid place-items-center">
+      <div className="pointer-events-auto w-[26rem] rounded-xl border border-ml2-border bg-ml2-surface-1/95 p-5 text-center shadow-xl backdrop-blur">
+        <h2 className="text-sm font-semibold text-ml2-text">开始创作</h2>
+        <p className="mt-1 text-[11px] text-ml2-text-3">直接建立一条可编辑的图像生成链，或从单个节点开始。</p>
+        <Button size="sm" variant="primary" data-test="empty-create-image-workflow" className="mt-4 w-full" onClick={onCreateWorkflow}>
+          一键创建图像工作流
+        </Button>
+        <div className="mt-2 grid grid-cols-3 gap-1.5">
+          <Button size="sm" variant="secondary" data-test="empty-add-prompt" onClick={() => onAdd('prompt')}>提示词</Button>
+          <Button size="sm" variant="secondary" data-test="empty-add-reference" onClick={() => onAdd('reference')}>参考素材</Button>
+          <Button size="sm" variant="secondary" data-test="empty-add-image" onClick={() => onAdd('image-generation')}>图像生成</Button>
+        </div>
+        <p className="mt-3 text-[10px] text-ml2-text-3">工作流会自动连线，选中提示词节点后即可在下方输入内容。</p>
+      </div>
+    </div>
+  );
+}
+
+function CanvasCore({ projectId, canvasRevision }: { projectId?: string; canvasRevision?: number | null }) {
+  const nodes = useStudioStore((s) => s.nodes);
+  const edges = useStudioStore((s) => s.edges);
+  const onNodesChange = useStudioStore((s) => s.onNodesChange);
+  const onEdgesChange = useStudioStore((s) => s.onEdgesChange);
+  const onConnect = useStudioStore((s) => s.onConnect);
+  const addNode = useStudioStore((s) => s.addNode);
+  const updateNodeParameter = useStudioStore((s) => s.updateNodeParameter);
+  const createStarterWorkflow = useStudioStore((s) => s.createStarterWorkflow);
+  const undo = useStudioStore((s) => s.undo);
+  const redo = useStudioStore((s) => s.redo);
+  const canUndo = useStudioStore(selectCanUndo);
+  const canRedo = useStudioStore(selectCanRedo);
+  const removeSelection = useStudioStore((s) => s.removeSelection);
+  const duplicateSelection = useStudioStore((s) => s.duplicateSelection);
+  const copySelection = useStudioStore((s) => s.copySelection);
+  const selectAll = useStudioStore((s) => s.selectAll);
+  const paste = useStudioStore((s) => s.paste);
+  const onNodeDragStart = useStudioStore((s) => s.onNodeDragStart);
+  const onNodeDragStop = useStudioStore((s) => s.onNodeDragStop);
+  const onViewportChange = useStudioStore((s) => s.onViewportChange);
+  const [menu, setMenu] = useState<{
+    x: number; y: number; fx: number; fy: number;
+    edgeFrom?: { nodeId: string; handleId: string; portType: PortType };
+  } | null>(null);
+  // W2: double-clicked node → NodePreviewModal (output preview / download / re-run).
+  const [previewNode, setPreviewNode] = useState<StudioNode | null>(null);
+  const { screenToFlowPosition, fitView } = useReactFlow();
+  const canvasRef = useRef<HTMLDivElement>(null);
+
+  // W5a — 协作在场：进画布即在线 + 15s 节流续活 + 15s peers 轮询（右上角在场条）。
+  const presence = useCanvasPresence(projectId);
+
+  // G05 edge-to-empty: node kinds whose input accepts the dragged output type.
+  const compatibleTargetKinds = useCallback((portType: PortType): StudioNodeKind[] => {
+    const out: StudioNodeKind[] = [];
+    for (const def of NODE_DEFS_LIST) {
+      if (def.inputPorts.some((p) => canConnectToPort(portType, p))) out.push(def.id);
+    }
+    return out;
+  }, []);
+
+  // First compatible input port id of a target node kind for the output type.
+  const firstCompatibleInput = useCallback((kind: StudioNodeKind, portType: PortType): string | null => {
+    const def = NODE_DEFS_LIST.find((d) => d.id === kind);
+    if (!def) return null;
+    const port = def.inputPorts.find((p) => canConnectToPort(portType, p));
+    return port?.id ?? null;
+  }, []);
+
+  // Controlled pattern: the zustand store is the single source of truth.
+  // onNodesChange (position/selection/dimensions) is applied back via applyNodeChanges.
+
+  const addAtCenter = useCallback((kind: StudioNodeKind) => {
+    // Use the ACTUAL canvas container rect (not the window) — the RF container
+    // is the center region between the library and inspector. Mapping the
+    // container center through screenToFlowPosition guarantees the new node
+    // lands in the visible viewport.
+    const rect = canvasRef.current?.getBoundingClientRect();
+    const cx = rect ? rect.left + rect.width / 2 : window.innerWidth / 2;
+    const cy = rect ? rect.top + rect.height / 2 : window.innerHeight / 2;
+    const flow = screenToFlowPosition({ x: cx, y: cy });
+    // Cascade onto a NON-overlapping grid (nodes are ~240-320px wide/tall):
+    // 3 columns across, then wrap down. This keeps new nodes visible AND
+    // distinct, so handles stay reachable for connections.
+    const i = useStudioStore.getState().nodes.length;
+    const col = i % 3;
+    const row = Math.floor(i / 3);
+    const id = addNode(kind, {
+      // M05-B2: wide cascade (>= card width + handle gutter) so input handles of
+      // a newly added node never overlap the output handles of the previous one
+      // — connection drags must start/end on the handle, not on a card body.
+      x: flow.x - 160 + col * 420,
+      y: flow.y - 120 + row * 300,
+    });
+    // Focus the newly added node so it is always visible and reachable, even
+    // under onlyRenderVisibleElements culling. maxZoom:1 keeps zoom sane
+    // (no extreme zoom-in); use the fit-all control to see the whole graph.
+    if (id) {
+      requestAnimationFrame(() => fitView({ nodes: [{ id }], duration: 200, padding: 0.35, maxZoom: 1 }));
+    }
+    return id;
+  }, [addNode, screenToFlowPosition, fitView]);
+
+  // Expose "add at viewport center" to consumers outside the RF provider
+  // (Node Library), so new nodes always land in the visible viewport.
+  useEffect(() => {
+    studioCanvasActions.addAtViewportCenter = addAtCenter;
+    return () => {
+      studioCanvasActions.addAtViewportCenter = () => null;
+    };
+  }, [addAtCenter]);
+
+  // keyboard shortcuts (canvas-scoped; text inputs keep native editing)
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const t = e.target as HTMLElement;
+      const inField = t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable;
+      if (e.key === 'Escape') {
+        setMenu(null);
+        return;
+      }
+      if (inField) return; // never fight text editing (native undo/copy/delete)
+      const mod = e.ctrlKey || e.metaKey;
+      if (mod && e.key.toLowerCase() === 'z') { e.preventDefault(); if (e.shiftKey) redo(); else undo(); return; }
+      if (mod && e.key.toLowerCase() === 'y') { e.preventDefault(); redo(); return; }
+      if (mod && e.key.toLowerCase() === 'a') { e.preventDefault(); selectAll(); return; }
+      if (mod && e.key.toLowerCase() === 'd') { e.preventDefault(); duplicateSelection(); return; }
+      if (mod && e.key.toLowerCase() === 'g') { e.preventDefault(); useStudioStore.getState().groupSelection(); return; }
+      if (mod && e.key.toLowerCase() === 'c') { copySelection(); return; }
+      if (mod && e.key.toLowerCase() === 'v') { e.preventDefault(); paste(); return; }
+      if (e.key === 'Delete' || e.key === 'Backspace') { removeSelection(); }
+      // G02 canvas input contract (Blueprint 02 §3): F = fit selected, Shift+F = fit all.
+      if (!mod && e.key.toLowerCase() === 'f') {
+        e.preventDefault();
+        const selectedIds = useStudioStore.getState().nodes.filter((n) => n.selected).map((n) => n.id);
+        if (!e.shiftKey && selectedIds.length > 0) {
+          fitView({ nodes: selectedIds.map((id) => ({ id })), padding: 0.3, maxZoom: 1.5, duration: 250 });
+        } else {
+          fitView({ padding: 0.15, duration: 250 });
+        }
+        return;
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [undo, redo, duplicateSelection, copySelection, paste, removeSelection, selectAll, fitView]);
+
+  return (
+    <div ref={canvasRef} data-test="studio-canvas" className="relative h-full w-full">
+      <ReactFlow
+        nodes={nodes}
+        edges={edges}
+        nodeTypes={nodeTypes}
+        onNodesChange={onNodesChange}
+        onEdgesChange={onEdgesChange}
+        onConnect={onConnect}
+        onNodeDragStart={onNodeDragStart}
+        onNodeDragStop={onNodeDragStop}
+        onMoveEnd={(_, v) => onViewportChange(v)}
+        defaultEdgeOptions={{ style: { stroke: '#52525b', strokeWidth: 1.5 }, type: 'smoothstep' }}
+        minZoom={0.05}
+        maxZoom={2}
+        onlyRenderVisibleElements
+        fitView
+        proOptions={{ hideAttribution: true }}
+        colorMode="dark"
+        deleteKeyCode={null} // we own Delete (input-guarded) in the keyboard handler
+        selectionOnDrag // LMB blank drag = box select (Blueprint 02 §3)
+        panOnDrag={[1]} // middle-mouse pan; Space+LMB pan via panActivationKeyCode
+        panActivationKeyCode="Space"
+        zoomOnDoubleClick={false} // reserve double-click for node-create menu (G05)
+        zoomOnScroll
+        onPaneContextMenu={(e) => {
+          const ev = (e as unknown as { clientX: number; clientY: number });
+          const el = e.currentTarget ?? canvasRef.current;
+          const rect = (el as HTMLElement).getBoundingClientRect();
+          const x = ev.clientX - rect.left;
+          const y = ev.clientY - rect.top;
+          const f = screenToFlowPosition({ x: ev.clientX, y: ev.clientY });
+          setMenu({ x, y, fx: f.x, fy: f.y });
+        }}
+        onDrop={(e) => {
+          e.preventDefault();
+          // G06 asset-library drag → ASSET node (assetId reference; never a
+          // generation node). Parsed first so an asset drop never falls through
+          // to the file-drop reference path below.
+          const assetPayload = parseAssetDragPayload(e.dataTransfer.getData(ASSET_DRAG_MIME));
+          if (assetPayload) {
+            const kind = assetTypeToNodeKind(assetPayload.assetType);
+            const f = screenToFlowPosition({ x: e.clientX, y: e.clientY });
+            const id = addNode(kind, { x: f.x - 120, y: f.y - 60 });
+            // Land the durable M04-S assetId on the node (both data.assetId and
+            // parameters.assetId — same path the Inspector's asset field uses).
+            if (id) updateNodeParameter(id, 'assetId', assetPayload.assetId);
+            return;
+          }
+          const kind = e.dataTransfer.getData('application/x-studio-node-kind') as StudioNodeKind;
+          if (kind && getNodeDef(kind)) {
+            const f = screenToFlowPosition({ x: e.clientX, y: e.clientY });
+            addNode(kind, { x: f.x - 120, y: f.y - 60 });
+          }
+          // Real file drop (G05 interaction): creates a Reference node at the
+          // drop point; the actual upload→asset binding ships with G06.
+          const hasFile = e.dataTransfer?.files?.length > 0;
+          if (hasFile) {
+            const f = screenToFlowPosition({ x: e.clientX, y: e.clientY });
+            addNode('reference', { x: f.x - 120, y: f.y - 60 });
+          }
+        }}
+        onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; }}
+        onConnectEnd={(event, connectionState) => {
+          // G05 edge-to-empty: a connection drag released over blank canvas opens
+          // a filtered create menu (compatible target node kinds only).
+          const from = connectionState?.fromNode;
+          const fromHandle = connectionState?.fromHandle;
+          const droppedOnTarget = connectionState?.toNode;
+          if (!from || !fromHandle || droppedOnTarget) return;
+          const handleId = (fromHandle as unknown as { id?: string })?.id ?? String(fromHandle);
+          const fromDef = getNodeDef(String((from.data as { nodeKind?: string })?.nodeKind ?? from.type));
+          const outPort = fromDef?.outputPorts.find((p) => p.id === handleId);
+          if (!outPort) return;
+          const ev = event as unknown as { clientX?: number; clientY?: number };
+          const x = typeof ev.clientX === 'number' ? ev.clientX : 0;
+          const y = typeof ev.clientY === 'number' ? ev.clientY : 0;
+          const f = screenToFlowPosition({ x, y });
+          setMenu({ x: x - 40, y: y - 10, fx: f.x, fy: f.y, edgeFrom: { nodeId: from.id, handleId, portType: outPort.type } });
+        }}
+        onNodeDoubleClick={(_e, node) => {
+          // M1 ②: double-click a node centres it in the viewport (节点双击定位居中).
+          fitView({ nodes: [{ id: node.id }], duration: 200, padding: 0.35, maxZoom: 1.5 });
+          // W2: same double-click also opens the output preview modal.
+          setPreviewNode(node);
+        }}
+        onDoubleClick={(e) => {
+          const target = e.target as HTMLElement;
+          if (!target.classList.contains('react-flow__pane')) return;
+          const f = screenToFlowPosition({ x: e.clientX, y: e.clientY });
+          setMenu({ x: e.nativeEvent.offsetX, y: e.nativeEvent.offsetY, fx: f.x, fy: f.y });
+        }}
+      >
+        {/* M1 — 无边网格线 (infinite line grid): react-flow Background Lines is
+            camera-following and borderless, closing the doc30/§33 'Dots, not
+            borderless grid' M1 gap. Line grid sits under nodes, edge/connection
+            candidates invisible until hover, pan/zoom-native and performant. */}
+        <Background variant={BackgroundVariant.Lines} gap={24} size={1} color="var(--ml2-border, #3f3f46)" />
+        <MiniMap pannable zoomable position="bottom-left" className="!bg-ml2-surface-1 !border !border-ml2-border" maskColor="rgba(0,0,0,0.5)" />
+        <Controls position="bottom-right" showInteractive={false} />
+      </ReactFlow>
+
+      <div className="absolute left-1/2 top-2 z-40 flex -translate-x-1/2 items-center gap-0.5 rounded-lg border border-ml2-border bg-ml2-surface-1/95 px-1 py-0.5 shadow-md backdrop-blur">
+        <IconButton data-test="canvas-undo" label="撤销 (Ctrl+Z)" size="sm" disabled={!canUndo} onClick={undo}><Undo2 className="size-3.5" /></IconButton>
+        <IconButton data-test="canvas-redo" label="重做 (Ctrl+Shift+Z)" size="sm" disabled={!canRedo} onClick={redo}><Redo2 className="size-3.5" /></IconButton>
+        <IconButton data-test="canvas-copy" label="复制 (Ctrl+C)" size="sm" onClick={copySelection}><Copy className="size-3.5" /></IconButton>
+        <IconButton data-test="canvas-duplicate" label="快速复制 (Ctrl+D)" size="sm" onClick={duplicateSelection}><Copy className="size-3.5" /></IconButton>
+        <IconButton data-test="canvas-delete" label="删除 (Del)" size="sm" onClick={removeSelection}><Trash2 className="size-3.5" /></IconButton>
+        <span className="mx-0.5 h-4 w-px bg-ml2-border" />
+        <IconButton data-test="canvas-fit" label="适应全部 (zoom-to-fit)" size="sm" onClick={() => fitView({ padding: 0.15 })}><Maximize2 className="size-3.5" /></IconButton>
+        <IconButton data-test="canvas-reset-viewport" label="重置视口" size="sm" onClick={() => fitView({ padding: 0.05, duration: 200 })}><Scan className="size-3.5" /></IconButton>
+      </div>
+
+      <InvalidConnectionToast />
+      <PresenceBar peers={presence.peers} />
+      {nodes.length === 0 && (
+        <EmptyState
+          onAdd={addAtCenter}
+          onCreateWorkflow={() => {
+            createStarterWorkflow('image');
+            requestAnimationFrame(() => fitView({ padding: 0.18, duration: 250, maxZoom: 1 }));
+          }}
+        />
+      )}
+      {previewNode !== null && (
+        <NodePreviewModal
+          open
+          node={previewNode}
+          projectId={projectId}
+          canvasRevision={canvasRevision}
+          onClose={() => setPreviewNode(null)}
+        />
+      )}
+      {menu && (
+        <ContextMenu
+          at={{ x: menu.x, y: menu.y }}
+          header={menu.edgeFrom ? '连接到此新节点' : undefined}
+          kinds={menu.edgeFrom ? compatibleTargetKinds(menu.edgeFrom.portType) : undefined}
+          onAdd={(k) => {
+            const id = addNode(k, { x: menu.fx - 120, y: menu.fy - 60 });
+            if (id && menu.edgeFrom) {
+              const targetHandle = firstCompatibleInput(k, menu.edgeFrom.portType);
+              if (targetHandle) {
+                onConnect({
+                  source: menu.edgeFrom.nodeId,
+                  sourceHandle: menu.edgeFrom.handleId,
+                  target: id,
+                  targetHandle,
+                });
+              }
+            }
+          }}
+          onClose={() => setMenu(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+export function StudioCanvas({ projectId, canvasRevision }: { projectId?: string; canvasRevision?: number | null }) {
+  return (
+    <ReactFlowProvider>
+      <StudioErrorBoundary>
+        <CanvasCore projectId={projectId} canvasRevision={canvasRevision} />
+      </StudioErrorBoundary>
+    </ReactFlowProvider>
+  );
+}
