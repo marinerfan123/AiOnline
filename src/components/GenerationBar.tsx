@@ -52,6 +52,7 @@ import {
   DialogTitle,
   DialogDescription,
 } from '@/components/ui/dialog';
+import { shouldAutoGenerate } from './generationBarBehavior';
 
 // 全部可选比例（与 settings.ts 的 Ratio 保持一致；'auto' = 智能比例）
 const ALL_RATIOS: Ratio[] = [
@@ -661,9 +662,10 @@ function GenerationBar({
       if (payload.referenceStyle !== undefined) {
         setAttributedStyle(payload.referenceStyle || null);
       }
+      if (!shouldAutoGenerate(payload.auto)) return;
       setTimeout(() => {
-        // auto=false 时只预填不生成；否则立即生成（一键复刻 / 一键变体 / 制作视频）
-        handleGenerateRef.current(payload.auto === false ? undefined : {
+        // 自动生成只用于一键复刻 / 一键变体 / 制作视频。
+        handleGenerateRef.current({
           referenceImages: payload.referenceImages,
           attributedStyle: payload.referenceStyle || null,
         });
@@ -990,8 +992,6 @@ function GenerationBar({
   };
 
   const handleGenerate = async (overrides?: { referenceImages?: string[]; attributedStyle?: ReferenceStyle | null }) => {
-    // 自我注册到 ref（避免在组件顶层读未初始化的 const，绕过 TDZ）
-    handleGenerateRef.current = handleGenerate;
 
     // 归因样式：优先用外部传入（工作台推广样式一键创作），否则用顶部选择器选中的
     const activeStyle = overrides?.attributedStyle !== undefined ? overrides.attributedStyle : attributedStyle;
@@ -1183,6 +1183,10 @@ function GenerationBar({
       }
     })();
   };
+
+  // Keep imperative actions on the latest render so delayed one-click actions
+  // cannot submit a prompt captured by a previous render.
+  handleGenerateRef.current = handleGenerate;
 
   // ── 刷新/挂载恢复：双保险 ──
   // 1) localStorage（含完整 pendingItems 元数据）—— 主恢复路径

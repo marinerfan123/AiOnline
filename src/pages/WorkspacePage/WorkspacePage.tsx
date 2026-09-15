@@ -540,7 +540,7 @@ export default function WorkspacePage() {
       ratio: style.ratio || settings.ratio,
       referenceImages: style.previewUrl ? [style.previewUrl] : [],
       referenceStyle: style,
-      auto: true,
+      auto: false,
     });
   };
 
