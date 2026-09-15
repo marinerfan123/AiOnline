@@ -540,7 +540,7 @@ export default function WorkspacePage() {
     }
   };
 
-  // T3 推广样式一键创作：把推广样式当参考图 + 归因到样式设计者（用于分成）
+  // 推广样式只预填提示词和参考图，用户确认后再手动提交。
   const handleUsePromotedStyle = (style: ReferenceStyle) => {
     generationBarRef.current?.generate({
       prompt: style.prompt || '',
@@ -548,7 +548,7 @@ export default function WorkspacePage() {
       ratio: style.ratio || settings.ratio,
       referenceImages: style.previewUrl ? [style.previewUrl] : [],
       referenceStyle: style,
-      auto: true,
+      auto: false,
     });
   };
 
