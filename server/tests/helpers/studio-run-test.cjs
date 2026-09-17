@@ -140,11 +140,12 @@ const nodes = {
 const edge = (edgeId, source, target, sourceHandle, targetHandle) => ({ edgeId, source, target, sourceHandle, targetHandle });
 
 /** Build a run engine bound to the shared pool (workerId unique per caller). */
-function makeEngine(pg, { workerId, executors, leaseSeconds, retryBackoffMs, onLog } = {}) {
+function makeEngine(pg, { workerId, executors, generationBridge, leaseSeconds, retryBackoffMs, onLog } = {}) {
   return createStudioRunEngine({
     pg,
     workerId: workerId || `w-${crypto.randomBytes(3).toString('hex')}`,
     executors: executors || null,
+    generationBridge: generationBridge || null,
     leaseSeconds,
     retryBackoffMs,
     onLog,

@@ -11,7 +11,8 @@
  *    Run creation; live Canvas rows are never re-read (STEP 4).
  *  - Multi-worker safe: FOR UPDATE SKIP LOCKED leasing, unique lease tokens,
  *    atomic counter decrement, expired-lease reaper (STEP 19-26).
- *  - M05-D1 never calls real AI / Generation V2 / billing.
+ *  - Generation execution is injected through the M05-E bridge; the engine
+ *    itself still owns only leases, fencing, state transitions, and spend.
  */
 const crypto = require('crypto');
 const { compileStudioGraph } = require('./studioRunGraph.cjs');
@@ -102,7 +103,10 @@ function createStudioRunEngine(deps) {
   // idempotency. Absent / not callable → engine behaviour is byte-for-byte the
   // pre-relay path (no relay calls at all).
   const relay = deps.relay && typeof deps.relay.relayRunEvent === 'function' ? deps.relay : null;
-  const registry = createStudioExecutorRegistry({ executors: deps.executors || null });
+  const registry = createStudioExecutorRegistry({
+    executors: deps.executors || null,
+    generationBridge: deps.generationBridge || null,
+  });
   const leaseSeconds = Math.max(1, Number(deps.leaseSeconds) || LIMITS.leaseSeconds);
   const pollLimit = Math.max(1, Math.min(100, Number(deps.leasePollLimit) || LIMITS.leasePollLimit));
   const defaultRetryBackoffMs = Array.isArray(deps.retryBackoffMs) ? deps.retryBackoffMs : null;
@@ -427,9 +431,10 @@ function createStudioRunEngine(deps) {
     const runId = `run-${crypto.randomUUID()}`;
     const counts = { READY: 0, BLOCKED: 0 };
     for (const r of nodeRows) counts[r.status] += 1;
-    // Run with only bridge-pending generation nodes can never finish in D1 -> BLOCKED (documented D1 policy).
+    // Without the bridge, retain the D1 safety state. A bridge-backed engine
+    // queues generation-only runs so the dedicated worker can execute them.
     let initialStatus = 'QUEUED';
-    if (anyBridgePending && graph.nodes.every((n) => n.executionKind === 'GENERATION')) initialStatus = 'BLOCKED';
+    if (anyBridgePending && !registry.hasGenerationBridge && graph.nodes.every((n) => n.executionKind === 'GENERATION')) initialStatus = 'BLOCKED';
     if (!nodeRows.length) initialStatus = 'COMPLETED'; // empty executable graph: terminal, nothing to do
 
     const compiledJson = JSON.stringify(graph);
@@ -446,7 +451,8 @@ function createStudioRunEngine(deps) {
          SET updated_at = studio_runs.updated_at
        RETURNING id, status, compiled_graph_json, (xmax = 0) AS is_fresh`,
       [runId, project.workspace_id, project.id, canvasId, Number(canvas.revision), Number(canvas.schema_version), initialStatus, runMode,
-       compiledJson, requestedBy, key, JSON.stringify(counts), nodeRows.length, anyBridgePending, initialStatus === 'COMPLETED' ? new Date() : null]
+       compiledJson, requestedBy, key, JSON.stringify(counts), nodeRows.length,
+       anyBridgePending && !registry.hasGenerationBridge, initialStatus === 'COMPLETED' ? new Date() : null]
     );
     const runRow = nr.rows[0];
     const createdFresh = runRow.is_fresh === true;
@@ -1012,6 +1018,7 @@ function createStudioRunEngine(deps) {
    * Returns the number of nodes processed this tick.
    */
   async function workerTick(opts = {}) {
+    await requeueBridgeRuns();
     let processed = 0;
     const concurrency = Math.max(1, Math.min(16, Number(opts.concurrency) || 1));
     const batch = Math.max(1, Math.min(pollLimit, Number(opts.batch) || pollLimit));
@@ -1063,6 +1070,27 @@ function createStudioRunEngine(deps) {
     return processed;
   }
 
+  /** Requeue runs created before the production generation bridge was installed. */
+  async function requeueBridgeRuns() {
+    if (!registry.hasGenerationBridge) return 0;
+    const r = await pg.query(
+      `UPDATE studio_runs r
+          SET status = 'QUEUED', executor_unavailable = FALSE, updated_at = NOW()
+        WHERE r.status = 'BLOCKED' AND r.executor_unavailable = TRUE
+          AND EXISTS (
+            SELECT 1 FROM studio_run_nodes n
+             WHERE n.run_id = r.id AND n.execution_kind = 'GENERATION'
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM studio_run_nodes n
+             WHERE n.run_id = r.id AND n.status NOT IN ('READY','BLOCKED')
+          )
+        RETURNING r.id`,
+    );
+    if (r.rowCount) log('run.bridge_requeued', { count: r.rowCount, workerId });
+    return r.rowCount || 0;
+  }
+
   /**
    * Park a node whose executor is unavailable (M05-E bridge boundary).
    * Deterministic: node -> WAITING, lease released, no retry loop.
@@ -1112,15 +1140,24 @@ function createStudioRunEngine(deps) {
       [node.run_id, depIds]
     );
     const upstreamResults = {};
-    for (const row of ur.rows) upstreamResults[row.studio_node_id] = row;
+    for (const row of ur.rows) upstreamResults[row.studio_node_id] = { result: row.result_json };
+    const runMeta = await pg.query('SELECT requested_by, project_id FROM studio_runs WHERE id=$1', [node.run_id]);
+    const meta = runMeta.rows && runMeta.rows[0] ? runMeta.rows[0] : {};
     return {
       runId: node.run_id,
       nodeId: node.studio_node_id,
       nodeType: node.node_type,
       attempt: node.attempt,
+      requestedBy: meta.requested_by || node.requested_by || null,
+      projectId: meta.project_id || node.project_id || null,
       input: { parameters: input.parameters || {}, ...(input.assetId ? { assetId: input.assetId } : {}), ...(typeof input.prompt === 'string' ? { prompt: input.prompt } : {}) },
       dependencies: depIds,
       upstreamResults,
+      heartbeat: (extendSeconds) => heartbeatLease(node.id, {
+        owner: node.lease_owner,
+        token: node.lease_token,
+        extendSeconds,
+      }),
     };
   }
 
@@ -1146,7 +1183,7 @@ function createStudioRunEngine(deps) {
     // populated by section includes (see module.exports below)
     createRunFromCanvas, loadRunNodes, leaseReadyNodes, leaseReadyNode, heartbeatLease, completeRunNode,
     failRunNode, reapExpiredNodes, requestRunCancellation, getRunSnapshot,
-    workerTick, aggregateRun,
+    workerTick, aggregateRun, requeueBridgeRuns,
   };
 }
 

@@ -80,7 +80,7 @@ const NODE_REGISTRY = {
     ],
     outputPorts: [port('image', 'IMAGE', false)],
     resultOutputs: ['IMAGE', 'ASSET_REF'],
-    // M05-D1: NO production executor. M05-E bridges to Generation V2.
+    // Resolved by the optional M05-E legacy-generation bridge at runtime.
     executorClass: 'generation-bridge-pending',
   },
   'image-to-video': {

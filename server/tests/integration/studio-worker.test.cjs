@@ -137,8 +137,14 @@ test('studio-worker: prints started, completes a run, drains and exits 0 on SIGT
   child.kill('SIGTERM');
   const exited = await Promise.race([exitPromise, sleep(8000).then(() => null)]);
   assert.ok(exited, 'worker should exit within 8s of SIGTERM');
-  assert.equal(exited.code, 0, `expected exit code 0, got ${JSON.stringify(exited)}. log=${getOut()}`);
-
-  const finalOut = getOut();
-  assert.ok(finalOut.includes('SIGTERM received; draining'), 'drain log must be emitted on SIGTERM');
+  if (process.platform === 'win32') {
+    // Windows terminates a child directly for SIGTERM and does not deliver the
+    // signal to Node's handler. Linux production containers exercise the
+    // graceful path below; this assertion only proves the child is stoppable.
+    assert.equal(exited.sig, 'SIGTERM', `expected Windows SIGTERM termination, got ${JSON.stringify(exited)}. log=${getOut()}`);
+  } else {
+    assert.equal(exited.code, 0, `expected exit code 0, got ${JSON.stringify(exited)}. log=${getOut()}`);
+    const finalOut = getOut();
+    assert.ok(finalOut.includes('SIGTERM received; draining'), 'drain log must be emitted on SIGTERM');
+  }
 });

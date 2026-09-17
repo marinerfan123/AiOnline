@@ -35,9 +35,14 @@ const os = require('os');
 const crypto = require('crypto');
 const { Pool } = require('pg');
 const { createStudioRunEngine } = require('./modules/project-foundation/studioRunEngine.cjs');
+const { createStudioGenerationBridge } = require('./modules/project-foundation/studioGenerationBridge.cjs');
 const budgetSpentStoreMod = require('./modules/project-foundation/budgetSpentStore.cjs');
 const { createRunEventRelay } = require('./modules/project-foundation/runEventRelay.cjs');
 const { createWorkerDaemon } = require('./modules/generation-v2/worker-daemon.cjs');
+const dispatcher = require('./dispatcher.cjs');
+const billing = require('./billing.cjs');
+const accounting = require('./accounting.cjs');
+const modelResolver = require('./modules/modelhub/resolver.cjs');
 
 function buildPgPool() {
   const pgSslMode = process.env.PG_SSLMODE || 'prefer';
@@ -85,6 +90,17 @@ async function main() {
   }
   if (!ready) process.exit(1);
 
+  const studioGenerationBridge = createStudioGenerationBridge({
+    pg: {
+      query: (sql, params) => pgPool.query(sql, params),
+      connect: () => pgPool.connect(),
+    },
+    dispatcher,
+    billing,
+    accounting,
+    modelResolver,
+  });
+
   // G21: every engine emit also lands in run_events (durable SSE log) via the
   // relay — failures warn-only, never block execution (relay own autocommit pool).
   // The relay is OPTIONAL and best-effort: if constructing it throws, the worker
@@ -111,6 +127,7 @@ async function main() {
       connect: () => pgPool.connect(),
     },
     workerId,
+    generationBridge: studioGenerationBridge,
     relay,
     budgetSpentStore: budgetSpentStoreMod,
     onLog: (tag, payload) => { try { console.log(JSON.stringify({ tag: 'studio-run', event: tag, ...(payload || {}) })); } catch (_) {} },

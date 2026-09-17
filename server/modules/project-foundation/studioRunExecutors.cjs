@@ -2,11 +2,10 @@
 /**
  * M05-D1 — Studio executor registry.
  *
- * Production M05-D1 registers ONLY deterministic executors (source/asset
- * resolution + output collector). Generation nodes (image-generation,
- * image-to-video, text-to-video) have NO production executor — resolve()
- * returns an explicit EXECUTOR_NOT_AVAILABLE result so the run engine can
- * park them for the M05-E Generation V2 bridge.
+ * Production registers deterministic executors plus the optional M05-E
+ * generation bridge. Generation remains unavailable when no bridge is passed,
+ * which preserves the explicit no-provider safety behavior in unit tests and
+ * non-worker API processes.
  *
  * Test-only deterministic fake executors exist in studioRunTestExecutors.cjs
  * and are wired exclusively through an explicit `executors` injection
@@ -23,7 +22,8 @@ function isPlainObject(v) {
 function upstreamResult(ctx, depNodeId) {
   const r = (ctx.upstreamResults || {})[depNodeId];
   if (!isPlainObject(r)) return null;
-  return r.result && isPlainObject(r.result) ? r.result : null;
+  const result = r.result || r.result_json;
+  return isPlainObject(result) ? result : null;
 }
 
 function hasValue(v) {
@@ -94,12 +94,15 @@ function makeDeterministicExecutor(def, ctx) {
  * Resolve the production executor for a node.
  * @returns {{ok:true, executor} | {ok:false, code:string, message:string}}
  */
-function resolveProductionExecutor(node, ctx) {
+function resolveProductionExecutor(node, ctx, generationBridge) {
   const def = NODE_REGISTRY[node.nodeType];
   if (!def) return { ok: false, code: 'UNKNOWN_NODE_TYPE', message: `unknown node type: ${node.nodeType}` };
   if (def.executionKind === 'STRUCTURAL') return { ok: false, code: 'STRUCTURAL_NODE', message: 'structural nodes are not executed' };
   if (def.executorClass === 'generation-bridge-pending') {
-    // M05-E bridge boundary: explicit, durable, no fabricated media.
+    if (generationBridge && typeof generationBridge.createExecutor === 'function') {
+      return { ok: true, executor: generationBridge.createExecutor(ctx) };
+    }
+    // No bridge configured: explicit, durable, no fabricated media.
     return { ok: false, code: 'EXECUTOR_NOT_AVAILABLE', message: 'generation executor pending M05-E bridge' };
   }
   if (!def.executorClass) return { ok: false, code: 'EXECUTOR_NOT_AVAILABLE', message: 'no executor registered' };
@@ -113,6 +116,9 @@ function resolveProductionExecutor(node, ctx) {
  */
 function createStudioExecutorRegistry(opts = {}) {
   const injected = isPlainObject(opts.executors) ? opts.executors : null;
+  const generationBridge = opts.generationBridge && typeof opts.generationBridge.createExecutor === 'function'
+    ? opts.generationBridge
+    : null;
   const testOnly = injected !== null;
 
   async function resolveExecutor(node, ctx) {
@@ -125,10 +131,10 @@ function createStudioExecutorRegistry(opts = {}) {
         return { ok: true, executor: ex, injected: true };
       }
     }
-    return resolveProductionExecutor(node, ctx);
+    return resolveProductionExecutor(node, ctx, generationBridge);
   }
 
-  return { resolveExecutor, isTestOnly: testOnly };
+  return { resolveExecutor, isTestOnly: testOnly, hasGenerationBridge: !!generationBridge };
 }
 
 module.exports = { createStudioExecutorRegistry, resolveProductionExecutor, makeDeterministicExecutor, sleep };

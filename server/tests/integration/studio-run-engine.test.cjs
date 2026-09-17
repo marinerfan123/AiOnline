@@ -785,3 +785,27 @@ test('engine: executor_unavailable BLOCKED safety net (aggregateRun parks determ
   const after = (await pg.query('SELECT status FROM studio_runs WHERE id=$1', [created.runId])).rows[0];
   assert.equal(after.status, 'BLOCKED');
 });
+
+test('engine: bridge-backed generation runs queue and recover old BLOCKED runs', { concurrency: 1 }, async () => {
+  const base = nodes.imageGen('g1');
+  const generation = {
+    ...base,
+    data: { ...base.data, prompt: 'a cat', parameters: { ...base.data.parameters, prompt: 'a cat' } },
+  };
+  const s = await seedProject(pg, { nodeRows: [generation], edgeRows: [] });
+  const noBridge = makeEngine(pg, { workerId: 'w-no-bridge' });
+  const blocked = await engineCreateRun(pg, noBridge, s, { idempotencyKey: 'bridge-old-1' });
+  assert.equal(blocked.status, 'BLOCKED');
+
+  const bridge = {
+    createExecutor() {
+      return { async execute() { return { result: { nodeType: 'image-generation', mediaIds: ['media-1'], assetIds: ['media-1'] } }; } };
+    },
+  };
+  const withBridge = makeEngine(pg, { workerId: 'w-with-bridge', generationBridge: bridge });
+  assert.ok((await withBridge.requeueBridgeRuns()) >= 1);
+  await withBridge.workerTick({ concurrency: 1, batch: 1, retryBackoffMs: [1] });
+  const finalRun = (await pg.query('SELECT status, executor_unavailable FROM studio_runs WHERE id=$1', [blocked.runId])).rows[0];
+  assert.equal(finalRun.status, 'COMPLETED');
+  assert.equal(finalRun.executor_unavailable, false);
+});

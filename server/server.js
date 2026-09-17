@@ -78,6 +78,7 @@ import studioShotApiMod from './modules/project-foundation/studioShotApi.cjs';
 import studioStructureApiMod from './modules/project-foundation/studioStructureApi.cjs';
 import studioRunApiMod from './modules/project-foundation/studioRunApi.cjs';
 import studioRunEngineMod from './modules/project-foundation/studioRunEngine.cjs';
+import studioGenerationBridgeMod from './modules/project-foundation/studioGenerationBridge.cjs';
 import budgetSpentStoreMod from './modules/project-foundation/budgetSpentStore.cjs';
 import generationV2Shadow from './modules/generation-v2/shadow.cjs';
 // ModelHub V3 Phase 1 — 唯一模型身份 resolver（server.js 仅在此一处调用，不再散落处理 display_name）
@@ -1504,6 +1505,9 @@ const aiControlRouter = aiControlRouterMod.createAiControlRouter({
     query: (sql, params) => pgPool
       ? pgPool.query(sql, params)
       : Promise.reject(Object.assign(new Error('数据库未就绪'), { status: 503 })),
+    connect: () => pgPool
+      ? pgPool.connect()
+      : Promise.reject(Object.assign(new Error('数据库未就绪'), { status: 503 })),
   },
   adminRequire: (req) => !!admin && admin.requireAdmin(req),
   sessionUser: (req) => session.getUserFromCookie(req),
@@ -1777,6 +1781,20 @@ const studioShotApi = studioShotApiMod.createStudioShotApi({
 // create/get/cancel threw (engine undefined) → 500 in production. A stateless
 // engine (same factory studio-worker.cjs uses) serves the API reads/writes;
 // the worker daemon drives claims/reaper in its own process.
+const studioGenerationBridge = studioGenerationBridgeMod.createStudioGenerationBridge({
+  pg: {
+    query: (sql, params) => pgPool
+      ? pgPool.query(sql, params)
+      : Promise.reject(Object.assign(new Error('数据库未就绪'), { status: 503 })),
+    connect: () => pgPool
+      ? pgPool.connect()
+      : Promise.reject(Object.assign(new Error('数据库未就绪'), { status: 503 })),
+  },
+  dispatcher,
+  billing,
+  accounting,
+  modelResolver: modelHubResolver,
+});
 const studioRunEngine = studioRunEngineMod.createStudioRunEngine({
   pg: {
     query: (sql, params) => pgPool
@@ -1787,6 +1805,7 @@ const studioRunEngine = studioRunEngineMod.createStudioRunEngine({
       : Promise.reject(Object.assign(new Error('数据库未就绪'), { status: 503 })),
   },
   workerId: `${NODE_ID || 'api'}-runapi`,
+  generationBridge: studioGenerationBridge,
   budgetSpentStore: budgetSpentStoreMod,
 });
 const studioRunApi = studioRunApiMod.createStudioRunApi({
