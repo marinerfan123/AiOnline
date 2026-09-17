@@ -4,21 +4,25 @@
 // Uses Node's parser (--check) — no runtime side effects.
 // Exit 0 = all pass, 1 = any failure.
 
-const { execSync } = require('child_process');
+const { execFileSync } = require('child_process');
+const fs = require('fs');
 const path = require('path');
 
 const root = path.resolve(__dirname, '..');
 const serverDir = path.join(root, 'server');
 
+function listServerSourceFiles(dir) {
+  const files = [];
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const fullPath = path.join(dir, entry.name);
+    if (entry.isDirectory()) files.push(...listServerSourceFiles(fullPath));
+    else if (entry.isFile() && /\.(cjs|js)$/.test(entry.name)) files.push(path.relative(root, fullPath));
+  }
+  return files.sort();
+}
+
 try {
-  const all = execSync('find server -name "*.cjs" -o -name "*.js"', {
-    cwd: root,
-    encoding: 'utf8',
-    stdio: 'pipe',
-  })
-    .trim()
-    .split('\n')
-    .filter(Boolean);
+  const all = listServerSourceFiles(serverDir);
 
   let ok = 0;
   let fail = 0;
@@ -26,11 +30,7 @@ try {
 
   for (const f of all) {
     try {
-      execSync(`node --check "${f}"`, {
-        cwd: root,
-        stdio: 'pipe',
-        timeout: 10000,
-      });
+      execFileSync(process.execPath, ['--check', f], { cwd: root, stdio: 'pipe', timeout: 10000 });
       ok++;
     } catch (e) {
       fail++;
