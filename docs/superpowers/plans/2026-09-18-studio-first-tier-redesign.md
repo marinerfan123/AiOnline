@@ -138,11 +138,19 @@
 - [x] **Step 1: Inspect the production bundle.**
   Confirm the generated JS/CSS contains the new shell, rail, canvas, and node presentation markers.
 
-- [ ] **Step 2: Commit and push the redesign branch.**
+- [x] **Step 2: Commit and push the redesign branch.**
   Commit the implementation and plan, then push `codex/ai-control-model-catalog`.
 
-- [ ] **Step 3: Deploy the verified bundle.**
+- [x] **Step 3: Deploy the verified bundle.**
   Reuse the low-memory image-overlay deployment path used previously, recreate only `app` and `studio-worker`, and preserve the database, Redis, secrets, and unrelated services.
 
-- [ ] **Step 4: Verify online state.**
+- [x] **Step 4: Verify online state.**
   Confirm the app health endpoint, public Studio HTML, actual Studio JS/CSS resources, container status, and new marker tokens. Report the authenticated-browser limitation if a project screenshot cannot be taken without user login.
+
+**Deployment evidence (2026-09-18):**
+
+- `npm test -- --run`: 79 files and 589 tests passed.
+- `npm run typecheck`, `npm run lint:eslint`, and `npm run build`: passed; ESLint reports 0 errors and 21 pre-existing warnings.
+- `app` and `studio-worker` were recreated from `www-moling-fun-app:latest`; PostgreSQL and Redis were preserved.
+- `https://www.moling.fun/api/healthz`: HTTP 200 with `status: ok`, PostgreSQL, and Redis healthy.
+- Production bundle contains `studio-app-shell`, `studio-canvas-tool-rail`, and `studio-bottom-dock` markers.
