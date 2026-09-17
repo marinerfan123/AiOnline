@@ -74,7 +74,7 @@
 - [x] Step 2: Update scoped canvas styles for the modal, toolbar, and focus states.
 - [x] Step 3: Run all Studio tests, typecheck, lint, and production build (all passed; ESLint reports 21 pre-existing warnings).
 - [x] Step 4: Review the diff with a fresh code reviewer; no Critical/Important findings. Also fixed the review's Minor focus-management and locked-alignment issues.
-- [ ] Step 5: Commit, push the tested branch, deploy through the existing server workflow, and verify the public Studio route plus the affected Run status behavior.
+- [x] Step 5: Commit, push the tested branch, deploy through the existing server workflow, and verify the public Studio route plus the affected Run status behavior.
 
 ## Research Notes
 
@@ -89,3 +89,10 @@
 - `npm run build`: passed.
 - `npm run lint:eslint`: passed with 0 errors and 21 warnings.
 - `npm run check:syntax`: 519 files, 519 passed, 0 failed.
+
+## Deployment Notes
+
+- Commits `dff2af2` and `e16ebf5` were pushed to `codex/ai-control-model-catalog`.
+- Production deployment completed on `47.243.237.239` using the existing `/opt/www-moling-fun` Compose stack; the pre-deploy database backup was written to the server backup directory.
+- The low-memory host could not complete a fresh Docker dependency install, so the locally verified `dist/build2` was injected into the existing application image; `app` and `studio-worker` were then recreated from the new image.
+- Production checks: app health returned `status: ok` with PostgreSQL and Redis healthy; worker started without new errors; the deployed image contained the command-palette asset marker; public `/studio` returned HTTP 200.
