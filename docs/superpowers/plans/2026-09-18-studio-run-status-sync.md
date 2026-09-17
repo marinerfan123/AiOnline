@@ -36,14 +36,14 @@
 
 - [x] **Step 1: Run the full frontend test suite.**
 - [x] **Step 2: Run typecheck and production build.**
-- [ ] **Step 3: Inspect the diff for unrelated changes and commit the focused fix.**
+- [x] **Step 3: Inspect the diff for unrelated changes and commit the focused fix.**
 
 ### Task 3: Deploy and validate production
 
 **Files:**
 - No additional source files; deploy the verified commit to `/opt/www-moling-fun/source` and recreate the app container.
 
-- [ ] **Step 1: Push the commit to the GitHub branch used by the deployment.**
-- [ ] **Step 2: Recreate `app` while keeping PostgreSQL, Redis, and `studio-worker` running.**
-- [ ] **Step 3: Verify container health, public `/studio` status, and the target Run's durable database status.**
-- [ ] **Step 4: Confirm worker logs contain no new startup or execution errors.**
+- [x] **Step 1: Push the commit to the GitHub branch used by the deployment.**
+- [x] **Step 2: Recreate `app` while keeping PostgreSQL, Redis, and `studio-worker` running.**
+- [x] **Step 3: Verify container health, public `/studio` status, and the target Run's durable database status.**
+- [x] **Step 4: Confirm worker logs contain no new startup or execution errors.**
