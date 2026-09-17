@@ -61,6 +61,14 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe('StudioNode output-thumbnail badge (W1B)', () => {
+  it('exposes the visual node presentation contract for generation cards', () => {
+    renderNode(vidNodeData());
+
+    const card = screen.getByTestId('studio-node-card');
+    expect(card.className).toContain('studio-node-card');
+    expect(card.getAttribute('data-node-type')).toBe('generation');
+  });
+
   it('renders an <img> thumbnail for the first outputAssetId, thumb over full', async () => {
     vi.mocked(v2asset.getAsset).mockResolvedValueOnce({
       asset: { assetId: 'media-1', assetType: 'VIDEO', thumbnailUrl: 'https://cdn.example/thumb.jpg', url: 'https://cdn.example/full.mp4' },

@@ -71,3 +71,262 @@
 [data-test='studio-page'] .react-flow__handle {
   z-index: 10;
 }
+
+/* The Studio is intentionally a layered workspace: the graph remains the
+   visual focus while the library and inspector read as floating tools. */
+[data-test='studio-page'] {
+  --studio-bg: #0a0d12;
+  --studio-panel: rgba(17, 21, 29, 0.86);
+  --studio-panel-strong: rgba(22, 27, 37, 0.94);
+  --studio-line: rgba(148, 163, 184, 0.16);
+  --studio-muted: #8e98a8;
+  --studio-glow: rgba(96, 165, 250, 0.12);
+  background: var(--studio-bg);
+}
+
+[data-test='studio-page'] .studio-topbar {
+  position: relative;
+  z-index: 20;
+  border-color: var(--studio-line);
+  background: linear-gradient(180deg, rgba(22, 27, 37, 0.96), rgba(13, 17, 24, 0.92));
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.03), 0 12px 32px rgba(0, 0, 0, 0.18);
+}
+
+[data-test='studio-page'] .studio-topbar-mark {
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08), 0 0 22px var(--studio-glow);
+}
+
+[data-test='studio-page'] .studio-save-status {
+  border-color: rgba(148, 163, 184, 0.2);
+  background: rgba(255, 255, 255, 0.045);
+}
+
+[data-test='studio-page'] .studio-workspace {
+  gap: 10px;
+  padding: 10px;
+  background:
+    radial-gradient(circle at 50% -20%, rgba(96, 165, 250, 0.055), transparent 42%),
+    var(--studio-bg);
+}
+
+[data-test='studio-page'] .studio-rail {
+  height: 100%;
+  border: 1px solid var(--studio-line);
+  border-radius: 16px;
+  background: linear-gradient(180deg, var(--studio-panel-strong), var(--studio-panel));
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.22), inset 0 1px 0 rgba(255, 255, 255, 0.035);
+}
+
+[data-test='studio-page'] .studio-node-library {
+  border-right-color: var(--studio-line);
+}
+
+[data-test='studio-page'] .studio-inspector-panel {
+  border-left-color: var(--studio-line);
+}
+
+[data-test='studio-page'] .studio-rail-header,
+[data-test='studio-page'] .studio-rail-footer,
+[data-test='studio-page'] .studio-inspector-section {
+  border-color: var(--studio-line);
+}
+
+[data-test='studio-page'] .studio-library-section {
+  margin-bottom: 6px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.018);
+}
+
+[data-test='studio-page'] .studio-section-toggle {
+  min-height: 28px;
+  color: var(--studio-muted);
+}
+
+[data-test='studio-page'] .studio-library-item {
+  margin: 2px 4px;
+  width: calc(100% - 8px);
+  border-color: transparent;
+}
+
+[data-test='studio-page'] .studio-library-item:hover {
+  border-color: rgba(96, 165, 250, 0.22);
+  background: rgba(96, 165, 250, 0.08);
+}
+
+[data-test='studio-page'] .studio-library-icon {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+[data-test='studio-page'] .studio-rail-footer {
+  background: rgba(0, 0, 0, 0.12);
+}
+
+[data-test='studio-page'] .studio-canvas-stage {
+  min-height: 0;
+  border: 1px solid var(--studio-line);
+  border-radius: 18px;
+  overflow: hidden;
+  background: #0d1118;
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.28), inset 0 1px 0 rgba(255, 255, 255, 0.035);
+}
+
+[data-test='studio-page'] .studio-canvas-root {
+  isolation: isolate;
+  background:
+    radial-gradient(circle at 50% 35%, rgba(96, 165, 250, 0.08), transparent 42%),
+    radial-gradient(circle at 90% 100%, rgba(129, 140, 248, 0.06), transparent 38%),
+    #0d1118;
+}
+
+[data-test='studio-page'] .studio-canvas-root::before {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  content: '';
+  background-image: linear-gradient(rgba(148, 163, 184, 0.035) 1px, transparent 1px), linear-gradient(90deg, rgba(148, 163, 184, 0.035) 1px, transparent 1px);
+  background-size: 48px 48px;
+  mask-image: linear-gradient(to bottom, rgba(0, 0, 0, 0.72), transparent 88%);
+}
+
+[data-test='studio-page'] .studio-canvas-root > .react-flow {
+  z-index: 1;
+  background: transparent;
+}
+
+[data-test='studio-page'] .react-flow__background {
+  opacity: 0.52;
+}
+
+[data-test='studio-page'] .studio-stage-label {
+  border-color: rgba(148, 163, 184, 0.2);
+  background: rgba(13, 17, 24, 0.66);
+}
+
+[data-test='studio-page'] .studio-canvas-toolbar {
+  border-color: rgba(148, 163, 184, 0.22);
+  background: rgba(19, 24, 33, 0.86);
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.28), inset 0 1px 0 rgba(255, 255, 255, 0.06);
+}
+
+[data-test='studio-page'] .studio-canvas-hint {
+  color: #9ba6b6;
+  border-color: rgba(148, 163, 184, 0.15);
+  background: rgba(13, 17, 24, 0.58);
+}
+
+[data-test='studio-page'] .studio-controls,
+[data-test='studio-page'] .studio-minimap {
+  border-color: rgba(148, 163, 184, 0.22);
+  background: rgba(19, 24, 33, 0.86) !important;
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.24);
+  backdrop-filter: blur(14px);
+}
+
+[data-test='studio-page'] .studio-minimap {
+  border-radius: 12px;
+}
+
+[data-test='studio-page'] .studio-empty-card {
+  border-color: rgba(148, 163, 184, 0.22);
+  background: linear-gradient(180deg, rgba(24, 30, 41, 0.96), rgba(16, 20, 28, 0.94));
+  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.35), 0 0 70px rgba(96, 165, 250, 0.08);
+}
+
+[data-test='studio-page'] .studio-node-card {
+  border-color: rgba(148, 163, 184, 0.28);
+  background: linear-gradient(180deg, rgba(24, 30, 41, 0.98), rgba(16, 20, 28, 0.98));
+  box-shadow: 0 14px 28px rgba(0, 0, 0, 0.26), inset 0 1px 0 rgba(255, 255, 255, 0.045);
+}
+
+[data-test='studio-page'] .studio-node-card:hover {
+  border-color: rgba(148, 163, 184, 0.5);
+  box-shadow: 0 18px 34px rgba(0, 0, 0, 0.32), 0 0 22px rgba(96, 165, 250, 0.07);
+}
+
+[data-test='studio-page'] .studio-node-card.selected,
+[data-test='studio-page'] .react-flow__node.selected .studio-node-card {
+  border-color: rgba(96, 165, 250, 0.9);
+  box-shadow: 0 18px 38px rgba(0, 0, 0, 0.34), 0 0 0 1px rgba(96, 165, 250, 0.25), 0 0 30px rgba(96, 165, 250, 0.16);
+}
+
+[data-test='studio-page'] .studio-node-header {
+  border-color: rgba(148, 163, 184, 0.16);
+  background: rgba(255, 255, 255, 0.035);
+}
+
+[data-test='studio-page'] .studio-node-body {
+  background: rgba(0, 0, 0, 0.08);
+}
+
+[data-test='studio-page'] .studio-node-body > .studio-node-preview,
+[data-test='studio-page'] .studio-node-body > div.bg-ml2-surface-3 {
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.045);
+}
+
+[data-test='studio-page'] .studio-node-status {
+  border: 1px solid rgba(148, 163, 184, 0.12);
+}
+
+[data-test='studio-page'] .studio-inspector-panel .studio-inspector-section > h3 {
+  letter-spacing: 0.12em;
+}
+
+[data-test='studio-page'] .studio-node-library,
+[data-test='studio-page'] .studio-inspector-panel {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(148, 163, 184, 0.22) transparent;
+}
+
+@media (max-width: 1180px) {
+  [data-test='studio-page'] .studio-node-library {
+    width: 204px;
+  }
+
+  [data-test='studio-page'] .studio-inspector-panel {
+    width: 248px;
+  }
+
+  [data-test='studio-page'] .studio-topbar-mode {
+    display: none;
+  }
+}
+
+@media (max-width: 920px) {
+  [data-test='studio-page'] .studio-node-library {
+    width: 56px;
+  }
+
+  [data-test='studio-page'] .studio-node-library .studio-rail-header > div:not(:first-child),
+  [data-test='studio-page'] .studio-node-library .studio-rail-header input,
+  [data-test='studio-page'] .studio-node-library .studio-library-item > span:last-child,
+  [data-test='studio-page'] .studio-node-library .studio-section-toggle,
+  [data-test='studio-page'] .studio-node-library .studio-rail-footer {
+    display: none;
+  }
+
+  [data-test='studio-page'] .studio-node-library .studio-rail-header {
+    padding: 12px 8px;
+  }
+
+  [data-test='studio-page'] .studio-node-library .studio-rail-header > div:first-child {
+    margin: 0;
+    justify-content: center;
+  }
+
+  [data-test='studio-page'] .studio-library-item {
+    justify-content: center;
+    margin-inline: 4px;
+    padding-inline: 4px;
+  }
+
+  [data-test='studio-page'] .studio-inspector-panel {
+    display: none;
+  }
+
+  [data-test='studio-page'] .studio-workspace {
+    gap: 6px;
+    padding: 6px;
+  }
+}

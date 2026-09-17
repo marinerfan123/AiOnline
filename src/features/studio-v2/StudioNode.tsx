@@ -173,8 +173,9 @@ function StudioNodeInner({ id, data, selected, width }: NodeProps<StudioNode>) {
     <div
       data-test="studio-node-card"
       data-node-kind={def.id}
+      data-node-type={def.executionKind.toLowerCase()}
       className={cn(
-        'relative flex flex-col overflow-hidden rounded-lg border bg-ml2-surface-1 shadow-md transition-shadow',
+        'studio-node-card relative flex flex-col overflow-hidden rounded-lg border bg-ml2-surface-1 shadow-md transition-shadow',
         selected ? 'border-ml2-accent ring-2 ring-ml2-accent/40 shadow-lg' : 'border-ml2-border hover:border-ml2-border-strong',
         data.status === 'disabled' && 'opacity-60',
         isFrame && 'w-full',
@@ -182,10 +183,12 @@ function StudioNodeInner({ id, data, selected, width }: NodeProps<StudioNode>) {
       style={isFrame ? undefined : { width: width ?? def.width }}
     >
       {!isFrame && <NodeResizer isVisible={selected && !locked} minWidth={240} minHeight={90} />}
-      <div className="flex items-center gap-1.5 border-b border-ml2-border bg-ml2-surface-2 px-2 py-1.5">
-        <NodeIcon name={def.icon} className="size-3.5 shrink-0 text-ml2-text-2" />
+      <div className="studio-node-header flex items-center gap-1.5 border-b border-ml2-border bg-ml2-surface-2 px-2.5 py-2">
+        <span className="studio-node-icon grid size-6 shrink-0 place-items-center rounded-md bg-ml2-accent/10 text-ml2-accent">
+          <NodeIcon name={def.icon} className="size-3.5" />
+        </span>
         <span className="truncate text-[11px] font-medium text-ml2-text">{data.title}</span>
-        <span className={cn('ml-auto shrink-0 rounded-full px-1.5 py-px text-[9px] font-medium', status.className)}>
+        <span className={cn('studio-node-status ml-auto shrink-0 rounded-full px-1.5 py-px text-[9px] font-medium', status.className)}>
           {status.label}
         </span>
       </div>
@@ -209,7 +212,7 @@ function StudioNodeInner({ id, data, selected, width }: NodeProps<StudioNode>) {
         </button>
       )}
 
-      <div className="p-1.5">
+      <div className="studio-node-body p-1.5">
         {def.id === 'prompt' && <TextPreview text={text} hint="在右侧 Inspector 编辑提示词" />}
         {def.id === 'script' && <TextPreview text={text} hint="在右侧 Inspector 编辑脚本" />}
         {def.id === 'character' && (

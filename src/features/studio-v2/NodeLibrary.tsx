@@ -6,7 +6,7 @@
 // Supports: search, section collapse, click-to-add, drag-to-canvas.
 
 import { useMemo, useState } from 'react';
-import { ChevronDown, ChevronRight, Search } from 'lucide-react';
+import { ChevronDown, ChevronRight, Layers3, Search } from 'lucide-react';
 import {
   LIBRARY_SECTIONS,
   NODE_DEFS_LIST,
@@ -34,9 +34,9 @@ function LibraryItem({ def, onAdd }: { def: NodeDef; onAdd: (k: StudioNodeKind) 
       }}
       onClick={() => onAdd(def.id)}
       title={def.description}
-      className="group flex w-full items-start gap-2 rounded-md border border-transparent px-2 py-1.5 text-left transition-colors hover:border-ml2-border hover:bg-ml2-surface-2"
+      className="studio-library-item group flex w-full items-start gap-2 rounded-md border border-transparent px-2 py-1.5 text-left transition-colors hover:border-ml2-border hover:bg-ml2-surface-2"
     >
-      <span className="mt-px grid size-6 shrink-0 place-items-center rounded bg-ml2-surface-3 text-ml2-text-2 group-hover:text-ml2-accent">
+      <span className="studio-library-icon mt-px grid size-7 shrink-0 place-items-center rounded-lg bg-ml2-surface-3 text-ml2-text-2 group-hover:text-ml2-accent">
         <NodeIcon name={def.icon} className="size-3.5" />
       </span>
       <span className="min-w-0">
@@ -74,9 +74,21 @@ export function NodeLibrary({ onAdd }: NodeLibraryProps) {
   return (
     <aside
       data-test="studio-node-library"
-      className="flex h-full w-48 shrink-0 flex-col border-r border-ml2-border bg-ml2-surface-1 2xl:w-56"
+      className="studio-rail studio-node-library flex h-full w-52 shrink-0 flex-col border-r border-ml2-border bg-ml2-surface-1 2xl:w-60"
     >
-      <div className="border-b border-ml2-border p-2">
+      <div className="studio-rail-header border-b border-ml2-border px-3 pb-3 pt-3">
+        <div className="mb-3 flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <span className="grid size-7 place-items-center rounded-lg bg-ml2-accent/15 text-ml2-accent">
+              <Layers3 className="size-3.5" />
+            </span>
+            <div>
+              <p className="text-xs font-semibold text-ml2-text">节点库</p>
+              <p className="text-[10px] text-ml2-text-3">拖入画布开始创作</p>
+            </div>
+          </div>
+          <span className="rounded-full bg-ml2-surface-3 px-2 py-0.5 text-[10px] text-ml2-text-3">{NODE_DEFS_LIST.length}</span>
+        </div>
         <div className="relative">
           <Search className="pointer-events-none absolute left-2 top-1/2 size-3.5 -translate-y-1/2 text-ml2-text-3" />
           <Input
@@ -95,12 +107,12 @@ export function NodeLibrary({ onAdd }: NodeLibraryProps) {
         {groups.map(({ sec, defs }) => {
           const isCollapsed = collapsed.has(sec.id);
           return (
-            <div key={sec.id} className="mb-1">
+            <div key={sec.id} className="studio-library-section mb-1">
               <button
                 type="button"
                 data-test={`node-library-category-${sec.id}`}
                 onClick={() => toggle(sec.id)}
-                className="flex w-full items-center gap-1 rounded px-2 py-1 text-[10px] font-semibold uppercase tracking-wide text-ml2-text-3 hover:text-ml2-text-2"
+                className="studio-section-toggle flex w-full items-center gap-1 rounded px-2 py-1 text-[10px] font-semibold uppercase tracking-wide text-ml2-text-3 hover:text-ml2-text-2"
               >
                 {isCollapsed ? <ChevronRight className="size-3" /> : <ChevronDown className="size-3" />}
                 {sec.label}
@@ -116,7 +128,7 @@ export function NodeLibrary({ onAdd }: NodeLibraryProps) {
           );
         })}
       </div>
-      <div className={cn('border-t border-ml2-border px-2 py-1.5 text-[10px] text-ml2-text-3')}>
+      <div className={cn('studio-rail-footer border-t border-ml2-border px-3 py-2 text-[10px] text-ml2-text-3')}>
         拖拽或点击添加 · 节点来自 Node Registry
       </div>
     </aside>

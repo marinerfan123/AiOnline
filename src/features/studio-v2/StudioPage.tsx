@@ -52,7 +52,7 @@ function StudioLayout() {
   );
 
   return (
-    <div data-test="studio-page" className="flex h-full min-h-0 flex-col bg-ml2-surface-0">
+    <div data-test="studio-page" className="studio-shell flex h-full min-h-0 flex-col bg-ml2-surface-0">
       <TopToolbar
         saveStatus={persistence.status}
         lastSavedAt={persistence.lastSavedAt}
@@ -61,9 +61,9 @@ function StudioLayout() {
         assetLibraryOpen={assetLibraryOpen}
         onToggleAssetLibrary={() => setAssetLibraryOpen((v) => !v)}
       />
-      <div className="flex min-h-0 flex-1">
+      <div className="studio-workspace flex min-h-0 flex-1">
         <NodeLibrary onAdd={addFromLibrary} />
-        <div className="relative min-w-0 flex-1">
+        <div className="studio-canvas-stage relative min-w-0 flex-1">
           <StudioCanvas projectId={projectId} canvasRevision={persistence.revision} />
           <StudioComposer projectId={projectId} canvasRevision={persistence.revision} flushNow={persistence.flush} />
           {assetLibraryOpen && projectId ? (

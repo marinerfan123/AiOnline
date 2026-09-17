@@ -12,7 +12,7 @@
 
 import { useEffect, useMemo } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { Trash2, Copy, Group, AlignStartVertical, AlignCenterVertical, AlignEndVertical, AlignHorizontalSpaceBetween, AlignVerticalSpaceBetween, Play, Network } from 'lucide-react';
+import { Trash2, Copy, Group, AlignStartVertical, AlignCenterVertical, AlignEndVertical, AlignHorizontalSpaceBetween, AlignVerticalSpaceBetween, Play, Network, SlidersHorizontal } from 'lucide-react';
 import { useStudioStore } from './store';
 import { getNodeDef } from './registry';
 import { NodeIcon } from './NodeIcon';
@@ -29,7 +29,7 @@ export { ShotInspector };
 
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (
-    <div className="border-b border-ml2-border px-3 py-2.5">
+    <div className="studio-inspector-section border-b border-ml2-border px-3 py-2.5">
       <h3 className="mb-1.5 text-[10px] font-semibold uppercase tracking-wide text-ml2-text-3">{title}</h3>
       {children}
     </div>
@@ -137,7 +137,16 @@ export function Inspector({
   }, [single, def, edges]);
 
   return (
-    <aside data-test="studio-inspector" className="flex h-full w-60 shrink-0 flex-col overflow-y-auto border-l border-ml2-border bg-ml2-surface-1 xl:w-64 2xl:w-72">
+    <aside data-test="studio-inspector" className="studio-rail studio-inspector-panel flex h-full w-64 shrink-0 flex-col overflow-y-auto border-l border-ml2-border bg-ml2-surface-1 xl:w-72 2xl:w-80">
+      <div className="studio-rail-header flex items-center gap-2 border-b border-ml2-border px-4 py-3">
+        <span className="grid size-7 place-items-center rounded-lg bg-ml2-accent/15 text-ml2-accent">
+          <SlidersHorizontal className="size-3.5" />
+        </span>
+        <div>
+          <p className="text-xs font-semibold text-ml2-text">检查器</p>
+          <p className="text-[10px] text-ml2-text-3">调整节点与运行参数</p>
+        </div>
+      </div>
       {showingShot ? (
         <ShotInspector projectId={projectId} episodeId={episodeId!} shotId={selectedShotId!} />
       ) : (

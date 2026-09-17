@@ -161,10 +161,11 @@ function InvalidConnectionToast() {
 
 function EmptyState({ onAdd, onCreateWorkflow }: { onAdd: (k: StudioNodeKind) => void; onCreateWorkflow: (kind: 'image' | 'video') => void }) {
   return (
-    <div data-test="studio-empty-state" className="pointer-events-none absolute inset-0 grid place-items-center">
-      <div className="pointer-events-auto w-[26rem] rounded-xl border border-ml2-border bg-ml2-surface-1/95 p-5 text-center shadow-xl backdrop-blur">
-        <h2 className="text-sm font-semibold text-ml2-text">开始创作</h2>
-        <p className="mt-1 text-[11px] text-ml2-text-3">直接建立一条可编辑的图像生成链，或从单个节点开始。</p>
+    <div data-test="studio-empty-state" className="studio-empty-state pointer-events-none absolute inset-0 grid place-items-center">
+      <div className="studio-empty-card pointer-events-auto w-[28rem] rounded-2xl border border-ml2-border bg-ml2-surface-1/95 p-6 text-center shadow-xl backdrop-blur">
+        <span className="studio-empty-kicker inline-flex items-center rounded-full border border-ml2-accent/30 bg-ml2-accent/10 px-2.5 py-1 text-[10px] font-medium text-ml2-accent">无限画布工作区</span>
+        <h2 className="mt-3 text-base font-semibold text-ml2-text">从一个想法开始</h2>
+        <p className="mt-1 text-[11px] text-ml2-text-3">建立一条可编辑的创作链，或者从单个节点自由组合。</p>
         <Button size="sm" variant="primary" data-test="empty-create-image-workflow" className="mt-4 w-full" onClick={() => onCreateWorkflow('image')}>
           一键创建图像工作流
         </Button>
@@ -336,7 +337,7 @@ function CanvasCore({ projectId, canvasRevision }: { projectId?: string; canvasR
   }, [undo, redo, duplicateSelection, copySelection, paste, removeSelection, selectAll, fitSelected, fitView]);
 
   return (
-    <div ref={canvasRef} data-test="studio-canvas" className="relative h-full w-full">
+    <div ref={canvasRef} data-test="studio-canvas" className="studio-canvas-root relative h-full w-full">
       <ReactFlow
         nodes={nodes}
         edges={edges}
@@ -433,11 +434,18 @@ function CanvasCore({ projectId, canvasRevision }: { projectId?: string; canvasR
             borderless grid' M1 gap. Line grid sits under nodes, edge/connection
             candidates invisible until hover, pan/zoom-native and performant. */}
         <Background variant={BackgroundVariant.Lines} gap={24} size={1} color="var(--ml2-border, #3f3f46)" />
-        <MiniMap pannable zoomable position="bottom-left" className="!bg-ml2-surface-1 !border !border-ml2-border" maskColor="rgba(0,0,0,0.5)" />
-        <Controls position="bottom-right" showInteractive={false} />
+        <MiniMap pannable zoomable position="bottom-left" className="studio-minimap !bg-ml2-surface-1 !border !border-ml2-border" maskColor="rgba(0,0,0,0.5)" />
+        <Controls position="bottom-right" className="studio-controls" showInteractive={false} />
       </ReactFlow>
 
-      <div className="absolute left-1/2 top-2 z-40 flex -translate-x-1/2 items-center gap-0.5 rounded-lg border border-ml2-border bg-ml2-surface-1/95 px-1 py-0.5 shadow-md backdrop-blur">
+      <div data-test="canvas-stage-label" className="studio-stage-label pointer-events-none absolute left-4 top-4 z-30 flex items-center gap-2 rounded-full border border-ml2-border/80 bg-ml2-surface-1/75 px-3 py-1.5 text-[10px] text-ml2-text-3 shadow-sm backdrop-blur">
+        <span className="size-1.5 rounded-full bg-emerald-400 shadow-[0_0_10px_rgba(52,211,153,0.8)]" />
+        无限画布
+        <span className="text-ml2-text-3/60">·</span>
+        节点工作流
+      </div>
+
+      <div className="studio-canvas-toolbar absolute left-1/2 top-4 z-40 flex -translate-x-1/2 items-center gap-0.5 rounded-xl border border-ml2-border bg-ml2-surface-1/90 px-1.5 py-1 shadow-lg backdrop-blur-xl">
         <IconButton data-test="canvas-undo" label="撤销 (Ctrl+Z)" size="sm" disabled={!canUndo} onClick={undo}><Undo2 className="size-3.5" /></IconButton>
         <IconButton data-test="canvas-redo" label="重做 (Ctrl+Shift+Z)" size="sm" disabled={!canRedo} onClick={redo}><Redo2 className="size-3.5" /></IconButton>
         <IconButton data-test="canvas-copy" label="复制 (Ctrl+C)" size="sm" onClick={copySelection}><Copy className="size-3.5" /></IconButton>
@@ -450,7 +458,7 @@ function CanvasCore({ projectId, canvasRevision }: { projectId?: string; canvasR
         <IconButton data-test="canvas-reset-viewport" label="重置视口" size="sm" onClick={() => fitView({ padding: 0.05, duration: 200 })}><Scan className="size-3.5" /></IconButton>
       </div>
 
-      <div data-test="canvas-interaction-hint" className="pointer-events-none absolute left-1/2 top-12 z-30 -translate-x-1/2 rounded-full border border-ml2-border/70 bg-ml2-surface-1/80 px-3 py-1 text-[10px] text-ml2-text-3 shadow-sm backdrop-blur">
+      <div data-test="canvas-interaction-hint" className="studio-canvas-hint pointer-events-none absolute left-1/2 top-[4.25rem] z-30 -translate-x-1/2 rounded-full border border-ml2-border/70 bg-ml2-surface-1/70 px-3 py-1 text-[10px] text-ml2-text-3 shadow-sm backdrop-blur">
         空格 + 拖拽平移 · 滚轮缩放 · 双击空白添加 · F 定位选中 · Ctrl/Cmd+K 命令
       </div>
 

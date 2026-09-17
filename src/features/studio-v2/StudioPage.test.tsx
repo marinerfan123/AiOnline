@@ -72,6 +72,7 @@ describe('StudioPage — 分镜接线 scriptId 传递', () => {
     mocks.projectId = 'proj-1';
     renderStudioPage();
     expect(screen.getByTestId('bottom-dock-probe')).toBeTruthy();
+    expect(document.querySelector('[data-test="studio-page"]')?.className).toContain('studio-shell');
     expect(mocks.bottomDockProps?.projectId).toBe('proj-1');
     expect(mocks.bottomDockProps?.scriptId).toBe('proj-1');
   });
