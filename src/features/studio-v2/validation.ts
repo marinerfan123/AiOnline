@@ -5,7 +5,7 @@
 
 import type { Edge } from '@xyflow/react';
 import type { LogicalModelConstraint, NodeDef } from './registry';
-import { getEffectiveParameterSchema } from './registry';
+import { canConnectToPort, getEffectiveParameterSchema, getNodeDef } from './registry';
 import type { NodeReadiness, NodeRuntimeStatus, ParameterField, StalePropagationInput, StudioNodeData, ValidationIssue, ValidationResult } from './types';
 import type { StudioNode, StudioEdge } from './store';
 
@@ -22,6 +22,17 @@ function valueMissing(v: unknown): boolean {
 /** whitespace normalization: a string of only whitespace is treated as empty */
 function isBlankString(v: unknown): v is string {
   return typeof v === 'string' && v.trim() === '';
+}
+
+/**
+ * Composer compatibility: generation nodes may carry their text directly
+ * while users are building a graph. An explicit prompt-node edge remains the
+ * preferred representation, but this legacy-safe payload is executable too.
+ */
+export function hasInlineTextInput(node: Pick<StudioNode, 'data'>): boolean {
+  const data = node.data as StudioNodeData;
+  const params = (data.parameters ?? {}) as Record<string, unknown>;
+  return [params.prompt, data.prompt].some((value) => typeof value === 'string' && value.trim().length > 0);
 }
 
 export function validateParameterValue(field: ParameterField, value: unknown): ValidationResult {
@@ -65,6 +76,8 @@ export interface ValidateNodeOpts {
   model?: LogicalModelConstraint & { capabilities?: { type?: string } } | null;
   /** asset existence check (M04-S resolver); null = unknown/deferred */
   assetExists?: boolean | null;
+  /** Full canvas nodes, used to validate persisted edge source ports/types. */
+  nodes?: StudioNode[];
 }
 
 /**
@@ -103,14 +116,35 @@ export function validateNode(node: StudioNode, def: NodeDef, edges: Edge[] = [],
   }
 
   for (const k of Object.keys(params)) {
-    if (!schemaKeys.has(k)) errors.push(issue('UNSUPPORTED_PARAMETER', `Unsupported parameter: ${k}`, k));
+    const inlinePromptParameter = def.executionKind === 'GENERATION' && k === 'prompt' && hasInlineTextInput(node);
+    if (!schemaKeys.has(k) && !inlinePromptParameter) errors.push(issue('UNSUPPORTED_PARAMETER', `Unsupported parameter: ${k}`, k));
+  }
+
+  // The server compiler validates persisted source/target handles and typed
+  // compatibility. Mirror those checks here so the Run button cannot submit
+  // a graph that the server will reject immediately.
+  if (opts.nodes) {
+    for (const edge of edges.filter((e) => e.target === node.id)) {
+      const source = opts.nodes.find((candidate) => candidate.id === edge.source);
+      const sourceDef = source ? getNodeDef(source.data.nodeKind) : undefined;
+      const sourcePort = sourceDef?.outputPorts.find((port) => port.id === edge.sourceHandle);
+      const targetPort = def.inputPorts.find((port) => port.id === edge.targetHandle);
+      if (!source || !sourcePort || !targetPort) {
+        errors.push(issue('PORT_NOT_FOUND', '连接端口不存在', undefined, edge.targetHandle ?? undefined));
+      } else if (!canConnectToPort(sourcePort.type, targetPort)) {
+        errors.push(issue('TYPE_INCOMPATIBLE', `Input ${targetPort.label} cannot accept ${sourcePort.type}`, undefined, targetPort.id));
+      }
+    }
   }
 
   // required input ports: missing connection = ERROR (blocks execution),
-  // not just a warning — M05-B2 production semantics.
+  // not just a warning — M05-B2 production semantics. The composer stores a
+  // direct generation prompt on the node for the single-node workflow, so a
+  // non-blank inline text payload satisfies only the required TEXT port.
   for (const p of def.inputPorts.filter((p) => p.required)) {
     const connected = edges.some((e) => e.target === node.id && e.targetHandle === p.id);
-    if (!connected) errors.push(issue('REQUIRED_INPUT_MISSING', `Input ${p.label} is not connected`, undefined, p.id));
+    const inlineText = def.executionKind === 'GENERATION' && p.id === 'text' && hasInlineTextInput(node);
+    if (!connected && !inlineText) errors.push(issue('REQUIRED_INPUT_MISSING', `Input ${p.label} is not connected`, undefined, p.id));
   }
   // optional input ports need no issue — they never block execution.
 
@@ -121,6 +155,43 @@ export function validateNode(node: StudioNode, def: NodeDef, edges: Edge[] = [],
   }
 
   return { valid: errors.length === 0, errors, warnings };
+}
+
+/**
+ * Resolve the same undirected executable closure used by a FROM_NODE run:
+ * downstream work plus every connected upstream dependency. Structural frame
+ * nodes are not executable and therefore do not extend the closure.
+ */
+function runClosure(rootId: string, nodes: StudioNode[], edges: StudioEdge[]): { nodes: StudioNode[]; edges: StudioEdge[] } {
+  const byId = new Map(nodes.map((node) => [node.id, node]));
+  const included = new Set<string>();
+  const stack = [rootId];
+  while (stack.length) {
+    const id = stack.pop()!;
+    const node = byId.get(id);
+    if (!node || included.has(id)) continue;
+    const def = getNodeDef(node.data.nodeKind);
+    if (!def || def.executionKind === 'STRUCTURAL') continue;
+    included.add(id);
+    for (const edge of edges) {
+      if (edge.source === id && byId.has(edge.target)) stack.push(edge.target);
+      if (edge.target === id && byId.has(edge.source)) stack.push(edge.source);
+    }
+  }
+  return {
+    nodes: nodes.filter((node) => included.has(node.id)),
+    edges: edges.filter((edge) => included.has(edge.source) && included.has(edge.target)),
+  };
+}
+
+/** Validate every node/edge that a FROM_NODE run would send to the server. */
+export function validateRunGraph(rootId: string, nodes: StudioNode[], edges: StudioEdge[], opts: Omit<ValidateNodeOpts, 'nodes' | 'model'> = {}): ValidationIssue[] {
+  const scoped = runClosure(rootId, nodes, edges);
+  return scoped.nodes.flatMap((node) => {
+    const def = getNodeDef(node.data.nodeKind);
+    if (!def) return [issue('UNKNOWN_NODE_TYPE', `Unknown node type: ${node.data.nodeKind}`)];
+    return validateNode(node, def, scoped.edges, { ...opts, model: null, nodes: scoped.nodes }).errors;
+  });
 }
 
 export function validationStatus(v?: ValidationResult): 'valid' | 'warning' | 'invalid' {

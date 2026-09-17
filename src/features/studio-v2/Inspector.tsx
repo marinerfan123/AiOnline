@@ -20,7 +20,7 @@ import { Button } from '@/shared/ui/v2/Button';
 import { Input } from '@/shared/ui/v2/Input';
 import { ParameterInspector } from './ParameterInspector';
 import { ShotInspector } from './ShotInspector';
-import { computeReadiness, validateNode } from './validation';
+import { computeReadiness, hasInlineTextInput, validateNode, validateRunGraph } from './validation';
 import { v2ai } from '@/shared/api/contract/ai-control-client';
 import { cn } from '@/lib/utils';
 
@@ -81,7 +81,6 @@ export function Inspector({
   // W1② run button state: only GENERATION nodes are runnable (media producers);
   // busy gate mirrors the store's single-flight runNode. Read surface for
   // terminal status/artifacts stays the Runs tab — the button only triggers.
-  const isRunnable = Boolean(def && def.executionKind === 'GENERATION');
   const runBusy = runningNodeId != null;
   const thisNodeRunning = Boolean(single && runningNodeId === single.id);
 
@@ -108,20 +107,31 @@ export function Inspector({
       validModelIds,
       model: selectedModel ?? null,
       assetExists: null,
+      nodes,
     });
-  }, [single, def, edges, modelsQuery.data, selectedModel]);
+  }, [single, def, edges, modelsQuery.data, selectedModel, nodes]);
 
   const readiness = useMemo(() => {
     if (!single || !def) return null;
     const validModelIds = modelsQuery.data ? modelsQuery.data.filter((m) => m.enabled !== false).map((m) => m.model_id) : undefined;
-    return computeReadiness(single, def, edges, { validModelIds, model: selectedModel ?? null, assetExists: null });
-  }, [single, def, edges, modelsQuery.data, selectedModel]);
+    return computeReadiness(single, def, edges, { validModelIds, model: selectedModel ?? null, assetExists: null, nodes });
+  }, [single, def, edges, modelsQuery.data, selectedModel, nodes]);
+
+  const runGraphErrors = useMemo(() => {
+    if (!single) return [];
+    const validModelIds = modelsQuery.data ? modelsQuery.data.filter((m) => m.enabled !== false).map((m) => m.model_id) : undefined;
+    return validateRunGraph(single.id, nodes, edges, { validModelIds, assetExists: null });
+  }, [single, nodes, edges, modelsQuery.data]);
+
+  const modelCatalogReady = !def?.isGeneration || modelsQuery.isSuccess;
+  const isRunnable = Boolean(def && def.executionKind === 'GENERATION' && modelCatalogReady && readiness?.executionReady && runGraphErrors.length === 0);
 
   const inputSummary = useMemo(() => {
     if (!single || !def) return [];
     return def.inputPorts.map((p) => {
       const connected = edges.some((e) => e.target === single.id && e.targetHandle === p.id);
-      return { port: p, connected };
+      const inline = def.executionKind === 'GENERATION' && p.id === 'text' && hasInlineTextInput(single);
+      return { port: p, connected, inline };
     });
   }, [single, def, edges]);
 
@@ -220,7 +230,7 @@ export function Inspector({
               {def.inputPorts.length > 0 && (
                 <Section title="必需输入">
                   <div data-test="inspector-ports" className="space-y-1 text-[11px]">
-                    {inputSummary.map(({ port, connected }) => (
+                    {inputSummary.map(({ port, connected, inline }) => (
                       <div key={port.id} className="flex items-center justify-between gap-2">
                         <span className="text-ml2-text-2">
                           {port.label}
@@ -231,13 +241,13 @@ export function Inspector({
                           className={cn(
                             'rounded-full px-1.5 py-px text-[9px] font-medium',
                             port.required
-                              ? connected
+                              ? connected || inline
                                 ? 'bg-emerald-500/15 text-emerald-400'
                                 : 'bg-red-500/15 text-red-400'
                               : 'bg-ml2-surface-3 text-ml2-text-3',
                           )}
                         >
-                          {port.required ? (connected ? '已连接' : '缺失') : connected ? '已连接' : '可选'}
+                          {port.required ? (connected ? '已连接' : inline ? '已填入' : '缺失') : connected ? '已连接' : '可选'}
                         </span>
                       </div>
                     ))}
@@ -271,7 +281,7 @@ export function Inspector({
                 </Button>
                 {!isRunnable && (
                   <p data-test="inspector-run-disabled-note" className="mt-1.5 text-[10px] text-ml2-text-3">
-                    仅生成（媒体）节点可运行；此节点为 {def.executionKind} 类型。
+                    {def.executionKind === 'GENERATION' ? '配置未就绪，请补齐必需输入或参数。' : `仅生成（媒体）节点可运行；此节点为 ${def.executionKind} 类型。`}
                   </p>
                 )}
                 {runError && (

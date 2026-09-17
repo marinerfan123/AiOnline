@@ -134,6 +134,38 @@ test('compile: required input port missing rejected', () => {
   assert.equal(r.error.code, 'REQUIRED_PORT_MISSING');
 });
 
+test('compile: inline generation prompt satisfies the required text input', () => {
+  const r = compileStudioGraph({
+    ...base,
+    nodes: [{
+      ...imageGenNode('img1'),
+      data: {
+        ...imageGenNode('img1').data,
+        prompt: 'a cinematic mountain at sunrise',
+      },
+    }],
+    edges: [],
+  });
+  assert.equal(r.ok, true, JSON.stringify(r.error));
+  assert.equal(r.graph.nodes[0].input.prompt, 'a cinematic mountain at sunrise');
+});
+
+test('compile: blank inline generation prompt is still rejected', () => {
+  const r = compileStudioGraph({
+    ...base,
+    nodes: [{
+      ...imageGenNode('img1'),
+      data: {
+        ...imageGenNode('img1').data,
+        prompt: '   ',
+      },
+    }],
+    edges: [],
+  });
+  assert.equal(r.ok, false);
+  assert.equal(r.error.code, 'REQUIRED_PORT_MISSING');
+});
+
 test('compile: output node without any input rejected', () => {
   const r = compileStudioGraph({
     ...base,

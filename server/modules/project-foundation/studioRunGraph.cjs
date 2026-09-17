@@ -79,6 +79,18 @@ function safeNodeInput(node) {
 }
 
 /**
+ * The bottom composer historically writes prompt text directly to a
+ * generation node. Treat that durable text as the node's TEXT input so a
+ * single-node workflow remains runnable; other required ports still need
+ * explicit typed edges.
+ */
+function hasInlineTextInput(node) {
+  const data = node && node.data && typeof node.data === 'object' ? node.data : {};
+  const params = data.parameters && typeof data.parameters === 'object' ? data.parameters : {};
+  return [params.prompt, data.prompt].some((value) => typeof value === 'string' && value.trim().length > 0);
+}
+
+/**
  * @param {object} input
  * @param {string} input.canvasId
  * @param {number} input.canvasRevision
@@ -230,26 +242,20 @@ function compileStudioGraph(input) {
     for (const nodeId of structuralNodeIdsCollector(nodeById, included)) structuralNodeIds.push(nodeId);
 
     // ── Required-port validation (B2 semantics: missing required input blocks execution).
-    // ALL mode: strict — a full-canvas run must have every required port connected.
-    // SELECTED/FROM_NODE: ports whose only possible upstream was intentionally
-    // excluded by the subgraph are allowed to stay unconnected (the selected
-    // targets still execute with the closure that WAS included); ports with
-    // NO connected executable edge at all are still rejected.
+    // A selected subgraph already pulls the complete upstream closure, so every
+    // required port must be represented by an included edge. The sole
+    // compatibility exception is a non-blank inline prompt on a generation
+    // node, which is the persisted form used by the single-node composer flow.
     for (const nodeId of included) {
       const { def } = nodeById.get(nodeId);
       if (def.executionKind === 'STRUCTURAL') continue;
       const connected = portCheck.get(nodeId) || new Set();
       for (const p of def.inputPorts) {
         if (!p.required) continue;
-        if (runMode === 'ALL') {
-          if (!connected.has(p.id)) {
-            throw new CompileError('REQUIRED_PORT_MISSING', `node ${nodeId} required input '${p.id}' is not connected`, [nodeId]);
-          }
-        } else {
-          // Subgraph mode: reject only when the node has zero connected inputs at all.
-          if (connected.size === 0) {
-            throw new CompileError('REQUIRED_PORT_MISSING', `node ${nodeId} required input '${p.id}' is not connected`, [nodeId]);
-          }
+        const raw = nodeById.get(nodeId).raw;
+        const inlineText = def.executionKind === 'GENERATION' && p.id === 'text' && hasInlineTextInput(raw);
+        if (!connected.has(p.id) && !inlineText) {
+          throw new CompileError('REQUIRED_PORT_MISSING', `node ${nodeId} required input '${p.id}' is not connected`, [nodeId]);
         }
       }
       if (def.executionKind === 'OUTPUT' && def.inputPorts.length > 0 && connected.size === 0) {

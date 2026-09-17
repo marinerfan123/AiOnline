@@ -42,7 +42,10 @@ function makeNode(id: string, nodeKind: string, extraData: Record<string, unknow
   } as StudioNode;
 }
 
-const genNode = () => makeNode('img-1', 'image-generation');
+const genNode = (prompt = 'a test image') => makeNode('img-1', 'image-generation', {
+  prompt,
+  parameters: { logicalModelId: 'model-1', aspectRatio: '1:1', resolution: '1024x1024' },
+});
 const sourceNode = () => makeNode('pr-1', 'prompt');
 
 function renderInspector(projectId = 'p1', canvasRevision = 3) {
@@ -57,7 +60,7 @@ beforeEach(() => {
   useStudioStore.getState().resetProjectState();
   mocks.runNode.mockReset();
   mocks.listModels.mockReset();
-  mocks.listModels.mockResolvedValue([]);
+  mocks.listModels.mockResolvedValue([{ model_id: 'model-1', enabled: true, capabilities: { type: 'text_to_image' } }]);
 });
 
 afterEach(cleanup);
@@ -68,7 +71,7 @@ describe('Inspector — Run 按钮禁用逻辑', () => {
     renderInspector();
 
     const btn = screen.getByTestId('inspector-run-button') as HTMLButtonElement;
-    expect(btn.disabled).toBe(false);
+    await waitFor(() => expect(btn.disabled).toBe(false));
 
     mocks.runNode.mockResolvedValue({ runId: 'run-1', status: 'QUEUED', idempotent: false } satisfies RunResult);
     fireEvent.click(btn);
@@ -76,6 +79,24 @@ describe('Inspector — Run 按钮禁用逻辑', () => {
     await waitFor(() => expect(mocks.runNode).toHaveBeenCalledTimes(1));
     expect(mocks.runNode).toHaveBeenCalledWith({ projectId: 'p1', nodeId: 'img-1', canvasRevision: 3 });
     await waitFor(() => expect(screen.getByTestId('inspector-run-last').textContent).toContain('run-1'));
+  });
+
+  it('缺少提示词和连接时禁用 Run，避免发送必然失败的请求', async () => {
+    useStudioStore.getState().loadGraph([genNode('')], []);
+    renderInspector();
+
+    const btn = screen.getByTestId('inspector-run-button') as HTMLButtonElement;
+    expect(btn.disabled).toBe(true);
+    expect(screen.getByTestId('inspector-run-disabled-note').textContent).toContain('配置未就绪');
+  });
+
+  it('模型目录加载失败时禁用 Run，避免绕过服务端模型校验', async () => {
+    mocks.listModels.mockRejectedValueOnce(new Error('catalog unavailable'));
+    useStudioStore.getState().loadGraph([genNode()], []);
+    renderInspector();
+
+    await waitFor(() => expect(mocks.listModels).toHaveBeenCalledTimes(1));
+    expect((screen.getByTestId('inspector-run-button') as HTMLButtonElement).disabled).toBe(true);
   });
 
   it('选中非 media 节点：Run 按钮禁用并注明类型', () => {
@@ -104,6 +125,7 @@ describe('Inspector — running 态转圈 + 禁再点', () => {
     mocks.runNode.mockImplementation(() => new Promise<RunResult>((res) => { resolveRun = res; }));
 
     renderInspector();
+    await waitFor(() => expect((screen.getByTestId('inspector-run-button') as HTMLButtonElement).disabled).toBe(false));
     fireEvent.click(screen.getByTestId('inspector-run-button'));
 
     const btn = screen.getByTestId('inspector-run-button') as HTMLButtonElement;
@@ -121,6 +143,7 @@ describe('Inspector — 错误 inline 显示', () => {
     mocks.runNode.mockRejectedValue(new Error('provider down'));
     renderInspector();
 
+    await waitFor(() => expect((screen.getByTestId('inspector-run-button') as HTMLButtonElement).disabled).toBe(false));
     fireEvent.click(screen.getByTestId('inspector-run-button'));
     await waitFor(() => expect(screen.getByTestId('inspector-run-error').textContent).toContain('provider down'));
   });
