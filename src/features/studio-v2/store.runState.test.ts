@@ -10,22 +10,27 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { useStudioStore } from './store';
 
 type RunResult = { runId: string; status: string; idempotent: boolean };
+type RunDetail = { run: { status: string } };
 
-const mocks = vi.hoisted(() => ({ runNode: vi.fn() }));
+const mocks = vi.hoisted(() => ({ runNode: vi.fn(), getRun: vi.fn() }));
 
 vi.mock('./run/studioRunClient', () => ({
-  studioRunClient: { runNode: mocks.runNode },
+  studioRunClient: { runNode: mocks.runNode, getRun: mocks.getRun },
+  isTerminalRunStatus: (status: string) => ['COMPLETED', 'FAILED', 'CANCELLED'].includes(status),
+  RUN_STATUSES: ['QUEUED', 'RUNNING', 'WAITING', 'COMPLETED', 'FAILED', 'CANCELLED', 'BLOCKED'],
 }));
 
 beforeEach(() => {
   useStudioStore.getState().resetProjectState();
   mocks.runNode.mockReset();
+  mocks.getRun.mockReset();
 });
 
 describe('runNode — FROM_NODE trigger request shape', () => {
   it('passes projectId/nodeId/canvasRevision from store context and omits idempotencyKey (client default prefix)', async () => {
     useStudioStore.getState().setRunContext('p1', 3);
     mocks.runNode.mockResolvedValue({ runId: 'run-1', status: 'QUEUED', idempotent: false } satisfies RunResult);
+    mocks.getRun.mockResolvedValue({ run: { status: 'COMPLETED' } } satisfies RunDetail);
 
     await useStudioStore.getState().runNode('n1');
 
@@ -33,10 +38,25 @@ describe('runNode — FROM_NODE trigger request shape', () => {
     expect(mocks.runNode).toHaveBeenCalledWith({ projectId: 'p1', nodeId: 'n1', canvasRevision: 3 });
     // no explicit idempotencyKey → client generates `from-node:n1:rev3`
     expect(mocks.runNode.mock.calls[0][0]).not.toHaveProperty('idempotencyKey');
-    // completed trigger backfills lastRun (initial status, not polled to terminal)
-    expect(useStudioStore.getState().lastRun).toEqual({ runId: 'run-1', status: 'QUEUED' });
+
+    await vi.waitFor(() => {
+      expect(useStudioStore.getState().lastRun).toEqual({ runId: 'run-1', status: 'COMPLETED' });
+    });
     expect(useStudioStore.getState().runningNodeId).toBeNull();
     expect(useStudioStore.getState().runError).toBeNull();
+  });
+
+  it('refreshes a transient BLOCKED response to the durable terminal status', async () => {
+    useStudioStore.getState().setRunContext('p1', 3);
+    mocks.runNode.mockResolvedValue({ runId: 'run-blocked', status: 'BLOCKED', idempotent: false } satisfies RunResult);
+    mocks.getRun.mockResolvedValue({ run: { status: 'COMPLETED' } } satisfies RunDetail);
+
+    await useStudioStore.getState().runNode('n1');
+
+    await vi.waitFor(() => {
+      expect(mocks.getRun).toHaveBeenCalledWith({ projectId: 'p1', runId: 'run-blocked' });
+      expect(useStudioStore.getState().lastRun).toEqual({ runId: 'run-blocked', status: 'COMPLETED' });
+    });
   });
 });
 
@@ -54,7 +74,9 @@ describe('runNode — busy 防重入', () => {
     expect(mocks.runNode).toHaveBeenCalledTimes(1);
 
     resolveRun({ runId: 'run-1', status: 'COMPLETED', idempotent: false });
+    mocks.getRun.mockResolvedValue({ run: { status: 'COMPLETED' } } satisfies RunDetail);
     await first;
+    await vi.waitFor(() => expect(mocks.getRun).toHaveBeenCalled());
     expect(useStudioStore.getState().runningNodeId).toBeNull();
     expect(useStudioStore.getState().lastRun).toEqual({ runId: 'run-1', status: 'COMPLETED' });
   });

@@ -41,9 +41,39 @@ import {
   type StudioNodeKind,
   type PortSpec,
 } from './types';
-import { studioRunClient, type StudioRunStatus } from './run/studioRunClient';
+import {
+  studioRunClient,
+  isTerminalRunStatus,
+  RUN_STATUSES,
+  type StudioRunStatus,
+} from './run/studioRunClient';
 import { canvasCommandLogClient, type CanvasCommand } from '@/shared/api/contract/canvasCommandLogClient';
 import { computeAutoLayout } from './dagLayout';
+
+const RUN_STATUS_POLL_INTERVAL_MS = 5000;
+const RUN_STATUS_POLL_MAX_ATTEMPTS = 1080; // 90 minutes, matching the server generation wait limit.
+
+function normalizeRunStatus(status: string, fallback: StudioRunStatus): StudioRunStatus {
+  return (RUN_STATUSES as readonly string[]).includes(status) ? status as StudioRunStatus : fallback;
+}
+
+async function pollTriggeredRun(projectId: string, runId: string, attempt = 0): Promise<void> {
+  try {
+    const detail = await studioRunClient.getRun({ projectId, runId });
+    const current = useStudioStore.getState().lastRun;
+    if (!current || current.runId !== runId) return;
+
+    const status = normalizeRunStatus(detail.run.status, current.status);
+    useStudioStore.setState({ lastRun: { runId, status } });
+    if (isTerminalRunStatus(status)) return;
+  } catch {
+    // The trigger already succeeded; a transient detail-read failure should not
+    // turn it into a false client error. The bounded retry below will recover.
+  }
+
+  if (attempt >= RUN_STATUS_POLL_MAX_ATTEMPTS) return;
+  setTimeout(() => { void pollTriggeredRun(projectId, runId, attempt + 1); }, RUN_STATUS_POLL_INTERVAL_MS);
+}
 
 export type StudioNode = Node<StudioNodeData>;
 export type StudioEdge = Edge<StudioEdgeData>;
@@ -125,10 +155,10 @@ interface StudioState {
   /** highest canvas_command_log seq consumed from the server (0 = not synced). */
   commandLogCursor: number;
 
-  // ── W1② run trigger state (fire-and-forget; read surface is the Runs tab) ──
+  // ── W1② run trigger state (the durable status is refreshed after trigger) ──
   /** node currently being run (non-null = one run in flight; busy gate) */
   runningNodeId: string | null;
-  /** last triggered run (initial server response; NOT polled to terminal) */
+  /** last triggered run, synchronized from the durable run detail endpoint */
   lastRun: { runId: string; status: StudioRunStatus } | null;
   /** inline failure copy for the last run trigger */
   runError: string | null;
@@ -174,7 +204,7 @@ interface StudioState {
   setRunContext: (projectId: string | null, canvasRevision: number | null) => void;
   /** W6① canvas identity: persistence writes the resolved primary canvas id after loadGraph. */
   setCurrentCanvasId: (canvasId: string | null) => void;
-  /** W1② trigger a FROM_NODE run for one node (fire-and-forget; no polling). */
+  /** W1② trigger a FROM_NODE run for one node and refresh its durable status. */
   runNode: (nodeId: string) => Promise<void>;
   /**
    * W4a read-only alignment: pull commands after `afterSeq` (default = current
@@ -775,6 +805,7 @@ export const useStudioStore = create<StudioState>((set, get) => ({
         canvasRevision: s.canvasRevision,
       });
       set({ runningNodeId: null, lastRun: { runId: res.runId, status: res.status } });
+      if (res.runId) void pollTriggeredRun(s.projectId, res.runId);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       set({ runningNodeId: null, runError: msg ? `运行失败：${msg}` : '运行失败，请稍后重试' });
