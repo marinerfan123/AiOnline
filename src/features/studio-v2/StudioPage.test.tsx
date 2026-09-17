@@ -17,10 +17,14 @@ import StudioPage from './StudioPage';
 const mocks = vi.hoisted(() => ({
   projectId: 'proj-1',
   bottomDockProps: null as null | { projectId?: string; scriptId?: string; revision?: number | null; onRestored?: () => void },
+  shellProps: null as null | { bareContent?: boolean; immersive?: boolean },
 }));
 
 vi.mock('@/features/project-foundation/ProjectShell', () => ({
-  ProjectShell: ({ children }: { children?: React.ReactNode }) => <>{children}</>,
+  ProjectShell: ({ children, ...props }: { children?: React.ReactNode; bareContent?: boolean; immersive?: boolean }) => {
+    mocks.shellProps = props;
+    return <>{children}</>;
+  },
 }));
 
 vi.mock('@/features/project-foundation/ProjectContext', () => ({
@@ -65,6 +69,7 @@ function renderStudioPage() {
 describe('StudioPage — 分镜接线 scriptId 传递', () => {
   beforeEach(() => {
     mocks.bottomDockProps = null;
+    mocks.shellProps = null;
   });
   afterEach(cleanup);
 
@@ -73,6 +78,7 @@ describe('StudioPage — 分镜接线 scriptId 传递', () => {
     renderStudioPage();
     expect(screen.getByTestId('bottom-dock-probe')).toBeTruthy();
     expect(document.querySelector('[data-test="studio-page"]')?.className).toContain('studio-shell');
+    expect(mocks.shellProps).toMatchObject({ bareContent: true, immersive: true });
     expect(mocks.bottomDockProps?.projectId).toBe('proj-1');
     expect(mocks.bottomDockProps?.scriptId).toBe('proj-1');
   });

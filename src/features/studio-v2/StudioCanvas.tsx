@@ -31,7 +31,7 @@ import type { StudioNodeKind } from './types';
 import type { PortType } from './types';
 import { Button } from '@/shared/ui/v2/Button';
 import { IconButton } from '@/shared/ui/v2/IconButton';
-import { Undo2, Redo2, Maximize2, Scan, LocateFixed, Command, X, Copy, Trash2, Network } from "lucide-react";
+import { Undo2, Redo2, Maximize2, Scan, LocateFixed, Command, X, Copy, Trash2, Network, Plus, Type, ImagePlus } from "lucide-react";
 
 const nodeTypes: NodeTypes = { studio: StudioNodeComponent };
 
@@ -445,6 +445,22 @@ function CanvasCore({ projectId, canvasRevision }: { projectId?: string; canvasR
         节点工作流
       </div>
 
+      <div data-test="canvas-tool-rail" className="studio-canvas-tool-rail absolute left-4 top-1/2 z-40 flex -translate-y-1/2 flex-col gap-1 rounded-xl border border-ml2-border bg-ml2-surface-1/85 p-1 shadow-lg backdrop-blur-xl">
+        <IconButton data-test="canvas-add-prompt" label="添加提示词节点" size="sm" onClick={() => addAtCenter('prompt')}>
+          <Type className="size-3.5" />
+        </IconButton>
+        <IconButton data-test="canvas-add-image-generation" label="添加图像生成节点" size="sm" onClick={() => addAtCenter('image-generation')}>
+          <ImagePlus className="size-3.5" />
+        </IconButton>
+        <span className="mx-1 h-px bg-ml2-border" />
+        <IconButton data-test="canvas-auto-layout" label="自动整理节点" size="sm" onClick={autoLayout}>
+          <Network className="size-3.5" />
+        </IconButton>
+        <IconButton data-test="canvas-add-node" label="打开命令面板添加节点" size="sm" onClick={() => setPaletteOpen(true)}>
+          <Plus className="size-3.5" />
+        </IconButton>
+      </div>
+
       <div className="studio-canvas-toolbar absolute left-1/2 top-4 z-40 flex -translate-x-1/2 items-center gap-0.5 rounded-xl border border-ml2-border bg-ml2-surface-1/90 px-1.5 py-1 shadow-lg backdrop-blur-xl">
         <IconButton data-test="canvas-undo" label="撤销 (Ctrl+Z)" size="sm" disabled={!canUndo} onClick={undo}><Undo2 className="size-3.5" /></IconButton>
         <IconButton data-test="canvas-redo" label="重做 (Ctrl+Shift+Z)" size="sm" disabled={!canRedo} onClick={redo}><Redo2 className="size-3.5" /></IconButton>
@@ -460,6 +476,14 @@ function CanvasCore({ projectId, canvasRevision }: { projectId?: string; canvasR
 
       <div data-test="canvas-interaction-hint" className="studio-canvas-hint pointer-events-none absolute left-1/2 top-[4.25rem] z-30 -translate-x-1/2 rounded-full border border-ml2-border/70 bg-ml2-surface-1/70 px-3 py-1 text-[10px] text-ml2-text-3 shadow-sm backdrop-blur">
         空格 + 拖拽平移 · 滚轮缩放 · 双击空白添加 · F 定位选中 · Ctrl/Cmd+K 命令
+      </div>
+
+      <div data-test="canvas-status-hud" className="studio-canvas-status-hud pointer-events-none absolute bottom-4 left-4 z-30 flex items-center gap-2 rounded-full border border-ml2-border/70 bg-ml2-surface-1/70 px-3 py-1.5 text-[10px] text-ml2-text-3 shadow-sm backdrop-blur">
+        <span className="font-medium text-ml2-text-2">{nodes.length} 节点</span>
+        <span className="text-ml2-text-3/60">·</span>
+        <span>{edges.length} 条连接</span>
+        <span className="text-ml2-text-3/60">·</span>
+        <span>自动保存</span>
       </div>
 
       <CanvasCommandPalette open={paletteOpen} commands={paletteCommands} onClose={() => setPaletteOpen(false)} />

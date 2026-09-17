@@ -36,7 +36,7 @@ export function PresenceBar({ peers }: { peers: PresencePeer[] }) {
       <div
         data-test="presence-bar"
         data-empty="true"
-        className="pointer-events-none absolute right-2 top-2 z-40 rounded-full border border-ml2-border bg-ml2-surface-1/90 px-2.5 py-1 text-[11px] text-ml2-text-3 shadow-md backdrop-blur"
+        className="studio-presence-bar pointer-events-none absolute right-4 top-4 z-40 rounded-full border border-ml2-border bg-ml2-surface-1/90 px-2.5 py-1 text-[11px] text-ml2-text-3 shadow-md backdrop-blur"
       >
         仅你在此画布
       </div>
@@ -46,7 +46,7 @@ export function PresenceBar({ peers }: { peers: PresencePeer[] }) {
   return (
     <div
       data-test="presence-bar"
-      className="pointer-events-none absolute right-2 top-2 z-40 flex items-center gap-1 rounded-full border border-ml2-border bg-ml2-surface-1/90 px-2 py-1 shadow-md backdrop-blur"
+      className="studio-presence-bar pointer-events-none absolute right-4 top-4 z-40 flex items-center gap-1 rounded-full border border-ml2-border bg-ml2-surface-1/90 px-2 py-1 shadow-md backdrop-blur"
     >
       {sorted.map((p) => (
         <div

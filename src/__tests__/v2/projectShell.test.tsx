@@ -5,8 +5,8 @@
  * stable ProjectContext contract without leaking full objects into global state.
  */
 
-import { describe, it, expect, vi } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { afterEach, describe, it, expect, vi } from 'vitest';
+import { cleanup, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter, Routes, Route } from 'react-router-dom';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { ProjectShell } from '@/features/project-foundation/ProjectShell';
@@ -41,6 +41,8 @@ function ContextProbe() {
 }
 
 describe('ProjectShell context (M01-S)', () => {
+  afterEach(cleanup);
+
   it('resolves project identity from route params', async () => {
     mockFetchOnce(200, {
       project: {
@@ -114,5 +116,30 @@ describe('ProjectShell context (M01-S)', () => {
 
     await waitFor(() => expect(screen.queryByText('加载项目中…')).toBeNull());
     expect(screen.getByText('项目不存在')).toBeTruthy();
+  });
+
+  it('keeps project context while hiding the duplicate project header in immersive mode', async () => {
+    mockFetchOnce(200, {
+      project: {
+        id: 'proj-immersive', workspaceId: 'ws-1', ownerId: 'u1', name: 'Immersive Project',
+        projectType: 'studio', status: 'active', version: 1, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+      },
+      permissions: { role: 'owner', canRead: true, canUpdate: true, canArchive: true, canRestore: false, canDelete: false },
+    });
+
+    render(
+      <Providers>
+        <MemoryRouter initialEntries={['/__v2/projects/proj-immersive']}>
+          <Routes>
+            <Route path="/__v2/projects/:projectId/*" element={<ProjectShell bareContent immersive><ContextProbe /></ProjectShell>} />
+          </Routes>
+        </MemoryRouter>
+      </Providers>,
+    );
+
+    await waitFor(() => expect(screen.queryByText('加载项目中…')).toBeNull());
+    expect(screen.getByTestId('pid').textContent).toBe('proj-immersive');
+    expect(screen.queryByTestId('project-shell-nav')).toBeNull();
+    expect(document.querySelector('[data-test="project-shell-content"]')).toBeTruthy();
   });
 });

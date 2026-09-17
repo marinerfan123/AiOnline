@@ -9,6 +9,7 @@ import { useAuth } from '@/services/authStore';
 export function StudioLayout() {
   const { user } = useAuth();
   const [mobileDockOpen, setMobileDockOpen] = useState(false);
+  const [dockExpanded, setDockExpanded] = useState(false);
 
   useEffect(() => {
     if (mobileDockOpen) {
@@ -23,15 +24,17 @@ export function StudioLayout() {
   const dockProps = studioDockConfig(user?.role);
 
   return (
-    <div className="flex h-screen w-full overflow-hidden bg-black text-white">
+    <div className="studio-app-shell flex h-screen w-full overflow-hidden bg-black text-white">
       <NavigationDock
         {...dockProps}
+        expanded={dockExpanded}
+        onExpandedChange={setDockExpanded}
         mobileOpen={mobileDockOpen}
         onMobileClose={() => setMobileDockOpen(false)}
       />
-      <div className="flex flex-1 flex-col min-w-0">
+      <div className="studio-app-column flex min-w-0 flex-1 flex-col">
         <MobileDockBar title="创作工作室" onOpen={() => setMobileDockOpen(true)} />
-        <main className="flex-1 min-h-0 overflow-y-auto">
+        <main className="studio-app-main min-h-0 flex-1 overflow-hidden">
           <Outlet />
         </main>
       </div>

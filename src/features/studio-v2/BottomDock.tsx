@@ -27,8 +27,8 @@ export function BottomDock({ projectId, scriptId, revision, onRestored }: { proj
 
   const closed = !tab;
   return (
-    <div data-test="studio-bottom-dock" className={cn('shrink-0 border-t border-ml2-border bg-ml2-surface-1', closed ? 'flex h-9 items-center gap-1 px-2' : 'flex h-32 flex-col')}>
-      <div className={cn('flex items-center gap-1', closed ? '' : 'px-2 pt-1')}>
+    <div data-test="studio-bottom-dock" className={cn('studio-bottom-dock border-t border-ml2-border bg-ml2-surface-1', closed ? 'studio-bottom-dock-closed flex h-9 items-center gap-1 px-2' : 'studio-bottom-dock-open flex h-32 flex-col')}>
+      <div className={cn('studio-bottom-dock-bar flex items-center gap-1', closed ? '' : 'px-2 pt-1')}>
         {TABS.map((t) => (
           <button key={t.id} data-test={`dock-tab-${t.id}`} onClick={() => setActive(t.id)} title={`${t.label} — ${t.phase}`} className={cn('flex items-center gap-1.5 rounded-md px-2.5 py-1 text-[11px] font-medium', active === t.id ? 'bg-ml2-surface-3 text-ml2-text' : 'text-ml2-text-3 hover:bg-ml2-surface-3 hover:text-ml2-text-2')}>
             <t.icon className="size-3.5" />{t.label}
@@ -36,7 +36,7 @@ export function BottomDock({ projectId, scriptId, revision, onRestored }: { proj
         ))}
         {closed ? <span className="ml-auto text-[10px] text-ml2-text-3">版本/运行已启用 · 时间线预留</span> : <button data-test="dock-close" onClick={() => setActive(null)} aria-label="收起 Dock" className="ml-auto rounded p-1 text-ml2-text-3 hover:bg-ml2-surface-3 hover:text-ml2-text"><span className="block text-sm leading-none">×</span></button>}
       </div>
-      {!closed && <div className="min-h-0 flex-1 px-3 py-2">
+      {!closed && <div className="studio-bottom-dock-content min-h-0 flex-1 px-3 py-2">
         {active === 'versions' ? (
           <div data-test="studio-versions-panel" className="h-full text-[11px] text-ml2-text-2">
             <div className="mb-2 flex items-center gap-2"><span className="font-medium text-ml2-text">版本</span><button data-test="create-version" onClick={() => createVersion.mutate()} className="rounded bg-ml2-surface-3 px-2 py-0.5">创建版本</button></div>

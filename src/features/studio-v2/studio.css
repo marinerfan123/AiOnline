@@ -74,6 +74,31 @@
 
 /* The Studio is intentionally a layered workspace: the graph remains the
    visual focus while the library and inspector read as floating tools. */
+[data-test='studio-page'],
+[data-test='studio-page'] .studio-shell {
+  position: relative;
+}
+
+.studio-app-shell {
+  background: #080a0e;
+}
+
+.studio-app-shell > aside {
+  border-color: rgba(148, 163, 184, 0.12);
+  background: linear-gradient(180deg, #10141b, #090b10);
+}
+
+.studio-app-column,
+.studio-app-main,
+.studio-project-shell-immersive,
+.studio-project-shell-content {
+  min-height: 0;
+}
+
+[data-test='studio-page'] .studio-shell {
+  min-height: 0;
+}
+
 [data-test='studio-page'] {
   --studio-bg: #0a0d12;
   --studio-panel: rgba(17, 21, 29, 0.86);
@@ -109,6 +134,38 @@
     var(--studio-bg);
 }
 
+[data-test='studio-page'] .studio-bottom-dock {
+  position: absolute;
+  bottom: 14px;
+  left: 50%;
+  z-index: 45;
+  width: min(760px, calc(100% - 32px));
+  transform: translateX(-50%);
+  overflow: hidden;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  border-radius: 14px;
+  background: rgba(18, 23, 32, 0.88);
+  box-shadow: 0 18px 44px rgba(0, 0, 0, 0.34), inset 0 1px 0 rgba(255, 255, 255, 0.055);
+  backdrop-filter: blur(18px);
+}
+
+[data-test='studio-page'] .studio-bottom-dock-closed {
+  height: 40px;
+}
+
+[data-test='studio-page'] .studio-bottom-dock-open {
+  height: 144px;
+}
+
+[data-test='studio-page'] .studio-bottom-dock-bar {
+  min-height: 40px;
+  border-color: rgba(148, 163, 184, 0.12);
+}
+
+[data-test='studio-page'] .studio-bottom-dock-content {
+  background: rgba(4, 7, 11, 0.22);
+}
+
 [data-test='studio-page'] .studio-rail {
   height: 100%;
   border: 1px solid var(--studio-line);
@@ -123,6 +180,10 @@
 
 [data-test='studio-page'] .studio-inspector-panel {
   border-left-color: var(--studio-line);
+}
+
+[data-test='studio-page'] .studio-inspector-panel.is-collapsed > :not(.studio-rail-header) {
+  display: none;
 }
 
 [data-test='studio-page'] .studio-rail-header,
@@ -201,6 +262,31 @@
 [data-test='studio-page'] .studio-stage-label {
   border-color: rgba(148, 163, 184, 0.2);
   background: rgba(13, 17, 24, 0.66);
+}
+
+[data-test='studio-page'] .studio-canvas-tool-rail {
+  border-color: rgba(148, 163, 184, 0.22);
+  background: rgba(19, 24, 33, 0.82);
+  box-shadow: 0 14px 32px rgba(0, 0, 0, 0.28), inset 0 1px 0 rgba(255, 255, 255, 0.05);
+}
+
+[data-test='studio-page'] .studio-canvas-tool-rail button {
+  color: #9ba6b6;
+}
+
+[data-test='studio-page'] .studio-canvas-tool-rail button:hover {
+  color: var(--ml2-text-primary);
+  background: rgba(96, 165, 250, 0.14);
+}
+
+[data-test='studio-page'] .studio-canvas-status-hud {
+  border-color: rgba(148, 163, 184, 0.17);
+  background: rgba(13, 17, 24, 0.62);
+}
+
+[data-test='studio-page'] .studio-presence-bar {
+  border-color: rgba(148, 163, 184, 0.2);
+  background: rgba(19, 24, 33, 0.78);
 }
 
 [data-test='studio-page'] .studio-canvas-toolbar {
@@ -321,12 +407,51 @@
     padding-inline: 4px;
   }
 
-  [data-test='studio-page'] .studio-inspector-panel {
+  [data-test='studio-page'] .studio-workspace {
+    gap: 6px;
+    padding: 6px;
+  }
+
+  [data-test='studio-page'] .studio-bottom-dock {
+    bottom: 8px;
+    width: calc(100% - 16px);
+  }
+}
+
+@media (max-width: 680px) {
+  .studio-app-shell > aside {
     display: none;
   }
 
   [data-test='studio-page'] .studio-workspace {
-    gap: 6px;
     padding: 6px;
+  }
+
+  [data-test='studio-page'] .studio-node-library,
+  [data-test='studio-page'] .studio-inspector-panel {
+    display: none;
+  }
+
+  [data-test='studio-page'] .studio-canvas-toolbar {
+    left: auto;
+    right: 12px;
+    transform: none;
+  }
+
+  [data-test='studio-page'] .studio-stage-label {
+    left: 12px;
+  }
+
+  [data-test='studio-page'] .studio-canvas-hint {
+    display: none;
+  }
+
+  [data-test='studio-page'] .studio-canvas-tool-rail {
+    left: 12px;
+  }
+
+  [data-test='studio-page'] .studio-canvas-status-hud {
+    bottom: 12px;
+    left: 12px;
   }
 }

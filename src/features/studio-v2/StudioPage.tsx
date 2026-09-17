@@ -85,7 +85,7 @@ function StudioLayout() {
 
 export default function StudioPage() {
   return (
-    <ProjectShell bareContent>
+    <ProjectShell bareContent immersive>
       <StudioLayout />
     </ProjectShell>
   );

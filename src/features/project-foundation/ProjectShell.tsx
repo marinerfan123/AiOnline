@@ -57,7 +57,7 @@ function statusBadgeStatus(status: string) {
   }
 }
 
-function ProjectShellInner({ children, bareContent = false }: { children?: ReactNode; bareContent?: boolean }) {
+function ProjectShellInner({ children, bareContent = false, immersive = false }: { children?: ReactNode; bareContent?: boolean; immersive?: boolean }) {
   const { projectId } = useParams();
   const ctx = useProjectContext();
 
@@ -84,9 +84,9 @@ function ProjectShellInner({ children, bareContent = false }: { children?: React
   }
 
   return (
-    <div className="flex h-full min-h-0 flex-col">
+    <div className={cn('studio-project-shell flex h-full min-h-0 flex-col', immersive && 'studio-project-shell-immersive')}>
       {/* Project header */}
-      <header className="shrink-0 border-b border-ml2-border bg-ml2-surface-1 px-4 py-3">
+      {!immersive && <header className="shrink-0 border-b border-ml2-border bg-ml2-surface-1 px-4 py-3">
         <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
           <div className="flex items-center gap-3">
             <div className="grid size-9 place-items-center rounded-md bg-ml2-accent text-sm font-bold text-ml2-on-accent">
@@ -143,11 +143,11 @@ function ProjectShellInner({ children, bareContent = false }: { children?: React
             );
           })}
         </nav>
-      </header>
+      </header>}
 
       {/* Page content */}
       <main
-        className={bareContent ? 'min-h-0 flex-1 overflow-hidden' : 'min-h-0 flex-1 overflow-auto p-4'}
+        className={cn(bareContent ? 'min-h-0 flex-1 overflow-hidden' : 'min-h-0 flex-1 overflow-auto p-4', immersive && 'studio-project-shell-content')}
         data-test="project-shell-content"
       >
         {children ?? <Outlet />}
@@ -156,10 +156,10 @@ function ProjectShellInner({ children, bareContent = false }: { children?: React
   );
 }
 
-export function ProjectShell({ children, bareContent = false }: { children?: ReactNode; bareContent?: boolean }) {
+export function ProjectShell({ children, bareContent = false, immersive = false }: { children?: ReactNode; bareContent?: boolean; immersive?: boolean }) {
   return (
     <ProjectProvider>
-      <ProjectShellInner bareContent={bareContent}>{children}</ProjectShellInner>
+      <ProjectShellInner bareContent={bareContent} immersive={immersive}>{children}</ProjectShellInner>
     </ProjectProvider>
   );
 }

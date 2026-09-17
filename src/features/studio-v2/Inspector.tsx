@@ -10,9 +10,9 @@
 // "Ready to run" / "Invalid configuration" / "Stale" result placeholders
 // (never fake media).
 
-import { useEffect, useMemo } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { Trash2, Copy, Group, AlignStartVertical, AlignCenterVertical, AlignEndVertical, AlignHorizontalSpaceBetween, AlignVerticalSpaceBetween, Play, Network, SlidersHorizontal } from 'lucide-react';
+import { Trash2, Copy, Group, AlignStartVertical, AlignCenterVertical, AlignEndVertical, AlignHorizontalSpaceBetween, AlignVerticalSpaceBetween, Play, Network, PanelRightClose, PanelRightOpen, SlidersHorizontal } from 'lucide-react';
 import { useStudioStore } from './store';
 import { getNodeDef } from './registry';
 import { NodeIcon } from './NodeIcon';
@@ -51,6 +51,7 @@ export function Inspector({
   canvasRevision?: number;
 }) {
   const showingShot = Boolean(episodeId && selectedShotId);
+  const [panelOpen, setPanelOpen] = useState(false);
   const nodes = useStudioStore((s) => s.nodes);
   const edges = useStudioStore((s) => s.edges);
   const updateNodeData = useStudioStore((s) => s.updateNodeData);
@@ -78,6 +79,10 @@ export function Inspector({
   const selected = useMemo(() => nodes.filter((n) => n.selected), [nodes]);
   const single = selected.length === 1 ? selected[0] : null;
   const def = single ? getNodeDef(single.data.nodeKind) : null;
+
+  useEffect(() => {
+    if (selected.length > 0 || showingShot) setPanelOpen(true);
+  }, [selected.length, showingShot]);
 
   // W1② run button state: only GENERATION nodes are runnable (media producers);
   // busy gate mirrors the store's single-flight runNode. Read surface for
@@ -137,15 +142,25 @@ export function Inspector({
   }, [single, def, edges]);
 
   return (
-    <aside data-test="studio-inspector" className="studio-rail studio-inspector-panel flex h-full w-64 shrink-0 flex-col overflow-y-auto border-l border-ml2-border bg-ml2-surface-1 xl:w-72 2xl:w-80">
-      <div className="studio-rail-header flex items-center gap-2 border-b border-ml2-border px-4 py-3">
+    <aside data-test="studio-inspector" className={cn('studio-rail studio-inspector-panel flex h-full shrink-0 flex-col overflow-y-auto border-l border-ml2-border bg-ml2-surface-1', panelOpen ? 'w-64 xl:w-72 2xl:w-80' : 'is-collapsed w-14')}>
+      <div className={cn('studio-rail-header flex items-center gap-2 border-b border-ml2-border px-4 py-3', !panelOpen && 'justify-center px-2')}>
         <span className="grid size-7 place-items-center rounded-lg bg-ml2-accent/15 text-ml2-accent">
           <SlidersHorizontal className="size-3.5" />
         </span>
-        <div>
+        {panelOpen && <div className="min-w-0">
           <p className="text-xs font-semibold text-ml2-text">检查器</p>
           <p className="text-[10px] text-ml2-text-3">调整节点与运行参数</p>
-        </div>
+        </div>}
+        <button
+          type="button"
+          data-test="inspector-toggle"
+          aria-label={panelOpen ? '收起检查器' : '展开检查器'}
+          title={panelOpen ? '收起检查器' : '展开检查器'}
+          onClick={() => setPanelOpen((value) => !value)}
+          className={cn('grid size-7 place-items-center rounded-lg text-ml2-text-3 hover:bg-ml2-surface-3 hover:text-ml2-text', panelOpen && 'ml-auto')}
+        >
+          {panelOpen ? <PanelRightClose className="size-3.5" /> : <PanelRightOpen className="size-3.5" />}
+        </button>
       </div>
       {showingShot ? (
         <ShotInspector projectId={projectId} episodeId={episodeId!} shotId={selectedShotId!} />
@@ -332,7 +347,7 @@ export function Inspector({
         </>
       )}
 
-      <div className="mt-auto px-3 py-2 text-[10px] leading-relaxed text-ml2-text-3">
+      <div className={cn('mt-auto px-3 py-2 text-[10px] leading-relaxed text-ml2-text-3', !panelOpen && 'hidden')}>
         快捷键：Del 删除 · Ctrl+D 复制 · Ctrl+C/V 拷贝粘贴 · Ctrl+Z / Ctrl+Shift+Z undo/redo
       </div>
     </aside>
