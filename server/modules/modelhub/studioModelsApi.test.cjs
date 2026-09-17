@@ -128,6 +128,23 @@ test('G07 models API: pool key (active ≥6) counts even when legacy api_key emp
   assert.equal(m.available['video.text2video'], true);
 });
 
+test('G07 models API: empty legacy image capabilities still expose an available image model', async () => {
+  const h = harness({
+    modelRows: [{
+      model_id: 'legacy-image', name: 'Legacy Image', type: 'image', provider_id: 'prov-1', enabled: true,
+      capabilities: {}, param_template: {}, modes: null, provider_name: 'Legacy Provider', provider_row_id: 'prov-1',
+    }],
+    bindings: [],
+    dispatchModels: [{ model_id: 'legacy-image', provider_id: 'prov-1', enabled: true }],
+    providers: [{ id: 'prov-1', enabled: true, api_key: 'sk-test-123456' }],
+  });
+  await h.api.handle({}, {}, '/api/studio/models', 'GET');
+  const m = h.responses[0].body.models[0];
+  assert.equal(m.capabilities['image.text2image'], true);
+  assert.equal(m.available['image.text2image'], true);
+  assert.equal(m.lineCount, 1);
+});
+
 test('G07 models API: isolated pool key is NOT dispatchable ⇒ lineCount 0', async () => {
   const h = harness({
     providers: [{ id: 'prov-1', enabled: true, api_key: '' }],

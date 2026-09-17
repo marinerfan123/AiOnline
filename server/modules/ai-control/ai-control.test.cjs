@@ -167,3 +167,29 @@ test('repo: listLogicalModels handles models with no provider bindings', async (
   );
 });
 
+test('repo: legacy image model projects capability and provider binding without PMB row', async () => {
+  const pg = {
+    async query(sql, params = []) {
+      const normalized = sql.replace(/\s+/g, ' ').trim().toUpperCase();
+      if (normalized.startsWith('SELECT * FROM MODELS WHERE ENABLED')) {
+        return { rows: [{
+          id: 'm3', model_id: 'legacy-image', display_name: 'Legacy Image', type: 'image', enabled: true,
+          capabilities: {}, ai_capabilities: {}, provider_id: 'p1', endpoint: { generate: { path: '/images' } },
+          param_template: { size: { type: 'string' } },
+        }] };
+      }
+      if (normalized.includes('FROM PROVIDER_MODEL_BINDINGS B')) return { rows: [] };
+      if (normalized.includes('FROM PROVIDERS WHERE ID=ANY($1)')) {
+        return { rows: [{ id: 'p1', name: 'Legacy Provider', base_url: 'https://provider.test', enabled: true }] };
+      }
+      return { rows: [] };
+    },
+  };
+
+  const models = await repo.listLogicalModels(pg);
+  assert.equal(models[0].ai_capabilities.type, 'text_to_image');
+  assert.equal(models[0].ai_capabilities.capabilities.text_to_image, true);
+  assert.equal(models[0].provider_bindings.length, 1);
+  assert.equal(models[0].provider_bindings[0].legacy_fallback, true);
+  assert.equal(models[0].provider_bindings[0].provider_model_code, 'legacy-image');
+});

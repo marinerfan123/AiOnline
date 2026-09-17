@@ -19,6 +19,47 @@ const { validateRevision, computeContentHash, toRevision } = require('../domain/
 const { validateGrant, toGrant } = require('../domain/grant.cjs');
 const { validatePolicy, toPolicy } = require('../domain/routing-policy.cjs');
 
+const LOGICAL_CAPABILITY_TYPES = new Set([
+  'text', 'text_to_image', 'image_to_image', 'image_edit', 'text_to_video',
+  'image_to_video', 'first_last_frame', 'reference_video', 'audio', 'tts',
+]);
+
+function hasEntries(value) {
+  return value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length > 0;
+}
+
+/** Project legacy model rows into the logical capability document used by AI Control. */
+function legacyCapabilityDoc(row) {
+  if (hasEntries(row.ai_capabilities)) return row.ai_capabilities;
+
+  const legacy = hasEntries(row.capabilities) ? row.capabilities : {};
+  const capabilities = {};
+  let hasGenerationDeclaration = false;
+  const aliases = {
+    text_to_image: ['text_to_image', 'image.text2image'],
+    text_to_video: ['text_to_video', 'video.text2video'],
+    image_to_video: ['image_to_video', 'video.image2video'],
+  };
+  for (const [name, keys] of Object.entries(aliases)) {
+    if (keys.some((key) => Object.prototype.hasOwnProperty.call(legacy, key))) hasGenerationDeclaration = true;
+    if (keys.some((key) => legacy[key] === true || legacy[key] === 1 || legacy[key] === 'true')) {
+      capabilities[name] = true;
+    }
+  }
+
+  if (!hasGenerationDeclaration) {
+    if (row.type === 'image') capabilities.text_to_image = true;
+    else if (row.type === 'video') capabilities.text_to_video = true;
+  }
+
+  let type = Object.keys(capabilities).find((name) => capabilities[name]) || 'text';
+  if (capabilities.text_to_video) type = 'text_to_video';
+  else if (capabilities.image_to_video) type = 'image_to_video';
+  else if (capabilities.text_to_image) type = 'text_to_image';
+  if (!LOGICAL_CAPABILITY_TYPES.has(type)) type = 'text';
+  return { type, capabilities };
+}
+
 function logicalModel(row) {
   if (!row) return null;
   return {
@@ -27,7 +68,7 @@ function logicalModel(row) {
     display_name: row.display_name ?? null,
     type: row.type ?? null,
     enabled: row.enabled !== false,
-    ai_capabilities: row.ai_capabilities ?? {},
+    ai_capabilities: legacyCapabilityDoc(row),
     ai_parameter_schemas: row.ai_parameter_schemas ?? {},
     capability_version: Number.isFinite(row.capability_version) ? row.capability_version : 1,
     credit_cost: row.credit_cost != null ? Number(row.credit_cost) : null,
@@ -90,7 +131,8 @@ async function attachKeyPool(pg, providers) {
 /** 逻辑模型目录（用户只选逻辑模型；bindings 作为其线路）。 */
 async function listLogicalModels(pg, { includeBindings = true } = {}) {
   const mr = await pg.query('SELECT * FROM models WHERE enabled=true ORDER BY created_at');
-  const models = (mr.rows || []).map(logicalModel);
+  const modelRows = mr.rows || [];
+  const models = modelRows.map(logicalModel);
   if (!models.length) return models;
   const modelIds = models.map((m) => m.model_id);
   if (includeBindings) {
@@ -98,17 +140,35 @@ async function listLogicalModels(pg, { includeBindings = true } = {}) {
       'SELECT b.id, b.model_id, b.provider_id, b.upstream_model_name, b.enabled, b.priority, b.weight, m.endpoint, m.param_template, p.base_url, p.enabled AS p_enabled, p.name AS p_name FROM provider_model_bindings b LEFT JOIN models m ON m.model_id=b.model_id AND m.provider_id=b.provider_id AND m.enabled=true LEFT JOIN providers p ON p.id=b.provider_id WHERE b.model_id=ANY($1) AND b.enabled=true ORDER BY b.model_id, b.priority DESC, b.weight DESC',
       [modelIds],
     );
-    const providerIds = [...new Set((br.rows || []).map((x) => x.provider_id))];
+    const bindingRows = br.rows || [];
+    const modelIdsWithBindings = new Set(bindingRows.map((x) => x.model_id));
+    const legacyRows = modelRows.filter((row) => row.provider_id && !modelIdsWithBindings.has(row.model_id));
+    const providerIds = [...new Set([
+      ...bindingRows.map((x) => x.provider_id),
+      ...legacyRows.map((x) => x.provider_id),
+    ].filter(Boolean))];
     const pr = providerIds.length
       ? await pg.query('SELECT id, name, base_url, enabled FROM providers WHERE id=ANY($1)', [providerIds])
       : { rows: [] };
     const provById = new Map((pr.rows || []).map((x) => [x.id, x]));
     const byModel = {};
-    for (const row of br.rows || []) {
+    for (const row of bindingRows) {
       const binding = toBinding(row, row.endpoint ? { endpoint: row.endpoint, param_template: row.param_template } : {}, provById.get(row.provider_id) || {});
       if (binding) (byModel[row.model_id] = byModel[row.model_id] || []).push(binding);
     }
-    for (const m of models) m.provider_bindings = byModel[m.model_id] || [];
+    for (let i = 0; i < models.length; i += 1) {
+      const m = models[i];
+      if (!byModel[m.model_id] && legacyRows.includes(modelRows[i])) {
+        const row = modelRows[i];
+        const binding = toBinding(
+          { model_id: row.model_id, provider_id: row.provider_id, upstream_model_name: row.model_id, enabled: true },
+          { endpoint: row.endpoint, param_template: row.param_template },
+          provById.get(row.provider_id) || {},
+        );
+        if (binding) (byModel[m.model_id] = []).push(binding);
+      }
+      m.provider_bindings = byModel[m.model_id] || [];
+    }
   }
   return models;
 }
@@ -122,7 +182,21 @@ async function getLogicalModel(pg, modelId) {
     'SELECT b.id, b.model_id, b.provider_id, b.upstream_model_name, b.enabled, b.priority, b.weight, m.endpoint, m.param_template, p.base_url, p.enabled AS p_enabled FROM provider_model_bindings b LEFT JOIN models m ON m.model_id=b.model_id AND m.provider_id=b.provider_id AND m.enabled=true LEFT JOIN providers p ON p.id=b.provider_id WHERE b.model_id=$1 AND b.enabled=true ORDER BY b.priority DESC, b.weight DESC',
     [modelId],
   );
-  model.provider_bindings = (br.rows || []).map((x) => toBinding(x, x.endpoint ? { endpoint: x.endpoint, param_template: x.param_template } : {}, {}));
+  const bindingRows = br.rows || [];
+  if (bindingRows.length) {
+    model.provider_bindings = bindingRows.map((x) => toBinding(x, x.endpoint ? { endpoint: x.endpoint, param_template: x.param_template } : {}, {}));
+  } else if (row.provider_id) {
+    const pr = await pg.query('SELECT id, name, base_url, enabled FROM providers WHERE id=$1', [row.provider_id]);
+    const provider = pr.rows && pr.rows[0];
+    const binding = toBinding(
+      { model_id: row.model_id, provider_id: row.provider_id, upstream_model_name: row.model_id, enabled: true },
+      { endpoint: row.endpoint, param_template: row.param_template },
+      provider || {},
+    );
+    model.provider_bindings = binding ? [binding] : [];
+  } else {
+    model.provider_bindings = [];
+  }
   return model;
 }
 

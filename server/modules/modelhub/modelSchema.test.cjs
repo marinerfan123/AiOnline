@@ -17,6 +17,12 @@ test('G07: capability projection passes the G00 ModelCapability schema for video
   assert.equal(r.ok, true, JSON.stringify(r.errors));
 });
 
+test('G07: empty legacy image capabilities infer text2image from model type', () => {
+  const p = projectModelBinding({ model_id: 'legacy-image', type: 'image', capabilities: {} }, {});
+  assert.equal(p.capabilities['image.text2image'], true);
+  assert.equal(p.legacyCapabilities.text_to_image, true);
+});
+
 test('G07: param_template maps to dynamic ModelSchema properties (originalField retained)', () => {
   const row = {
     model_id: 'seedance-2.5',

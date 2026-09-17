@@ -45,6 +45,14 @@ function normalizeCapabilities(rawCapabilities = {}, raw = {}) {
     if (NUMERIC_KEYS.has(canonical)) out[canonical] = Number(cap[k]);
     else out[canonical] = Boolean(cap[k]);
   }
+  // Older rows often have an empty capabilities JSONB; preserve their model type
+  // as the minimum generation capability until the catalog migration completes.
+  const hasGenerationDeclaration = ['image.text2image', 'video.text2video', 'video.image2video']
+    .some((key) => Object.prototype.hasOwnProperty.call(out, key));
+  if (!hasGenerationDeclaration) {
+    if (raw.type === 'image') out['image.text2image'] = true;
+    else if (raw.type === 'video') out['video.text2video'] = true;
+  }
   for (const k of CANONICAL_KEYS) {
     if (k in out) continue;
     if (NUMERIC_KEYS.has(k)) out[k] = Number(raw[k] ?? 0);
