@@ -1,0 +1,25 @@
+services:
+  studio-worker:
+    container_name: www-moling-fun-studio-worker
+    image: www-moling-fun-app:latest
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      PG_HOST: postgres
+      PG_PORT: 5432
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      STUDIO_WORKER_TICK_MS: ${STUDIO_WORKER_TICK_MS:-1000}
+      STUDIO_WORKER_CONCURRENCY: ${STUDIO_WORKER_CONCURRENCY:-4}
+      STUDIO_WORKER_BATCH: ${STUDIO_WORKER_BATCH:-10}
+      STUDIO_WORKER_REAPER_MS: ${STUDIO_WORKER_REAPER_MS:-5000}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: ["node", "server/studio-worker.cjs"]
+    healthcheck:
+      disable: true
+    restart: unless-stopped

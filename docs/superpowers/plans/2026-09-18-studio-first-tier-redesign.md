@@ -154,5 +154,6 @@
 - `app` and `studio-worker` were recreated from `www-moling-fun-app:latest`; PostgreSQL and Redis were preserved.
 - `https://www.moling.fun/api/healthz`: HTTP 200 with `status: ok`, PostgreSQL, and Redis healthy.
 - Production bundle contains `studio-app-shell`, `studio-canvas-tool-rail`, and `studio-bottom-dock` markers.
+- `docker-compose.studio-worker.yml` disables the inherited app HTTP probe for the worker-only process; the worker is running without a false `unhealthy` state.
 
 **Post-review fixes:** Restored export in the immersive toolbar, kept the Studio project list scrollable, removed compact-rail overflow, retained mobile rail controls, synchronized inspector close state after deselection, and added keyboard-focus styles plus regression tests for export and compact library behavior.
