@@ -66,6 +66,20 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe('Inspector — Run 按钮禁用逻辑', () => {
+  it('多选节点时显示对齐与均匀分布操作，并把分布交给画布 store', () => {
+    useStudioStore.getState().loadGraph([
+      { ...makeNode('prompt-1', 'prompt'), position: { x: 0, y: 0 } },
+      { ...makeNode('prompt-2', 'prompt'), position: { x: 100, y: 0 } },
+      { ...makeNode('prompt-3', 'prompt'), position: { x: 500, y: 0 } },
+    ].map((n) => ({ ...n, selected: true })), []);
+    renderInspector();
+
+    expect(screen.getByTestId('inspector-distribute-horizontal')).toBeTruthy();
+    expect(screen.getByTestId('inspector-distribute-vertical')).toBeTruthy();
+    fireEvent.click(screen.getByTestId('inspector-distribute-horizontal'));
+    expect(useStudioStore.getState().nodes.map((n) => n.position.x)).toEqual([0, 250, 500]);
+  });
+
   it('选中 GENERATION（媒体）节点：Run 按钮可点，点击触发 FROM_NODE run（projectId/rev 自 store）', async () => {
     useStudioStore.getState().loadGraph([genNode()], []);
     renderInspector();

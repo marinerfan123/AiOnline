@@ -179,9 +179,10 @@ interface StudioState {
   selectAll: () => void;
   paste: () => void;
   alignSelection: (kind: 'left' | 'middle' | 'right') => void;
+  distributeSelection: (axis: 'horizontal' | 'vertical') => void;
   groupSelection: () => string | null;
   /** Empty-canvas starter: create a connected, executable workflow as one undoable action. */
-  createStarterWorkflow: (kind: 'image') => void;
+  createStarterWorkflow: (kind: 'image' | 'video') => void;
   /** W6④ — layered DAG auto-layout of all non-frame, non-locked nodes (undoable). */
   autoLayout: () => void;
   beginEdit: () => void;
@@ -553,6 +554,34 @@ export const useStudioStore = create<StudioState>((set, get) => ({
       };
     }),
 
+  distributeSelection: (axis) =>
+    set((st) => {
+      const selected = st.nodes.filter((n) => n.selected && n.data.nodeKind !== 'frame' && !isNodeLocked(st, n.id));
+      if (selected.length < 3) return st;
+      const valueOf = (n: StudioNode) => axis === 'horizontal' ? n.position.x : n.position.y;
+      const ordered = [...selected].sort((a, b) => valueOf(a) - valueOf(b));
+      const first = valueOf(ordered[0]);
+      const last = valueOf(ordered[ordered.length - 1]);
+      const step = (last - first) / (ordered.length - 1);
+      const positions = new Map(ordered.map((n, index) => [n.id, first + step * index]));
+      const { undoStack, redoStack } = pushUndo(st, snapshot(st));
+      return {
+        ...st,
+        undoStack,
+        redoStack,
+        nodes: st.nodes.map((n) => {
+          const next = positions.get(n.id);
+          if (next == null) return n;
+          return {
+            ...n,
+            position: axis === 'horizontal'
+              ? { ...n.position, x: next }
+              : { ...n.position, y: next },
+          };
+        }),
+      };
+    }),
+
   groupSelection: () => {
     const s = get();
     const selected = s.nodes.filter((n) => n.selected && n.data.nodeKind !== 'frame');
@@ -585,18 +614,19 @@ export const useStudioStore = create<StudioState>((set, get) => ({
   },
 
   createStarterWorkflow: (kind) => {
-    if (kind !== 'image') return;
     const s = get();
     // This action is intentionally empty-canvas-only: a starter must never
     // overwrite or silently merge into the user's existing graph.
     if (s.nodes.length > 0 || s.edges.length > 0) return;
 
     const promptDef = getNodeDef('prompt')!;
-    const imageDef = getNodeDef('image-generation')!;
+    const middleKind = kind === 'video' ? 'text-to-video' : 'image-generation';
+    const middleDef = getNodeDef(middleKind)!;
     const outputDef = getNodeDef('output')!;
     const promptId = mintNodeId('prompt');
-    const imageId = mintNodeId('image-generation');
+    const middleId = mintNodeId(middleKind);
     const outputId = mintNodeId('output');
+    const outputPort = middleDef.outputPorts[0];
     const nodes: StudioNode[] = [
       {
         id: promptId,
@@ -607,11 +637,11 @@ export const useStudioStore = create<StudioState>((set, get) => ({
         selected: true,
       },
       {
-        id: imageId,
+        id: middleId,
         type: 'studio',
         position: { x: -80, y: -80 },
-        data: { ...imageDef.defaultData, title: imageDef.title },
-        width: imageDef.width,
+        data: { ...middleDef.defaultData, title: middleDef.title },
+        width: middleDef.width,
         selected: false,
       },
       {
@@ -624,12 +654,15 @@ export const useStudioStore = create<StudioState>((set, get) => ({
       },
     ];
     const edges: StudioEdge[] = [
-      buildEdge({ source: promptId, sourceHandle: 'text', target: imageId, targetHandle: 'text' }, 'TEXT'),
-      buildEdge({ source: imageId, sourceHandle: 'image', target: outputId, targetHandle: 'image' }, 'IMAGE'),
+      buildEdge({ source: promptId, sourceHandle: 'text', target: middleId, targetHandle: 'text' }, 'TEXT'),
+      buildEdge(
+        { source: middleId, sourceHandle: outputPort.id, target: outputId, targetHandle: outputPort.id },
+        outputPort.type,
+      ),
     ];
     set({
       ...pushUndo(s, snapshot(s)),
-      nodes: recomputeStatus(nodes, [promptId, imageId, outputId], edges),
+      nodes: recomputeStatus(nodes, [promptId, middleId, outputId], edges),
       edges,
     });
   },

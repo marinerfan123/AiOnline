@@ -278,3 +278,24 @@ describe('G05 selection-shortcut wiring — select all / duplicate / group', () 
     expect(st.nodes.some((n) => n.data.nodeKind === 'frame')).toBe(true);
   });
 });
+
+describe('Canvas command palette shortcut', () => {
+  it('Ctrl/Cmd+K opens the palette but the same shortcut in its search field is ignored', () => {
+    fireEvent.keyDown(window, { key: 'k', ctrlKey: true });
+    expect(screen.getByTestId('canvas-command-palette')).toBeTruthy();
+
+    const input = screen.getByTestId('canvas-command-input');
+    fireEvent.keyDown(input, { key: 'k', ctrlKey: true });
+    expect(screen.getByTestId('canvas-command-palette')).toBeTruthy();
+
+    fireEvent.keyDown(input, { key: 'Escape' });
+    expect(screen.queryByTestId('canvas-command-palette')).toBeNull();
+  });
+
+  it('Escape closes the palette even after focus leaves its search field', () => {
+    fireEvent.keyDown(window, { key: 'k', ctrlKey: true });
+    expect(screen.getByTestId('canvas-command-palette')).toBeTruthy();
+    fireEvent.keyDown(window, { key: 'Escape' });
+    expect(screen.queryByTestId('canvas-command-palette')).toBeNull();
+  });
+});

@@ -23,6 +23,7 @@ import {
 } from './store';
 import { StudioNodeComponent } from './StudioNode';
 import { NodePreviewModal } from './NodePreviewModal';
+import { CanvasCommandPalette, type CanvasCommand } from './CanvasCommandPalette';
 import { PresenceBar } from './PresenceBar';
 import { useCanvasPresence } from './useCanvasPresence';
 import { NODE_DEFS_LIST, canConnectToPort, getNodeDef } from './registry';
@@ -30,7 +31,7 @@ import type { StudioNodeKind } from './types';
 import type { PortType } from './types';
 import { Button } from '@/shared/ui/v2/Button';
 import { IconButton } from '@/shared/ui/v2/IconButton';
-import { Undo2, Redo2, Maximize2, Scan, X, Copy, Trash2 } from "lucide-react";
+import { Undo2, Redo2, Maximize2, Scan, LocateFixed, Command, X, Copy, Trash2, Network } from "lucide-react";
 
 const nodeTypes: NodeTypes = { studio: StudioNodeComponent };
 
@@ -158,14 +159,17 @@ function InvalidConnectionToast() {
   );
 }
 
-function EmptyState({ onAdd, onCreateWorkflow }: { onAdd: (k: StudioNodeKind) => void; onCreateWorkflow: () => void }) {
+function EmptyState({ onAdd, onCreateWorkflow }: { onAdd: (k: StudioNodeKind) => void; onCreateWorkflow: (kind: 'image' | 'video') => void }) {
   return (
     <div data-test="studio-empty-state" className="pointer-events-none absolute inset-0 grid place-items-center">
       <div className="pointer-events-auto w-[26rem] rounded-xl border border-ml2-border bg-ml2-surface-1/95 p-5 text-center shadow-xl backdrop-blur">
         <h2 className="text-sm font-semibold text-ml2-text">开始创作</h2>
         <p className="mt-1 text-[11px] text-ml2-text-3">直接建立一条可编辑的图像生成链，或从单个节点开始。</p>
-        <Button size="sm" variant="primary" data-test="empty-create-image-workflow" className="mt-4 w-full" onClick={onCreateWorkflow}>
+        <Button size="sm" variant="primary" data-test="empty-create-image-workflow" className="mt-4 w-full" onClick={() => onCreateWorkflow('image')}>
           一键创建图像工作流
+        </Button>
+        <Button size="sm" variant="secondary" data-test="empty-create-video-workflow" className="mt-2 w-full" onClick={() => onCreateWorkflow('video')}>
+          一键创建文生视频工作流
         </Button>
         <div className="mt-2 grid grid-cols-3 gap-1.5">
           <Button size="sm" variant="secondary" data-test="empty-add-prompt" onClick={() => onAdd('prompt')}>提示词</Button>
@@ -196,6 +200,7 @@ function CanvasCore({ projectId, canvasRevision }: { projectId?: string; canvasR
   const copySelection = useStudioStore((s) => s.copySelection);
   const selectAll = useStudioStore((s) => s.selectAll);
   const paste = useStudioStore((s) => s.paste);
+  const autoLayout = useStudioStore((s) => s.autoLayout);
   const onNodeDragStart = useStudioStore((s) => s.onNodeDragStart);
   const onNodeDragStop = useStudioStore((s) => s.onNodeDragStop);
   const onViewportChange = useStudioStore((s) => s.onViewportChange);
@@ -205,6 +210,7 @@ function CanvasCore({ projectId, canvasRevision }: { projectId?: string; canvasR
   } | null>(null);
   // W2: double-clicked node → NodePreviewModal (output preview / download / re-run).
   const [previewNode, setPreviewNode] = useState<StudioNode | null>(null);
+  const [paletteOpen, setPaletteOpen] = useState(false);
   const { screenToFlowPosition, fitView } = useReactFlow();
   const canvasRef = useRef<HTMLDivElement>(null);
 
@@ -271,6 +277,28 @@ function CanvasCore({ projectId, canvasRevision }: { projectId?: string; canvasR
     };
   }, [addAtCenter]);
 
+  const fitSelected = useCallback(() => {
+    const selectedIds = useStudioStore.getState().nodes.filter((n) => n.selected).map((n) => n.id);
+    if (selectedIds.length > 0) {
+      fitView({ nodes: selectedIds.map((id) => ({ id })), padding: 0.3, maxZoom: 1.5, duration: 250 });
+    } else {
+      fitView({ padding: 0.15, duration: 250 });
+    }
+  }, [fitView]);
+
+  const paletteCommands = useMemo<CanvasCommand[]>(() => [
+    { id: 'add-prompt', label: '添加提示词节点', description: '在当前视口中心创建 Prompt 节点', keywords: 'node create prompt text', icon: <Command className="size-3.5" />, action: () => addAtCenter('prompt') },
+    { id: 'add-reference', label: '添加参考素材节点', description: '创建 Reference 节点并绑定素材', keywords: 'node create asset reference', icon: <Command className="size-3.5" />, action: () => addAtCenter('reference') },
+    { id: 'add-image-generation', label: '添加图像生成节点', description: '创建 Image Generation 节点', keywords: 'node create image generate', icon: <Command className="size-3.5" />, action: () => addAtCenter('image-generation') },
+    { id: 'add-video-generation', label: '添加文生视频节点', description: '创建 Text-to-Video 节点', keywords: 'node create video generate', icon: <Command className="size-3.5" />, action: () => addAtCenter('text-to-video') },
+    { id: 'fit-all', label: '适应全部节点', description: '将整个工作流放入当前视口', keywords: 'view zoom fit', shortcut: 'Shift+F', icon: <Maximize2 className="size-3.5" />, action: () => fitView({ padding: 0.15, duration: 250 }) },
+    { id: 'fit-selected', label: '定位选中节点', description: '没有选中节点时自动适应全部', keywords: 'view zoom focus', shortcut: 'F', icon: <LocateFixed className="size-3.5" />, action: fitSelected },
+    { id: 'auto-layout', label: '自动布局工作流', description: '按 DAG 层级整理未锁定节点', keywords: 'layout arrange dag', icon: <Network className="size-3.5" />, action: autoLayout },
+    { id: 'select-all', label: '选择全部节点', description: '选择画布中的所有节点', keywords: 'selection all', shortcut: 'Ctrl/Cmd+A', icon: <Command className="size-3.5" />, action: selectAll },
+    { id: 'duplicate', label: '复制选中节点', description: '保留内部连线并偏移复制', keywords: 'copy duplicate selection', shortcut: 'Ctrl/Cmd+D', icon: <Copy className="size-3.5" />, action: duplicateSelection },
+    { id: 'group', label: '将选中节点成组', description: '用 Frame 包裹至少两个节点', keywords: 'group frame selection', shortcut: 'Ctrl/Cmd+G', icon: <Command className="size-3.5" />, action: () => useStudioStore.getState().groupSelection() },
+  ], [addAtCenter, autoLayout, duplicateSelection, fitSelected, fitView, selectAll]);
+
   // keyboard shortcuts (canvas-scoped; text inputs keep native editing)
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -278,10 +306,12 @@ function CanvasCore({ projectId, canvasRevision }: { projectId?: string; canvasR
       const inField = t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable;
       if (e.key === 'Escape') {
         setMenu(null);
+        setPaletteOpen(false);
         return;
       }
       if (inField) return; // never fight text editing (native undo/copy/delete)
       const mod = e.ctrlKey || e.metaKey;
+      if (mod && e.key.toLowerCase() === 'k') { e.preventDefault(); setPaletteOpen((open) => !open); return; }
       if (mod && e.key.toLowerCase() === 'z') { e.preventDefault(); if (e.shiftKey) redo(); else undo(); return; }
       if (mod && e.key.toLowerCase() === 'y') { e.preventDefault(); redo(); return; }
       if (mod && e.key.toLowerCase() === 'a') { e.preventDefault(); selectAll(); return; }
@@ -293,9 +323,8 @@ function CanvasCore({ projectId, canvasRevision }: { projectId?: string; canvasR
       // G02 canvas input contract (Blueprint 02 §3): F = fit selected, Shift+F = fit all.
       if (!mod && e.key.toLowerCase() === 'f') {
         e.preventDefault();
-        const selectedIds = useStudioStore.getState().nodes.filter((n) => n.selected).map((n) => n.id);
-        if (!e.shiftKey && selectedIds.length > 0) {
-          fitView({ nodes: selectedIds.map((id) => ({ id })), padding: 0.3, maxZoom: 1.5, duration: 250 });
+        if (!e.shiftKey) {
+          fitSelected();
         } else {
           fitView({ padding: 0.15, duration: 250 });
         }
@@ -304,7 +333,7 @@ function CanvasCore({ projectId, canvasRevision }: { projectId?: string; canvasR
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [undo, redo, duplicateSelection, copySelection, paste, removeSelection, selectAll, fitView]);
+  }, [undo, redo, duplicateSelection, copySelection, paste, removeSelection, selectAll, fitSelected, fitView]);
 
   return (
     <div ref={canvasRef} data-test="studio-canvas" className="relative h-full w-full">
@@ -415,17 +444,25 @@ function CanvasCore({ projectId, canvasRevision }: { projectId?: string; canvasR
         <IconButton data-test="canvas-duplicate" label="快速复制 (Ctrl+D)" size="sm" onClick={duplicateSelection}><Copy className="size-3.5" /></IconButton>
         <IconButton data-test="canvas-delete" label="删除 (Del)" size="sm" onClick={removeSelection}><Trash2 className="size-3.5" /></IconButton>
         <span className="mx-0.5 h-4 w-px bg-ml2-border" />
+        <IconButton data-test="canvas-command-palette-trigger" label="命令面板 (Ctrl/Cmd+K)" size="sm" onClick={() => setPaletteOpen(true)}><Command className="size-3.5" /></IconButton>
         <IconButton data-test="canvas-fit" label="适应全部 (zoom-to-fit)" size="sm" onClick={() => fitView({ padding: 0.15 })}><Maximize2 className="size-3.5" /></IconButton>
+        <IconButton data-test="canvas-fit-selected" label="定位选中节点 (F)" size="sm" onClick={fitSelected}><LocateFixed className="size-3.5" /></IconButton>
         <IconButton data-test="canvas-reset-viewport" label="重置视口" size="sm" onClick={() => fitView({ padding: 0.05, duration: 200 })}><Scan className="size-3.5" /></IconButton>
       </div>
+
+      <div data-test="canvas-interaction-hint" className="pointer-events-none absolute left-1/2 top-12 z-30 -translate-x-1/2 rounded-full border border-ml2-border/70 bg-ml2-surface-1/80 px-3 py-1 text-[10px] text-ml2-text-3 shadow-sm backdrop-blur">
+        空格 + 拖拽平移 · 滚轮缩放 · 双击空白添加 · F 定位选中 · Ctrl/Cmd+K 命令
+      </div>
+
+      <CanvasCommandPalette open={paletteOpen} commands={paletteCommands} onClose={() => setPaletteOpen(false)} />
 
       <InvalidConnectionToast />
       <PresenceBar peers={presence.peers} />
       {nodes.length === 0 && (
         <EmptyState
           onAdd={addAtCenter}
-          onCreateWorkflow={() => {
-            createStarterWorkflow('image');
+          onCreateWorkflow={(kind) => {
+            createStarterWorkflow(kind);
             requestAnimationFrame(() => fitView({ padding: 0.18, duration: 250, maxZoom: 1 }));
           }}
         />

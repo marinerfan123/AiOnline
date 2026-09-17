@@ -12,7 +12,7 @@
 
 import { useEffect, useMemo } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { Trash2, Copy, Group, AlignStartVertical, AlignCenterVertical, AlignEndVertical, Play, Network } from 'lucide-react';
+import { Trash2, Copy, Group, AlignStartVertical, AlignCenterVertical, AlignEndVertical, AlignHorizontalSpaceBetween, AlignVerticalSpaceBetween, Play, Network } from 'lucide-react';
 import { useStudioStore } from './store';
 import { getNodeDef } from './registry';
 import { NodeIcon } from './NodeIcon';
@@ -60,6 +60,7 @@ export function Inspector({
   const duplicateSelection = useStudioStore((s) => s.duplicateSelection);
   const copySelection = useStudioStore((s) => s.copySelection);
   const alignSelection = useStudioStore((s) => s.alignSelection);
+  const distributeSelection = useStudioStore((s) => s.distributeSelection);
   const groupSelection = useStudioStore((s) => s.groupSelection);
   const autoLayout = useStudioStore((s) => s.autoLayout);
   const setRunContext = useStudioStore((s) => s.setRunContext);
@@ -174,6 +175,8 @@ export function Inspector({
                 <Button size="sm" variant="secondary" data-test="inspector-align-left" onClick={() => alignSelection('left')}><AlignStartVertical className="size-3" />左对齐</Button>
                 <Button size="sm" variant="secondary" data-test="inspector-align-middle" onClick={() => alignSelection('middle')}><AlignCenterVertical className="size-3" />水平居中</Button>
                 <Button size="sm" variant="secondary" data-test="inspector-align-right" onClick={() => alignSelection('right')}><AlignEndVertical className="size-3" />右对齐</Button>
+                <Button size="sm" variant="secondary" data-test="inspector-distribute-horizontal" onClick={() => distributeSelection('horizontal')}><AlignHorizontalSpaceBetween className="size-3" />横向分布</Button>
+                <Button size="sm" variant="secondary" data-test="inspector-distribute-vertical" onClick={() => distributeSelection('vertical')}><AlignVerticalSpaceBetween className="size-3" />纵向分布</Button>
                 <Button size="sm" variant="secondary" data-test="inspector-group" onClick={groupSelection}><Group className="size-3" />成组</Button>
               </div>
             </Section>

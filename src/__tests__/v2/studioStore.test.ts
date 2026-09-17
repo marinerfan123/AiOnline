@@ -160,6 +160,19 @@ describe('画布起步工作流 — 一键创建可执行图像链', () => {
     expect(st().edges).toHaveLength(0);
   });
 
+  it('空画布可以创建 Prompt→Text-to-Video→Output 起步模板', () => {
+    const st = () => useStudioStore.getState();
+
+    st().createStarterWorkflow('video');
+
+    expect(st().nodes.map((n) => n.data.nodeKind)).toEqual(['prompt', 'text-to-video', 'output']);
+    expect(st().edges.map((e) => [e.sourceHandle, e.targetHandle])).toEqual([
+      ['text', 'text'],
+      ['video', 'video'],
+    ]);
+    expect(st().undoStack).toHaveLength(1);
+  });
+
   it('非空画布拒绝覆盖已有内容', () => {
     const st = () => useStudioStore.getState();
     st().addNode('text', { x: 0, y: 0 });

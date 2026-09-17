@@ -209,6 +209,37 @@ describe('Canvas session store — operations', () => {
     expect(xs[1]).toBe(100);
   });
 
+  it('distributeSelection spaces selected nodes evenly without moving the outer nodes', () => {
+    useStudioStore.setState({
+      nodes: [
+        node('prompt', 'a', 0, 40, { selected: true }),
+        node('prompt', 'b', 100, 80, { selected: true }),
+        node('prompt', 'c', 500, 120, { selected: true }),
+      ],
+    });
+    useStudioStore.getState().distributeSelection('horizontal');
+    const st = useStudioStore.getState();
+    expect(st.nodes.map((n) => n.position.x)).toEqual([0, 250, 500]);
+    expect(st.nodes.map((n) => n.position.y)).toEqual([40, 80, 120]);
+    expect(st.undoStack).toHaveLength(1);
+  });
+
+  it('distributeSelection supports vertical spacing and is a no-op for fewer than three nodes', () => {
+    useStudioStore.setState({
+      nodes: [
+        node('prompt', 'a', 20, 10, { selected: true }),
+        node('prompt', 'b', 40, 100, { selected: true }),
+        node('prompt', 'c', 60, 400, { selected: true }),
+      ],
+    });
+    useStudioStore.getState().distributeSelection('vertical');
+    expect(useStudioStore.getState().nodes.map((n) => n.position.y)).toEqual([10, 205, 400]);
+
+    useStudioStore.setState({ nodes: [node('prompt', 'only', 0, 0, { selected: true })], undoStack: [] });
+    useStudioStore.getState().distributeSelection('horizontal');
+    expect(useStudioStore.getState().undoStack).toHaveLength(0);
+  });
+
   it('groupSelection wraps the selection in a frame and clears prior selection', () => {
     useStudioStore.setState({
       nodes: [
