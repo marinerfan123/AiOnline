@@ -108,6 +108,15 @@ describe('StudioComposer commit() — 写 schema 参数 (M05-B2 HIGH)', () => {
 });
 
 describe('StudioComposer — Generate dispatch', () => {
+  it('native model select keeps the browser menu on the dark theme', () => {
+    reset([node('image-generation', 'g1', { selected: true })]);
+    render(<StudioComposer />);
+
+    const select = document.querySelector('[data-test="composer-model-select"]') as HTMLSelectElement;
+    expect(select.style.colorScheme).toBe('dark');
+    expect(select.querySelector('option')?.className).toContain('bg-ml2-surface-1');
+  });
+
   it('保存提示词后通过 runNode 触发一次 FROM_NODE 运行', async () => {
     const generation = node('image-generation', 'g1', {
       selected: true,

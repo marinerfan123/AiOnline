@@ -251,11 +251,12 @@ export function StudioComposer({ projectId, canvasRevision, flushNow }: { projec
                 flushRef.current && window.clearTimeout(flushRef.current);
                 flushRef.current = window.setTimeout(flush, 800);
               }}
+              style={{ colorScheme: 'dark' }}
               className="min-w-0 flex-1 rounded-lg border border-ml2-border bg-ml2-surface-0 px-2 py-1 text-[11px] text-ml2-text outline-none focus:border-ml2-accent/60"
             >
-              {capableModels.length === 0 && <option value="">{modelName || '模型列表加载中 / 无可用模型'}</option>}
+              {capableModels.length === 0 && <option value="" className="bg-ml2-surface-1 text-ml2-text">{modelName || '模型列表加载中 / 无可用模型'}</option>}
               {capableModels.map((m) => (
-                <option key={m.bindingId} value={m.bindingId}>{m.name}</option>
+                <option key={m.bindingId} value={m.bindingId} className="bg-ml2-surface-1 text-ml2-text">{m.name}</option>
               ))}
             </select>
           </div>
@@ -285,14 +286,15 @@ export function StudioComposer({ projectId, canvasRevision, flushNow }: { projec
                     const pick = opts.find((o) => `${o.entityType}:${o.entityId}` === e.target.value);
                     chooseBinding(r.token, pick ?? null);
                   }}
+                  style={{ colorScheme: 'dark' }}
                   className={cn(
                     'max-w-52 cursor-pointer rounded-full border px-2 py-px text-[10px] outline-none',
                     bound ? 'border-ml2-accent/60 bg-ml2-accent/20 text-ml2-accent' : 'border-ml2-border bg-ml2-surface-1 text-ml2-text-2',
                   )}
                 >
-                  <option value="">@{r.token}（未绑定）</option>
+                  <option value="" className="bg-ml2-surface-1 text-ml2-text">@{r.token}（未绑定）</option>
                   {opts.map((o, oi) => (
-                    <option key={`${o.entityType}:${o.entityId}-${oi}`} value={`${o.entityType}:${o.entityId}`}>
+                    <option key={`${o.entityType}:${o.entityId}-${oi}`} value={`${o.entityType}:${o.entityId}`} className="bg-ml2-surface-1 text-ml2-text">
                       {o.entityType} / {o.canonicalName ?? r.token}
                     </option>
                   ))}
