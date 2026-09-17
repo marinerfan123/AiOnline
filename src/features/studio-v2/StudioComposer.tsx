@@ -56,7 +56,7 @@ function primaryTextParameterKey(kind: string): string | null {
   }
 }
 
-export function StudioComposer({ projectId, canvasRevision }: { projectId?: string; canvasRevision?: number | null }) {
+export function StudioComposer({ projectId, canvasRevision, flushNow }: { projectId?: string; canvasRevision?: number | null; flushNow?: () => Promise<number | null> }) {
   const nodes = useStudioStore((s) => s.nodes);
   const beginEdit = useStudioStore((s) => s.beginEdit);
   const endEdit = useStudioStore((s) => s.endEdit);
@@ -210,6 +210,15 @@ export function StudioComposer({ projectId, canvasRevision }: { projectId?: stri
         ? { ok: false as const, note: '请输入提示词' }
         : null;
 
+
+  const handleGenerate = async () => {
+    if (!node) return;
+    flush();
+    const savedRevision = flushNow ? await flushNow() : (canvasRevision ?? null);
+    if (savedRevision == null) return;
+    setRunContext(projectId ?? null, savedRevision);
+    await runNode(node.id);
+  };
   if (state === 'NO_SELECTION') {
     return (
       <div data-test="studio-composer" className="pointer-events-none absolute inset-x-0 bottom-3 z-30 flex justify-center">
@@ -325,7 +334,7 @@ export function StudioComposer({ projectId, canvasRevision }: { projectId?: stri
           <button
             data-test="composer-generate"
             disabled={!isGeneration || text.trim().length === 0}
-            onClick={() => { flush(); if (node) void runNode(node.id); }}
+            onClick={() => { void handleGenerate(); }}
             title={isGeneration ? '保存提示词并运行当前生成节点' : '仅生成类节点可执行'}
             className="flex items-center gap-1.5 rounded-xl bg-ml2-accent px-3 py-1.5 text-[11px] font-medium text-black enabled:hover:brightness-110 disabled:opacity-40"
           >

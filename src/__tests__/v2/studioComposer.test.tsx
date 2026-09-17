@@ -117,15 +117,17 @@ describe('StudioComposer — Generate dispatch', () => {
     useStudioStore.setState({ projectId: 'p1', canvasRevision: 3 });
     mocks.runNode.mockResolvedValue({ runId: 'run-1', status: 'QUEUED' });
 
-    render(<StudioComposer projectId="p1" canvasRevision={3} />);
+    const flushNow = vi.fn().mockResolvedValue(4);
+    render(<StudioComposer projectId="p1" canvasRevision={3} flushNow={flushNow} />);
     fireEvent.change(screen.getByRole('textbox'), { target: { value: 'new prompt' } });
     fireEvent.click(screen.getByRole('button', { name: '生成' }));
 
     await waitFor(() => expect(mocks.runNode).toHaveBeenCalledTimes(1));
+    expect(flushNow).toHaveBeenCalledTimes(1);
     expect(mocks.runNode).toHaveBeenCalledWith({
       projectId: 'p1',
       nodeId: 'g1',
-      canvasRevision: 3,
+      canvasRevision: 4,
     });
   });
 });

@@ -33,10 +33,9 @@ export function useStudioCanvasPersistence(projectId: string, enabled = true) {
   const suppressRef = useRef(false);
   const blockedRef = useRef(false);
   const conflictRef = useRef<ResolvedConflict | null>(null);
-  // F2: single-flight mutex + pending flag so concurrent flush requests are
-  // serialized instead of racing with a stale baseRevision (self-inflicted 409).
-  const inFlightRef = useRef(false);
-  const pendingFlushRef = useRef(false);
+  // F2: single-flight promise so concurrent flush requests serialize instead
+  // of racing with a stale baseRevision (self-inflicted 409).
+  const inFlightRef = useRef<Promise<number | null> | null>(null);
   const prevNodesRef = useRef(new Map<string, string>());
   const prevEdgesRef = useRef(new Map<string, string>());
   const prevViewportRef = useRef('');
@@ -56,6 +55,7 @@ export function useStudioCanvasPersistence(projectId: string, enabled = true) {
     setLastSavedAt(new Date().toISOString());
     setStatus('Saved');
     markClean(useStudioStore.getState().nodes, useStudioStore.getState().edges, useStudioStore.getState().viewport);
+    return rev;
   };
 
   // Enter the blocked conflict state WITHOUT dropping the retained buffer —
@@ -95,15 +95,15 @@ export function useStudioCanvasPersistence(projectId: string, enabled = true) {
     }
   };
 
-  const doFlush = async () => {
-    if (blockedRef.current || !projectId || revisionRef.current == null) return;
-    if (bufferRef.current.isEmpty()) return;
+  const doFlush = async (): Promise<number | null> => {
+    if (blockedRef.current || !projectId || revisionRef.current == null) return revisionRef.current;
+    if (bufferRef.current.isEmpty()) return revisionRef.current;
     setStatus('Saving');
 
     const cmid = mutationId();
     const first = await attempt(revisionRef.current, cmid);
 
-    if (first.ok) { commitAndSave(first.res, first.patch); return; }
+    if (first.ok) return commitAndSave(first.res, first.patch);
 
     if (first.conflict) {
       // F1: server has moved past our base. Keep the uncommitted buffer and
@@ -122,45 +122,41 @@ export function useStudioCanvasPersistence(projectId: string, enabled = true) {
       // client path yet (never 409s today) and falls through to the F1 retry.
       if (conflictClientMode(first.conflict.kindPolicy) === 'reload' && first.conflict.kindPolicy !== undefined) {
         enterConflict(first.conflict);
-        return;
+        return null;
       }
       const rebased = await attempt(first.conflict.serverRevision, mutationId());
-      if (rebased.ok) { commitAndSave(rebased.res, rebased.patch); return; }
+      if (rebased.ok) return commitAndSave(rebased.res, rebased.patch);
       if (rebased.conflict) {
         // Still conflicting: enter conflict state, but KEEP the buffer so the
         // user's local edits survive for a later retry.
         enterConflict(rebased.conflict);
-        return;
+        return null;
       }
       setStatus(navigator.onLine === false ? 'Offline' : 'Save failed');
-      return;
+      return null;
     }
 
     // Non-conflict failure (network, transient): retry once with the SAME
     // clientMutationId so the server's idempotency guard dedupes a patch that
     // committed but lost its response (F2).
     const retried = await attempt(revisionRef.current, cmid);
-    if (retried.ok) { commitAndSave(retried.res, retried.patch); return; }
+    if (retried.ok) return commitAndSave(retried.res, retried.patch);
     setStatus(navigator.onLine === false ? 'Offline' : 'Save failed');
+    return null;
   };
 
   // F2 serialization gate: at most one flush in flight. A flush requested while
   // one is running is queued and re-run after the current one settles.
-  const flush = () => {
-    if (blockedRef.current) return;
-    if (inFlightRef.current) { pendingFlushRef.current = true; return; }
-    inFlightRef.current = true;
-    void (async () => {
-      try {
-        await doFlush();
-      } finally {
-        inFlightRef.current = false;
-        if (pendingFlushRef.current && !blockedRef.current) {
-          pendingFlushRef.current = false;
-          flush();
-        }
-      }
-    })();
+  const flush = (): Promise<number | null> => {
+    if (blockedRef.current) return Promise.resolve(null);
+    const previous = inFlightRef.current ?? Promise.resolve(revisionRef.current);
+    const next = previous.then(() => (blockedRef.current ? null : doFlush()));
+    let settled: Promise<number | null>;
+    settled = next.finally(() => {
+      if (inFlightRef.current === settled) inFlightRef.current = null;
+    });
+    inFlightRef.current = settled;
+    return settled;
   };
 
   const schedule = () => {
@@ -246,5 +242,5 @@ export function useStudioCanvasPersistence(projectId: string, enabled = true) {
     flush();
   };
 
-  return { status, revision, lastSavedAt, conflict, retry, reloadFromServer };
+  return { status, revision, lastSavedAt, conflict, retry, reloadFromServer, flush };
 }
