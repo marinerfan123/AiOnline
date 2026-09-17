@@ -74,7 +74,7 @@
 - [x] Step 2: Update scoped canvas styles for the modal, toolbar, and focus states.
 - [x] Step 3: Run all Studio tests, typecheck, lint, and production build (all passed; ESLint reports 21 pre-existing warnings).
 - [x] Step 4: Review the diff with a fresh code reviewer; no Critical/Important findings. Also fixed the review's Minor focus-management and locked-alignment issues.
-- [x] Step 5: Commit, push the tested branch, deploy through the existing server workflow, and verify the public Studio route plus the affected Run status behavior.
+- [x] Step 5: Commit, push the tested branch, deploy through the existing server workflow, and verify the public Studio route plus app/worker health (no generation Run was triggered by this canvas-only release).
 
 ## Research Notes
 
