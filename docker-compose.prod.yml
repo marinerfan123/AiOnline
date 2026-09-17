@@ -31,6 +31,10 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+    # Linux Docker does not provide host.docker.internal automatically.
+    # Map it to the host so the configured external PostgreSQL remains reachable.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       NODE_ENV: production
       PORT: 3001
