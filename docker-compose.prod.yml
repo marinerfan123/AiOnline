@@ -43,6 +43,7 @@ services:
       PG_DATABASE: ${PG_DATABASE:-huabu}
       PG_USER: ${PG_USER:?PG_USER is required}
       PG_PASSWORD: ${PG_PASSWORD:?PG_PASSWORD is required}
+      PG_SSLMODE: ${PG_SSLMODE:-disable}
       PG_POOL_MAX: ${PG_POOL_MAX:-20}
       REDIS_HOST: redis
       REDIS_PORT: 6379
