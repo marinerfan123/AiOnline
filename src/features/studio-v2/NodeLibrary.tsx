@@ -76,7 +76,7 @@ export function NodeLibrary({ onAdd }: NodeLibraryProps) {
   return (
     <aside
       data-test="studio-node-library"
-      className={cn('studio-rail studio-node-library flex h-full shrink-0 flex-col border-r border-ml2-border bg-ml2-surface-1', expanded ? 'w-52 2xl:w-60' : 'w-14')}
+      className={cn('studio-rail studio-node-library flex h-full shrink-0 flex-col border-r border-ml2-border bg-ml2-surface-1', expanded ? 'is-expanded w-52 2xl:w-60' : 'is-collapsed w-14')}
     >
       <div className={cn('studio-rail-header border-b border-ml2-border px-3 pb-3 pt-3', !expanded && 'px-2')}>
         <div className={cn('flex items-center justify-between', expanded ? 'mb-3' : 'mb-0 justify-center')}>
@@ -96,7 +96,7 @@ export function NodeLibrary({ onAdd }: NodeLibraryProps) {
             aria-label={expanded ? '收起节点库' : '展开节点库'}
             title={expanded ? '收起节点库' : '展开节点库'}
             onClick={() => setExpanded((value) => !value)}
-            className={cn('grid size-7 place-items-center rounded-lg text-ml2-text-3 hover:bg-ml2-surface-3 hover:text-ml2-text', expanded && 'ml-1')}
+            className={cn('grid size-7 place-items-center rounded-lg text-ml2-text-3 hover:bg-ml2-surface-3 hover:text-ml2-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ml2-accent/70', expanded && 'ml-1')}
           >
             {expanded ? <PanelLeftClose className="size-3.5" /> : <PanelLeftOpen className="size-3.5" />}
           </button>
@@ -140,9 +140,9 @@ export function NodeLibrary({ onAdd }: NodeLibraryProps) {
           );
         })}
       </div>
-      <div className={cn('studio-rail-footer border-t border-ml2-border px-3 py-2 text-[10px] text-ml2-text-3')}>
-        拖拽或点击添加 · 节点来自 Node Registry
-      </div>
+      {expanded && <div className="studio-rail-footer border-t border-ml2-border px-3 py-2 text-[10px] text-ml2-text-3">
+          拖拽或点击添加 · 节点来自 Node Registry
+        </div>}
     </aside>
   );
 }

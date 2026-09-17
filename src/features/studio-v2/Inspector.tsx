@@ -82,6 +82,7 @@ export function Inspector({
 
   useEffect(() => {
     if (selected.length > 0 || showingShot) setPanelOpen(true);
+    else setPanelOpen(false);
   }, [selected.length, showingShot]);
 
   // W1② run button state: only GENERATION nodes are runnable (media producers);
@@ -157,7 +158,7 @@ export function Inspector({
           aria-label={panelOpen ? '收起检查器' : '展开检查器'}
           title={panelOpen ? '收起检查器' : '展开检查器'}
           onClick={() => setPanelOpen((value) => !value)}
-          className={cn('grid size-7 place-items-center rounded-lg text-ml2-text-3 hover:bg-ml2-surface-3 hover:text-ml2-text', panelOpen && 'ml-auto')}
+          className={cn('grid size-7 place-items-center rounded-lg text-ml2-text-3 hover:bg-ml2-surface-3 hover:text-ml2-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ml2-accent/70', panelOpen && 'ml-auto')}
         >
           {panelOpen ? <PanelRightClose className="size-3.5" /> : <PanelRightOpen className="size-3.5" />}
         </button>

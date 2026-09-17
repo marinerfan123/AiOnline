@@ -7,6 +7,7 @@ import { useProjectContext } from '@/features/project-foundation/ProjectContext'
 import { Badge } from '@/shared/ui/v2/Badge';
 import type { SaveStatus } from './useStudioCanvasPersistence';
 import { AssetLibraryToggle } from './AssetLibraryDrawer';
+import { ExportMenu } from '@/features/project-foundation/ExportMenu';
 
 /** SaveStatus 枚举 → 中文显示（仅展示用，不改枚举值）。 */
 const SAVE_STATUS_LABEL: Record<SaveStatus, string> = {
@@ -53,6 +54,7 @@ export function TopToolbar({ saveStatus = 'Saved', lastSavedAt, onRetry, onReloa
           <Sparkles className="size-3 text-ml2-accent" />
           创作模式
         </span>
+        {projectId && <ExportMenu projectId={projectId} />}
         {onToggleAssetLibrary && <AssetLibraryToggle active={assetLibraryOpen} onClick={onToggleAssetLibrary} />}
         <span data-test="studio-save-status" className="studio-save-status rounded-full border border-ml2-border bg-ml2-surface-2 px-2.5 py-1 text-[10px] text-ml2-text-2">
           {SAVE_STATUS_LABEL[saveStatus] ?? saveStatus}{lastSavedAt && saveStatus === 'Saved' ? ` · ${new Date(lastSavedAt).toLocaleTimeString()}` : ''}

@@ -34,7 +34,7 @@ export function StudioLayout() {
       />
       <div className="studio-app-column flex min-w-0 flex-1 flex-col">
         <MobileDockBar title="创作工作室" onOpen={() => setMobileDockOpen(true)} />
-        <main className="studio-app-main min-h-0 flex-1 overflow-hidden">
+        <main className="studio-app-main min-h-0 flex-1 overflow-x-hidden overflow-y-auto">
           <Outlet />
         </main>
       </div>
