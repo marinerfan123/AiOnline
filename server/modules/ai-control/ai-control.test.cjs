@@ -138,3 +138,32 @@ test('repo: upsertModelCapability validates before write', async () => {
     'invalid capability must be rejected before any DB write'
   );
 });
+
+test('repo: listLogicalModels handles models with no provider bindings', async () => {
+  const queries = [];
+  const pg = {
+    async query(sql, params = []) {
+      queries.push({ sql, params });
+      const normalized = sql.replace(/\s+/g, ' ').trim().toUpperCase();
+      if (normalized.startsWith('SELECT * FROM MODELS WHERE ENABLED')) {
+        return { rows: [{
+          id: 'm2', model_id: 'unbound-image', display_name: 'Unbound Image',
+          type: 'image', enabled: true,
+        }] };
+      }
+      if (normalized.includes('FROM PROVIDER_MODEL_BINDINGS B')) return { rows: [] };
+      if (normalized.includes('FROM PROVIDERS WHERE ID=ANY($1)')) {
+        throw new Error('provider lookup must not run for an empty binding set');
+      }
+      return { rows: [] };
+    },
+  };
+
+  const models = await repo.listLogicalModels(pg);
+  assert.deepEqual(models[0].provider_bindings, []);
+  assert.equal(
+    queries.some((q) => q.sql.toUpperCase().includes('FROM PROVIDERS WHERE ID=ANY($1)')),
+    false,
+  );
+});
+

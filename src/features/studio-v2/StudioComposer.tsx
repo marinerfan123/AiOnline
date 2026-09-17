@@ -56,12 +56,14 @@ function primaryTextParameterKey(kind: string): string | null {
   }
 }
 
-export function StudioComposer({ projectId }: { projectId?: string }) {
+export function StudioComposer({ projectId, canvasRevision }: { projectId?: string; canvasRevision?: number | null }) {
   const nodes = useStudioStore((s) => s.nodes);
   const beginEdit = useStudioStore((s) => s.beginEdit);
   const endEdit = useStudioStore((s) => s.endEdit);
   const updateNodeData = useStudioStore((s) => s.updateNodeData);
   const updateNodeParameter = useStudioStore((s) => s.updateNodeParameter);
+  const setRunContext = useStudioStore((s) => s.setRunContext);
+  const runNode = useStudioStore((s) => s.runNode);
   const editing = useRef(false);
   const flushRef = useRef<number | null>(null);
   const [models, setModels] = useState<ModelOption[]>([]);
@@ -76,6 +78,11 @@ export function StudioComposer({ projectId }: { projectId?: string }) {
   const isGeneration = Boolean(def?.isGeneration);
   const [text, setText] = useState('');
   const [savedFlash, setSavedFlash] = useState(false);
+
+
+  useEffect(() => {
+    setRunContext(projectId ?? null, canvasRevision ?? null);
+  }, [projectId, canvasRevision, setRunContext]);
 
   // Load the public model list once (canonical capabilities projection).
   useEffect(() => {
@@ -318,8 +325,8 @@ export function StudioComposer({ projectId }: { projectId?: string }) {
           <button
             data-test="composer-generate"
             disabled={!isGeneration || text.trim().length === 0}
-            onClick={() => { flush(); }}
-            title={isGeneration ? '执行链经 G15 Run 层接入；当前保存节点提示词' : '仅生成类节点可执行'}
+            onClick={() => { flush(); if (node) void runNode(node.id); }}
+            title={isGeneration ? '保存提示词并运行当前生成节点' : '仅生成类节点可执行'}
             className="flex items-center gap-1.5 rounded-xl bg-ml2-accent px-3 py-1.5 text-[11px] font-medium text-black enabled:hover:brightness-110 disabled:opacity-40"
           >
             <Send className="size-3" /> 生成

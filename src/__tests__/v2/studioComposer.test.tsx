@@ -10,11 +10,17 @@
  *   dirty clears — promptValueOf reads back the committed value (== input text)
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { render, screen, fireEvent, cleanup } from '@testing-library/react';
+import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/react';
 import { StudioComposer, promptValueOf } from '@/features/studio-v2/StudioComposer';
 import { useStudioStore, type StudioNode, type StudioEdge } from '@/features/studio-v2/store';
 import { getNodeDef } from '@/features/studio-v2/registry';
 import type { StudioNodeKind } from '@/features/studio-v2/types';
+
+const mocks = vi.hoisted(() => ({ runNode: vi.fn() }));
+
+vi.mock('@/features/studio-v2/run/studioRunClient', () => ({
+  studioRunClient: { runNode: mocks.runNode },
+}));
 
 const node = (
   kind: StudioNodeKind,
@@ -47,6 +53,7 @@ function reset(nodes: StudioNode[], edges: StudioEdge[] = []) {
 }
 
 beforeEach(() => {
+  mocks.runNode.mockReset();
   // Composer mounts two fire-and-forget fetches (models + shortcuts); stub them
   // with empty payloads so neither effect sets state.
   vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ json: () => Promise.resolve({}) }));
@@ -97,5 +104,28 @@ describe('StudioComposer commit() — 写 schema 参数 (M05-B2 HIGH)', () => {
     const after = useStudioStore.getState().nodes.find((n) => n.id === 't1')!;
     expect(after.data.parameters.content).toBe('a text node');
     expect(promptValueOf(after.data)).toBe('a text node'); // dirty 清（读 parameters.content）
+  });
+});
+
+describe('StudioComposer — Generate dispatch', () => {
+  it('保存提示词后通过 runNode 触发一次 FROM_NODE 运行', async () => {
+    const generation = node('image-generation', 'g1', {
+      selected: true,
+      data: { prompt: 'old prompt' },
+    });
+    reset([generation]);
+    useStudioStore.setState({ projectId: 'p1', canvasRevision: 3 });
+    mocks.runNode.mockResolvedValue({ runId: 'run-1', status: 'QUEUED' });
+
+    render(<StudioComposer projectId="p1" canvasRevision={3} />);
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'new prompt' } });
+    fireEvent.click(screen.getByRole('button', { name: '生成' }));
+
+    await waitFor(() => expect(mocks.runNode).toHaveBeenCalledTimes(1));
+    expect(mocks.runNode).toHaveBeenCalledWith({
+      projectId: 'p1',
+      nodeId: 'g1',
+      canvasRevision: 3,
+    });
   });
 });
