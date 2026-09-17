@@ -91,11 +91,11 @@
 - [x] **Step 2: Inspect the built bundle for the new visual hooks.**
   Confirm the production output contains `studio-shell`, `studio-canvas-stage`, and the refreshed node presentation class/data attributes, ensuring deployment cannot silently serve the previous bundle.
 
-- [ ] **Step 3: Commit and push the implementation branch.**
+- [x] **Step 3: Commit and push the implementation branch.**
   Commit only the visual refresh and plan changes with a focused message, then push `codex/ai-control-model-catalog` to the configured GitHub repository.
 
-- [ ] **Step 4: Deploy the verified build to the configured server.**
+- [x] **Step 4: Deploy the verified build to the configured server.**
   Reuse the repository's established low-memory deployment path, rebuild/restart the Studio-serving services, and avoid changing secrets or unrelated services.
 
-- [ ] **Step 5: Verify the online deployment.**
+- [x] **Step 5: Verify the online deployment.**
   Check HTTP health, fetch the production HTML/static asset manifest, and confirm the new bundle/class tokens are present. If an authenticated browser session is available, open the project Studio and take a screenshot; otherwise report the authenticated-session limitation explicitly.
