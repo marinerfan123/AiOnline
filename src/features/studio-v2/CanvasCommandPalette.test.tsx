@@ -30,4 +30,21 @@ describe('CanvasCommandPalette', () => {
     fireEvent.mouseDown(screen.getByTestId('canvas-command-palette-backdrop'));
     expect(onClose).toHaveBeenCalledTimes(2);
   });
+
+  it('traps Tab within the dialog and restores focus when closed', () => {
+    const trigger = document.createElement('button');
+    document.body.appendChild(trigger);
+    trigger.focus();
+    const { rerender } = render(<CanvasCommandPalette open commands={commands} onClose={vi.fn()} />);
+    const input = screen.getByTestId('canvas-command-input');
+    const lastCommand = screen.getByTestId('canvas-command-fit-all');
+
+    lastCommand.focus();
+    fireEvent.keyDown(lastCommand, { key: 'Tab' });
+    expect(document.activeElement).toBe(input);
+
+    rerender(<CanvasCommandPalette open={false} commands={commands} onClose={vi.fn()} />);
+    expect(document.activeElement).toBe(trigger);
+    trigger.remove();
+  });
 });

@@ -21,6 +21,8 @@ export function CanvasCommandPalette({ open, commands, onClose }: CanvasCommandP
   const [query, setQuery] = useState('');
   const [activeIndex, setActiveIndex] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const restoreFocusRef = useRef<HTMLElement | null>(null);
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -31,10 +33,16 @@ export function CanvasCommandPalette({ open, commands, onClose }: CanvasCommandP
   }, [commands, query]);
 
   useEffect(() => {
-    if (!open) return;
+    if (!open) {
+      restoreFocusRef.current?.focus();
+      restoreFocusRef.current = null;
+      return;
+    }
+    restoreFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     setQuery('');
     setActiveIndex(0);
-    requestAnimationFrame(() => inputRef.current?.focus());
+    const frame = requestAnimationFrame(() => inputRef.current?.focus());
+    return () => cancelAnimationFrame(frame);
   }, [open]);
 
   useEffect(() => {
@@ -62,6 +70,27 @@ export function CanvasCommandPalette({ open, commands, onClose }: CanvasCommandP
         aria-modal="true"
         aria-label="画布命令面板"
         data-test="canvas-command-palette"
+        ref={dialogRef}
+        onKeyDown={(event) => {
+          if (event.key !== 'Tab') return;
+          const focusable = Array.from(dialogRef.current?.querySelectorAll<HTMLElement>(
+            'input:not([disabled]), button:not([disabled]), [tabindex]:not([tabindex="-1"])',
+          ) ?? []);
+          if (focusable.length === 0) {
+            event.preventDefault();
+            dialogRef.current?.focus();
+            return;
+          }
+          const first = focusable[0];
+          const last = focusable[focusable.length - 1];
+          if (event.shiftKey && document.activeElement === first) {
+            event.preventDefault();
+            last.focus();
+          } else if (!event.shiftKey && document.activeElement === last) {
+            event.preventDefault();
+            first.focus();
+          }
+        }}
         className="w-[min(34rem,calc(100%-2rem))] overflow-hidden rounded-xl border border-ml2-border bg-ml2-surface-1 shadow-2xl"
       >
         <div className="flex items-center gap-2 border-b border-ml2-border px-3">
@@ -78,7 +107,7 @@ export function CanvasCommandPalette({ open, commands, onClose }: CanvasCommandP
               if (event.key === 'Enter') { event.preventDefault(); execute(filtered[activeIndex]); }
             }}
             placeholder="搜索节点、视图和操作…"
-            className="h-11 min-w-0 flex-1 bg-transparent text-sm text-ml2-text outline-none placeholder:text-ml2-text-3"
+            className="h-11 min-w-0 flex-1 bg-transparent text-sm text-ml2-text outline-none placeholder:text-ml2-text-3 focus-visible:ring-2 focus-visible:ring-ml2-accent/60"
           />
           <kbd className="rounded border border-ml2-border bg-ml2-surface-2 px-1.5 py-0.5 text-[10px] text-ml2-text-3">Esc</kbd>
         </div>

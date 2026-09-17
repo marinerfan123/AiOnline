@@ -55,10 +55,6 @@
   stroke-dasharray: 5;
 }
 
-[data-test='studio-page'] [data-test='canvas-command-palette'] input:focus {
-  outline: none;
-}
-
 [data-test='studio-page'] .react-flow__selection {
   border: 1px solid color-mix(in srgb, var(--ml2-accent) 70%, transparent);
   background: color-mix(in srgb, var(--ml2-accent) 12%, transparent);

@@ -534,7 +534,7 @@ export const useStudioStore = create<StudioState>((set, get) => ({
 
   alignSelection: (kind) =>
     set((st) => {
-      const selected = st.nodes.filter((n) => n.selected && n.data.nodeKind !== 'frame');
+      const selected = st.nodes.filter((n) => n.selected && n.data.nodeKind !== 'frame' && !isNodeLocked(st, n.id));
       if (selected.length < 2) return st;
       const xs = selected.map((n) => n.position.x);
       const target =
@@ -549,7 +549,9 @@ export const useStudioStore = create<StudioState>((set, get) => ({
         undoStack,
         redoStack,
         nodes: st.nodes.map((n) =>
-          n.selected && n.data.nodeKind !== 'frame' ? { ...n, position: { ...n.position, x: target } } : n,
+          n.selected && n.data.nodeKind !== 'frame' && !isNodeLocked(st, n.id)
+            ? { ...n, position: { ...n.position, x: target } }
+            : n,
         ),
       };
     }),

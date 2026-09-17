@@ -73,7 +73,7 @@
 - [x] Step 1: Add the command-palette trigger and fit-selected action to the existing toolbar.
 - [x] Step 2: Update scoped canvas styles for the modal, toolbar, and focus states.
 - [x] Step 3: Run all Studio tests, typecheck, lint, and production build (all passed; ESLint reports 21 pre-existing warnings).
-- [ ] Step 4: Review the diff with a fresh code reviewer and fix all Critical/Important findings.
+- [x] Step 4: Review the diff with a fresh code reviewer; no Critical/Important findings. Also fixed the review's Minor focus-management and locked-alignment issues.
 - [ ] Step 5: Commit, push the tested branch, deploy through the existing server workflow, and verify the public Studio route plus the affected Run status behavior.
 
 ## Research Notes

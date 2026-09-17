@@ -240,6 +240,20 @@ describe('Canvas session store — operations', () => {
     expect(useStudioStore.getState().undoStack).toHaveLength(0);
   });
 
+  it('alignment leaves locked selected nodes unchanged', () => {
+    useStudioStore.setState({
+      nodes: [
+        node('prompt', 'unlocked', 0, 0, { selected: true }),
+        node('prompt', 'locked', 100, 200, { selected: true, locked: true }),
+        node('prompt', 'other', 300, 100, { selected: true }),
+      ],
+    });
+    useStudioStore.getState().alignSelection('left');
+    const st = useStudioStore.getState();
+    expect(st.nodes.find((n) => n.id === 'locked')?.position).toEqual({ x: 100, y: 200 });
+    expect(st.nodes.filter((n) => n.id !== 'locked').map((n) => n.position.x)).toEqual([0, 0]);
+  });
+
   it('groupSelection wraps the selection in a frame and clears prior selection', () => {
     useStudioStore.setState({
       nodes: [
