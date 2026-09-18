@@ -1585,19 +1585,22 @@ function startStuckTaskWatchdog(pgPool) {
 }
 
 // 查询单个任务状态
-async function getTaskStatus(pgPool, taskId) {
+async function getTaskStatus(pgPool, taskId, userId) {
   if (!pgPool) return { status: 'unknown', error: '数据库不可用' };
   try {
+    const params = [taskId];
+    const ownerClause = userId ? ' AND user_id=$2' : '';
+    if (userId) params.push(userId);
     const r = await pgPool.query(
       `SELECT task_id, status, result, error, pending_ids, client_meta, model, prompt, count, content_type, created_at, completed_at
-         FROM generation_tasks WHERE task_id=$1`,
-      [taskId],
+         FROM generation_tasks WHERE task_id=$1${ownerClause}`,
+      params,
     );
     if (r.rows.length === 0) return { status: 'not_found', error: '任务不存在或已清理' };
     const row = r.rows[0];
     return {
       taskId: row.task_id,
-      status: row.status,
+      status: row.status === 'finalizing' ? 'running' : row.status,
       result: row.result || null,
       error: row.error || '',
       pendingIds: row.pending_ids || [],
@@ -1620,7 +1623,7 @@ async function listActiveTasks(pgPool, userId) {
   if (!pgPool) return { tasks: [] };
   try {
     const params = [];
-    let where = `WHERE (status='running' OR (completed_at > NOW() - INTERVAL '1 hour'))`;
+    let where = `WHERE (status IN ('running', 'finalizing') OR (completed_at > NOW() - INTERVAL '1 hour'))`;
     if (userId) {
       params.push(userId);
       where += ` AND user_id=$${params.length}`;
@@ -1635,7 +1638,7 @@ async function listActiveTasks(pgPool, userId) {
     return {
       tasks: r.rows.map((row) => ({
         taskId: row.task_id,
-        status: row.status,
+        status: row.status === 'finalizing' ? 'running' : row.status,
         result: row.result || null,
         error: row.error || '',
         pendingIds: row.pending_ids || [],

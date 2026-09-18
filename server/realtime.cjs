@@ -101,14 +101,14 @@ async function snapshotActive(pgPool, userId) {
       `SELECT task_id, status, result, error, pending_ids, client_meta, model, prompt, count, content_type, created_at, completed_at
          FROM generation_tasks
         WHERE user_id = $1
-          AND (status IN ('running', 'waiting') OR (completed_at > NOW() - INTERVAL '1 hour'))
+          AND (status IN ('running', 'waiting', 'finalizing') OR (completed_at > NOW() - INTERVAL '1 hour'))
         ORDER BY created_at DESC
         LIMIT 200`,
       [userId],
     );
     return r.rows.map((row) => ({
       taskId: row.task_id,
-      status: row.status,
+      status: row.status === 'finalizing' ? 'running' : row.status,
       result: row.result || null,
       error: row.error || '',
       pendingIds: row.pending_ids || [],

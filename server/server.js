@@ -67,6 +67,18 @@ import referenceStylesMod from './reference-styles.cjs'; // 参考样式库：�
 import referenceStyleAudit from './reference-style-audit.cjs'; // 参考样式 AI 预审
 import agentResolver from './agent-model-resolver.cjs';         // 智能体文本模型统一解析（全局兜底模型）
 import seedDefaultsMod from './seed-defaults.cjs'; // 首次部署兜底种子（占位服务商 + 常用模型）
+import relayClientMod from './relayClient.cjs'; // AiOnline -> molingapi 服务端 BFF
+import relayGenerationMod from './relayGeneration.cjs';
+import uploadQueueMod from './uploadQueue.cjs';
+
+const relayClient = relayClientMod.createRelayClient();
+const relayGeneration = relayGenerationMod.createRelayGenerationService({
+  relayClient,
+  billing,
+  accounting,
+  uploadQueue: uploadQueueMod,
+  realtime,
+});
 
 // 初始化向导限流（同一进程内 ≤20 次/10min；真正防护靠"建好即锁定"）
 const setupAttempts = new Map();
@@ -2854,8 +2866,31 @@ async function handleAPI(req, res) {
   }
 
   if (url === '/api/providers' && method === 'GET') {
+    // 非管理员只拿脱敏的 relay provider 摘要；管理写操作统一在 molingapi 独立控制台完成。
+    if (relayClientMod.isRelayEnabled() && req.user?.role !== 'admin') {
+      try {
+        const relayModels = await relayClient.listModels({ userId: (realUser && realUser.id) || req.user?.id || '__system__' });
+        const providers = [];
+        const seen = new Set();
+        for (const model of relayModels.models || []) {
+          for (const providerId of model.providerIds || []) {
+            if (seen.has(providerId)) continue;
+            seen.add(providerId);
+            providers.push({ id: providerId, name: providerId, type: 'relay', baseUrl: '', apiKey: '', supportedTypes: [], enabled: true, apiKeys: [] });
+          }
+        }
+        return sendJSON(res, 200, providers);
+      } catch (error) {
+        console.warn('[relay-catalog] provider summary unavailable:', error.code || 'relay_error');
+      }
+    }
     const maskKey = (p) => ({ ...p, apiKey: p.apiKey ? '***' : '' });
-    if (pgPool) { const r = await pgPool.query('SELECT * FROM providers ORDER BY created_at'); return sendJSON(res, 200, r.rows.map(fromSnake).map(maskKey)); }
+    if (pgPool) {
+      const r = await pgPool.query('SELECT * FROM providers ORDER BY created_at');
+      const rows = r.rows.map(fromSnake).map(maskKey);
+      if (relayClientMod.isRelayEnabled() && req.user?.role !== 'admin') return sendJSON(res, 200, rows.map((p) => ({ ...p, baseUrl: '', apiKey: '', type: 'relay', apiKeys: [] })));
+      return sendJSON(res, 200, rows);
+    }
     return sendJSON(res, 200, readJSON('providers').map(maskKey));
   }
   // ── POST /api/providers：单条创建（RESTful，不再是破坏性全量同步）──
@@ -2998,9 +3033,12 @@ async function handleAPI(req, res) {
 
     // 幂等：已存在同键任务？
     const ex = await pgPool.query(
-      'SELECT task_id, status, cost FROM generation_tasks WHERE idempotency_key=$1', [idemKey]);
+      'SELECT task_id, status, cost, cost_pool, user_id FROM generation_tasks WHERE idempotency_key=$1', [idemKey]);
     if (ex.rows.length) {
       const row = ex.rows[0];
+      if (String(row.user_id || '') !== String(realUser.id)) {
+        return sendJSON(res, 409, { status: 'failed', error: '幂等键已被其他用户使用', code: 'IDEMPOTENCY_CONFLICT' });
+      }
       if (row.status === 'failed') {
         // 失败的可复用同一键重试：先释放旧 held（按原池），再删行腾出唯一约束
         await billing.releaseCredits(pgPool, realUser.id, row.cost || 0, idemKey, row.cost_pool || 'recharge').catch(() => {});
@@ -3072,6 +3110,7 @@ async function handleAPI(req, res) {
       pendingIds: body.pendingIds || [],
       negative: (body.negative || '').toString().trim(),
       durationSec: Number(body.duration) || 6,
+      duration: Number(body.duration) || 6,
       videoMode: body.videoMode || undefined,
       user_id: realUser.id,
       idempotencyKey: idemKey,
@@ -3095,6 +3134,12 @@ async function handleAPI(req, res) {
 
     // 异步：插入任务表，后台跑，前端轮询（完成回调里 commit/release + 服务端最终化）
     try {
+      // 灰度开关：启用后 provider/model/routing 由 molingapi 处理，AiOnline 只保留身份、计费、媒体和 OSS。
+      // 关闭 MODEL_RELAY_ENABLED 即回到下方原 dispatcher 路径，保留可回滚能力。
+      if (relayClientMod.isRelayEnabled()) {
+        const relayTask = await relayGeneration.create({ pgPool, userId: realUser.id, generation: genOpts });
+        return sendJSON(res, 200, { status: 'pending', taskId: relayTask.taskId });
+      }
       const { taskId, error } = await dispatcher.generateAsync(pgPool, genOpts);
       if (error) {
         await billing.releaseCredits(pgPool, realUser.id, cost, idemKey, pay.pool).catch(() => {});
@@ -3119,6 +3164,8 @@ async function handleAPI(req, res) {
     if (!realUser) return sendJSON(res, 401, { ok: false, error: '未登录' });
     const taskId = decodeURIComponent(url.slice('/api/generate/cancel/'.length));
     if (!taskId) return sendJSON(res, 400, { ok: false, error: '缺少 taskId' });
+    const relayResult = await relayGeneration.cancel({ pgPool, userId: realUser.id, taskId });
+    if (relayResult.handled) return sendJSON(res, relayResult.ok ? 200 : relayResult.code || 400, relayResult);
     const r = await dispatcher.cancelTask(pgPool, realUser.id, taskId);
     // r.code: 404 不存在 / 403 越权 / 409 已结束 / 500 内部 / 503 无 DB；ok:true 成功
     return sendJSON(res, r.ok ? 200 : (r.code || 400), r);
@@ -3127,8 +3174,9 @@ async function handleAPI(req, res) {
   // GET /api/generate/status/:taskId — 查询单个任务状态
   if (url.startsWith('/api/generate/status/') && method === 'GET') {
     if (!pgPool) return sendJSON(res, 200, { status: 'unknown', error: '数据库不可用' });
+    if (!realUser) return sendJSON(res, 401, { error: '未登录' });
     const taskId = decodeURIComponent(url.slice('/api/generate/status/'.length));
-    const r = await dispatcher.getTaskStatus(pgPool, taskId);
+    const r = await dispatcher.getTaskStatus(pgPool, taskId, realUser.id);
     return sendJSON(res, 200, r);
   }
 
@@ -3584,6 +3632,40 @@ async function handleAPI(req, res) {
 
   // ── Models ──
   if (url === '/api/models' && method === 'GET') {
+    if (relayClientMod.isRelayEnabled() && req.user?.role !== 'admin') {
+      try {
+        const userId = (realUser && realUser.id) || req.user?.id || '__system__';
+        const relayModels = await relayClient.listModels({ userId });
+        const ids = (relayModels.models || []).map((m) => m.modelId).filter(Boolean);
+        let localByModel = new Map();
+        if (pgPool && ids.length) {
+          const local = await pgPool.query('SELECT * FROM models WHERE model_id = ANY($1) ORDER BY created_at ASC', [ids]);
+          localByModel = new Map(local.rows.map((row) => [row.model_id, fromSnake(row)]));
+        }
+        const mapped = (relayModels.models || []).map((model) => {
+          const local = localByModel.get(model.modelId) || {};
+          return {
+            ...local,
+            id: model.id,
+            modelId: model.modelId,
+            displayName: model.displayName,
+            mappingName: model.mappingName || local.mappingName || '',
+            type: model.type,
+            providerId: (model.providerIds || [])[0] || '',
+            providerIds: model.providerIds || [],
+            enabled: model.enabled !== false,
+            capabilities: model.capabilities || {},
+            paramTemplate: model.paramTemplate || {},
+            sortOrder: model.sortOrder || 0,
+            apiKey: '',
+            endpoint: undefined,
+          };
+        });
+        if (mapped.length) return sendJSON(res, 200, mapped);
+      } catch (error) {
+        console.warn('[relay-catalog] model catalog unavailable:', error.code || 'relay_error');
+      }
+    }
     if (pgPool) { const r = await pgPool.query('SELECT * FROM models ORDER BY sort_order ASC, created_at ASC'); return sendJSON(res, 200, r.rows.map(fromSnake)); }
     return sendJSON(res, 200, readJSON('models'));
   }
@@ -4301,7 +4383,11 @@ if (pgPool && IS_LEADER) {
     .catch((e) => console.warn('[startup] 等待区恢复扫描失败（不影响启动）:', e.message));
   // 搬运与 API 解耦：启动后台上传队列 worker（建表 + 崩溃恢复 + 起 worker），仅 leader worker 跑
   dispatcher.startUploadQueue(pgPool)
-    .then(() => console.log('[startup] 上传队列 worker 已启动'))
+    .then(async () => {
+      console.log('[startup] 上传队列 worker 已启动');
+      const resumed = await relayGeneration.resume(pgPool);
+      if (resumed.resumed) console.log(`[startup] molingapi 任务恢复：续轮询 ${resumed.resumed} 个任务`);
+    })
     .catch((e) => console.warn('[startup] 上传队列启动失败（不影响启动）:', e.message));
 }
 
