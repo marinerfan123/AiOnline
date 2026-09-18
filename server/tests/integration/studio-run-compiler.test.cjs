@@ -5,6 +5,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { compileStudioGraph } = require('../../modules/project-foundation/studioRunGraph.cjs');
+const { resolveProductionExecutor } = require('../../modules/project-foundation/studioRunExecutors.cjs');
 
 const promptNode = (id, prompt = 'hello world') => ({
   nodeId: id, nodeType: 'prompt', nodeSchemaVersion: 1,
@@ -88,6 +89,35 @@ test('compile: unknown node type rejected', () => {
   });
   assert.equal(r.ok, false);
   assert.equal(r.error.code, 'UNKNOWN_NODE_TYPE');
+});
+
+test('compile: Blueprint base node types are accepted by the run registry', () => {
+  const baseNodes = [
+    { nodeId: 'text-1', nodeType: 'text', nodeSchemaVersion: 1, data: { nodeKind: 'text', schemaVersion: 1, parameters: { content: 'hello' } } },
+    { nodeId: 'image-1', nodeType: 'image', nodeSchemaVersion: 1, data: { nodeKind: 'image', schemaVersion: 1, parameters: { assetId: 'asset-image-1' }, assetId: 'asset-image-1' } },
+    { nodeId: 'audio-1', nodeType: 'audio', nodeSchemaVersion: 1, data: { nodeKind: 'audio', schemaVersion: 1, parameters: { assetId: 'asset-audio-1' }, assetId: 'asset-audio-1' } },
+    { nodeId: 'clip-1', nodeType: 'video-clip', nodeSchemaVersion: 1, data: { nodeKind: 'video-clip', schemaVersion: 1, parameters: { assetId: 'asset-video-1' }, assetId: 'asset-video-1' } },
+    { nodeId: 'storyboard-1', nodeType: 'storyboard', nodeSchemaVersion: 1, data: { nodeKind: 'storyboard', schemaVersion: 1, parameters: {} } },
+  ];
+  const r = compileStudioGraph({ ...base, nodes: baseNodes, edges: [] });
+  assert.equal(r.ok, true, JSON.stringify(r.error));
+  assert.equal(r.graph.nodeCount, 4);
+  assert.deepEqual(r.graph.structuralNodeIds, ['storyboard-1']);
+});
+
+test('execute: Blueprint text and asset nodes resolve through production executors', async () => {
+  const cases = [
+    { nodeType: 'text', input: { parameters: { content: 'hello' } }, resultKey: 'text', resultValue: 'hello' },
+    { nodeType: 'image', input: { parameters: { assetId: 'image-asset' } }, resultKey: 'imageAssetId', resultValue: 'image-asset' },
+    { nodeType: 'audio', input: { parameters: { assetId: 'audio-asset' } }, resultKey: 'audioAssetId', resultValue: 'audio-asset' },
+    { nodeType: 'video-clip', input: { parameters: { assetId: 'video-asset' } }, resultKey: 'videoAssetId', resultValue: 'video-asset' },
+  ];
+  for (const item of cases) {
+    const resolved = resolveProductionExecutor({ nodeType: item.nodeType }, { input: item.input, dependencies: [] }, null);
+    assert.equal(resolved.ok, true, item.nodeType);
+    const result = await resolved.executor.execute();
+    assert.equal(result.result[item.resultKey], item.resultValue, item.nodeType);
+  }
 });
 
 test('compile: schema version mismatch rejected', () => {

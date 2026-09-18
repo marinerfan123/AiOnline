@@ -38,9 +38,11 @@ const SCHEMA_VERSIONS = {
   prompt: 1, script: 1, character: 1, reference: 1,
   'image-generation': 1, 'image-to-video': 1, 'text-to-video': 1,
   video: 1, output: 1, frame: 1,
+  text: 1, image: 1, audio: 1, storyboard: 1, 'video-clip': 1,
 };
 
-// Stable B2 production core node set (10 identities).
+// Stable B2 production core plus Blueprint base node identities. This must stay
+// aligned with src/features/studio-v2/registry.ts and canvasGraphValidator.cjs.
 const NODE_REGISTRY = {
   prompt: {
     id: 'prompt', version: SCHEMA_VERSIONS.prompt, executionKind: 'SOURCE',
@@ -133,6 +135,41 @@ const NODE_REGISTRY = {
     outputPorts: [],
     resultOutputs: [],
     executorClass: null,
+  },
+  text: {
+    id: 'text', version: SCHEMA_VERSIONS.text, executionKind: 'SOURCE',
+    inputPorts: [port('text', 'TEXT', true, false)],
+    outputPorts: [port('text', 'TEXT', false)],
+    resultOutputs: ['TEXT'],
+    executorClass: 'deterministic-source',
+  },
+  image: {
+    id: 'image', version: SCHEMA_VERSIONS.image, executionKind: 'ASSET',
+    inputPorts: [port('image', 'IMAGE', true, false)],
+    outputPorts: [port('image', 'IMAGE', false)],
+    resultOutputs: ['IMAGE', 'ASSET_REF'],
+    executorClass: 'deterministic-asset',
+  },
+  audio: {
+    id: 'audio', version: SCHEMA_VERSIONS.audio, executionKind: 'ASSET',
+    inputPorts: [port('audio', 'AUDIO', true, false)],
+    outputPorts: [port('audio', 'AUDIO', false)],
+    resultOutputs: ['AUDIO', 'ASSET_REF'],
+    executorClass: 'deterministic-asset',
+  },
+  storyboard: {
+    id: 'storyboard', version: SCHEMA_VERSIONS.storyboard, executionKind: 'STRUCTURAL',
+    inputPorts: [port('image', 'IMAGE', true, false)],
+    outputPorts: [port('image', 'IMAGE', false)],
+    resultOutputs: ['IMAGE'],
+    executorClass: null,
+  },
+  'video-clip': {
+    id: 'video-clip', version: SCHEMA_VERSIONS['video-clip'], executionKind: 'ASSET',
+    inputPorts: [port('video', 'VIDEO', true, false)],
+    outputPorts: [port('video', 'VIDEO', false)],
+    resultOutputs: ['VIDEO', 'ASSET_REF'],
+    executorClass: 'deterministic-asset',
   },
 };
 

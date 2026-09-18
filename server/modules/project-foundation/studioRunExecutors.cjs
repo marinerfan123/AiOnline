@@ -47,6 +47,7 @@ function makeDeterministicExecutor(def, ctx) {
 
       if (def.executionKind === 'SOURCE') {
         if (def.id === 'prompt') result.text = typeof params.prompt === 'string' ? params.prompt : (ctx.input.prompt || '');
+        if (def.id === 'text') result.text = typeof params.content === 'string' ? params.content : '';
         if (def.id === 'script') {
           result.text = typeof params.scriptText === 'string' ? params.scriptText : (params.prompt || '');
           result.script = result.text;
@@ -69,7 +70,10 @@ function makeDeterministicExecutor(def, ctx) {
           result.reference = { assetId, role: typeof params.referenceRole === 'string' ? params.referenceRole : 'visual', weight: Number(params.weight) || null };
           result.imageAssetId = assetId; // IMAGE-compatible output (durable ref, never a URL)
         }
+        if (def.id === 'image') result.imageAssetId = assetId;
+        if (def.id === 'audio') result.audioAssetId = assetId;
         if (def.id === 'video') result.videoAssetId = assetId;
+        if (def.id === 'video-clip') result.videoAssetId = assetId;
       } else if (def.executionKind === 'OUTPUT') {
         // Boundary/collector: gather resolved upstream durable references.
         const collected = { upstream: {} };
