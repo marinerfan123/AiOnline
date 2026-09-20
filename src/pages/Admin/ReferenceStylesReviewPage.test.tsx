@@ -12,7 +12,7 @@ vi.mock('@/services/api', () => ({
   apiAdminGetReferenceStyles: mocks.list,
   apiAdminReviewReferenceStyle: vi.fn(),
   apiAdminPromoteReferenceStyle: vi.fn(),
-  apiDeleteReferenceStyle: mocks.remove,
+  apiAdminDeleteReferenceStyle: mocks.remove,
 }));
 vi.mock('sonner', () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
 

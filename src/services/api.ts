@@ -578,6 +578,11 @@ export async function apiDeleteReferenceStyle(id: string): Promise<{ ok: boolean
   catch { return { ok: false }; }
 }
 
+export async function apiAdminDeleteReferenceStyle(id: string): Promise<{ ok: boolean; error?: string }> {
+  try { return await apiFetch(`/api/admin/reference-styles/${id}`, { method: 'DELETE' }); }
+  catch (e: any) { return { ok: false, error: e?.message || '删除失败' }; }
+}
+
 export async function apiAdminGetReferenceStyles(params: { status?: string; q?: string; limit?: number; offset?: number } = {}): Promise<{ items: ReferenceStyle[]; total: number }> {
   const sp = new URLSearchParams();
   if (params.status) sp.set('status', params.status);

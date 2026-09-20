@@ -4,6 +4,7 @@
 //   POST   /api/reference-styles           投稿（从自己的 media 创建 pending 样式）
 //   DELETE /api/reference-styles/:id        删除（本人或 admin）
 //   GET    /api/admin/reference-styles      管理员审核列表
+//   DELETE /api/admin/reference-styles/:id  管理员删除
 //   POST   /api/admin/reference-styles/:id/review  人工通过/拒绝
 //
 // 审核原则：AI 只做预审建议，最终 approve/reject 必须由人工完成；
@@ -143,6 +144,15 @@ function createReferenceStyles(ctx) {
     return ok(res, { ok: true });
   }
 
+  async function removeAdmin(req, res, id) {
+    if (!requireAdmin(req)) return err(res, 403, '需要管理员权限');
+    if (!pg()) return err(res, 503, '数据库不可用');
+
+    const r = await pg().query('DELETE FROM reference_styles WHERE id=$1 RETURNING id', [id]);
+    if (!r.rows.length) return err(res, 404, '样式不存在');
+    return ok(res, { ok: true });
+  }
+
   // ───────────────────────── 管理员列表 ─────────────────────────
   async function listAdmin(req, res, query) {
     if (!requireAdmin(req)) return err(res, 403, '需要管理员权限');
@@ -262,6 +272,11 @@ function createReferenceStyles(ctx) {
   async function handleAdmin(req, res, url, method) {
     if (url === '/api/admin/reference-styles' && method === 'GET') {
       await listAdmin(req, res, parseQuery(url));
+      return true;
+    }
+    const dm = url.match(/^\/api\/admin\/reference-styles\/([^/]+)$/);
+    if (dm && method === 'DELETE') {
+      await removeAdmin(req, res, dm[1]);
       return true;
     }
     const m = url.match(/^\/api\/admin\/reference-styles\/([^/]+)\/review$/);

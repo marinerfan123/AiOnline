@@ -10,7 +10,7 @@ import {
   apiAdminGetReferenceStyles,
   apiAdminReviewReferenceStyle,
   apiAdminPromoteReferenceStyle,
-  apiDeleteReferenceStyle,
+  apiAdminDeleteReferenceStyle,
   type ReferenceStyle,
 } from '@/services/api';
 
@@ -124,9 +124,9 @@ export default function ReferenceStylesReviewPage() {
   const removeStyle = async (item: ReferenceStyle) => {
     setBusyDeleteId(item.id);
     try {
-      const result = await apiDeleteReferenceStyle(item.id);
+      const result = await apiAdminDeleteReferenceStyle(item.id);
       if (!result.ok) {
-        toast.error('删除失败，请重试');
+        toast.error(result.error || '删除失败，请重试');
         return;
       }
       setItems((current) => current.filter((entry) => entry.id !== item.id));
